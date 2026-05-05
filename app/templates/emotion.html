@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Emotion Check-In — MedAiCarePlus{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-8 col-lg-6">
+    <h4 class="text-primary mb-3"><i class="bi bi-emoji-smile me-2"></i>Emotion Check-In</h4>
+
+    <div class="card mb-3">
+      <div class="card-body text-center">
+        <video id="video" width="480" height="360" autoplay muted playsinline class="rounded border mb-2 w-100" style="max-width:480px"></video>
+        <canvas id="canvas" class="d-none" width="480" height="360"></canvas>
+
+        <div class="mb-2">
+          <span id="emotionLabel" class="fs-3 fw-bold text-primary">—</span>
+          <span id="emotionEmoji" class="fs-3 ms-2"></span>
+        </div>
+
+        <!-- Probability bars -->
+        <div id="probBars" class="mb-3">
+          {% for em in ['Angry','Happy','Neutral','Sad'] %}
+          <div class="d-flex align-items-center mb-1">
+            <span class="text-muted small" style="width:60px">{{ em }}</span>
+            <div class="progress flex-grow-1 me-2" style="height:14px">
+              <div class="progress-bar" id="bar_{{ em }}" role="progressbar" style="width:0%"></div>
+            </div>
+            <span class="small" id="pct_{{ em }}" style="width:40px">0%</span>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div id="timerBar" class="mb-3 d-none">
+          <div class="progress" style="height:6px">
+            <div class="progress-bar bg-warning progress-bar-striped progress-bar-animated" id="timerFill" style="width:100%"></div>
+          </div>
+          <small class="text-muted" id="timerLabel">Recording…</small>
+        </div>
+
+        <div id="controls">
+          <button id="startBtn" class="btn btn-primary me-2" onclick="startSession()"><i class="bi bi-play-fill me-1"></i>Start (5s)</button>
+        </div>
+
+        <div id="resultPanel" class="d-none mt-3">
+          <div class="alert alert-info">
+            Final emotion: <strong id="finalEmotion"></strong>
+            (<span id="finalScore"></span>)
+          </div>
+          <div class="input-group mb-2">
+            <span class="input-group-text">Note</span>
+            <input type="text" id="noteInput" class="form-control" placeholder="Optional note…">
+          </div>
+          <button class="btn btn-success me-2" onclick="saveEmotion()"><i class="bi bi-check-lg me-1"></i>Save</button>
+          <button class="btn btn-outline-secondary" onclick="resetSession()">Retry</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/camera.js"></script>
+<script src="/static/js/emotion_ws.js"></script>
+{% endblock %}

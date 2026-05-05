@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}Register — MedAiCarePlus{% endblock %}
+
+{% set hint       = request.query_params.get('hint') %}
+{% set pre_label  = request.query_params.get('face_label', '') %}
+{% set pre_name   = pre_label.replace('_', ' ').title() if pre_label else '' %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-10 col-lg-8">
+    <div class="card shadow-sm mt-4">
+      <div class="card-body p-4">
+        <h3 class="mb-3 text-primary"><i class="bi bi-person-plus me-2"></i>Register Patient</h3>
+
+        {% if hint %}
+        <div class="alert alert-success py-2 mb-3">
+          <i class="bi bi-person-check me-1"></i>
+          Face recognised as <strong>{{ pre_label }}</strong> — fill in your details and click <strong>Complete Registration</strong>. No new photos needed.
+        </div>
+        {% endif %}
+
+        {% if request.query_params.get('error') %}
+        <div class="alert alert-danger">{{ request.query_params.get('error') }}</div>
+        {% endif %}
+
+        <!-- ── Step 1: Patient details ──────────────────────────────── -->
+        <div id="stepDetails">
+          {% if not hint %}
+          <p class="text-muted small mb-3">Step 1 of 2 — fill in your details, then take 3 enrollment photos.</p>
+          {% endif %}
+
+          <div class="row">
+            <div class="col-md-6 mb-3">
+              <label class="form-label fw-semibold">Full Name *</label>
+              <input type="text" id="inputName" class="form-control" required
+                     placeholder="e.g. Ferdinand"
+                     value="{{ pre_name }}"
+                     oninput="autoFaceLabel(this.value)">
+            </div>
+            <div class="col-md-6 mb-3">
+              <label class="form-label fw-semibold">Face ID <span class="text-muted fw-normal small">(auto-generated)</span></label>
+              <div class="input-group">
+                <span class="input-group-text"><i class="bi bi-person-badge"></i></span>
+                <input type="text" id="inputFaceLabel" class="form-control bg-light text-muted"
+                       readonly placeholder="will fill as you type name"
+                       value="{{ pre_label }}">
+              </div>
+              <div class="form-text">Derived from your name — used to match your face photos.</div>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="col-md-4 mb-3">
+              <label class="form-label">Age</label>
+              <input type="number" id="inputAge" class="form-control" min="1" max="120" placeholder="—">
+            </div>
+            <div class="col-md-4 mb-3">
+              <label class="form-label">Gender</label>
+              <select id="inputGender" class="form-select">
+                <option value="">—</option>
+                <option>Male</option>
+                <option>Female</option>
+                <option>Other</option>
+              </select>
+            </div>
+            <div class="col-md-4 mb-3">
+              <label class="form-label">Address</label>
+              <input type="text" id="inputAddres" class="form-control" placeholder="optional">
+            </div>
+          </div>
+
+          <!-- LINE ID optional, collapsed -->
+          <div class="mb-3">
+            <a class="text-muted small" data-bs-toggle="collapse" href="#lineIdRow" role="button">
+              <i class="bi bi-chevron-down me-1"></i>Add LINE ID (optional)
+            </a>
+            <div class="collapse" id="lineIdRow">
+              <div class="mt-2" style="max-width:300px">
+                <input type="text" id="inputLineId" class="form-control form-control-sm" placeholder="@your_line_id">
+              </div>
+            </div>
+          </div>
+
+          {% if hint %}
+          <!-- Face already in gallery — submit directly, no photo step -->
+          <button class="btn btn-success btn-lg" onclick="submitDirectly()">
+            <i class="bi bi-person-check me-1"></i>Complete Registration
+          </button>
+          {% else %}
+          <!-- Normal flow — proceed to photo capture -->
+          <button class="btn btn-primary" onclick="goToCapture()">
+            Next — Take Enrollment Photos <i class="bi bi-camera-video ms-1"></i>
+          </button>
+          {% endif %}
+          <a href="/auth/login" class="btn btn-link btn-sm ms-2">Back to login</a>
+        </div>
+
+        <!-- ── Step 2: 3-shot photo capture (normal flow only) ──────── -->
+        <div id="stepCapture" class="d-none">
+          <h5 class="mb-2 text-secondary">Step 2 — Enrollment Photos</h5>
+          <p class="small text-muted mb-2">Stand so your full head is visible. Follow the orientation prompts.</p>
+
+          <div id="captureProgress" class="mb-2"></div>
+          <div id="captureStatus" class="small mb-2 text-muted">Initialising camera…</div>
+
+          <div class="position-relative mb-2" style="display:inline-block;max-width:100%;">
+            <video id="regVideo" autoplay muted playsinline
+                   style="width:640px;max-width:100%;border-radius:8px;display:block;"></video>
+            <canvas id="regCanvas"
+                    style="position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px;"></canvas>
+          </div>
+
+          <div class="d-flex gap-2 mt-2">
+            <button id="captureBtn" class="btn btn-success" disabled onclick="doCapture()">
+              <i class="bi bi-camera me-1"></i>Capture
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="backToDetails()">← Back</button>
+          </div>
+          <p class="small text-muted mt-1">Tip: press <kbd>Space</kbd> to capture when enabled.</p>
+        </div>
+
+        <!-- ── Step 3: Review + Submit (normal flow only) ───────────── -->
+        <div id="stepReview" class="d-none">
+          <h5 class="mb-2 text-secondary">Step 3 — Review &amp; Submit</h5>
+          <div class="row g-2 mb-3">
+            <div class="col-4 text-center">
+              <img class="review-img img-fluid rounded border" alt="FRONT" style="aspect-ratio:2/3;object-fit:cover;">
+              <div class="small text-muted mt-1">FRONT</div>
+            </div>
+            <div class="col-4 text-center">
+              <img class="review-img img-fluid rounded border" alt="LEFT" style="aspect-ratio:2/3;object-fit:cover;">
+              <div class="small text-muted mt-1">LEFT</div>
+            </div>
+            <div class="col-4 text-center">
+              <img class="review-img img-fluid rounded border" alt="RIGHT" style="aspect-ratio:2/3;object-fit:cover;">
+              <div class="small text-muted mt-1">RIGHT</div>
+            </div>
+          </div>
+          <div id="reviewStatus" class="small mb-2 text-primary fw-bold">Review your photos, then submit.</div>
+          <div class="d-flex gap-2">
+            <button id="btnSubmit" class="btn btn-primary" onclick="doSubmit()">
+              <i class="bi bi-person-check me-1"></i>Register
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="retakePhotos()">Retake Photos</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Always-available helpers (no CDN dependency) ─────────────────
+
+  // Lock face label if server pre-filled it
+  (function() {
+    const fl = document.getElementById('inputFaceLabel');
+    if (fl && fl.value) fl.dataset.locked = '1';
+  })();
+
+  function autoFaceLabel(name) {
+    const fl = document.getElementById('inputFaceLabel');
+    if (!fl || fl.dataset.locked) return;
+    fl.value = name.trim().toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, '_');
+  }
+
+  function buildAndSubmit() {
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "/auth/register";
+    const lineIdEl = document.getElementById("inputLineId");
+    const fields = {
+      name:       document.getElementById("inputName").value,
+      face_label: document.getElementById("inputFaceLabel").value.trim().toLowerCase(),
+      line_id:    lineIdEl ? lineIdEl.value : "",
+      age:        document.getElementById("inputAge").value,
+      gender:     document.getElementById("inputGender").value,
+      addres:     document.getElementById("inputAddres").value,
+    };
+    for (const [k, v] of Object.entries(fields)) {
+      const inp = document.createElement("input");
+      inp.type = "hidden"; inp.name = k; inp.value = v;
+      form.appendChild(inp);
+    }
+    document.body.appendChild(form);
+    form.submit();
+  }
+
+  // Hint flow: face already in gallery, skip photos entirely
+  function submitDirectly() {
+    const name      = document.getElementById("inputName").value.trim();
+    const faceLabel = document.getElementById("inputFaceLabel").value.trim();
+    if (!name)      { alert("Please enter your full name."); return; }
+    if (!faceLabel) { alert("Face ID is missing — please type your name."); return; }
+    buildAndSubmit();
+  }
+
+  // Normal flow: validate then load MediaPipe and start capture
+  async function goToCapture() {
+    const name      = document.getElementById("inputName").value.trim();
+    const faceLabel = document.getElementById("inputFaceLabel").value.trim();
+    if (!name)      { alert("Please enter your full name."); return; }
+    if (!faceLabel) { alert("Face ID is empty — please type your name first."); return; }
+
+    document.getElementById("stepDetails").classList.add("d-none");
+    document.getElementById("stepCapture").classList.remove("d-none");
+
+    // Dynamic import — only loads MediaPipe CDN when capture step is entered
+    const { initPhotoCapture, captureShot, uploadPhotos } =
+      await import("/static/js/photo_capture.js");
+    window._captureShot  = captureShot;
+    window._uploadPhotos = uploadPhotos;
+
+    initPhotoCapture({
+      video:         document.getElementById("regVideo"),
+      canvas:        document.getElementById("regCanvas"),
+      captureButton: document.getElementById("captureBtn"),
+      status:        document.getElementById("captureStatus"),
+      progress:      document.getElementById("captureProgress"),
+      review:        document.getElementById("stepReview"),
+    });
+  }
+
+  async function doCapture() {
+    await window._captureShot();
+    if (!document.getElementById("stepReview").classList.contains("d-none")) {
+      document.getElementById("stepCapture").classList.add("d-none");
+    }
+  }
+
+  function backToDetails()  { location.reload(); }
+  function retakePhotos()   { location.reload(); }
+
+  async function doSubmit() {
+    const faceLabel = document.getElementById("inputFaceLabel").value.trim().toLowerCase();
+    const btn = document.getElementById("btnSubmit");
+    const statusEl = document.getElementById("reviewStatus");
+    btn.disabled = true;
+    statusEl.textContent = "Uploading photos…";
+    statusEl.className = "small mb-2 text-muted";
+    const ok = await window._uploadPhotos(faceLabel);
+    if (!ok) {
+      btn.disabled = false;
+      statusEl.textContent = "Photo upload failed — please retake.";
+      statusEl.className = "small mb-2 text-danger";
+      return;
+    }
+    statusEl.textContent = "Photos saved! Submitting registration…";
+    buildAndSubmit();
+  }
+
+  document.addEventListener("keydown", e => {
+    if (e.code === "Space") {
+      const btn = document.getElementById("captureBtn");
+      if (btn && !btn.disabled && !document.getElementById("stepCapture").classList.contains("d-none")) {
+        e.preventDefault();
+        doCapture();
+      }
+    }
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Medicines — MedAiCarePlus{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="text-primary mb-0"><i class="bi bi-capsule me-2"></i>Medicines</h4>
+  <button class="btn btn-outline-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addModal">
+    <i class="bi bi-plus-lg me-1"></i>Add Manually
+  </button>
+</div>
+
+{% if not meds %}
+<div class="alert alert-info">No active medications. <a href="/ocr/">Scan a prescription</a> to add one.</div>
+{% endif %}
+
+<div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">
+{% for med in meds %}
+<div class="col">
+  <div class="card h-100">
+    <div class="card-body">
+      <h6 class="card-title text-primary">{{ med.med_name }}</h6>
+      <p class="card-text small text-muted mb-1">
+        Prescribed: <strong>{{ med.pill_prescribed }}</strong> &nbsp;|&nbsp;
+        Taken: <strong>{{ med.total_intake }}</strong>
+      </p>
+      {% if med.schedule_time %}
+      <p class="card-text small">
+        {% set sched = med.schedule_time %}
+        {% if sched.morning %}<span class="badge bg-warning text-dark me-1">Morning</span>{% endif %}
+        {% if sched.noon %}<span class="badge bg-info text-dark me-1">Noon</span>{% endif %}
+        {% if sched.night %}<span class="badge bg-secondary me-1">Night</span>{% endif %}
+        {% if sched.bedtime %}<span class="badge bg-dark me-1">Bedtime</span>{% endif %}
+        {% if sched.before_meals %}<span class="badge bg-light text-dark border me-1">Before meals</span>{% endif %}
+        {% if sched.after_meals %}<span class="badge bg-light text-dark border me-1">After meals</span>{% endif %}
+      </p>
+      {% endif %}
+      {% if med.warning and med.warning != 'N/A' %}
+      <p class="card-text small text-danger"><i class="bi bi-exclamation-triangle me-1"></i>{{ med.warning[:80] }}</p>
+      {% endif %}
+    </div>
+    <div class="card-footer d-flex gap-2">
+      <button class="btn btn-success btn-sm flex-fill" onclick="markDose({{ med.med_id }},'taken')">
+        <i class="bi bi-check-lg me-1"></i>Take
+      </button>
+      <button class="btn btn-outline-secondary btn-sm flex-fill" onclick="markDose({{ med.med_id }},'skipped')">
+        Skip
+      </button>
+      <button class="btn btn-outline-danger btn-sm" onclick="deleteMed({{ med.med_id }})">
+        <i class="bi bi-trash"></i>
+      </button>
+    </div>
+  </div>
+</div>
+{% endfor %}
+</div>
+
+<!-- Add Medicine Modal -->
+<div class="modal fade" id="addModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Add Medicine</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3"><label class="form-label">Medicine Name *</label>
+          <input type="text" id="newMedName" class="form-control"></div>
+        <div class="mb-3"><label class="form-label">Prescribed Pills</label>
+          <input type="number" id="newPillPrescribed" class="form-control" value="0"></div>
+        <label class="form-label">Schedule</label>
+        <div class="d-flex flex-wrap gap-2 mb-3">
+          {% for slot in ['morning','noon','night','bedtime','before_meals','after_meals'] %}
+          <div class="form-check form-check-inline">
+            <input class="form-check-input sched-check" type="checkbox" id="sched_{{ slot }}" value="{{ slot }}">
+            <label class="form-check-label small" for="sched_{{ slot }}">{{ slot.replace('_',' ').title() }}</label>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" onclick="addMedicine()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function markDose(medId, status) {
+  await fetch(`/medicines/${medId}/${status}`, {method:'PATCH'});
+  location.reload();
+}
+async function deleteMed(medId) {
+  if (!confirm('Remove this medicine?')) return;
+  await fetch(`/medicines/${medId}`, {method:'DELETE'});
+  location.reload();
+}
+async function addMedicine() {
+  const checks = [...document.querySelectorAll('.sched-check:checked')].map(c=>c.value);
+  const schedule = {};
+  ['morning','noon','night','bedtime','before_meals','after_meals'].forEach(k => schedule[k] = checks.includes(k));
+  await fetch('/medicines/', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      med_name: document.getElementById('newMedName').value,
+      pill_prescribed: parseInt(document.getElementById('newPillPrescribed').value)||0,
+      schedule_time: schedule
+    })
+  });
+  bootstrap.Modal.getInstance(document.getElementById('addModal')).hide();
+  location.reload();
+}
+</script>
+{% endblock %}

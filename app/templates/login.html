@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Login — MedAiCarePlus{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-6 col-lg-5">
+    <div class="card shadow-sm mt-4">
+      <div class="card-body p-4 text-center">
+        <h3 class="mb-1 text-primary"><i class="bi bi-person-bounding-box me-2"></i>Face Login</h3>
+        <p class="text-muted small mb-3">Position your face in the frame</p>
+
+        {% if request.query_params.get('registered') %}
+        <div class="alert alert-success py-2">Registration successful — please login.</div>
+        {% endif %}
+        {% if request.query_params.get('error') %}
+        <div class="alert alert-danger py-2">Face not registered. <a href="/auth/register">Register here</a>.</div>
+        {% endif %}
+
+        <div class="position-relative d-inline-block mb-3">
+          <video id="video" width="320" height="240" autoplay muted playsinline class="rounded border"></video>
+          <canvas id="canvas" width="320" height="240" class="d-none"></canvas>
+          <div id="overlay" class="face-overlay"></div>
+        </div>
+
+        <div id="status" class="mb-3 text-muted small">Starting camera…</div>
+
+        <form id="confirmForm" action="/auth/confirm-login" method="post" class="d-none">
+          <input type="hidden" name="name" id="recognisedName">
+          <div class="alert alert-success py-2" id="recognisedMsg"></div>
+          <button type="submit" class="btn btn-success w-100">Confirm Login</button>
+        </form>
+
+        <a href="/auth/register" class="btn btn-link btn-sm mt-2">New patient? Register</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/camera.js"></script>
+<script src="/static/js/face_login.js"></script>
+{% endblock %}

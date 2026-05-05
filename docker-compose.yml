@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: medai
+      POSTGRES_PASSWORD: medai
+      POSTGRES_DB: medaicare
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medai"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  medaicare:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://medai:medai@postgres:5432/medaicare
+      FACE_REC_BASE: /models/face_recognition
+      EMOTION_MODEL_PATH: /models/emotion/model4.2.2.pth
+      YOLO_MODEL_PATH: /models/segmentation/prescription_best_100_epo.pt
+      OLLAMA_URL: http://ollama:11434/api/generate
+      SECRET_KEY: "change-me-to-a-random-32-char-string"
+    volumes:
+      - "C:/Users/ferdinan/Downloads/project_AI_/face_recognition_folder/face_recognition:/models/face_recognition:rw"
+      - "C:/Users/ferdinan/Downloads/project_AI_/FaceEmotionDetector/FaceEmotionDetector:/models/emotion:ro"
+      - "C:/Users/ferdinan/Downloads/project_AI_/segmentation:/models/segmentation:ro"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    # First-time setup — run once after `docker compose up ollama`:
+    #   docker compose exec ollama ollama pull minicpm-v
+
+volumes:
+  pgdata:
+  ollama_models:

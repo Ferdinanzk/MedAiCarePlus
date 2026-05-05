@@ -1,0 +1,73 @@
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+
+class UserCreate(BaseModel):
+    name: str
+    line_id: Optional[str] = None
+    face_label: str
+    photo_url: Optional[str] = None
+
+
+class DetailCreate(BaseModel):
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    addres: Optional[str] = None
+
+
+class FaceFrameResponse(BaseModel):
+    identified: bool
+    name: Optional[str] = None
+    distance: Optional[float] = None
+    face_count: int
+    error: Optional[str] = None
+
+
+class EmotionFrameResult(BaseModel):
+    detected: bool
+    emotion_type: Optional[str] = None
+    emotion_score: Optional[float] = None
+    probabilities: dict
+    error: Optional[str] = None
+
+
+class EmotionSave(BaseModel):
+    emotion_type: str
+    emotion_score: float
+    note: Optional[str] = None
+
+
+class OCRResult(BaseModel):
+    med_name: str
+    quantity: Optional[str] = None
+    amount_each_intake: Optional[str] = None
+    total_intake: Optional[str] = None
+    schedule_time: Optional[dict] = None
+    warning: Optional[str] = None
+    intake_time_label: Optional[str] = None
+    error: Optional[str] = None
+
+
+class MedicationCreate(BaseModel):
+    med_name: str
+    pill_prescribed: int
+    schedule_time: Optional[dict] = None
+    warning: Optional[str] = None
+    amount_each_intake: Optional[str] = None
+
+
+class IntakeSave(BaseModel):
+    med_id: int
+    emot_id: Optional[int] = None
+    intake_stats: str = "taken"
+
+
+class TodayIntakeItem(BaseModel):
+    intk_id: Optional[int] = None
+    med_id: int
+    med_name: str
+    scheduled_slots: list
+    intake_stats: str
+    pill_prescribed: int
+    total_intake: int
