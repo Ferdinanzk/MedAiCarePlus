@@ -33,3 +33,12 @@ FACE_DET_CONFIDENCE  = float(os.getenv("FACE_DET_CONFIDENCE",  "0.6"))
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.3"))
 OLLAMA_TIMEOUT       = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 OLLAMA_MODELS        = ["minicpm-v", "llama3.2-vision", "llava"]
+
+# ── React frontend / Supabase integration ────────────────────────────────────
+SUPABASE_URL       = os.getenv("SUPABASE_URL", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+# ── LINE Messaging API ───────────────────────────────────────────────────────
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_API_URL = "https://api.line.me/v2/bot/message/push"
