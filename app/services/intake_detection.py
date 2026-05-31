@@ -18,6 +18,7 @@ MOUTH_ZONE_SCALE_Y = 2.0
 
 MOUTH_NEAR_DISTANCE_PX = 60
 MOUTH_NEAR_DISTANCE_NORM = 0.75
+APPROACH_SPEED_THRESHOLD = 4.0
 APPROACH_SPEED_THRESHOLD_NORM = 0.05
 AT_MOUTH_MIN_DURATION = 0.25
 AT_MOUTH_MAX_DURATION = 1.5
@@ -432,6 +433,7 @@ class PillIngestionDetector:
         curr_dist = features["fingertip_to_mouth"]
         curr_dist_norm = float(features.get("fingertip_to_mouth_norm", curr_dist / max(1.0, MOUTH_NEAR_DISTANCE_PX)))
         in_mouth_zone_now = features.get("in_mouth_zone", False)
+        approach_speed_px_based = moving_toward(state.prev_mouth_dist, curr_dist)
         approach_speed_norm = moving_toward(state.prev_mouth_dist_norm, curr_dist_norm)
 
         self._buffer_push(state.recent_distances, curr_dist_norm)
@@ -444,9 +446,17 @@ class PillIngestionDetector:
         approach_std_norm = self._std(state.recent_approaches_norm) if len(state.recent_approaches_norm) >= 2 else 0.0
 
         is_approaching = avg_approach > APPROACH_SPEED_THRESHOLD_NORM
+        near_mouth_px_based = curr_dist < MOUTH_NEAR_DISTANCE_PX or in_mouth_zone_now
         near_mouth_norm_based = curr_dist_norm < MOUTH_NEAR_DISTANCE_NORM or in_mouth_zone_now
         near_mouth = near_mouth_norm_based
 
+        mouth_contact_px_based = min(
+            1.0,
+            max(
+                1.0 - curr_dist / max(1.0, MOUTH_NEAR_DISTANCE_PX * 1.2),
+                1.0 if in_mouth_zone_now else 0.0,
+            ),
+        )
         mouth_contact_norm_based = min(
             1.0,
             max(
@@ -455,6 +465,7 @@ class PillIngestionDetector:
             ),
         )
         mouth_contact = mouth_contact_norm_based
+        mouth_contact_delta_norm_minus_px = mouth_contact_norm_based - mouth_contact_px_based
 
         # Track mouth contact window
         if near_mouth:
@@ -596,6 +607,10 @@ class PillIngestionDetector:
             if state.last_contact_dist_norm is not None:
                 withdrawal_delta_norm = curr_dist_norm - state.last_contact_dist_norm
                 withdrew_enough = withdrawal_delta_norm > WITHDRAW_DISTANCE_DELTA_NORM
+
+            withdrew_enough_px_based = False
+            if state.last_contact_dist is not None:
+                withdrew_enough_px_based = (curr_dist - state.last_contact_dist) > 25
 
             cooldown_ok = (current_time - self.last_event_time) > EVENT_COOLDOWN
 
@@ -798,6 +813,94 @@ class PillIngestionDetector:
                 event_detected = True
 
             state.reset_event_window()
+
+        # Build event debug dictionary for post-hoc analysis
+        event_debug = {
+            "event_detected": event_detected,
+            "event_confidence": state.event_confidence,
+            "fingertip_to_mouth": curr_dist,
+            "mouth_contact": peak_mouth_contact,
+            "peak_mouth_contact": peak_mouth_contact,
+            "mouth_contact_px_based": mouth_contact_px_based,
+            "mouth_contact_norm_based": mouth_contact_norm_based,
+            "mouth_contact_delta_norm_minus_px": mouth_contact_delta_norm_minus_px,
+            "near_mouth_px_based": near_mouth_px_based,
+            "near_mouth_norm_based": near_mouth_norm_based,
+            "mouth_open": mouth_open_occurred,
+            "mouth_open_allowed": mouth_open_allowed,
+            "mouth_open_ratio": peak_mouth_open_ratio,
+            "peak_mouth_open_ratio": peak_mouth_open_ratio,
+            "in_mouth_zone": in_mouth_zone_occurred,
+            "in_mouth_zone_occurred": in_mouth_zone_occurred,
+            "dwell": dwell,
+            "withdrew_enough": withdrew_enough,
+            "withdrew_enough_px_based": withdrew_enough_px_based,
+            "avg_approach": avg_approach,
+            "approach_std": approach_std,
+            "avg_approach_norm": avg_approach_norm,
+            "approach_std_norm": approach_std_norm,
+            "baseline_contribution": 0.08,
+            "mouth_contact_contribution": mouth_contact_contribution,
+            "mouth_open_contribution": mouth_activity_contribution,
+            "dwell_contribution": dwell_contribution,
+            "trajectory_contribution": trajectory_contribution,
+            "withdrawal_contribution": withdrawal_contribution,
+            "fingertip_delivery_contribution": fingertip_delivery_contribution,
+            "mouth_activity_cap_penalty": 0.0,
+            "flat_palm_cover_penalty": -0.12 if likely_mouth_cover else 0.0,
+            "no_mouth_open_palm_dump_penalty": -0.12 if no_mouth_open_palm_dump_contradiction else 0.0,
+            "strong_palm_dump_geometry": strong_palm_dump_geometry,
+            "palm_dump_geometry_reward": PALM_DUMP_GEOMETRY_REWARD if strong_palm_dump_geometry else 0.0,
+            "weak_palm_dump_no_lower_mouth_geometry": weak_palm_dump_no_lower_mouth_geometry,
+            "weak_palm_dump_cap_exception_applied": weak_palm_dump_cap_exception_applied,
+            "mouth_occlusion_penalty": -mouth_occlusion_penalty,
+            "unknown_open_mouth_no_delivery_geometry": unknown_open_mouth_no_delivery_geometry,
+            "peak_mouth_occlusion_score": peak_mouth_occlusion_score,
+            "palm_overlap_ratio_of_event": palm_overlap_ratio_of_event,
+            "mouth_visible_frame_ratio": mouth_visible_frame_ratio,
+            "flat_palm_frame_ratio": flat_palm_frame_ratio,
+            "pinch_frame_ratio": pinch_frame_ratio,
+            "loose_grip_frame_ratio": loose_grip_frame_ratio,
+            "holding_object_frame_ratio": holding_object_frame_ratio,
+            "possible_palm_dump_delivery": possible_palm_dump_delivery,
+            "likely_mouth_cover": likely_mouth_cover,
+            "event_style": event_style,
+            "min_fingertip_to_mouth_norm": min_fingertip_to_mouth_norm,
+            "min_palm_to_mouth_norm": min_palm_to_mouth_norm,
+            "head_pitch_at_event_start": head_pitch_at_event_start,
+            "peak_head_pitch_delta": peak_head_pitch_delta,
+            "min_head_pitch_delta": min_head_pitch_delta,
+            "head_tilt_back_detected": head_tilt_back_detected,
+            "head_tilt_back_frame_count": head_tilt_back_frame_count,
+            "palm_center_in_lower_mouth_roi": features.get("palm_center_in_lower_mouth_roi", False),
+            "palm_to_lower_mouth_norm": features.get("palm_to_lower_mouth_norm"),
+            "min_palm_to_lower_mouth_norm": min_palm_to_lower_mouth_norm,
+            "palm_lower_mouth_ratio": palm_lower_mouth_ratio,
+            "flat_palm_lower_mouth_ratio": flat_palm_lower_mouth_ratio,
+            "partial_withdrawal_seen": partial_withdrawal_seen,
+            "frame_confidence": state.frame_confidence,
+            "positive_points_total": (
+                0.08
+                + mouth_contact_contribution
+                + mouth_activity_contribution
+                + dwell_contribution
+                + trajectory_contribution
+                + withdrawal_contribution
+                + fingertip_delivery_contribution
+                + (PALM_DUMP_GEOMETRY_REWARD if strong_palm_dump_geometry else 0.0)
+            ),
+            "penalty_points_total": (
+                (0.08 if dwell < 0.1 and dwell > 0.0 else 0.0)
+                + (0.08 if not withdrew_enough else 0.0)
+                + (0.10 if dwell > LONG_DWELL_PENALTY_THRESHOLD else 0.0)
+                + (0.05 if approach_std > ERRATIC_APPROACH_STD_NORM else 0.0)
+                + mouth_occlusion_penalty
+                + (0.12 if likely_mouth_cover else 0.0)
+                + (0.12 if no_mouth_open_palm_dump_contradiction else 0.0)
+            ),
+            "raw_event_score": confidence,
+            "status": self.last_status,
+        }
 
         # Frame-level confidence for real-time feedback
         time_since_event = current_time - state.event_confidence_time
