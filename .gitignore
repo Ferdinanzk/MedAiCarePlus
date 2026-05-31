@@ -78,3 +78,8 @@ tmp_gen_token.py
 *.pth
 !models/segmentation/*.pt
 !models/emotion/*.pth
+
+# *.bin and *.xml inside models/face_recognition/ are tracked via Git LFS
+# *.bin outside models/ stays ignored (large public downloads)
+!models/face_recognition/**/*.bin
+!models/face_recognition/**/*.xml
