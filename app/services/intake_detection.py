@@ -568,6 +568,8 @@ class PillIngestionDetector:
             palm_lower_mouth_ratio = palm_lower_mouth_frame_count / occlusion_frame_count
             flat_palm_lower_mouth_ratio = state.flat_palm_lower_mouth_frame_count / occlusion_frame_count
 
+            mouth_open_allowed = peak_mouth_contact > 0.05 or in_mouth_zone_occurred
+
             dwell = 0.0
             if state.at_mouth_start_time is not None:
                 dwell = current_time - state.at_mouth_start_time
@@ -609,7 +611,7 @@ class PillIngestionDetector:
             confidence += mouth_contact_contribution
 
             # Mouth activity (open mouth)
-            raw_mouth_activity_contribution = mouth_activity_points(peak_mouth_open_ratio, mouth_open_occurred)
+            raw_mouth_activity_contribution = mouth_activity_points(peak_mouth_open_ratio, mouth_open_occurred and mouth_open_allowed)
             mouth_activity_contribution = raw_mouth_activity_contribution
             if likely_mouth_cover and mouth_activity_contribution > 0.04:
                 mouth_activity_contribution = 0.04
@@ -761,6 +763,7 @@ class PillIngestionDetector:
                 peak_mouth_contact >= 0.5
                 and confidence >= 0.38
                 and mouth_open_occurred
+                and mouth_open_allowed
                 and cooldown_ok
                 and not unknown_open_mouth_no_delivery_geometry
                 and not (weak_palm_dump_no_lower_mouth_geometry and not weak_palm_dump_cap_exception_applied)
