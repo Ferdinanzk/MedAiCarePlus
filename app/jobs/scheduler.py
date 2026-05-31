@@ -17,7 +17,7 @@ def start_scheduler():
 
     scheduler.add_job(
         check_missed_doses,
-        IntervalTrigger(minutes=15),
+        IntervalTrigger(minutes=1),
         id="missed_doses",
         replace_existing=True,
     )

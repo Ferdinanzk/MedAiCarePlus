@@ -74,7 +74,8 @@ export default function Onboarding() {
   const [poseStageIdx, setPoseStageIdx] = useState(0);       // 0=front, 1=left, 2=right
   const [capturedPhotos, setCapturedPhotos] = useState<string[]>([]);
   const [cameraOn, setCameraOn] = useState(false);
-  const [poseResult, setPoseResult] = useState<{ detected: boolean; direction: string; stub: boolean } | null>(null);
+  const [poseResult, setPoseResult] = useState<{ detected: boolean; direction: string; stub: boolean; face_size_ratio?: number } | null>(null);
+  const [proximity, setProximity] = useState<'too_close' | 'too_far' | 'good' | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);  // 3,2,1 or null
   const [enrolling, setEnrolling] = useState(false);
   const stagePhotosRef = useRef<string[]>([]);
@@ -236,7 +237,7 @@ export default function Onboarding() {
     stopPoseLoop();
     poseIntervalRef.current = setInterval(async () => {
       const video = videoRef.current;
-      if (!video || !video.srcObject) return;
+      if (!video || !video.srcObject || video.videoWidth === 0 || video.readyState < 2) return;
 
       // Take a frame snapshot
       const canvas = document.createElement('canvas');
@@ -247,7 +248,8 @@ export default function Onboarding() {
       ctx.drawImage(video, 0, 0);
 
       try {
-        const blob = await new Promise<Blob>((r) => canvas.toBlob((b) => r(b!), 'image/jpeg', 0.7));
+        const cropped = cropPortraitCenter(canvas);
+        const blob = await new Promise<Blob>((r) => cropped.toBlob((b) => r(b!), 'image/jpeg', 0.7));
         const file = new File([blob], 'pose.jpg', { type: 'image/jpeg' });
         const form = new FormData();
         form.append('file', file);
@@ -257,6 +259,19 @@ export default function Onboarding() {
         const result = await res.json();
         setPoseResult(result);
 
+        // Proximity feedback (only when model is live, not stub)
+        if (!result.stub && result.detected && typeof result.face_size_ratio === 'number') {
+          if (result.face_size_ratio < 0.20) {
+            setProximity('too_far');
+          } else if (result.face_size_ratio > 0.65) {
+            setProximity('too_close');
+          } else {
+            setProximity('good');
+          }
+        } else if (!result.detected) {
+          setProximity(null);
+        }
+
         const targetDir = STAGE_ORDER[poseStageIdxRef.current] as PoseDir;
 
         if (result.stub) {
@@ -265,7 +280,12 @@ export default function Onboarding() {
           return;
         }
 
-        if (result.detected && result.direction === targetDir) {
+        // Proximity check for live mode: must be good proximity (0.20 <= face_size_ratio <= 0.65)
+        const isGoodProximity = result.stub || typeof result.face_size_ratio !== 'number'
+          ? true
+          : (result.face_size_ratio >= 0.20 && result.face_size_ratio <= 0.65);
+
+        if (result.detected && result.direction === targetDir && isGoodProximity) {
           if (!holdStartRef.current) holdStartRef.current = Date.now();
           const elapsed = Date.now() - holdStartRef.current;
           const remaining = Math.max(0, 3 - Math.floor(elapsed / 1000));
@@ -312,6 +332,7 @@ export default function Onboarding() {
     setCameraOn(false);
     holdStartRef.current = null;
     prevFrameRef.current = null;
+    setProximity(null);
   };
 
   const dataUrlToFile = (dataUrl: string, filename: string): File => {
@@ -461,10 +482,21 @@ export default function Onboarding() {
                     </div>
                   </div>
 
-                  {/* Oval guide */}
-                  <div className={`w-44 h-60 rounded-full border-4 transition-colors duration-300 ${
-                    countdown !== null ? 'border-green-400' : 'border-white/60'
-                  }`} />
+                  {/* Oval guide — 2:3 portrait crop indicator */}
+                  <div
+                    className={`w-48 h-[288px] rounded-full border-4 transition-colors duration-300 ${
+                      countdown !== null
+                        ? 'border-green-400'
+                        : proximity === 'too_close'
+                        ? 'border-red-400'
+                        : proximity === 'too_far'
+                        ? 'border-orange-400'
+                        : proximity === 'good'
+                        ? 'border-green-400'
+                        : 'border-white/60'
+                    }`}
+                    style={{ boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)' }}
+                  />
 
                   {/* Countdown */}
                   {countdown !== null && (
@@ -475,10 +507,22 @@ export default function Onboarding() {
 
                   {/* Status bar */}
                   <div className="absolute bottom-4 left-0 right-0 flex justify-center">
-                    <div className={`px-4 py-2 rounded-xl transition-colors ${countdown !== null ? 'bg-green-600/80' : 'bg-black/60'}`}>
+                    <div className={`px-4 py-2 rounded-xl transition-colors ${
+                      countdown !== null
+                        ? 'bg-green-600/80'
+                        : proximity === 'too_close'
+                        ? 'bg-red-600/80'
+                        : proximity === 'too_far'
+                        ? 'bg-orange-500/80'
+                        : 'bg-black/60'
+                    }`}>
                       <p className="text-white text-base font-medium text-center">
                         {countdown !== null
                           ? 'Hold still...'
+                          : proximity === 'too_close'
+                          ? '↔ Move back a little'
+                          : proximity === 'too_far'
+                          ? '→ Come closer to camera'
                           : poseResult?.detected
                             ? 'Face detected — turn to position'
                             : 'Position your face in the oval'}

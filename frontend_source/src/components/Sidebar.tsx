@@ -7,6 +7,7 @@ import {
   History,
   User,
   LogOut,
+  Settings,
 } from 'lucide-react';
 import LanguageSwitcher from './LanguageSwitcher';
 import { type FaceAuthUser } from '../lib/face-auth';
@@ -26,6 +27,7 @@ export default function Sidebar({ faceUser }: SidebarProps) {
     { to: '/scan', icon: Camera, label: t('scan.title') },
     { to: '/history', icon: History, label: t('history.title') },
     { to: '/family', icon: User, label: t('family.title') },
+    { to: '/settings', icon: Settings, label: t('settings.title') },
   ];
 
   return (

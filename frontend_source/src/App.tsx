@@ -15,6 +15,7 @@ import Family from './pages/Family';
 import Onboarding from './pages/Onboarding';
 import HistoryPage from './pages/History';
 import Register from './pages/Register';
+import Settings from './pages/Settings';
 
 function App() {
   const [faceUser] = useState<FaceAuthUser | null>(() => getFaceSession());
@@ -87,6 +88,10 @@ function App() {
           <Route
             path="/history"
             element={isLoggedIn ? (needsOnboarding ? <Navigate to="/onboarding" /> : <HistoryPage />) : <Navigate to="/login" />}
+          />
+          <Route
+            path="/settings"
+            element={isLoggedIn ? (needsOnboarding ? <Navigate to="/onboarding" /> : <Settings />) : <Navigate to="/login" />}
           />
           <Route
             path="/onboarding"

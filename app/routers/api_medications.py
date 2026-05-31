@@ -109,11 +109,17 @@ class MedicationPayload(BaseModel):
 
 
 @router.get("/today")
-async def today_medications(user: dict = Depends(get_current_user)):
+async def today_medications(user: dict = Depends(get_current_user), date: Optional[str] = None):
     u_id = await _get_u_id(user)
     if not u_id:
         return []
-    today = datetime.date.today()
+    target_date = datetime.date.today()
+    if date:
+        try:
+            target_date = datetime.date.fromisoformat(date)
+        except ValueError:
+            pass
+    today = target_date
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(

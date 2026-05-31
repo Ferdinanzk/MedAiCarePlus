@@ -1,10 +1,10 @@
-import { Outlet, useLocation } from 'react-router-dom';
+import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import BottomNav from './BottomNav';
 import Sidebar from './Sidebar';
 import LanguageSwitcher from './LanguageSwitcher';
 import { faceLogout, type FaceAuthUser } from '../lib/face-auth';
-import { LogOut } from 'lucide-react';
+import { LogOut, Settings } from 'lucide-react';
 
 interface LayoutProps {
   faceUser?: FaceAuthUser | null;
@@ -13,6 +13,7 @@ interface LayoutProps {
 export default function Layout({ faceUser }: LayoutProps) {
   const { t } = useTranslation();
   const location = useLocation();
+  const navigate = useNavigate();
   const isLoginPage = location.pathname === '/login' || location.pathname === '/register';
 
   const handleLogout = () => {
@@ -46,13 +47,22 @@ export default function Layout({ faceUser }: LayoutProps) {
             <div className="flex items-center gap-3">
               <LanguageSwitcher />
               {faceUser && (
-                <button
-                  onClick={handleLogout}
-                  className="p-2 text-gray-500 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors touch-target"
-                  title={t('common.logout')}
-                >
-                  <LogOut className="w-5 h-5" />
-                </button>
+                <>
+                  <button
+                    onClick={() => navigate('/settings')}
+                    className="p-2 text-gray-500 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors touch-target"
+                    title={t('settings.title')}
+                  >
+                    <Settings className="w-5 h-5" />
+                  </button>
+                  <button
+                    onClick={handleLogout}
+                    className="p-2 text-gray-500 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors touch-target"
+                    title={t('common.logout')}
+                  >
+                    <LogOut className="w-5 h-5" />
+                  </button>
+                </>
               )}
             </div>
           </div>

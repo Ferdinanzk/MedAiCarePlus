@@ -10,6 +10,17 @@ from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_current_user
 from app.services.line_service import LineService
 from app.database import get_pool
+from pydantic import BaseModel
+from typing import Optional
+
+
+class NotificationSettingsPayload(BaseModel):
+    remind_before_minutes: int
+    remind_after_minutes: int
+    remind_after_retries: int
+    notify_family_on_missed: bool
+    notify_family_on_bad_mood: bool
+
 
 router = APIRouter(prefix="/api/notify", tags=["notify-api"])
 
@@ -170,3 +181,82 @@ async def notify_status(user: dict = Depends(get_current_user)):
         "configured": LineService._available,
         "channel_token_set": bool(LineService.get_instance()),
     }
+
+
+@router.get("/settings")
+async def get_notification_settings(user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT remind_before_minutes, remind_after_minutes, remind_after_retries,
+                   notify_family_on_missed, notify_family_on_bad_mood
+            FROM notification_settings
+            WHERE u_id = $1
+            """,
+            user["u_id"]
+        )
+        if not row:
+            # Insert default settings
+            await conn.execute(
+                "INSERT INTO notification_settings (u_id) VALUES ($1) ON CONFLICT (u_id) DO NOTHING",
+                user["u_id"]
+            )
+            return {
+                "remind_before_minutes": 5,
+                "remind_after_minutes": 10,
+                "remind_after_retries": 3,
+                "notify_family_on_missed": True,
+                "notify_family_on_bad_mood": True
+            }
+        return dict(row)
+
+
+@router.post("/settings")
+async def update_notification_settings(payload: NotificationSettingsPayload, user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO notification_settings (u_id, remind_before_minutes, remind_after_minutes,
+                                                remind_after_retries, notify_family_on_missed,
+                                                notify_family_on_bad_mood)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (u_id) DO UPDATE SET
+                remind_before_minutes = EXCLUDED.remind_before_minutes,
+                remind_after_minutes = EXCLUDED.remind_after_minutes,
+                remind_after_retries = EXCLUDED.remind_after_retries,
+                notify_family_on_missed = EXCLUDED.notify_family_on_missed,
+                notify_family_on_bad_mood = EXCLUDED.notify_family_on_bad_mood
+            """,
+            user["u_id"], payload.remind_before_minutes, payload.remind_after_minutes,
+            payload.remind_after_retries, payload.notify_family_on_missed, payload.notify_family_on_bad_mood
+        )
+    return {"success": True}
+
+
+@router.get("/list")
+async def list_notifications(category: Optional[str] = None, user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if category:
+            rows = await conn.fetch(
+                """
+                SELECT id, category, type, message, created_at
+                FROM notification
+                WHERE u_id = $1 AND category = $2
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                user["u_id"], category
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, category, type, message, created_at
+                FROM notification
+                WHERE u_id = $1
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                user["u_id"]
+            )
+    return [dict(r) for r in rows]

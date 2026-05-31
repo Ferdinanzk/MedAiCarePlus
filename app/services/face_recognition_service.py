@@ -84,19 +84,19 @@ class FaceRecognitionService:
         """
         if not FaceRecognitionService._available:
             # Stub mode — return front so frontend can fall back to manual capture
-            return {"detected": False, "direction": "none", "stub": True}
+            return {"detected": False, "direction": "none", "stub": True, "face_size_ratio": 0.0}
         try:
             # Run face detection
             rois = self.face_det.infer((frame_bgr,))
             if not rois:
-                return {"detected": False, "direction": "none", "stub": False}
+                return {"detected": False, "direction": "none", "stub": False, "face_size_ratio": 0.0}
 
             roi = rois[0]  # Use first detected face
 
             # Get 5-point landmarks: [left_eye, right_eye, nose_tip, left_mouth, right_mouth]
             landmarks_list = self.lm_det.infer((frame_bgr, [roi]))
             if not landmarks_list:
-                return {"detected": True, "direction": "front", "stub": False}
+                return {"detected": True, "direction": "front", "stub": False, "face_size_ratio": 0.0}
 
             lm = landmarks_list[0]  # shape depends on LandmarksDetector implementation
 
@@ -115,11 +115,11 @@ class FaceRecognitionService:
                     right_eye_x = float(lm[2])
                     nose_x = float(lm[4])
             else:
-                return {"detected": True, "direction": "front", "stub": False}
+                return {"detected": True, "direction": "front", "stub": False, "face_size_ratio": 0.0}
 
             eye_width = abs(right_eye_x - left_eye_x)
             if eye_width < 1e-6:
-                return {"detected": True, "direction": "front", "stub": False}
+                return {"detected": True, "direction": "front", "stub": False, "face_size_ratio": 0.0}
 
             eye_center_x = (left_eye_x + right_eye_x) / 2.0
             # Positive yaw = nose to the right of eye center (person turned RIGHT from camera view)
@@ -134,11 +134,20 @@ class FaceRecognitionService:
             else:
                 direction = "front"
 
-            return {"detected": True, "direction": direction, "yaw": round(yaw, 3), "stub": False}
+            # face_size_ratio: bounding-box width as fraction of cropped frame width
+            face_size_ratio = float(roi.size[0]) / float(frame_bgr.shape[1])
+
+            return {
+                "detected": True,
+                "direction": direction,
+                "yaw": round(yaw, 3),
+                "face_size_ratio": round(face_size_ratio, 3),
+                "stub": False,
+            }
 
         except Exception as exc:
             print(f"[FaceRecognition] get_face_direction error: {exc}")
-            return {"detected": False, "direction": "none", "stub": True}
+            return {"detected": False, "direction": "none", "stub": True, "face_size_ratio": 0.0}
 
     def identify_frame(self, frame_bgr: np.ndarray) -> dict:
         """

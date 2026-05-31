@@ -33,12 +33,19 @@ function getAuthHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function getLocalDateString(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 export default function Schedule() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState(() => getLocalDateString(new Date()));
 
   const handleTakeEarly = async (medId: number) => {
     navigate(`/intake?med=${medId}`);
@@ -48,7 +55,7 @@ export default function Schedule() {
     setLoading(true);
     try {
       const headers = getAuthHeaders();
-      const response = await fetch('/api/medications/today', {
+      const response = await fetch(`/api/medications/today?date=${selectedDate}`, {
         headers,
       });
       if (!response.ok) {
@@ -74,7 +81,7 @@ export default function Schedule() {
       setSchedules([]);
     }
     setLoading(false);
-  }, []);
+  }, [selectedDate]);
 
   useEffect(() => {
     fetchSchedule();
@@ -84,7 +91,7 @@ export default function Schedule() {
     const d = new Date();
     d.setDate(d.getDate() + i);
     return {
-      date: d.toISOString().split('T')[0],
+      date: getLocalDateString(d),
       label: i === 0 ? t('schedule.today') : d.toLocaleDateString(i18n.language === 'zh-TW' ? 'zh-TW' : 'en', { weekday: 'short' }),
       dayNum: d.getDate(),
     };

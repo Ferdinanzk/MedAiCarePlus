@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
 import {
   Users,
@@ -14,7 +15,13 @@ import {
   Copy,
   X,
   User,
+  Settings,
 } from 'lucide-react';
+
+interface GlobalNotifySettings {
+  notify_family_on_missed: boolean;
+  notify_family_on_bad_mood: boolean;
+}
 
 interface FamilyContact {
   id: number;
@@ -61,7 +68,9 @@ function getAvatarColor(name: string): string {
 
 export default function Family() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const [contacts, setContacts] = useState<FamilyContact[]>([]);
+  const [globalSettings, setGlobalSettings] = useState<GlobalNotifySettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showForm, setShowForm] = useState(false);
@@ -83,6 +92,7 @@ export default function Family() {
 
   useEffect(() => {
     fetchContacts();
+    fetchGlobalSettings();
   }, []);
 
   const fetchContacts = async () => {
@@ -95,6 +105,21 @@ export default function Family() {
     }
     setLoading(false);
   };
+
+  const fetchGlobalSettings = async () => {
+    const headers = getAuthHeaders();
+    const resp = await fetch('/api/notify/settings', { headers }).catch(() => null);
+    if (resp?.ok) {
+      const data = await resp.json();
+      setGlobalSettings({
+        notify_family_on_missed: !!data.notify_family_on_missed,
+        notify_family_on_bad_mood: !!data.notify_family_on_bad_mood,
+      });
+    }
+  };
+
+  const missedOffGlobal = !!globalSettings && !globalSettings.notify_family_on_missed;
+  const moodOffGlobal = !!globalSettings && !globalSettings.notify_family_on_bad_mood;
 
   const resetForm = () => {
     setForm({ name: '', relationship: '', phone: '', notify_missed: true, notify_emotion: true, notify_weekly: false });
@@ -202,6 +227,31 @@ export default function Family() {
         <h2 className="text-2xl font-bold text-gray-900">{t('family.title')}</h2>
       </div>
 
+      {/* Family notification context */}
+      {missedOffGlobal || moodOffGlobal ? (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
+          <BellOff className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-amber-800">{t('family.someAlertsOff')}</p>
+            <ul className="mt-1 space-y-0.5">
+              {missedOffGlobal && <li className="text-xs text-amber-700">• {t('family.missedAlertsOffGlobal')}</li>}
+              {moodOffGlobal && <li className="text-xs text-amber-700">• {t('family.moodAlertsOffGlobal')}</li>}
+            </ul>
+            <button
+              onClick={() => navigate('/settings')}
+              className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-amber-800 hover:text-amber-900"
+            >
+              <Settings className="w-3.5 h-3.5" /> {t('family.goToSettings')}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 flex items-start gap-3">
+          <Bell className="w-5 h-5 text-[#0057B8] shrink-0 mt-0.5" />
+          <p className="flex-1 text-sm text-gray-600">{t('family.familyReceivesHint')}</p>
+        </div>
+      )}
+
       {/* Add Member Form Modal */}
       {showForm && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm px-4 pb-4">
@@ -279,19 +329,28 @@ export default function Family() {
               <div className="space-y-2">
                 <p className="text-sm font-medium text-gray-700">{t('family.notifications')}</p>
                 {[
-                  { key: 'notify_missed' as const, label: t('family.notifyMissed') },
-                  { key: 'notify_emotion' as const, label: t('family.notifyEmotion') },
-                  { key: 'notify_weekly' as const, label: t('family.notifyWeekly') },
+                  { key: 'notify_missed' as const, label: t('family.notifyMissed'), offGlobal: missedOffGlobal, hint: t('family.missedAlertsOffGlobal') },
+                  { key: 'notify_emotion' as const, label: t('family.notifyEmotion'), offGlobal: moodOffGlobal, hint: t('family.moodAlertsOffGlobal') },
+                  { key: 'notify_weekly' as const, label: t('family.notifyWeekly'), offGlobal: false, hint: '' },
                 ].map((item) => (
-                  <label key={item.key} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={form[item.key]}
-                      onChange={(e) => setForm({ ...form, [item.key]: e.target.checked })}
-                      className="w-4 h-4 text-[#0057B8] rounded border-gray-300 focus:ring-[#0057B8]"
-                    />
-                    <span className="text-sm text-gray-600">{item.label}</span>
-                  </label>
+                  <div key={item.key}>
+                    <label className={`flex items-center gap-2 ${item.offGlobal ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}>
+                      <input
+                        type="checkbox"
+                        checked={form[item.key]}
+                        disabled={item.offGlobal}
+                        onChange={(e) => setForm({ ...form, [item.key]: e.target.checked })}
+                        className="w-4 h-4 text-[#0057B8] rounded border-gray-300 focus:ring-[#0057B8] disabled:opacity-50"
+                      />
+                      <span className="text-sm text-gray-600">{item.label}</span>
+                      {item.offGlobal && (
+                        <span className="text-2xs px-1.5 py-0.5 bg-amber-50 border border-amber-200 text-amber-700 rounded-full">
+                          {t('family.offInSettings')}
+                        </span>
+                      )}
+                    </label>
+                    {item.offGlobal && <p className="text-2xs text-amber-600 ml-6 mt-0.5">{item.hint}</p>}
+                  </div>
                 ))}
               </div>
               <div className="flex gap-3 pt-2">
@@ -385,12 +444,24 @@ export default function Family() {
                     {c.line_id && <p className="text-sm text-gray-500">LINE: {c.line_id}</p>}
                   </div>
                   <div className="flex items-center gap-2 mt-2">
-                    {c.notify_missed && <Bell className="w-3.5 h-3.5 text-[#0057B8]" />}
-                    {c.notify_emotion && <Bell className="w-3.5 h-3.5 text-amber-500" />}
-                    {c.notify_weekly && <Bell className="w-3.5 h-3.5 text-green-500" />}
+                    {c.notify_missed && (
+                      <span title={missedOffGlobal ? t('family.missedAlertsOffGlobal') : t('family.notifyMissed')} className="flex">
+                        <Bell className={`w-3.5 h-3.5 ${missedOffGlobal ? 'text-gray-300' : 'text-[#0057B8]'}`} />
+                      </span>
+                    )}
+                    {c.notify_emotion && (
+                      <span title={moodOffGlobal ? t('family.moodAlertsOffGlobal') : t('family.notifyEmotion')} className="flex">
+                        <Bell className={`w-3.5 h-3.5 ${moodOffGlobal ? 'text-gray-300' : 'text-amber-500'}`} />
+                      </span>
+                    )}
+                    {c.notify_weekly && (
+                      <span title={t('family.notifyWeekly')} className="flex">
+                        <Bell className="w-3.5 h-3.5 text-green-500" />
+                      </span>
+                    )}
                     {!c.notify_missed && !c.notify_emotion && !c.notify_weekly && (
                       <span className="flex items-center gap-1 text-sm text-gray-400">
-                        <BellOff className="w-3.5 h-3.5" /> No notifications
+                        <BellOff className="w-3.5 h-3.5" /> {t('family.noNotifications')}
                       </span>
                     )}
                   </div>

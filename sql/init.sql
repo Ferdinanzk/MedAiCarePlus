@@ -108,3 +108,27 @@ CREATE INDEX IF NOT EXISTS idx_emotion_user           ON emotion(u_id, time_stam
 CREATE INDEX IF NOT EXISTS idx_intake_user     ON intake(u_id, intake_time_stamp DESC);
 CREATE INDEX IF NOT EXISTS idx_intake_med      ON intake(med_id);
 CREATE INDEX IF NOT EXISTS idx_medication_user ON medication(u_id, is_active);
+
+-- ─────────────────────────────────────────────
+-- Notification Settings & Logs
+-- ─────────────────────────────────────────────
+ALTER TABLE intake ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE intake ADD COLUMN IF NOT EXISTS missed_reminders_sent INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS notification_settings (
+    u_id INTEGER PRIMARY KEY REFERENCES "user"(u_id) ON DELETE CASCADE,
+    remind_before_minutes INTEGER NOT NULL DEFAULT 5,
+    remind_after_minutes INTEGER NOT NULL DEFAULT 10,
+    remind_after_retries INTEGER NOT NULL DEFAULT 3,
+    notify_family_on_missed BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_family_on_bad_mood BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS notification (
+    id SERIAL PRIMARY KEY,
+    u_id INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    category VARCHAR(20) NOT NULL CHECK (category IN ('user', 'family')),
+    type VARCHAR(50) NOT NULL, -- 'upcoming_reminder', 'missed_reminder', 'missed_alert', 'emotion_alert'
+    message TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
