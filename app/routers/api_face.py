@@ -2,20 +2,25 @@ import asyncio
 import cv2
 import numpy as np
 from typing import List
-from fastapi import APIRouter, UploadFile, File, Depends
+from fastapi import APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
+from itsdangerous import URLSafeTimedSerializer
 from app.dependencies import get_current_user
+from app.config import SECRET_KEY
+from app.database import get_pool
 from app.services.face_recognition_service import FaceRecognitionService
 
 router = APIRouter(prefix="/api/face", tags=["face-api"])
+
+_face_signer = URLSafeTimedSerializer(SECRET_KEY)
 
 
 @router.post("/identify")
 async def identify_face(
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
 ):
-    """Upload a photo, return face recognition result as JSON."""
+    """Upload a photo, return face recognition result as JSON.
+    Public endpoint — no auth required, used during login flow."""
     image_bytes = await file.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -28,20 +33,65 @@ async def identify_face(
     return result
 
 
+@router.post("/login")
+async def face_login(file: UploadFile = File(...)):
+    """Identify face and return a signed session token for API access."""
+    image_bytes = await file.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse({"identified": False, "error": "Invalid image"}, status_code=400)
+
+    svc = FaceRecognitionService.get_instance()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, svc.identify_frame, frame)
+
+    if not result.get("identified"):
+        return result
+
+    face_label = result.get("name", "").lower()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT u_id, name FROM "user" WHERE face_label = $1 AND user_active = TRUE',
+            face_label,
+        )
+
+    if not row:
+        return JSONResponse({"identified": False, "error": "User not found in database"}, status_code=404)
+
+    token = _face_signer.dumps({"u_id": row["u_id"], "name": row["name"]})
+    return {**result, "token": token, "u_id": row["u_id"]}
+
+
 @router.post("/identify-bytes")
-async def identify_face_bytes(
-    user: dict = Depends(get_current_user),
-):
+async def identify_face_bytes():
     """Accept raw JPEG bytes in request body for webcam frames."""
-    from fastapi import Request
-    # FastAPI doesn't support raw bytes in POST without special handling
-    # This endpoint is a placeholder; the actual implementation uses the file upload endpoint
     return {"identified": False, "error": "Use /api/face/identify with multipart upload"}
+
+
+@router.post("/check-pose")
+async def check_pose(file: UploadFile = File(...)):
+    """
+    Public endpoint — detect face and determine head orientation.
+    Used by onboarding face enrollment to guide front/left/right captures.
+    Returns: {detected, direction: 'front'|'left'|'right'|'none', yaw, stub}
+    """
+    image_bytes = await file.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return {"detected": False, "direction": "none", "stub": False}
+
+    svc = FaceRecognitionService.get_instance()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, svc.get_face_direction, frame)
+    return result
 
 
 @router.post("/enroll")
 async def enroll_face(
-    face_label: str,
+    face_label: str = Form(...),
     photos: List[UploadFile] = File(...),
     user: dict = Depends(get_current_user),
 ):
@@ -66,4 +116,6 @@ async def enroll_face(
         cv2.imwrite(str(path), img)
         saved.append(str(path))
 
+    svc = FaceRecognitionService.get_instance()
+    svc.reload_gallery()
     return {"saved": saved, "face_label": label}

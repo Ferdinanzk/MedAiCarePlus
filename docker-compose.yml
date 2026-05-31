@@ -23,6 +23,7 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://medai:medai@postgres:5432/medaicare
       FACE_REC_BASE: /models/face_recognition
@@ -50,6 +51,17 @@ services:
     restart: unless-stopped
     # First-time setup — run once after `docker compose up ollama`:
     #   docker compose exec ollama ollama pull minicpm-v
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: ["http", "medaicare:8000", "--scheme=https"]
+    env_file: .env
+    ports:
+      - "4040:4040"
+    depends_on:
+      medaicare:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   pgdata:

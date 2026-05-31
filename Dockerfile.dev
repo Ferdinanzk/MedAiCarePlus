@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# MedAiCarePlus — LIGHTWEIGHT Dev Dockerfile (no heavy ML models)
+# Stage 1: Build React frontend
+# Stage 2: FastAPI backend with core packages only
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Stage 1: Build React Frontend ─────────────────────────────────────────────
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+
+COPY frontend_source/package*.json ./
+RUN npm ci
+
+COPY frontend_source/ .
+RUN npm run build
+
+# ── Stage 2: FastAPI Backend (Lightweight) ───────────────────────────────────
+FROM python:3.11-slim
+
+# Minimal system deps (no OpenCV/GL)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install lightweight Python deps only
+COPY requirements-core.txt .
+RUN pip install --no-cache-dir -r requirements-core.txt
+
+# Copy backend code
+COPY app/ ./app/
+COPY sql/ ./sql/
+
+# Copy built frontend from Stage 1
+COPY --from=frontend-builder /frontend/dist /app/static/web
+
+# Copy legacy static assets (CSS, JS for Jinja2 templates)
+COPY static/css ./static/css
+COPY static/js ./static/js
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

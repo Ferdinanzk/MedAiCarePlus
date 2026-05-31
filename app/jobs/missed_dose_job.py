@@ -15,14 +15,14 @@ async def check_missed_doses():
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT il.id, il.patient_id, il.scheduled_time, m.name AS med_name,
-                   p.name AS patient_name
-            FROM intake_logs il
-            JOIN medications m ON m.id = il.medication_id
-            JOIN profiles p ON p.id = il.patient_id
-            WHERE il.status = 'pending'
-              AND il.scheduled_time < $1
-              AND il.notified = FALSE
+            SELECT i.intk_id AS id, i.u_id, i.intake_time_stamp AS scheduled_time,
+                   m.med_name, u.name AS patient_name
+            FROM intake i
+            JOIN medication m ON m.med_id = i.med_id
+            JOIN "user" u ON u.u_id = i.u_id
+            WHERE i.intake_stats = 'pending'
+              AND i.intake_time_stamp < $1
+              AND i.notify_stats = 'pending'
             """,
             cutoff,
         )
@@ -34,7 +34,7 @@ async def check_missed_doses():
 
         for row in rows:
             await conn.execute(
-                "UPDATE intake_logs SET status = 'missed', notified = TRUE, notified_at = NOW() WHERE id = $1",
+                "UPDATE intake SET intake_stats = 'missed', notify_stats = 'sent' WHERE intk_id = $1",
                 row["id"],
             )
 
@@ -42,9 +42,9 @@ async def check_missed_doses():
                 """
                 SELECT line_id, name
                 FROM family_contacts
-                WHERE patient_id = $1 AND notify_missed = TRUE AND verified = TRUE
+                WHERE u_id = $1 AND notify_missed = TRUE AND verified = TRUE
                 """,
-                row["patient_id"],
+                row["u_id"],
             )
 
             for contact in family:
@@ -55,3 +55,20 @@ async def check_missed_doses():
                         row["med_name"],
                         row["scheduled_time"].strftime("%Y-%m-%d %H:%M"),
                     )
+
+            # Also notify patient themselves
+            patient_line_id = await conn.fetchval(
+                'SELECT line_id FROM "user" WHERE u_id = $1',
+                row["u_id"],
+            )
+            if patient_line_id:
+                line_svc.send_text(
+                    patient_line_id,
+                    (
+                        f"⚠️ 用藥提醒\n"
+                        f"您錯過了預定用藥\n"
+                        f"藥物: {row['med_name']}\n"
+                        f"預定時間: {row['scheduled_time'].strftime('%Y-%m-%d %H:%M')}\n"
+                        f"請盡快補服或聯繫家人。"
+                    ),
+                )

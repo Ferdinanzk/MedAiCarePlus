@@ -13,6 +13,7 @@ def start_scheduler():
     from app.jobs.missed_dose_job import check_missed_doses
     from app.jobs.weekly_summary_job import send_weekly_summaries
     from app.jobs.refill_reminder_job import check_refill_reminders
+    from app.jobs.emotion_alert_job import check_negative_emotions
 
     scheduler.add_job(
         check_missed_doses,
@@ -30,6 +31,12 @@ def start_scheduler():
         check_refill_reminders,
         CronTrigger(hour=8, minute=0),
         id="refill_reminder",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        check_negative_emotions,
+        IntervalTrigger(minutes=30),
+        id="emotion_alerts",
         replace_existing=True,
     )
     scheduler.start()

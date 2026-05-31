@@ -12,9 +12,9 @@ async def check_refill_reminders():
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT m.id, m.name, m.pills_remaining, m.patient_id, p.name AS patient_name
-            FROM medications m
-            JOIN profiles p ON p.id = m.patient_id
+            SELECT m.med_id, m.med_name, m.pills_remaining, m.u_id, u.name AS patient_name
+            FROM medication m
+            JOIN "user" u ON u.u_id = m.u_id
             WHERE m.is_active = TRUE AND m.pills_remaining <= 7
             """
         )
@@ -28,14 +28,14 @@ async def check_refill_reminders():
             family = await conn.fetch(
                 """
                 SELECT line_id FROM family_contacts
-                WHERE patient_id = $1 AND notify_missed = TRUE AND verified = TRUE
+                WHERE u_id = $1 AND notify_missed = TRUE AND verified = TRUE
                 """,
-                row["patient_id"],
+                row["u_id"],
             )
 
             for contact in family:
                 if contact["line_id"]:
                     line_svc.send_text(
                         contact["line_id"],
-                        f"💊 藥量提醒\n{row['patient_name']} 的 {row['name']} 只剩下 {row['pills_remaining']} 顆，請安排領藥或購買。",
+                        f"💊 藥量提醒\n{row['patient_name']} 的 {row['med_name']} 只剩下 {row['pills_remaining']} 顆，請安排領藥或購買。",
                     )

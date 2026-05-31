@@ -32,7 +32,7 @@ DEVICE       = "CPU"
 FACE_DET_CONFIDENCE  = float(os.getenv("FACE_DET_CONFIDENCE",  "0.6"))
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.3"))
 OLLAMA_TIMEOUT       = int(os.getenv("OLLAMA_TIMEOUT", "180"))
-OLLAMA_MODELS        = ["minicpm-v", "llama3.2-vision", "llava"]
+OLLAMA_MODELS        = ["gemini-3-flash-preview", "minicpm-v", "llama3.2-vision", "llava", "gemma3"]
 
 # ── React frontend / Supabase integration ────────────────────────────────────
 SUPABASE_URL       = os.getenv("SUPABASE_URL", "")

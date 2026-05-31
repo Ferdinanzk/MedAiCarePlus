@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    /* myBCA-inspired blue palette */
+    --primary: #0057B8;
+    --primary-light: #E8F4FD;
+    --primary-dark: #003D82;
+    --success: #00A651;
+    --warning: #FF9500;
+    --danger: #DC3545;
+    --text-primary: #1A1A1A;
+    --text-secondary: #4B5563;
+    --text-tertiary: #6B7280;
+    --background: #F8F9FA;
+    --card: #FFFFFF;
+    --border: #E5E7EB;
+
+    /* Shadcn compatibility */
+    --background-hsl: 0 0% 100%;
+    --foreground-hsl: 222.2 84% 4.9%;
+    --card-hsl: 0 0% 100%;
+    --card-foreground-hsl: 222.2 84% 4.9%;
+    --popover-hsl: 0 0% 100%;
+    --popover-foreground-hsl: 222.2 84% 4.9%;
+    --primary-hsl: 211 100% 36%;
+    --primary-foreground-hsl: 210 40% 98%;
+    --secondary-hsl: 210 40% 96.1%;
+    --secondary-foreground-hsl: 222.2 47.4% 11.2%;
+    --muted-hsl: 210 40% 96.1%;
+    --muted-foreground-hsl: 215.4 16.3% 46.9%;
+    --accent-hsl: 210 40% 96.1%;
+    --accent-foreground-hsl: 222.2 47.4% 11.2%;
+    --destructive-hsl: 0 84.2% 60.2%;
+    --destructive-foreground-hsl: 210 40% 98%;
+    --border-hsl: 214.3 31.8% 91.4%;
+    --input-hsl: 214.3 31.8% 91.4%;
+    --ring-hsl: 211 100% 36%;
+    --radius: 0.5rem;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  * {
+    border-color: hsl(var(--border-hsl));
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.6;
+  }
+
+  p, li, .body-text {
+    line-height: 1.625;
+    letter-spacing: 0.01em;
+  }
+
+  h1, h2, h3 {
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  .touch-target {
+    min-height: 48px;
+    min-width: 48px;
+  }
+
+  .touch-target-large {
+    min-height: 56px;
+    min-width: 56px;
+  }
+
+  /* Safe area utilities for notch/island phones */
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* Shimmer animation for skeletons */
+  .shimmer {
+    background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  /* Page fade-in */
+  .fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+
+  /* Slide up for cards */
+  .slide-up {
+    animation: slideUp 0.3s ease-out;
+  }
+
+  /* Card utility */
+  .card {
+    @apply bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md transition-all duration-300;
+  }
+
+  /* Card hover lift */
+  .card-hover {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .card-hover:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0, 87, 184, 0.08);
+  }
+
+  /* Primary button */
+  .btn-primary {
+    @apply px-6 py-4 bg-[#0057B8] text-white rounded-xl font-semibold hover:bg-[#003D82] active:scale-95 transition-all min-h-[56px];
+  }
+
+  /* Secondary button */
+  .btn-secondary {
+    @apply px-6 py-3 bg-white text-[#0057B8] border border-[#0057B8] rounded-xl font-semibold hover:bg-blue-50 active:scale-95 transition-all min-h-[48px];
+  }
+
+  /* Input field */
+  .input {
+    @apply w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/20 focus:border-[#0057B8] transition-all min-h-[48px];
+  }
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}

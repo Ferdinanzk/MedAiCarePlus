@@ -1,0 +1,32 @@
+{
+  "name": "medaicareplus",
+  "version": "1.0.0",
+  "description": "AIOT CAREBOX — a medical care web application combining face recognition login, real-time emotion monitoring, and AI-powered prescription OCR.",
+  "main": "playwright_ui_audit.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node node_modules/playwright/cli.js test --config playwright.config.js",
+    "test:list": "node node_modules/playwright/cli.js test --list --config playwright.config.js",
+    "test:headed": "node node_modules/playwright/cli.js test --config playwright.config.js --headed"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ferdinanzk/MedAiCarePlus.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Ferdinanzk/MedAiCarePlus/issues"
+  },
+  "homepage": "https://github.com/Ferdinanzk/MedAiCarePlus#readme",
+  "dependencies": {
+    "playwright": "^1.60.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}

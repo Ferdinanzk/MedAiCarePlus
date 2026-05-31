@@ -40,21 +40,39 @@ class EmotionSave(BaseModel):
 
 class OCRResult(BaseModel):
     med_name: str
+    dosage: Optional[str] = None
     quantity: Optional[str] = None
+    pill_count: Optional[int] = None
     amount_each_intake: Optional[str] = None
     total_intake: Optional[str] = None
     schedule_time: Optional[dict] = None
+    instructions: Optional[str] = None
     warning: Optional[str] = None
     intake_time_label: Optional[str] = None
+    clinical_uses: Optional[str] = None
+    manufacturer: Optional[str] = None
+    hospital: Optional[str] = None
+    prescription_no: Optional[str] = None
+    use_before: Optional[str] = None
+    physician: Optional[str] = None
+    pharmacist: Optional[str] = None
+    patient_name: Optional[str] = None
+    date_dispensed: Optional[str] = None
+    pill_description: Optional[str] = None
     error: Optional[str] = None
 
 
 class MedicationCreate(BaseModel):
     med_name: str
+    dosage: Optional[str] = None
     pill_prescribed: int
+    pills_remaining: Optional[int] = None
     schedule_time: Optional[dict] = None
+    instructions: Optional[str] = None
     warning: Optional[str] = None
     amount_each_intake: Optional[str] = None
+    pill_description: Optional[str] = None
+    prescription_meta: Optional[dict] = None
 
 
 class IntakeSave(BaseModel):

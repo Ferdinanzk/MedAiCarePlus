@@ -1,3 +1,5 @@
+from app import ml_stubs; ml_stubs.install()  # dev: stubs for heavy ML packages
+
 from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
@@ -11,8 +13,10 @@ from app.services.face_recognition_service import FaceRecognitionService
 from app.services.emotion_service import EmotionService
 from app.services.ocr_service import OCRService
 from app.services.line_service import LineService
+from app.services.intake_detection import IntakeDetectionService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
-from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify
+from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake
+from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 
 
@@ -23,6 +27,7 @@ async def lifespan(app: FastAPI):
     EmotionService.get_instance()
     OCRService.get_instance()
     LineService.get_instance()
+    IntakeDetectionService.get_instance()
     start_scheduler()
     yield
     stop_scheduler()
@@ -65,6 +70,26 @@ app.include_router(api_face.router,          tags=["api-face"])
 app.include_router(api_ocr_router.router,    tags=["api-ocr"])
 app.include_router(api_emotion_router.router, tags=["api-emotion"])
 app.include_router(api_notify.router,       tags=["api-notify"])
+app.include_router(api_auth.router,          tags=["api-auth"])
+app.include_router(api_family.router,        tags=["api-family"])
+app.include_router(api_medications.router,   tags=["api-medications"])
+app.include_router(api_history.router,       tags=["api-history"])
+app.include_router(api_intake.router,        tags=["api-intake"])
+app.include_router(line_router,              tags=["line-webhook"])
+
+
+# ── Health check (must be before catch-all) ──────────────────────────────────
+@app.get("/health")
+async def health():
+    """Health check for deployments."""
+    return {
+        "status": "ok",
+        "face_recognition": FaceRecognitionService._available,
+        "emotion": EmotionService._available,
+        "ocr": OCRService._available,
+        "line": LineService._available,
+        "intake_detection": IntakeDetectionService._available,
+    }
 
 
 # ── React SPA serving ────────────────────────────────────────────────────────
@@ -84,15 +109,3 @@ async def serve_spa(full_path: str):
         return FileResponse(file_path)
     # SPA fallback: return index.html so React Router handles the path.
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
-
-
-@app.get("/health")
-async def health():
-    """Health check for deployments."""
-    return {
-        "status": "ok",
-        "face_recognition": FaceRecognitionService._available,
-        "emotion": EmotionService._available,
-        "ocr": OCRService._available,
-        "line": LineService._available,
-    }

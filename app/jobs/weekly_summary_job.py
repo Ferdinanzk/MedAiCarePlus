@@ -13,7 +13,7 @@ async def send_weekly_summaries():
 
     async with pool.acquire() as conn:
         patients = await conn.fetch(
-            "SELECT id, name FROM profiles"
+            'SELECT u_id AS id, name FROM "user"'
         )
 
         line_svc = LineService.get_instance()
@@ -21,8 +21,8 @@ async def send_weekly_summaries():
         for patient in patients:
             rows = await conn.fetch(
                 """
-                SELECT status FROM intake_logs
-                WHERE patient_id = $1 AND scheduled_time >= $2
+                SELECT intake_stats AS status FROM intake
+                WHERE u_id = $1 AND intake_time_stamp >= $2
                 """,
                 patient["id"], week_ago,
             )
@@ -33,9 +33,9 @@ async def send_weekly_summaries():
 
             emotion_rows = await conn.fetch(
                 """
-                SELECT emotion_type FROM emotion_logs
-                WHERE patient_id = $1 AND recorded_at >= $2
-                ORDER BY recorded_at DESC LIMIT 7
+                SELECT emotion_type FROM emotion
+                WHERE u_id = $1 AND time_stamp >= $2
+                ORDER BY time_stamp DESC LIMIT 7
                 """,
                 patient["id"], week_ago,
             )
@@ -45,7 +45,7 @@ async def send_weekly_summaries():
             family = await conn.fetch(
                 """
                 SELECT line_id FROM family_contacts
-                WHERE patient_id = $1 AND notify_weekly = TRUE AND verified = TRUE
+                WHERE u_id = $1 AND notify_weekly = TRUE AND verified = TRUE
                 """,
                 patient["id"],
             )

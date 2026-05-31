@@ -1,72 +1,170 @@
-# MedAiCarePlus
+# MedAiCarePlus — AIOT CAREBOX
 
-AIOT CAREBOX — a medical care web application combining face recognition login, real-time emotion monitoring, and AI-powered prescription OCR.
+Full-stack medical care app with face recognition login, prescription OCR, medication tracking, and LINE notifications.
 
 ## Features
 
-| Module | AI Model | Description |
-|--------|----------|-------------|
-| Face Login | OpenVINO face-detection + face-reidentification | Identify registered patients via webcam |
-| Emotion Check-In | PyTorch CNN (model4.2.2.pth) | Detect Angry / Happy / Neutral / Sad in 5s session |
-| Prescription Scan | YOLO + Ollama (minicpm-v) | Two-pass OCR of Taiwanese hospital prescriptions |
-| Dashboard | — | Today's intake status, emotion history chart |
-| Notifications | — | Pending dose alerts, LINE send stub |
+- **Face login** — OpenVINO 3-stage pipeline (detect → landmark → re-id)
+- **Emotion detection** — Custom PyTorch CNN via webcam
+- **Prescription OCR** — YOLOv8-seg + Ollama vision (19 fields extracted)
+- **Medication tracking** — CRUD with schedule, use-before dates, warnings
+- **Intake scheduling** — Auto-generates 30-day intake records on medication add
+- **LINE notifications** — Missed-dose alerts, emotion alerts, weekly summaries
+- **Family contacts** — Verification code-based contact management
+
+## Stack
+
+| Layer | Tech |
+|-------|------|
+| Backend | FastAPI + asyncpg (raw SQL, no ORM) |
+| Frontend | React + Vite + Tailwind (served by FastAPI) |
+| Database | PostgreSQL 16 (via Supabase or local Docker) |
+| Auth | Supabase JWT + itsdangerous face token |
+| ML | OpenVINO 2024.5, PyTorch, MediaPipe, YOLOv8 |
+| OCR | Ollama (minicpm-v / Gemini Flash cloud) |
+| Notifications | LINE Messaging API |
 
 ---
 
 ## Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (for the Docker path)
-- **OR** Python 3.11 + pip (for local dev)
-- Webcam connected and accessible
+- Docker Desktop
+- Python 3.10+ (for local dev outside Docker)
+- [Ollama](https://ollama.com) installed and running locally
+- A [Supabase](https://supabase.com) project (free tier works)
+- Git LFS: `git lfs install`
 
 ---
 
-## Quick Start — Docker
+## Setup
+
+### 1. Clone and configure environment
 
 ```bash
-# 1. Start all services
-docker compose up --build -d
+git clone <repo-url>
+cd MedAiCarePlus
+git lfs pull          # downloads ML model files tracked by LFS
 
-# 2. First-time: pull the Ollama vision model (~5 GB)
-docker compose exec ollama ollama pull minicpm-v
-
-# 3. Open the app
-start http://localhost:8000
+cp .env.example .env
+# Edit .env — fill in SUPABASE_URL, SUPABASE_JWT_SECRET, SECRET_KEY
 ```
 
-The PostgreSQL database is initialised automatically on first start.
+### 2. Download ML models
 
----
+Place model files in the `models/` directory as shown below.
 
-## Quick Start — Local Development (Windows)
+#### A. Face recognition — OpenVINO (Intel Open Model Zoo, free & public)
 
-```bat
-# Install dependencies
-pip install -r requirements.txt
-
-# Set env vars (copy and edit .env.example)
-set DATABASE_URL=postgresql://medai:medai@localhost:5432/medaicare
-
-# Start PostgreSQL separately (or use Docker for just the DB):
-docker compose up postgres -d
-
-# Start the app
-run_dev.bat
+```bash
+pip install openvino-dev
+omz_downloader --name face-detection-adas-0001          --output_dir models/face_recognition/intel
+omz_downloader --name landmarks-regression-retail-0009  --output_dir models/face_recognition/intel
+omz_downloader --name face-reidentification-retail-0095 --output_dir models/face_recognition/intel
 ```
+
+> Docs: [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)
+
+#### B. Emotion detection — `models/emotion/model4.2.2.pth`
+
+Custom PyTorch CNN (4 classes: Angry, Happy, Neutral, Sad).
+Downloaded automatically by `git lfs pull`.
+
+#### C. Prescription YOLO — `models/segmentation/prescription_best_100_epo.pt`
+
+Custom YOLOv8-seg model trained on prescription documents.
+Downloaded automatically by `git lfs pull`.
+
+#### D. Ollama vision model
+
+```bash
+ollama pull minicpm-v
+# Cloud OCR (gemini-3-flash-preview:cloud) needs no local pull — internet required
+```
+
+### 3. Set up the database
+
+```bash
+# Supabase: Dashboard → SQL Editor → paste sql/init.sql → Run
+# Local Docker: psql -U medai -d medaicare -f sql/init.sql
+```
+
+### 4. Start the stack
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+App runs at: **http://localhost:8000**
 
 ---
 
 ## Environment Variables
 
-| Variable | Default (dev) | Docker value |
-|----------|--------------|--------------|
-| `DATABASE_URL` | `postgresql://medai:medai@localhost:5432/medaicare` | `postgresql://medai:medai@postgres:5432/medaicare` |
-| `FACE_REC_BASE` | `../face_recognition_folder/face_recognition` | `/models/face_recognition` |
-| `EMOTION_MODEL_PATH` | `../FaceEmotionDetector/FaceEmotionDetector/model4.2.2.pth` | `/models/emotion/model4.2.2.pth` |
-| `YOLO_MODEL_PATH` | `../segmentation/prescription_best_100_epo.pt` | `/models/segmentation/prescription_best_100_epo.pt` |
-| `OLLAMA_URL` | `http://localhost:11434/api/generate` | `http://ollama:11434/api/generate` |
-| `SECRET_KEY` | `change-me-in-production-32chars!!` | Set a strong random string |
+Copy `.env.example` → `.env` and fill in your values.
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Postgres — use port **5432** (not Supabase pooler 6543) |
+| `SECRET_KEY` | Signs face auth tokens — `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `SUPABASE_JWT_SECRET` | Validates Supabase JWTs — Supabase Dashboard → Settings → API |
+| `SUPABASE_URL` | Your Supabase project URL |
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE bot token — leave empty to disable notifications |
+| `OLLAMA_URL` | Ollama API — default works with Docker Desktop |
+
+---
+
+## LINE Webhook Setup (optional)
+
+LINE requires a public HTTPS URL. On local dev, use ngrok:
+
+```bash
+ngrok http 8000
+# Copy HTTPS URL → LINE Developers Console → Webhook URL:
+# https://<id>.ngrok-free.app/api/notify/webhook
+```
+
+> Free ngrok gives a new URL on each restart. A paid plan or fixed domain gives a persistent URL.
+
+---
+
+## Development Workflow
+
+```powershell
+# Rebuild backend after Python changes:
+docker compose -f docker-compose.dev.yml up -d --build medaicare
+
+# Rebuild frontend (sync source first):
+Copy-Item "medaicareplus-web\src\pages\*.tsx" "frontend_source\src\pages\" -Force
+docker compose -f docker-compose.dev.yml up -d --build medaicare
+
+# Health check:
+curl http://localhost:8000/health
+```
+
+> **React source lives in two places:** `medaicareplus-web/src/` (edit here) and `frontend_source/src/` (Docker build input). Always sync before rebuilding.
+
+---
+
+## Project Structure
+
+```
+MedAiCarePlus/
+├── app/
+│   ├── routers/          # API endpoints
+│   ├── services/         # ML services (face, emotion, OCR, LINE)
+│   ├── jobs/             # APScheduler jobs (missed dose, weekly summary)
+│   ├── config.py         # Env var loading + model paths
+│   └── dependencies.py   # JWT auth (Supabase + face token)
+├── models/
+│   ├── face_recognition/ # OpenVINO models + face gallery (download via omz_downloader)
+│   ├── emotion/          # model4.2.2.pth (Git LFS)
+│   └── segmentation/     # prescription_best_100_epo.pt (Git LFS)
+├── frontend_source/      # React source — Docker build input
+├── medaicareplus-web/    # React source — local editing copy
+├── sql/init.sql          # Database schema
+├── docker-compose.dev.yml
+└── Dockerfile
+```
 
 ---
 
@@ -74,37 +172,21 @@ run_dev.bat
 
 | Table | Description |
 |-------|-------------|
-| `user` | Registered patients (name, face_label, line_id) |
-| `detail` | Extended profile (age, gender, address) — 1:1 with user |
-| `emotion` | Emotion check-in records (emotion_type, emotion_score, time_stamp) |
-| `medication` | Prescriptions (med_name, schedule_time JSONB, pill_prescribed) |
-| `intake` | Daily dose events (intake_stats: taken/skipped/pending, notify_stats) |
+| `user` | Registered patients (name, face_label, supabase_id) |
+| `detail` | Extended profile (age, gender, address) |
+| `emotion` | Emotion check-in records |
+| `medication` | Prescriptions (med_name, schedule_time JSONB) |
+| `intake` | Daily dose events (taken/skipped/pending) |
+| `family_contacts` | Family members with notification preferences |
 
 ---
 
-## AI Model Files Required
+## Common Issues
 
-| Model | Location in project_AI_ |
-|-------|------------------------|
-| Face detection | `face_recognition_folder/face_recognition/intel/face-detection-adas-0001/FP32/` |
-| Face re-identification | `face_recognition_folder/face_recognition/intel/face-reidentification-retail-0095/FP32/` |
-| Landmarks | `face_recognition_folder/face_recognition/intel/landmarks-regression-retail-0009/FP32/` |
-| Face gallery | `face_recognition_folder/face_recognition/face_gallery/` |
-| Emotion CNN | `FaceEmotionDetector/FaceEmotionDetector/model4.2.2.pth` |
-| YOLO prescription | `segmentation/prescription_best_100_epo.pt` |
-| Ollama vision | Downloaded via `ollama pull minicpm-v` |
-
----
-
-## Web Pages
-
-| URL | Page |
-|-----|------|
-| `/auth/login` | Face recognition login |
-| `/auth/register` | Patient registration |
-| `/display/` | Dashboard (intake + emotion chart) |
-| `/emotion/` | Live emotion check-in |
-| `/ocr/` | Prescription scanner |
-| `/medicines/` | Medication list |
-| `/notifications/` | Pending dose alerts |
-| `/docs` | FastAPI OpenAPI docs |
+| Symptom | Fix |
+|---------|-----|
+| OCR returns all N/A | Remove `num_predict` from Ollama options for `:cloud` models |
+| Face auth token expired | 8h TTL — re-login via face scan |
+| asyncpg JSONB error | Wrap `dict` in `json.dumps()` before passing to asyncpg |
+| Model not loading | Check `/health`; verify `models/` paths are mounted correctly |
+| LINE webhook not firing | Update webhook URL in LINE Developer Console after ngrok restart |

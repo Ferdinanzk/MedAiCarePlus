@@ -2,7 +2,6 @@ import re
 import cv2
 import json
 import base64
-import time
 import requests
 import numpy as np
 from app.config import YOLO_MODEL_PATH, OLLAMA_URL, OLLAMA_TIMEOUT, OLLAMA_MODELS
@@ -12,10 +11,22 @@ Extract these fields from the prescription image. Read BOTH Chinese (繁體中�
 
 Return ONLY a JSON object:
 {
-  "medication_name": "Full name including code, brand, generic name and strength",
-  "quantity": "From 總量/Quantity field including number and unit",
-  "administration_text": "EXACT text from 用法用量/Administration section",
-  "amount_each_intake": "How many pills per dose from the administration text",
+  "medication_name": "Full name including code, brand, generic name and strength (e.g. Allegra (Fexofenadine) 60mg/tab)",
+  "dosage": "Only the strength per unit extracted from medication name (e.g. 60mg/tab). If not visible, infer from name.",
+  "quantity": "From 總量/Quantity field as written (e.g. 14 顆)",
+  "pill_count": "Integer number only from quantity (e.g. 14)",
+  "administration_text": "EXACT full text from 用法用量/Administration and Dosage section",
+  "amount_each_intake": "How many pills per dose (e.g. 1顆). Extract from administration_text.",
+  "clinical_uses": "From 主要用途/Clinical Uses section. Return 'N/A' if not visible.",
+  "manufacturer": "From 藥品廠牌名 section (e.g. SANOFI). Return 'N/A' if not visible.",
+  "hospital": "Hospital name from header (e.g. 花蓮慈濟醫院). Return 'N/A' if not visible.",
+  "prescription_no": "Prescription number (領藥號). Return 'N/A' if not visible.",
+  "use_before": "Use before / expiration date (處方期限). Return 'N/A' if not visible.",
+  "physician": "Physician name (處方醫師). Return 'N/A' if not visible.",
+  "pharmacist": "Pharmacist name (調劑藥師). Return 'N/A' if not visible.",
+  "patient_name": "Patient name from top section. Return 'N/A' if not visible.",
+  "date_dispensed": "Date dispensed (調劑日期). Return 'N/A' if not visible.",
+  "pill_appearance": "From 藥品外觀/Appearance section. Describe shape and color in Chinese (e.g. 橢圓形橘色). Return 'N/A' if not visible.",
   "warning": "From 注意事項及警語 section. Return 'N/A' if not visible."
 }
 
@@ -56,8 +67,9 @@ class OCRService:
         return cls._instance
 
     def _resolve_model(self) -> str | None:
+        ollama_base = OLLAMA_URL.split("/api/")[0]
         try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+            resp = requests.get(f"{ollama_base}/api/tags", timeout=5)
             installed = [m["name"] for m in resp.json().get("models", [])]
             for preferred in OLLAMA_MODELS:
                 for name in installed:
@@ -92,23 +104,48 @@ class OCRService:
             return {"error": "No Ollama vision model available. Run: ollama pull minicpm-v"}
 
         print("[OCR] Pass 1/2: text extraction…")
-        text_data = self._call_ollama(_PROMPT_TEXT, enhanced)
+        text_data = self._clean(self._call_ollama(_PROMPT_TEXT, enhanced))
         print("[OCR] Pass 2/2: icon row…")
-        icon_data = self._call_ollama(_PROMPT_ICONS, icon_crop)
+        icon_data = self._clean(self._call_ollama(_PROMPT_ICONS, icon_crop))
 
         admin_text = text_data.get("administration_text", "")
         amount_str = text_data.get("amount_each_intake", "")
         schedule = self._parse_schedule(icon_data, admin_text)
         total = self._calc_total(admin_text, amount_str)
+        raw_qty = text_data.get("quantity", "")
+        pill_count = text_data.get("pill_count")
+        if pill_count is None and raw_qty:
+            m = re.search(r"(\d+)", str(raw_qty))
+            if m:
+                pill_count = int(m.group(1))
+        # Ensure pill_count is always int (Ollama may return it as a string)
+        if pill_count is not None:
+            try:
+                pill_count = int(str(pill_count).split(".")[0])
+            except (ValueError, TypeError):
+                pill_count = None
 
         return {
             "med_name":           text_data.get("medication_name", "N/A"),
-            "quantity":           text_data.get("quantity", "N/A"),
+            "dosage":             text_data.get("dosage", "N/A"),
+            "quantity":           raw_qty or "N/A",
+            "pill_count":         pill_count,
             "amount_each_intake": amount_str or "N/A",
             "total_intake":       total,
             "schedule_time":      schedule,
+            "instructions":     admin_text or "N/A",
             "warning":            text_data.get("warning", "N/A"),
+            "pill_description":   text_data.get("pill_appearance", "N/A"),
             "intake_time_label":  self._schedule_label(schedule, admin_text),
+            "clinical_uses":      text_data.get("clinical_uses", "N/A"),
+            "manufacturer":       text_data.get("manufacturer", "N/A"),
+            "hospital":           text_data.get("hospital", "N/A"),
+            "prescription_no":    text_data.get("prescription_no", "N/A"),
+            "use_before":         text_data.get("use_before", "N/A"),
+            "physician":          text_data.get("physician", "N/A"),
+            "pharmacist":         text_data.get("pharmacist", "N/A"),
+            "patient_name":       text_data.get("patient_name", "N/A"),
+            "date_dispensed":     text_data.get("date_dispensed", "N/A"),
         }
 
     # ── internal helpers ──────────────────────────────────────────────────────
@@ -167,19 +204,33 @@ class OCRService:
     def _call_ollama(self, prompt: str, img) -> dict:
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
         b64 = base64.b64encode(buf).decode("utf-8")
+        opts: dict = {"temperature": 0.0}
+        if ":cloud" not in (self.active_model or ""):
+            opts["num_predict"] = -1
         payload = {
             "model": self.active_model,
             "prompt": prompt,
             "images": [b64],
             "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.0, "num_predict": 1500},
+            "options": opts,
         }
         try:
             resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
-            return self._parse_json(resp.json().get("response", ""))
+            r = resp.json()
+            # Thinking models (e.g. kimi-k2.6:cloud) put the answer in "thinking" when response is empty
+            raw = r.get("response") or r.get("thinking", "")
+            return self._parse_json(raw)
         except Exception:
             return {}
+
+    @staticmethod
+    def _clean(value):
+        """Remove surrogate characters that Ollama sometimes produces."""
+        if isinstance(value, str):
+            return value.encode("utf-8", errors="ignore").decode("utf-8")
+        if isinstance(value, dict):
+            return {k: OCRService._clean(v) for k, v in value.items()}
+        return value
 
     def _parse_json(self, raw: str) -> dict:
         if not raw:
@@ -207,12 +258,13 @@ class OCRService:
                 "bedtime": False, "before_meals": False, "after_meals": False}
         parsed = {}
         if admin_text:
-            if "早" in admin_text:            parsed["morning"] = True
-            if "晚" in admin_text:            parsed["night"] = True
-            if "中午" in admin_text:          parsed["noon"] = True
-            if "睡前" in admin_text:          parsed["bedtime"] = True
-            if "飯前" in admin_text:          parsed["before_meals"] = True
-            if "飯後" in admin_text:          parsed["after_meals"] = True
+            if "早" in admin_text:                        parsed["morning"] = True
+            if "晚" in admin_text:                        parsed["night"] = True
+            if "中午" in admin_text:                      parsed["noon"] = True
+            if "睡前" in admin_text:                      parsed["bedtime"] = True
+            # 飯前/飯後 AND 餐前/餐後 (e.g. 早餐後, 晚餐後)
+            if "飯前" in admin_text or "餐前" in admin_text:  parsed["before_meals"] = True
+            if "飯後" in admin_text or "餐後" in admin_text:  parsed["after_meals"] = True
             if "每天兩次" in admin_text or "一天兩次" in admin_text:
                 if parsed.get("morning"):  parsed["night"] = True
                 if parsed.get("night"):    parsed["morning"] = True
@@ -241,13 +293,15 @@ class OCRService:
             freq = _CN_NUM.get(v) or (int(v) if v.isdigit() else None)
         per_dose = None
         combined = f"{amount_str} {admin_text}"
-        m2 = re.search(r"每次(\d+(?:\.\d+)?)\s*(?:顆|粒|錠|片|包|ml|CC)", combined)
+        m2 = re.search(r"每次([一二兩三四五六七八\d]+(?:\.\d+)?)\s*(?:顆|粒|錠|片|包|ml|CC)", combined)
         if m2:
-            per_dose = float(m2.group(1))
+            v2 = m2.group(1)
+            per_dose = float(_CN_NUM.get(v2, v2) if not v2.replace(".", "").isdigit() else v2)
         days = None
-        m3 = re.search(r"共(\d+)天", admin_text)
+        m3 = re.search(r"共([一二兩三四五六七八\d]+)天", admin_text)
         if m3:
-            days = int(m3.group(1))
+            v3 = m3.group(1)
+            days = _CN_NUM.get(v3) or (int(v3) if v3.isdigit() else None)
         if freq and per_dose and days:
             total = int(freq * per_dose * days)
             return f"{total}顆 ({freq}次/天 × {int(per_dose)}顆/次 × {days}天)"

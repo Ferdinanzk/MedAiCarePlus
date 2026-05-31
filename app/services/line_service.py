@@ -79,3 +79,11 @@ class LineService:
             f"當有重要健康提醒時，您將收到通知。"
         )
         return self.send_text(to, text)
+
+    def send_sync_success_to_patient(self, to: str, contact_name: str) -> dict:
+        text = (
+            f"✅ 成功連結！\n"
+            f"{contact_name} 已成功與您同步，\n"
+            f"現在可以接收您的健康提醒通知。"
+        )
+        return self.send_text(to, text)

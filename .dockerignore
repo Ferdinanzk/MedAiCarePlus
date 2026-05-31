@@ -1,0 +1,5 @@
+frontend_source/node_modules
+frontend_source/dist
+.git
+.env
+*.log

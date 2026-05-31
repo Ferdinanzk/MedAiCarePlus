@@ -1,0 +1,49 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: medai
+      POSTGRES_PASSWORD: medai
+      POSTGRES_DB: medaicare
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medai"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  medaicare:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env                  # Loads LINE_CHANNEL_ACCESS_TOKEN, SUPABASE_*, SECRET_KEY
+    environment:
+      # Override DATABASE_URL to point at the local postgres container
+      DATABASE_URL: postgresql://medai:medai@postgres:5432/medaicare
+      # Frontend is served by FastAPI itself — not a separate dev server
+      FRONTEND_URL: http://localhost:8000
+      # Model paths inside container (mapped via volumes below)
+      FACE_REC_BASE: /models/face_recognition
+      EMOTION_MODEL_PATH: /models/emotion/model4.2.2.pth
+      YOLO_MODEL_PATH: /models/segmentation/prescription_best_100_epo.pt
+      OLLAMA_URL: http://host.docker.internal:11434/api/generate
+    volumes:
+      - ./models/face_recognition:/models/face_recognition:rw
+      - ./models/emotion:/models/emotion:ro
+      - ./models/segmentation:/models/segmentation:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

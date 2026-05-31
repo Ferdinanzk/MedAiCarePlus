@@ -65,6 +65,81 @@ class FaceRecognitionService:
             cls._instance = cls()
         return cls._instance
 
+    def reload_gallery(self):
+        """Reload faces database from disk after new enrollments."""
+        if not FaceRecognitionService._available:
+            return
+        try:
+            faces_db = FacesDatabase(str(FACE_GALLERY_DIR), self.face_id, self.lm_det)
+            self.face_id.set_faces_database(faces_db)
+            print(f"[FaceRecognition] Gallery reloaded — {len(faces_db)} identity(ies).")
+        except Exception as exc:
+            print(f"[FaceRecognition] Gallery reload failed: {exc}")
+
+    def get_face_direction(self, frame_bgr: np.ndarray) -> dict:
+        """
+        Detect face and determine head orientation (front/left/right) from landmarks.
+        Used by the onboarding face enrollment wizard.
+        Returns: {detected: bool, direction: str, yaw: float, stub: bool}
+        """
+        if not FaceRecognitionService._available:
+            # Stub mode — return front so frontend can fall back to manual capture
+            return {"detected": False, "direction": "none", "stub": True}
+        try:
+            # Run face detection
+            rois = self.face_det.infer((frame_bgr,))
+            if not rois:
+                return {"detected": False, "direction": "none", "stub": False}
+
+            roi = rois[0]  # Use first detected face
+
+            # Get 5-point landmarks: [left_eye, right_eye, nose_tip, left_mouth, right_mouth]
+            landmarks_list = self.lm_det.infer((frame_bgr, [roi]))
+            if not landmarks_list:
+                return {"detected": True, "direction": "front", "stub": False}
+
+            lm = landmarks_list[0]  # shape depends on LandmarksDetector implementation
+
+            # Extract key points (normalized or pixel coords)
+            # landmarks-regression-retail-0009 outputs 5 pairs: (x0,y0),(x1,y1),...
+            # as a flat array or array of pairs
+            if hasattr(lm, '__len__') and len(lm) >= 3:
+                if hasattr(lm[0], '__len__'):
+                    # Array of (x, y) pairs
+                    left_eye_x = float(lm[0][0])
+                    right_eye_x = float(lm[1][0])
+                    nose_x = float(lm[2][0])
+                else:
+                    # Flat array: x0, y0, x1, y1, x2, y2...
+                    left_eye_x = float(lm[0])
+                    right_eye_x = float(lm[2])
+                    nose_x = float(lm[4])
+            else:
+                return {"detected": True, "direction": "front", "stub": False}
+
+            eye_width = abs(right_eye_x - left_eye_x)
+            if eye_width < 1e-6:
+                return {"detected": True, "direction": "front", "stub": False}
+
+            eye_center_x = (left_eye_x + right_eye_x) / 2.0
+            # Positive yaw = nose to the right of eye center (person turned RIGHT from camera view)
+            # Negative yaw = nose to the left of eye center (person turned LEFT from camera view)
+            yaw = (nose_x - eye_center_x) / eye_width
+
+            # Thresholds: ±0.12 corresponds to roughly 15-20° head turn
+            if yaw < -0.12:
+                direction = "left"
+            elif yaw > 0.12:
+                direction = "right"
+            else:
+                direction = "front"
+
+            return {"detected": True, "direction": direction, "yaw": round(yaw, 3), "stub": False}
+
+        except Exception as exc:
+            print(f"[FaceRecognition] get_face_direction error: {exc}")
+            return {"detected": False, "direction": "none", "stub": True}
+
     def identify_frame(self, frame_bgr: np.ndarray) -> dict:
         """
         Returns:

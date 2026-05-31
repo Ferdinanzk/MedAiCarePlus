@@ -1,43 +1,25 @@
-import jwt
-from fastapi import HTTPException, Depends, Header
+from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from app.config import SUPABASE_JWT_SECRET
+from itsdangerous import URLSafeTimedSerializer, BadSignature
+from app.config import SECRET_KEY
 
 security = HTTPBearer(auto_error=False)
 
+_face_signer = URLSafeTimedSerializer(SECRET_KEY)
+_FACE_SESSION_MAX_AGE = 60 * 60 * 8  # 8 hours
+
+
+def _unsign_face_token(token: str) -> dict | None:
+    try:
+        return _face_signer.loads(token, max_age=_FACE_SESSION_MAX_AGE)
+    except BadSignature:
+        return None
+
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """
-    Verify Supabase JWT from Authorization: Bearer <token> header.
-    Returns dict with at least { 'sub': user_id } on success.
-    Raises 401 if token is missing, expired, or invalid.
-    """
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Authorization header missing")
-
-    token = credentials.credentials
-
-    if not SUPABASE_JWT_SECRET:
-        # Development fallback: accept any token, extract sub if possible
-        try:
-            payload = jwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
-            return {"sub": payload.get("sub", ""), "email": payload.get("email", "")}
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid token format")
-
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        return {
-            "sub": payload.get("sub", ""),
-            "email": payload.get("email", ""),
-            "role": payload.get("role", ""),
-        }
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    face_data = _unsign_face_token(credentials.credentials)
+    if face_data and face_data.get("u_id"):
+        return {"u_id": face_data["u_id"], "name": face_data.get("name", "")}
+    raise HTTPException(status_code=401, detail="Invalid or expired token")

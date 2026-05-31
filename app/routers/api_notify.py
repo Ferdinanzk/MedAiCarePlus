@@ -8,6 +8,9 @@ from app.database import get_pool
 
 router = APIRouter(prefix="/api/notify", tags=["notify-api"])
 
+# Separate router so LINE can POST to /line/webhook (the URL set in LINE Developer Console)
+line_router = APIRouter(prefix="/line", tags=["line-webhook"])
+
 
 def _generate_code(length: int = 6) -> str:
     """Generate a random alphanumeric verification code."""
@@ -24,8 +27,8 @@ async def generate_verification_code(
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE family_contacts SET verification_code = $1, verified = FALSE WHERE id = $2 AND patient_id = $3",
-            code, contact_id, user["sub"],
+            "UPDATE family_contacts SET verification_code = $1, verified = FALSE WHERE id = $2 AND u_id = $3",
+            code, contact_id, user["u_id"],
         )
     return {"code": code}
 
@@ -56,7 +59,7 @@ async def line_webhook(request: Request):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, patient_id, name
+                SELECT id, u_id, name
                 FROM family_contacts
                 WHERE verification_code = $1
                 """,
@@ -74,13 +77,19 @@ async def line_webhook(request: Request):
                 )
 
                 patient = await conn.fetchrow(
-                    "SELECT name FROM profiles WHERE id = $1", row["patient_id"]
+                    'SELECT name, line_id FROM "user" WHERE u_id = $1', row["u_id"]
                 )
+                patient_name = patient["name"] if patient else "Patient"
 
-                line_svc.send_verification_success(
-                    line_user_id,
-                    patient["name"] if patient else "Patient",
-                )
+                # Notify family member (the one who just verified)
+                line_svc.send_verification_success(line_user_id, patient_name)
+
+                # Notify patient that someone successfully synced with them
+                if patient and patient.get("line_id"):
+                    line_svc.send_sync_success_to_patient(
+                        patient["line_id"],
+                        row["name"],
+                    )
             else:
                 line_svc.send_text(
                     line_user_id,
@@ -88,6 +97,12 @@ async def line_webhook(request: Request):
                 )
 
     return {"status": "ok"}
+
+
+@line_router.post("/webhook")
+async def line_webhook_public(request: Request):
+    """LINE webhook at /line/webhook — mirrors /api/notify/webhook/line."""
+    return await line_webhook(request)
 
 
 @router.post("/missed-dose")
