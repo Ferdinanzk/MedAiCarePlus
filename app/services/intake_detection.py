@@ -93,15 +93,13 @@ def rect_overlap_ratio(hand_bbox, mouth_rect) -> float:
 
 
 def mouth_activity_points(peak_mouth_open_ratio: float, mouth_open_occurred: bool) -> float:
-    if not mouth_open_occurred:
-        return 0.0
-    if peak_mouth_open_ratio >= 0.60:
+    if mouth_open_occurred:
         return 0.14
-    elif peak_mouth_open_ratio >= 0.45:
-        return 0.10
-    elif peak_mouth_open_ratio >= 0.30:
-        return 0.06
-    elif peak_mouth_open_ratio >= 0.18:
+    if peak_mouth_open_ratio >= 0.30:
+        return 0.14
+    if peak_mouth_open_ratio >= 0.20:
+        return 0.08
+    if peak_mouth_open_ratio >= 0.10:
         return 0.03
     return 0.0
 
