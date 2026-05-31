@@ -1,7 +1,12 @@
-import random
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 import string
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_current_user
 from app.services.line_service import LineService
 from app.database import get_pool
@@ -12,9 +17,9 @@ router = APIRouter(prefix="/api/notify", tags=["notify-api"])
 line_router = APIRouter(prefix="/line", tags=["line-webhook"])
 
 
-def _generate_code(length: int = 6) -> str:
-    """Generate a random alphanumeric verification code."""
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
+def _generate_code(length: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 @router.post("/generate-code")
@@ -39,7 +44,18 @@ async def line_webhook(request: Request):
     Handle incoming messages from LINE bot.
     Caregivers send verification codes here to link their LINE user_id.
     """
-    body = await request.json()
+    raw_body = await request.body()
+
+    # Verify X-Line-Signature before processing any events
+    if LINE_CHANNEL_SECRET:
+        signature = request.headers.get("X-Line-Signature", "")
+        expected = base64.b64encode(
+            hmac.new(LINE_CHANNEL_SECRET.encode(), raw_body, hashlib.sha256).digest()
+        ).decode()
+        if not hmac.compare_digest(expected, signature):
+            return JSONResponse({"error": "Invalid signature"}, status_code=401)
+
+    body = json.loads(raw_body)
     events = body.get("events", [])
 
     pool = get_pool()

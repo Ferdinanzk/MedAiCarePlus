@@ -41,4 +41,5 @@ FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # ── LINE Messaging API ───────────────────────────────────────────────────────
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"

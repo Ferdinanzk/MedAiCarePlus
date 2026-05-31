@@ -91,18 +91,37 @@ async def check_pose(file: UploadFile = File(...)):
 
 @router.post("/enroll")
 async def enroll_face(
-    face_label: str = Form(...),
     photos: List[UploadFile] = File(...),
     user: dict = Depends(get_current_user),
 ):
-    """Save 3 enrollment photos to face gallery."""
+    """Save 3 enrollment photos to face gallery.
+    face_label is derived from the authenticated user's DB row — never from the request."""
     from app.config import FACE_GALLERY_DIR
 
-    label = face_label.strip().lower()
-    if not label or "/" in label or "\\" in label:
-        return JSONResponse({"error": "Invalid face_label"}, status_code=400)
     if len(photos) != 3:
         return JSONResponse({"error": "Exactly 3 photos required"}, status_code=400)
+
+    # Resolve the caller's face_label from the DB — never trust client-supplied label
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if "u_id" in user:
+            row = await conn.fetchrow(
+                'SELECT u_id, face_label FROM "user" WHERE u_id=$1 AND user_active=TRUE',
+                user["u_id"],
+            )
+        else:
+            row = await conn.fetchrow(
+                'SELECT u_id, face_label FROM "user" WHERE supabase_id=$1 AND user_active=TRUE',
+                user.get("sub"),
+            )
+
+    if not row or not row["face_label"]:
+        return JSONResponse(
+            {"error": "User not found or missing face_label. Complete registration first."},
+            status_code=404,
+        )
+
+    label = row["face_label"]
 
     FACE_GALLERY_DIR.mkdir(parents=True, exist_ok=True)
     saved = []

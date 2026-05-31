@@ -152,23 +152,24 @@ class RegisterPayload(BaseModel):
     age: str = ""
     gender: str = ""
     addres: str = ""
-    supabase_id: str = ""
+    # supabase_id intentionally excluded — use POST /link-account after
+    # registration to bind a Supabase identity (requires face_token proof)
 
 @router.post("/register")
 async def register(payload: RegisterPayload):
-    """Create a local DB user so face-login can find them later."""
+    """Create a local DB user so face-login can find them later.
+    Supabase identity is bound separately via /link-account to prevent spoofing."""
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
             password_hash = _hash_password(payload.password) if payload.password else None
             u_id = await conn.fetchval(
-                'INSERT INTO "user" (name, face_label, email, password_hash, line_id, supabase_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING u_id',
+                'INSERT INTO "user" (name, face_label, email, password_hash, line_id) VALUES ($1,$2,$3,$4,$5) RETURNING u_id',
                 payload.name.strip(),
                 payload.face_label.strip().lower(),
                 payload.email.strip().lower() if payload.email else None,
                 password_hash,
                 payload.line_id or None,
-                payload.supabase_id or None,
             )
             age_val = int(payload.age) if payload.age.isdigit() else None
             await conn.execute(
