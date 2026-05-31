@@ -645,6 +645,13 @@ class PillIngestionDetector:
                 and peak_mouth_occlusion_score < OCCLUSION_MODERATE_SCORE
                 and min_fingertip_to_mouth_norm is not None
                 and not likely_mouth_cover
+                and not (
+                    event_style == "palm_dump_delivery"
+                    and flat_palm_frame_ratio >= 0.70
+                    and palm_lower_mouth_ratio <= 0.0
+                    and min_palm_to_lower_mouth_norm is not None
+                    and min_palm_to_lower_mouth_norm > 0.90
+                )
             ):
                 if (
                     min_palm_to_mouth_norm is not None
