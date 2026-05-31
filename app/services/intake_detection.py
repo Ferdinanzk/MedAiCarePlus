@@ -113,17 +113,37 @@ def compute_mouth_occlusion_score(
     fingertip_to_mouth_norm: float,
     flat_palm: bool,
 ) -> Tuple[float, str]:
-    if hand_bbox_mouth_overlap_ratio >= 0.60 and palm_center_in_mouth_roi:
-        if flat_palm:
-            return min(1.0, hand_bbox_mouth_overlap_ratio + OCCLUSION_FLAT_PALM_PENALTY), "heavy_occlusion"
-        return min(1.0, hand_bbox_mouth_overlap_ratio + 0.10), "heavy_occlusion"
-    elif hand_bbox_mouth_overlap_ratio >= 0.35 and palm_center_in_mouth_roi:
-        return 0.55, "moderate_occlusion"
-    elif palm_to_mouth_norm < 0.50 or fingertip_to_mouth_norm < 0.40:
-        if hand_bbox_mouth_overlap_ratio >= 0.25:
-            return 0.40, "palm_overlap"
-        return 0.25, "fingertip_contact"
-    return 0.0, "none"
+    score = 0.0
+    if hand_bbox_mouth_overlap_ratio >= 0.60:
+        score += 0.45
+    elif hand_bbox_mouth_overlap_ratio >= 0.30:
+        score += 0.30
+    elif hand_bbox_mouth_overlap_ratio >= 0.10:
+        score += 0.15
+
+    if palm_center_in_mouth_roi:
+        score += 0.25
+
+    palm_close = palm_to_mouth_norm <= 1.25
+    palm_as_close_as_fingertip = palm_to_mouth_norm <= fingertip_to_mouth_norm + 0.25
+    if palm_close and palm_as_close_as_fingertip:
+        score += 0.20
+
+    if flat_palm and score >= 0.35:
+        score += 0.10
+
+    score = min(score, 1.0)
+    if score >= OCCLUSION_HEAVY_SCORE:
+        occlusion_type = "heavy_occlusion"
+    elif score < OCCLUSION_MODERATE_SCORE and fingertip_to_mouth_norm <= 1.0:
+        occlusion_type = "fingertip_contact"
+    elif palm_center_in_mouth_roi or hand_bbox_mouth_overlap_ratio >= 0.30:
+        occlusion_type = "palm_overlap"
+    elif fingertip_to_mouth_norm <= 1.0:
+        occlusion_type = "fingertip_contact"
+    else:
+        occlusion_type = "none"
+    return score, occlusion_type
 
 
 # =========================================================
