@@ -131,6 +131,7 @@ async def today_medications(user: dict = Depends(get_current_user), date: Option
                 m.dosage,
                 m.pills_remaining,
                 m.pill_description,
+                m.warning,
                 m.use_before,
                 m.schedule_time,
                 i.intake_time_stamp AS scheduled_time,

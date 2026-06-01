@@ -5,6 +5,7 @@ import { getFaceToken } from '../lib/face-auth';
 import { aiApi } from '../lib/ai-api';
 import { useMediaPipe } from '../hooks/useMediaPipe';
 import { useIntakeDetection } from '../hooks/useIntakeDetection';
+import { useTTS } from '../hooks/useTTS';
 import {
   Pill,
   CheckCircle2,
@@ -16,6 +17,7 @@ import {
   ScanFace,
   AlertTriangle,
   RefreshCw,
+  Volume2,
 } from 'lucide-react';
 
 interface IntakeItem {
@@ -27,6 +29,7 @@ interface IntakeItem {
   status: 'pending' | 'taken' | 'skipped' | 'missed';
   pills_remaining: number;
   dosage_amount: number;
+  warning?: string | null;
 }
 
 interface RawIntakeItem {
@@ -40,6 +43,7 @@ interface RawIntakeItem {
   status?: string;
   pills_remaining?: number;
   dosage_amount?: number;
+  warning?: string | null;
 }
 
 type Phase = 'list' | 'ready' | 'detecting' | 'pre' | 'post' | 'complete';
@@ -50,7 +54,8 @@ function getAuthHeaders(): Record<string, string> {
 }
 
 export default function Intake() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const { speak, stop: stopTTS, isSpeaking } = useTTS();
   const [searchParams] = useSearchParams();
   const params = useParams();
   const highlightMedId = searchParams.get('med') || params.medicationId || null;
@@ -229,6 +234,29 @@ export default function Intake() {
     return () => clearInterval(interval);
   }, [phase, detectionStartTime]);
 
+  // Auto-speak the medication warning when entering the 'ready' phase.
+  useEffect(() => {
+    if (phase === 'ready' && activeItem) {
+      const warningText = activeItem.warning
+        ? t('intake.tts.warningPrefix') + activeItem.warning
+        : t('intake.tts.genericWarning');
+      const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
+      speak(warningText, lang);
+    }
+    return () => stopTTS();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, activeItem]);
+
+  // Auto-speak the cheerful encouragement when entering the 'complete' phase.
+  useEffect(() => {
+    if (phase === 'complete') {
+      const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
+      speak(t('intake.tts.cheerUp'), lang);
+    }
+    return () => stopTTS();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
   const captureVideoAndAnalyze = async () => {
     if (!videoRef.current || !cameraOn) {
       console.error('[Intake] captureVideoAndAnalyze early return. videoRef=', !!videoRef.current, 'cameraOn=', cameraOn);
@@ -327,6 +355,7 @@ export default function Intake() {
           status: (item.status || 'pending') as IntakeItem['status'],
           pills_remaining: item.pills_remaining ?? 999,
           dosage_amount: item.dosage_amount ?? 1,
+          warning: item.warning ?? null,
         })));
       }
     } catch {
@@ -420,10 +449,25 @@ export default function Intake() {
   };
 
   const handleReadyCancel = () => {
+    stopTTS();
     setPhase('list');
     setActiveItem(null);
     resetAiState();
     setAiError('');
+  };
+
+  const replayWarning = () => {
+    if (!activeItem) return;
+    const warningText = activeItem.warning
+      ? t('intake.tts.warningPrefix') + activeItem.warning
+      : t('intake.tts.genericWarning');
+    const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
+    speak(warningText, lang);
+  };
+
+  const replayCheerUp = () => {
+    const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
+    speak(t('intake.tts.cheerUp'), lang);
   };
 
   const handleManualConfirm = () => {
@@ -453,6 +497,7 @@ export default function Intake() {
   };
 
   const handleCancelDetection = () => {
+    stopTTS();
     stopDetection();
     stopCamera();
     setPhase('list');
@@ -600,6 +645,25 @@ export default function Intake() {
               {activeItem.dosage ? ` · ${activeItem.dosage}` : ''}
             </p>
           </div>
+
+          {/* Warning box (amber) */}
+          {activeItem.warning && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-base text-amber-800 text-left">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                <p className="flex-1">{activeItem.warning}</p>
+              </div>
+              <button
+                onClick={replayWarning}
+                aria-label={t('intake.tts.speakerLabel')}
+                className="mt-3 ml-auto flex items-center gap-2 px-4 py-3 bg-amber-100 text-amber-800 text-base font-medium rounded-lg hover:bg-amber-200 active:scale-95 transition-all touch-target-large"
+              >
+                <Volume2 className="w-5 h-5" />
+                {t('intake.tts.speakerLabel')}
+              </button>
+            </div>
+          )}
+
           <div className="space-y-3 pt-2">
             <button
               onClick={handleReadyConfirm}
@@ -613,6 +677,12 @@ export default function Intake() {
             >
               {t('common.cancel')}
             </button>
+            {isSpeaking && (
+              <p className="flex items-center justify-center gap-2 text-base text-[#0057B8] font-medium">
+                <Volume2 className="w-5 h-5 animate-pulse" />
+                {t('intake.tts.speakerLabel')}...
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -631,8 +701,23 @@ export default function Intake() {
             <h3 className="text-xl font-semibold text-gray-900">Intake Complete</h3>
             <p className="text-gray-500 mt-1">{activeItem.medication_name} has been recorded.</p>
           </div>
+
+          {/* Encouragement box (green) */}
+          <div className="p-3 bg-green-50 border border-green-200 rounded-xl text-base text-green-700 text-left">
+            <p>🎉 {t('intake.tts.cheerUp')}</p>
+            <button
+              onClick={replayCheerUp}
+              aria-label={t('intake.tts.speakerLabel')}
+              className="mt-3 ml-auto flex items-center gap-2 px-4 py-3 bg-green-100 text-green-700 text-base font-medium rounded-lg hover:bg-green-200 active:scale-95 transition-all touch-target-large"
+            >
+              <Volume2 className="w-5 h-5" />
+              {t('intake.tts.speakerLabel')}
+            </button>
+          </div>
+
           <button
             onClick={() => {
+              stopTTS();
               setPhase('list');
               setActiveItem(null);
               resetAiState();
@@ -641,6 +726,12 @@ export default function Intake() {
           >
             Back to Schedule
           </button>
+          {isSpeaking && (
+            <p className="flex items-center justify-center gap-2 text-base text-green-700 font-medium">
+              <Volume2 className="w-5 h-5 animate-pulse" />
+              {t('intake.tts.speakerLabel')}...
+            </p>
+          )}
         </div>
       </div>
     );
@@ -831,6 +922,7 @@ export default function Intake() {
 
             <button
               onClick={() => {
+                stopTTS();
                 stopCamera();
                 resetAiState();
                 setPhase('list');
