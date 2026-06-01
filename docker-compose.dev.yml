@@ -33,7 +33,8 @@ services:
       FACE_REC_BASE: /models/face_recognition
       EMOTION_MODEL_PATH: /models/emotion/model4.2.2.pth
       YOLO_MODEL_PATH: /models/segmentation/prescription_best_100_epo.pt
-      OLLAMA_URL: http://host.docker.internal:11434/api/generate
+      # Points at the ollama service container below (same compose network)
+      OLLAMA_URL: http://ollama:11434/api/generate
     volumes:
       - ./models/face_recognition:/models/face_recognition:rw
       - ./models/emotion:/models/emotion:ro
@@ -41,9 +42,34 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ollama:
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    # First-time setup — pull a local vision model (cloud models like
+    # gemini-3-flash-preview:cloud need no pull):
+    #   docker compose -f docker-compose.dev.yml exec ollama ollama pull minicpm-v
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: ["http", "medaicare:8000", "--scheme=https"]
+    env_file: .env                  # Needs NGROK_AUTHTOKEN
+    ports:
+      - "4040:4040"                 # ngrok inspection dashboard
+    depends_on:
+      medaicare:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  ollama_models:

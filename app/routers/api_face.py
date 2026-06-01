@@ -123,6 +123,8 @@ async def enroll_face(
 
     label = row["face_label"]
 
+    svc = FaceRecognitionService.get_instance()
+
     FACE_GALLERY_DIR.mkdir(parents=True, exist_ok=True)
     saved = []
     for i, upload in enumerate(photos):
@@ -131,10 +133,28 @@ async def enroll_face(
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             return JSONResponse({"error": f"Cannot decode photo {i}"}, status_code=400)
+
+        # Crop to the detected face before storing. The gallery descriptor is
+        # computed over the whole stored image, while login detects + crops the
+        # face first — so we must store a tight face crop here for the two
+        # descriptors to live in the same space and actually match.
+        face_img = img
+        try:
+            rois = svc.face_det.infer((img,))
+            if rois:
+                roi = rois[0]
+                x, y = int(roi.position[0]), int(roi.position[1])
+                w, h = int(roi.size[0]), int(roi.size[1])
+                crop = img[max(0, y):y + h, max(0, x):x + w]
+                if crop.size:
+                    face_img = crop
+        except Exception:
+            # If detection is unavailable, fall back to the full frame.
+            pass
+
         path = FACE_GALLERY_DIR / f"{label}-{i}.jpg"
-        cv2.imwrite(str(path), img)
+        cv2.imwrite(str(path), face_img)
         saved.append(str(path))
 
-    svc = FaceRecognitionService.get_instance()
     svc.reload_gallery()
     return {"saved": saved, "face_label": label}
