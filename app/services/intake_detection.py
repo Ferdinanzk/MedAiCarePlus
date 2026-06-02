@@ -232,6 +232,8 @@ class PillIngestionDetector:
         self.hand_states: Dict[str, HandTrackState] = {}
         self.last_event_time = 0.0
         self.last_status = "IDLE"
+        self.peak_event_confidence = 0.0
+        self.highest_5s_confidence = 0.0
 
     def compute_head_pose_proxy(self, face_landmarks: List[dict], width: int, height: int) -> dict:
         nose = to_pixel_coords(face_landmarks[NOSE_TIP], width, height)
@@ -867,6 +869,11 @@ class PillIngestionDetector:
 
             state.reset_event_window()
 
+        # Track peak confidence on EVERY frame (not just event-closing ones).
+        # This enables the video-level fallback: event_detected OR peak_confidence >= 0.50
+        if state.event_confidence > self.peak_event_confidence:
+            self.peak_event_confidence = state.event_confidence
+
         # Build event debug dictionary for post-hoc analysis
         event_debug = {
             "event_detected": event_detected,
@@ -978,9 +985,10 @@ class PillIngestionDetector:
 
         return {
             "event_detected": event_detected,
-            "ingestion_detected": event_detected or state.event_confidence >= 0.50,
+            "ingestion_detected": event_detected or self.peak_event_confidence >= 0.50,
             "confidence": state.event_confidence,
             "event_confidence": state.event_confidence,
+            "peak_confidence": self.peak_event_confidence,
             "frame_confidence": frame_confidence,
             "status": self.last_status,
             "mouth_open": features.get("mouth_open", False),
