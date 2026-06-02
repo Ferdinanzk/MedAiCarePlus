@@ -587,6 +587,7 @@ class PillIngestionDetector:
         withdrawal_contribution = 0.0
         fingertip_delivery_contribution = 0.0
         mouth_occlusion_penalty = 0.0
+        missing_mouth_open_soft_penalty = 0.0
         no_mouth_open_palm_dump_contradiction = False
         strong_palm_dump_geometry = False
         weak_palm_dump_no_lower_mouth_geometry = False
@@ -837,6 +838,13 @@ class PillIngestionDetector:
             if unknown_open_mouth_no_delivery_geometry and confidence > UNKNOWN_OPEN_MOUTH_NO_DELIVERY_CAP:
                 confidence = UNKNOWN_OPEN_MOUTH_NO_DELIVERY_CAP
 
+            # Soft penalty for missing mouth-open evidence (was a hard gate).
+            # Strong events can still pass; weaker events lose 0.10 confidence.
+            missing_mouth_open_soft_penalty = 0.0
+            if not mouth_open_occurred and confidence < 0.50:
+                missing_mouth_open_soft_penalty = 0.10
+                confidence -= missing_mouth_open_soft_penalty
+
             # Clamp confidence
             confidence = max(0.0, min(confidence, 1.0))
 
@@ -848,7 +856,6 @@ class PillIngestionDetector:
             if (
                 peak_mouth_contact >= 0.5
                 and confidence >= 0.38
-                and mouth_open_occurred
                 and mouth_open_allowed
                 and cooldown_ok
                 and not unknown_open_mouth_no_delivery_geometry
@@ -893,6 +900,7 @@ class PillIngestionDetector:
             "withdrawal_contribution": withdrawal_contribution,
             "fingertip_delivery_contribution": fingertip_delivery_contribution,
             "mouth_activity_cap_penalty": 0.0,
+            "missing_mouth_open_soft_penalty": -missing_mouth_open_soft_penalty,
             "flat_palm_cover_penalty": -0.12 if likely_mouth_cover else 0.0,
             "no_mouth_open_palm_dump_penalty": -0.12 if no_mouth_open_palm_dump_contradiction else 0.0,
             "strong_palm_dump_geometry": strong_palm_dump_geometry,
@@ -941,6 +949,7 @@ class PillIngestionDetector:
                 + (0.10 if dwell > LONG_DWELL_PENALTY_THRESHOLD else 0.0)
                 + (0.05 if approach_std > ERRATIC_APPROACH_STD_NORM else 0.0)
                 + mouth_occlusion_penalty
+                + missing_mouth_open_soft_penalty
                 + (0.12 if likely_mouth_cover else 0.0)
                 + (0.12 if no_mouth_open_palm_dump_contradiction else 0.0)
             ),
@@ -969,6 +978,8 @@ class PillIngestionDetector:
 
         return {
             "event_detected": event_detected,
+            "ingestion_detected": event_detected or state.event_confidence >= 0.50,
+            "confidence": state.event_confidence,
             "event_confidence": state.event_confidence,
             "frame_confidence": frame_confidence,
             "status": self.last_status,
@@ -1043,6 +1054,7 @@ class IntakeDetectionService:
                 "hand_near_mouth": False,
                 "status": "NO_FACE",
                 "event_detected": False,
+                "ingestion_detected": False,
             }
 
         mouth_geom = detector.compute_mouth_geometry(face_landmarks, width, height)
@@ -1053,6 +1065,7 @@ class IntakeDetectionService:
             "hand_near_mouth": False,
             "status": detector.last_status,
             "event_detected": False,
+            "ingestion_detected": False,
         }
 
         for i, hand_lm in enumerate(hand_landmarks):
@@ -1067,12 +1080,18 @@ class IntakeDetectionService:
                     "hand_near_mouth": result["hand_near_mouth"],
                     "status": result["status"],
                     "event_detected": result["event_detected"],
+                    "ingestion_detected": result["event_detected"],
                 }
 
             if result["event_detected"]:
                 best_result["event_detected"] = True
+                best_result["ingestion_detected"] = True
                 best_result["confidence"] = result["event_confidence"]
                 break
+
+        # Add confidence fallback (matches old system behavior)
+        if not best_result["ingestion_detected"]:
+            best_result["ingestion_detected"] = best_result["confidence"] >= 0.50
 
         return best_result
 
