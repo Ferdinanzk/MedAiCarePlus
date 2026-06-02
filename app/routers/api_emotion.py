@@ -110,6 +110,9 @@ async def analyze_emotion_batch(
     if not EmotionService._available:
         return {"detected": False, "error": "Model not loaded", "frame_count": 0}
 
+    # Reset rotation smoothing for each new video stream
+    svc.reset_session()
+
     all_results = []
     for file in frames:
         image_bytes = await file.read()
@@ -150,3 +153,24 @@ async def analyze_emotion_batch(
             for e, s in emotion_scores.items()
         },
     }
+
+
+@router.post("/analyze-debug")
+async def analyze_emotion_debug(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """Debug endpoint — returns per-frame debug info (rotation angles, crop coords, etc.)."""
+    image_bytes = await file.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse({"detected": False, "error": "Invalid image"}, status_code=400)
+
+    svc = EmotionService.get_instance()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, svc.predict_frame_debug, frame)
+
+    if result.get("emotion_type"):
+        result["emotion_type"] = result["emotion_type"].capitalize()
+    return result
