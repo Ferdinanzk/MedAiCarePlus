@@ -569,9 +569,55 @@ class PillIngestionDetector:
 
         event_detected = False
 
+        # Defaults for frames that do not close an at-mouth event. The debug dict
+        # below is built on every frame, so these must exist even when the hand
+        # has not just left the mouth area.
+        peak_mouth_contact = state.peak_mouth_contact
+        in_mouth_zone_occurred = state.in_mouth_zone_occurred
+        mouth_open_occurred = state.mouth_open_occurred
+        mouth_open_allowed = False
+        peak_mouth_open_ratio = state.peak_mouth_open_ratio
+        dwell = 0.0
+        withdrew_enough = False
+        withdrew_enough_px_based = False
+        mouth_contact_contribution = 0.0
+        mouth_activity_contribution = 0.0
+        dwell_contribution = 0.0
+        trajectory_contribution = 0.0
+        withdrawal_contribution = 0.0
+        fingertip_delivery_contribution = 0.0
+        mouth_occlusion_penalty = 0.0
+        no_mouth_open_palm_dump_contradiction = False
+        strong_palm_dump_geometry = False
+        weak_palm_dump_no_lower_mouth_geometry = False
+        weak_palm_dump_cap_exception_applied = False
+        unknown_open_mouth_no_delivery_geometry = False
+        peak_mouth_occlusion_score = state.peak_mouth_occlusion_score
+        palm_overlap_ratio_of_event = 0.0
+        mouth_visible_frame_ratio = 0.0
+        flat_palm_frame_ratio = 0.0
+        pinch_frame_ratio = 0.0
+        loose_grip_frame_ratio = 0.0
+        holding_object_frame_ratio = 0.0
+        possible_palm_dump_delivery = False
+        likely_mouth_cover = False
+        event_style = "none"
+        min_fingertip_to_mouth_norm = state.min_fingertip_to_mouth_norm
+        min_palm_to_mouth_norm = state.min_palm_to_mouth_norm
+        head_pitch_at_event_start = state.head_pitch_at_event_start
+        peak_head_pitch_delta = state.peak_head_pitch_delta
+        min_head_pitch_delta = state.min_head_pitch_delta
+        head_tilt_back_detected = state.head_tilt_back_detected
+        head_tilt_back_frame_count = state.head_tilt_back_frame_count
+        min_palm_to_lower_mouth_norm = state.min_palm_to_lower_mouth_norm
+        palm_lower_mouth_ratio = 0.0
+        flat_palm_lower_mouth_ratio = 0.0
+        partial_withdrawal_seen = state.partial_withdrawal_seen
+        confidence = state.event_confidence
+
         # Evaluate only when hand leaves mouth area
         if state.was_near_mouth and not near_mouth:
-            peak_mouth_contact = state.peak_mouth_contact
+
             in_mouth_zone_occurred = state.in_mouth_zone_occurred
             mouth_open_occurred = state.mouth_open_occurred
             peak_mouth_open_ratio = state.peak_mouth_open_ratio
