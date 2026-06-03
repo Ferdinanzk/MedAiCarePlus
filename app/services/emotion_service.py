@@ -54,9 +54,13 @@ class EmotionService:
             self.model.to(self.device).eval()
 
             self.preprocess = transforms.Compose([
-                transforms.ToTensor(),  # simple [0, 1] scaling (x / 255.0); model trained from scratch on FER data
+                transforms.ToTensor(),
+                # ImageNet normalization matches Facial_Emotion_Detector_Final.py line 306.
+                # Removing this causes a training/inference mismatch that drops valdb
+                # accuracy from 54.5% to 50.5% (sad class recall collapses from 72.7% to 22.7%).
+                # See: C:\Users\user\Documents\MedCareAi\Emotion Detection — Learnings & Failures.md
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ])
-            self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             mp_fm = mp.solutions.face_mesh
             self.face_mesh = mp_fm.FaceMesh(
                 max_num_faces=1, refine_landmarks=True,
@@ -79,13 +83,6 @@ class EmotionService:
     def reset_session(self):
         """Reset per-session state (rotation smoothing) before processing a new video stream."""
         self._last_angle = 0.0
-
-    def _normalize_lighting(self, face_bgr: np.ndarray) -> np.ndarray:
-        """Apply CLAHE to luminance before resizing/model normalization."""
-        lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        l_channel = self._clahe.apply(l_channel)
-        return cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
 
     def _letterbox_face(self, face_bgr: np.ndarray) -> np.ndarray:
         """Resize face crop without aspect-ratio distortion, padding to model input size."""
@@ -176,7 +173,6 @@ class EmotionService:
             else:
                 self._last_angle = self._last_angle * (1.0 - _ROTATION_ALPHA)
 
-            face = self._normalize_lighting(face)
             # Grayscale conversion: model was trained on grayscale FER2013 data
             gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
             face = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
