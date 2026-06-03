@@ -856,6 +856,7 @@ class PillIngestionDetector:
             if (
                 peak_mouth_contact >= 0.5
                 and confidence >= 0.38
+                and mouth_open_occurred
                 and mouth_open_allowed
                 and cooldown_ok
                 and not unknown_open_mouth_no_delivery_geometry
