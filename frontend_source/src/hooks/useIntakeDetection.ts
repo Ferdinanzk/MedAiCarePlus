@@ -113,7 +113,7 @@ export function useIntakeDetection(
           const msg = e instanceof Error ? e.message : 'Detection request failed';
           onError?.(msg);
         }
-      }, 200);
+      }, 100);
     },
     [sessionId, onDetect, onError, stop]
   );
