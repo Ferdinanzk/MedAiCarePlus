@@ -99,7 +99,7 @@ class EmotionService:
         interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
 
 
-        resized = cv2.resize(face, (new_w, new_h), interpolation=interp)
+        resized = cv2.resize(face_bgr, (new_w, new_h), interpolation=interp)
         canvas = np.zeros((self.img_size, self.img_size, 3), dtype=face_bgr.dtype)
         top = (self.img_size - new_h) // 2
         left = (self.img_size - new_w) // 2
