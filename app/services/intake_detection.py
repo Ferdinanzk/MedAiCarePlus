@@ -394,6 +394,13 @@ class PillIngestionDetector:
             or self.point_in_rect(middle_tip, mouth_lower_rect)
         )
 
+        # Resolution-adaptive mouth-near threshold
+        # eye_width (distance between landmarks 33 and 263) scales with resolution
+        face_width_px = max(1.0, mouth_geom.get("eye_width", 0.0))
+        reference_face_width = 200.0
+        mouth_near_distance_px = MOUTH_NEAR_DISTANCE_PX * (face_width_px / reference_face_width)
+        mouth_near_distance_px = max(30.0, min(120.0, mouth_near_distance_px))
+
         return {
             "wrist": wrist,
             "thumb_tip": thumb_tip,
@@ -426,6 +433,7 @@ class PillIngestionDetector:
             "palm_center_in_mouth_roi": palm_center_in_mouth_roi,
             "palm_center_in_lower_mouth_roi": palm_center_in_lower_mouth_roi,
             "hand_bbox_mouth_overlap_ratio": hand_bbox_mouth_overlap_ratio,
+            "mouth_near_distance_px": mouth_near_distance_px,
         }
 
     def update_hand_state(self, hand_id: str, features: dict, current_time: float) -> dict:
@@ -433,7 +441,8 @@ class PillIngestionDetector:
         state.last_seen_time = current_time
 
         curr_dist = features["fingertip_to_mouth"]
-        curr_dist_norm = float(features.get("fingertip_to_mouth_norm", curr_dist / max(1.0, MOUTH_NEAR_DISTANCE_PX)))
+        mouth_near_distance_px = features.get("mouth_near_distance_px", MOUTH_NEAR_DISTANCE_PX)
+        curr_dist_norm = float(features.get("fingertip_to_mouth_norm", curr_dist / max(1.0, mouth_near_distance_px)))
         in_mouth_zone_now = features.get("in_mouth_zone", False)
         approach_speed_px_based = moving_toward(state.prev_mouth_dist, curr_dist)
         approach_speed_norm = moving_toward(state.prev_mouth_dist_norm, curr_dist_norm)
@@ -448,14 +457,14 @@ class PillIngestionDetector:
         approach_std_norm = self._std(state.recent_approaches_norm) if len(state.recent_approaches_norm) >= 2 else 0.0
 
         is_approaching = avg_approach > APPROACH_SPEED_THRESHOLD_NORM
-        near_mouth_px_based = curr_dist < MOUTH_NEAR_DISTANCE_PX or in_mouth_zone_now
+        near_mouth_px_based = curr_dist < mouth_near_distance_px or in_mouth_zone_now
         near_mouth_norm_based = curr_dist_norm < MOUTH_NEAR_DISTANCE_NORM or in_mouth_zone_now
         near_mouth = near_mouth_norm_based
 
         mouth_contact_px_based = min(
             1.0,
             max(
-                1.0 - curr_dist / max(1.0, MOUTH_NEAR_DISTANCE_PX * 1.2),
+                1.0 - curr_dist / max(1.0, mouth_near_distance_px * 1.2),
                 1.0 if in_mouth_zone_now else 0.0,
             ),
         )
