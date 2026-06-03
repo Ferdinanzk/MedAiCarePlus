@@ -105,7 +105,7 @@ export function useIntakeDetection(
           setStatus(result.status || 'DETECTING');
 
           const detectionConfidence = result.confidence || 0;
-          if (result.event_detected && detectionConfidence >= 0.50 && result.mouth_open) {
+          if (result.event_detected && detectionConfidence >= 0.38) {
             stop();
             onDetect(detectionConfidence);
           }
