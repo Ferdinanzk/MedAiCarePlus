@@ -840,11 +840,6 @@ class PillIngestionDetector:
             if unknown_open_mouth_no_delivery_geometry and confidence > UNKNOWN_OPEN_MOUTH_NO_DELIVERY_CAP:
                 confidence = UNKNOWN_OPEN_MOUTH_NO_DELIVERY_CAP
 
-            # Soft penalty for missing mouth-open evidence (was a hard gate).
-            # Strong events can still pass; weaker events lose 0.10 confidence.
-            if not mouth_open_occurred and confidence < 0.50:
-                confidence -= 0.10
-
             # Clamp confidence
             confidence = max(0.0, min(confidence, 1.0))
 
