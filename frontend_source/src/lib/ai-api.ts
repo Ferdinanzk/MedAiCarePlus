@@ -163,6 +163,12 @@ export const aiApi = {
     hand_near_mouth?: boolean;
     status?: string;
     event_detected?: boolean;
+    decision?: 'confirmed' | 'uncertain' | 'none';
+    decision_reason?: string;
+    frame_confidence?: number;
+    event_confidence?: number;
+    peak_confidence?: number;
+    debug?: Record<string, unknown>;
     error?: string;
   }> {
     const resp = await aiFetch('/api/intake/detect', {

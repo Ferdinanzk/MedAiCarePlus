@@ -30,11 +30,15 @@ services:
       EMOTION_MODEL_PATH: /models/emotion/model4.2.2.pth
       YOLO_MODEL_PATH: /models/segmentation/prescription_best_100_epo.pt
       OLLAMA_URL: http://ollama:11434/api/generate
-      SECRET_KEY: "change-me-to-a-random-32-char-string"
+      # SECRET_KEY is loaded from .env (see env_file above). Do NOT hardcode it
+      # here — a different value invalidates every existing face-auth token
+      # (signed with the .env key) and causes 401s on all authenticated calls.
     volumes:
-      - "C:/Users/ferdinan/Downloads/project_AI_/face_recognition_folder/face_recognition:/models/face_recognition:rw"
-      - "C:/Users/ferdinan/Downloads/project_AI_/FaceEmotionDetector/FaceEmotionDetector:/models/emotion:ro"
-      - "C:/Users/ferdinan/Downloads/project_AI_/segmentation:/models/segmentation:ro"
+      # Mount the model folders that ship with this repo (relative paths) so the
+      # stack is portable. Do NOT hardcode a developer's home directory here.
+      - ./models/face_recognition:/models/face_recognition:rw
+      - ./models/emotion:/models/emotion:ro
+      - ./models/segmentation:/models/segmentation:ro
     depends_on:
       postgres:
         condition: service_healthy

@@ -89,6 +89,9 @@ export default function Intake() {
   const [detectionStartTime, setDetectionStartTime] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
+  // Ambiguous-detection confirmation prompt (holds the detected confidence; null = hidden)
+  const [uncertainPrompt, setUncertainPrompt] = useState<number | null>(null);
+
   // Store detection confidence for recording after pre-emotion
   const detectionConfidenceRef = useRef<number>(0);
 
@@ -97,11 +100,14 @@ export default function Intake() {
   const {
     videoRef: detectionVideoRef,
     confidence,
+    peakConfidence,
     status: detectionStatus,
+    debug: detectionDebug,
     start: startDetection,
     stop: stopDetection,
   } = useIntakeDetection(
     sessionId,
+    // confirmed: high-confidence delivery -> auto-record as taken
     (conf) => {
       stopCamera();
       stopDetection();
@@ -119,6 +125,13 @@ export default function Intake() {
       setPhase('post');
       resetAiState();
       startCamera();
+    },
+    // uncertain: ambiguous event -> ask the patient to confirm before logging.
+    // Patient-safety: never silently record a dose that may not have been taken.
+    (conf) => {
+      stopDetection();
+      detectionConfidenceRef.current = conf;
+      setUncertainPrompt(conf);
     },
     (err) => setAiError(err)
   );
@@ -490,6 +503,35 @@ export default function Intake() {
     startCamera();
   };
 
+  // Patient confirmed an ambiguous ("uncertain") detection -> record as taken.
+  const handleUncertainConfirm = () => {
+    const conf = uncertainPrompt ?? detectionConfidenceRef.current ?? 0;
+    setUncertainPrompt(null);
+    stopCamera();
+    setPhase('post');
+    setDetectionStartTime(null);
+    setElapsedSeconds(0);
+    resetAiState();
+    if (activeItem) {
+      aiApi.recordIntake({
+        intk_id: activeItem.id,
+        detection_confidence: conf,
+        detection_method: 'uncertain_confirmed',
+      }).then(() => {
+        updateStatus(activeItem.id, 'taken');
+      });
+    }
+    startCamera();
+  };
+
+  // Patient said they have not taken it -> resume detection (camera still live).
+  const handleUncertainReject = () => {
+    setUncertainPrompt(null);
+    if (handLandmarker.current && faceLandmarker.current) {
+      startDetection(handLandmarker.current, faceLandmarker.current);
+    }
+  };
+
   const getGuidanceText = () => {
     if (confidence >= 50) return t('intake.guidanceAlmost');
     if (detectionStatus === 'HAND_AT_MOUTH') return t('intake.guidanceHand');
@@ -580,12 +622,26 @@ export default function Intake() {
             <p className="text-white/80 text-sm">{getGuidanceText()}</p>
           </div>
 
+          {/* DEBUG panel: the "Confidence" meter below is the decaying live
+              signal; peak/event are the real scores driving the decision. */}
+          {detectionDebug && (
+            <div className="absolute top-20 left-2 z-20 bg-black/70 text-green-300 font-mono text-[10px] leading-tight p-2 rounded-md max-w-[60%] space-y-0.5">
+              <div>decision: {String(detectionDebug.decision)} ({String(detectionDebug.decision_reason ?? '')})</div>
+              <div>peak: {String(detectionDebug.peak_confidence)} | event: {String(detectionDebug.event_confidence)} | frame: {String(detectionDebug.frame_confidence)}</div>
+              <div>confirm@ {String(detectionDebug.confirm_threshold)} | raw: {String(detectionDebug.raw_event_score)}</div>
+              <div>style: {String(detectionDebug.event_style)} | contact: {String(detectionDebug.peak_mouth_contact)}</div>
+              <div>mouthOpen: {String(detectionDebug.mouth_open)} ({String(detectionDebug.mouth_open_ratio)}) | withdrew: {String(detectionDebug.withdrew_enough)}</div>
+              <div>dwell: {String(detectionDebug.dwell)} | nearMouth: {String(detectionDebug.hand_near_mouth)} | hands: {String(detectionDebug.hands)}</div>
+              <div>winClosed: {String(detectionDebug.event_window_closed)} | status: {String(detectionDebug.status)}</div>
+            </div>
+          )}
+
           {/* Confidence meter */}
           <div className="absolute bottom-24 left-4 right-4">
             <div className="bg-black/50 rounded-xl p-4 backdrop-blur-sm space-y-2">
               <div className="flex justify-between text-white text-sm mb-2">
                 <span>Confidence</span>
-                <span className="font-mono">{confidence}%</span>
+                <span className="font-mono">{confidence}% <span className="text-white/50">(peak {peakConfidence}%)</span></span>
               </div>
               <div className="w-full h-3 bg-gray-700 rounded-full overflow-hidden">
                 <div
@@ -607,6 +663,33 @@ export default function Intake() {
                 <p className="text-red-300 text-xs">{mediaPipeError}</p>
               )}
             </div>          </div>
+
+          {/* Ambiguous-detection confirmation prompt (patient safety: never auto-log) */}
+          {uncertainPrompt !== null && (
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm p-8 text-white">
+              <AlertTriangle className="w-12 h-12 mb-4 text-yellow-400" />
+              <h3 className="text-xl font-semibold text-center mb-2">需要確認 / Please confirm</h3>
+              <p className="text-base text-center mb-8 opacity-90">
+                系統偵測到您可能已服藥，但無法完全確定。請確認您是否已服下藥物。
+                <br />
+                We detected a possible intake but aren't certain. Did you take your medication?
+              </p>
+              <div className="space-y-3 w-full max-w-xs">
+                <button
+                  onClick={handleUncertainConfirm}
+                  className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
+                >
+                  是的，我已服藥 / Yes, I took it
+                </button>
+                <button
+                  onClick={handleUncertainReject}
+                  className="w-full py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
+                >
+                  尚未服藥，繼續偵測 / Not yet, keep detecting
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Cancel + Manual buttons */}
           <div className="absolute bottom-4 left-4 right-4 space-y-2">

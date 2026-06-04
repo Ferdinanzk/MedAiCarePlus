@@ -41,6 +41,19 @@ OCCLUSION_HEAVY_PENALTY = 0.20
 OCCLUSION_MODERATE_PENALTY = 0.12
 OCCLUSION_FLAT_PALM_PENALTY = 0.15
 
+# Decision band thresholds. Patient-safety design: auto-log ("confirmed") a
+# delivery, route ambiguous events to "uncertain" so the patient confirms with
+# one tap, and ignore everything else ("none").
+# CONFIRM_THRESHOLD is set to lean POSITIVE: genuine intakes (which scored as low
+# as ~0.45 on the dev benchmark, and lower still under live camera lag) should
+# auto-confirm rather than getting stuck below the bar. False positives are held
+# at 0 not by this threshold but by the semantic contradiction flags
+# (`unknown_open_mouth_no_delivery`, wide-yawn mouth-cover) and the base gates,
+# which the only gate-passing FALSE videos (False3/False10) still trip.
+CONFIRM_THRESHOLD = 0.45
+UNCERTAIN_FLOOR = 0.38
+WIDE_OPEN_MOUTH_COVER_RATIO = 0.75
+
 HEAD_TILT_BACK_DELTA_THRESHOLD = 0.08
 UNKNOWN_OPEN_MOUTH_NO_DELIVERY_CAP = 0.49
 PALM_DUMP_GEOMETRY_REWARD = 0.22
@@ -420,6 +433,11 @@ class PillIngestionDetector:
             "loose_grip": loose_grip,
             "flat_palm": flat_palm,
             "holding_object": holding_object,
+            "mouth_open": mouth_geom.get("mouth_open", False),
+            "mouth_open_ratio": mouth_geom.get("mouth_open_ratio", 0.0),
+            "head_pitch_proxy": mouth_geom.get("head_pitch_proxy"),
+            "head_face_height": mouth_geom.get("face_height"),
+            "head_eye_width": mouth_geom.get("eye_width"),
             "fingertip_to_mouth": fingertip_to_mouth,
             "fingertip_to_mouth_norm": fingertip_to_mouth_norm,
             "palm_to_mouth_norm": palm_to_mouth_norm,
@@ -600,11 +618,15 @@ class PillIngestionDetector:
         mouth_occlusion_penalty = 0.0
         missing_mouth_open_soft_penalty = 0.0
         no_mouth_open_palm_dump_contradiction = False
+        closed_mouth_strong_palm_dump_recovery = False
+        closed_mouth_supported_pinch_recovery = False
         strong_palm_dump_geometry = False
         weak_palm_dump_no_lower_mouth_geometry = False
         weak_palm_dump_cap_exception_applied = False
+
         unknown_open_mouth_no_delivery_geometry = False
         peak_mouth_occlusion_score = state.peak_mouth_occlusion_score
+
         palm_overlap_ratio_of_event = 0.0
         mouth_visible_frame_ratio = 0.0
         flat_palm_frame_ratio = 0.0
@@ -626,9 +648,13 @@ class PillIngestionDetector:
         flat_palm_lower_mouth_ratio = 0.0
         partial_withdrawal_seen = state.partial_withdrawal_seen
         confidence = state.event_confidence
+        decision = "none"
+        decision_reason = ""
+        safety_contradiction = False
+        event_window_closed = bool(state.was_near_mouth and not near_mouth)
 
         # Evaluate only when hand leaves mouth area
-        if state.was_near_mouth and not near_mouth:
+        if event_window_closed:
 
             in_mouth_zone_occurred = state.in_mouth_zone_occurred
             mouth_open_occurred = state.mouth_open_occurred
@@ -770,18 +796,10 @@ class PillIngestionDetector:
             if likely_mouth_cover:
                 confidence -= 0.12
 
-            # Palm dump no mouth open penalty
-            no_mouth_open_palm_dump_contradiction = bool(
-                event_style == "palm_dump_delivery"
-                and not mouth_open_occurred
-                and peak_mouth_open_ratio <= 0.18
-                and not head_tilt_back_detected
-                and palm_lower_mouth_ratio <= 0.0
-                and min_palm_to_lower_mouth_norm is not None
-                and min_palm_to_lower_mouth_norm > 0.80
-            )
-            if no_mouth_open_palm_dump_contradiction:
-                confidence -= 0.12
+            # Mouth opening is positive evidence only. A weak/closed mouth should
+            # not subtract points by itself; non-intake mouth-cover/talking cases
+            # must be blocked by explicit cover/unknown-delivery contradictions.
+            no_mouth_open_palm_dump_contradiction = False
 
             # Palm dump geometry reward
             strong_palm_dump_geometry = bool(
@@ -852,34 +870,113 @@ class PillIngestionDetector:
             # Clamp confidence
             confidence = max(0.0, min(confidence, 1.0))
 
-            # Update event confidence
+            closed_mouth_strong_palm_dump_recovery = bool(
+                not mouth_open_occurred
+                and event_style == "palm_dump_delivery"
+                and confidence >= 0.80
+                and strong_palm_dump_geometry
+                and withdrew_enough
+                and partial_withdrawal_seen
+                and head_tilt_back_detected
+                and not likely_mouth_cover
+                and not unknown_open_mouth_no_delivery_geometry
+            )
+            closed_mouth_supported_pinch_recovery = bool(
+                not mouth_open_occurred
+                and event_style == "pinch_delivery"
+                and confidence >= 0.65
+                and mouth_open_allowed
+                and withdrew_enough
+                and partial_withdrawal_seen
+                and not likely_mouth_cover
+                and not unknown_open_mouth_no_delivery_geometry
+            )
+            mouth_open_gate_passed = bool(mouth_open_occurred and mouth_open_allowed)
+            weak_mouth_recovery_passed = bool(
+                closed_mouth_strong_palm_dump_recovery
+                or closed_mouth_supported_pinch_recovery
+            )
+
+            # Decide the event band. Keep the Step-B mouth-open gate for ordinary
+            # events; recover only the two weak-mouth delivery patterns that have
+            # explicit geometry/withdrawal support.
             state.event_confidence = confidence
             state.event_confidence_time = current_time
 
-            # Check if ingestion detected
-            if (
+            # Hard gates shared by confirmed and uncertain bands. A real
+            # hand-at-mouth contact with either an open mouth or a supported
+            # weak-mouth recovery is enough to *consider* the event; whether it
+            # auto-logs or merely prompts is decided below.
+            base_gates_passed = bool(
                 peak_mouth_contact >= 0.5
-                and confidence >= 0.38
-                and mouth_open_occurred
-                and mouth_open_allowed
+                and (mouth_open_gate_passed or weak_mouth_recovery_passed)
+            )
+
+            # Soft safety contradiction: geometry contradicts a clean delivery, so
+            # even a high-confidence event is downgraded to "uncertain" (requires
+            # confirmation) rather than auto-logged. Never silently marks a dose.
+            safety_contradiction = bool(
+                unknown_open_mouth_no_delivery_geometry
+                or (likely_mouth_cover and peak_mouth_open_ratio >= WIDE_OPEN_MOUTH_COVER_RATIO)
+            )
+
+            # Weak palm-dump geometry (flat palm that never reaches the lower
+            # mouth) blocks AUTO-LOGGING only. It still surfaces as "uncertain"
+            # so a genuine but ambiguous delivery can be confirmed by the patient
+            # instead of being silently dropped.
+            weak_palm_dump_blocks_confirm = bool(
+                weak_palm_dump_no_lower_mouth_geometry
+                and not weak_palm_dump_cap_exception_applied
+            )
+
+            confirmed_blockers = bool(safety_contradiction or weak_palm_dump_blocks_confirm)
+
+            would_confirm = bool(
+                base_gates_passed
+                and confidence >= CONFIRM_THRESHOLD
                 and cooldown_ok
-                and not unknown_open_mouth_no_delivery_geometry
-                and not (weak_palm_dump_no_lower_mouth_geometry and not weak_palm_dump_cap_exception_applied)
-            ):
+                and not confirmed_blockers
+            )
+
+            if would_confirm:
+                decision = "confirmed"
+                decision_reason = "high_confidence_delivery"
                 self.last_event_time = current_time
                 self.last_status = "LIKELY_INGESTION"
                 event_detected = True
+            elif base_gates_passed and confidence >= UNCERTAIN_FLOOR:
+                decision = "uncertain"
+                if unknown_open_mouth_no_delivery_geometry:
+                    decision_reason = "unknown_open_mouth_no_delivery"
+                elif safety_contradiction:
+                    decision_reason = "wide_open_mouth_cover"
+                elif weak_palm_dump_blocks_confirm:
+                    decision_reason = "weak_palm_dump_needs_confirmation"
+                elif confidence < CONFIRM_THRESHOLD:
+                    decision_reason = "below_confirm_threshold"
+                else:
+                    decision_reason = "needs_confirmation"
+                self.last_status = "POSSIBLE_INGESTION"
+            else:
+                decision = "none"
+                decision_reason = ""
 
             state.reset_event_window()
 
-        # Track peak confidence on EVERY frame (not just event-closing ones).
-        # This enables the video-level fallback: event_detected OR peak_confidence >= 0.50
+        # Track peak confidence for telemetry / future use, but do NOT use it as a
+        # decision signal. The event-detection gate is now contact/score based;
+        # mouth opening contributes positive score but is not a hard TRUE gate.
+        # This avoids rejecting true delivery when the mouth is weakly open or
+        # temporarily occluded, while keeping high peak confidence out of the
+        # video-level decision path.
+
         if state.event_confidence > self.peak_event_confidence:
             self.peak_event_confidence = state.event_confidence
 
         # Build event debug dictionary for post-hoc analysis
         event_debug = {
             "event_detected": event_detected,
+            "event_window_closed": event_window_closed,
             "event_confidence": state.event_confidence,
             "fingertip_to_mouth": curr_dist,
             "mouth_contact": peak_mouth_contact,
@@ -913,6 +1010,8 @@ class PillIngestionDetector:
             "missing_mouth_open_soft_penalty": -missing_mouth_open_soft_penalty,
             "flat_palm_cover_penalty": -0.12 if likely_mouth_cover else 0.0,
             "no_mouth_open_palm_dump_penalty": -0.12 if no_mouth_open_palm_dump_contradiction else 0.0,
+            "closed_mouth_strong_palm_dump_recovery": closed_mouth_strong_palm_dump_recovery,
+            "closed_mouth_supported_pinch_recovery": closed_mouth_supported_pinch_recovery,
             "strong_palm_dump_geometry": strong_palm_dump_geometry,
             "palm_dump_geometry_reward": PALM_DUMP_GEOMETRY_REWARD if strong_palm_dump_geometry else 0.0,
             "weak_palm_dump_no_lower_mouth_geometry": weak_palm_dump_no_lower_mouth_geometry,
@@ -964,6 +1063,9 @@ class PillIngestionDetector:
                 + (0.12 if no_mouth_open_palm_dump_contradiction else 0.0)
             ),
             "raw_event_score": confidence,
+            "decision": decision,
+            "decision_reason": decision_reason,
+            "safety_contradiction": safety_contradiction,
             "status": self.last_status,
         }
 
@@ -982,13 +1084,16 @@ class PillIngestionDetector:
 
         frame_confidence = max(0.0, min(frame_confidence, 1.0))
         state.frame_confidence = frame_confidence
+        event_debug["frame_confidence"] = frame_confidence
 
         state.prev_mouth_dist = curr_dist
         state.prev_mouth_dist_norm = curr_dist_norm
 
         return {
             "event_detected": event_detected,
-            "ingestion_detected": event_detected or self.peak_event_confidence >= 0.50,
+            "ingestion_detected": event_detected,
+            "decision": decision,
+            "decision_reason": decision_reason,
             "confidence": state.event_confidence,
             "event_confidence": state.event_confidence,
             "peak_confidence": self.peak_event_confidence,
@@ -996,6 +1101,7 @@ class PillIngestionDetector:
             "status": self.last_status,
             "mouth_open": features.get("mouth_open", False),
             "hand_near_mouth": near_mouth,
+            "event_debug": event_debug,
         }
 
     @staticmethod
@@ -1066,6 +1172,8 @@ class IntakeDetectionService:
                 "status": "NO_FACE",
                 "event_detected": False,
                 "ingestion_detected": False,
+                "decision": "none",
+                "decision_reason": "",
             }
 
         mouth_geom = detector.compute_mouth_geometry(face_landmarks, width, height)
@@ -1077,12 +1185,23 @@ class IntakeDetectionService:
             "status": detector.last_status,
             "event_detected": False,
             "ingestion_detected": False,
+            "decision": "none",
+            "decision_reason": "",
         }
+
+        # Rank bands so an "uncertain" event is surfaced even when other hands
+        # produced nothing, while a "confirmed" event always wins.
+        decision_rank = {"none": 0, "uncertain": 1, "confirmed": 2}
+
+        chosen = None  # the per-hand result that drove best_result (for debug)
 
         for i, hand_lm in enumerate(hand_landmarks):
             hand_id = f"hand_{i}"
             features = detector.compute_hand_features(hand_lm, mouth_geom, width, height)
             result = detector.update_hand_state(hand_id, features, timestamp)
+
+            if chosen is None:
+                chosen = result
 
             if result["frame_confidence"] > best_result["confidence"]:
                 best_result = {
@@ -1092,17 +1211,55 @@ class IntakeDetectionService:
                     "status": result["status"],
                     "event_detected": result["event_detected"],
                     "ingestion_detected": result["event_detected"],
+                    "decision": result["decision"],
+                    "decision_reason": result["decision_reason"],
                 }
+                chosen = result
+
+            if decision_rank.get(result["decision"], 0) > decision_rank.get(best_result["decision"], 0):
+                best_result["decision"] = result["decision"]
+                best_result["decision_reason"] = result["decision_reason"]
+                best_result["status"] = result["status"]
+                # An event closed (confirmed or uncertain): report the actual
+                # event score, not the decaying real-time meter value.
+                best_result["confidence"] = result["event_confidence"]
+                chosen = result
 
             if result["event_detected"]:
                 best_result["event_detected"] = True
                 best_result["ingestion_detected"] = True
+                best_result["decision"] = "confirmed"
+                best_result["decision_reason"] = result["decision_reason"]
                 best_result["confidence"] = result["event_confidence"]
+                chosen = result
                 break
 
-        # Add confidence fallback (matches old system behavior)
-        if not best_result["ingestion_detected"]:
-            best_result["ingestion_detected"] = best_result["confidence"] >= 0.50
+        # Attach debug telemetry so the live UI can show the REAL scores (the
+        # on-screen meter is the decaying frame_confidence; event_confidence and
+        # peak_confidence are the values that actually drive the decision).
+        ed = (chosen or {}).get("event_debug", {}) or {}
+        best_result["frame_confidence"] = (chosen or {}).get("frame_confidence", best_result["confidence"])
+        best_result["event_confidence"] = (chosen or {}).get("event_confidence", 0.0)
+        best_result["peak_confidence"] = (chosen or {}).get("peak_confidence", detector.peak_event_confidence)
+        best_result["debug"] = {
+            "decision": best_result["decision"],
+            "decision_reason": best_result["decision_reason"],
+            "status": best_result["status"],
+            "hand_near_mouth": best_result["hand_near_mouth"],
+            "hands": len(hand_landmarks),
+            "frame_confidence": round(float(best_result["frame_confidence"] or 0.0), 3),
+            "event_confidence": round(float(best_result["event_confidence"] or 0.0), 3),
+            "peak_confidence": round(float(best_result["peak_confidence"] or 0.0), 3),
+            "event_window_closed": ed.get("event_window_closed"),
+            "peak_mouth_contact": ed.get("peak_mouth_contact"),
+            "mouth_open": ed.get("mouth_open"),
+            "mouth_open_ratio": round(float(ed.get("mouth_open_ratio") or 0.0), 3),
+            "event_style": ed.get("event_style"),
+            "withdrew_enough": ed.get("withdrew_enough"),
+            "dwell": round(float(ed.get("dwell") or 0.0), 3),
+            "raw_event_score": round(float(ed.get("raw_event_score") or 0.0), 3),
+            "confirm_threshold": CONFIRM_THRESHOLD,
+        }
 
         return best_result
 
