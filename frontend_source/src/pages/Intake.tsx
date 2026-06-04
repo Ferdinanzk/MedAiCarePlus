@@ -76,6 +76,10 @@ export default function Intake() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const mountedRef = useRef(true);
   const cameraStartingRef = useRef(false);
+  // The active camera stream, tracked independently of the <video> element.
+  // Each phase mounts its own <video>, so the element ref can be null/swapped
+  // when we need to stop the camera — the stream ref is the reliable handle.
+  const streamRef = useRef<MediaStream | null>(null);
   const [cameraOn, setCameraOn] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
@@ -146,6 +150,14 @@ export default function Intake() {
         return;
       }
 
+      // Release any previously-acquired stream before keeping the new one, then
+      // track this stream so it can always be stopped regardless of which
+      // <video> element is currently mounted.
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+      streamRef.current = stream;
+
       // Wait for DOM to settle after phase transition (200ms)
       await new Promise((r) => setTimeout(r, 200));
 
@@ -192,6 +204,7 @@ export default function Intake() {
       } else {
         setAiError('Camera stream started but video not ready. Please retry.');
         stream.getTracks().forEach((t) => t.stop());
+        if (streamRef.current === stream) streamRef.current = null;
       }
     } catch (err) {
       console.error('[Intake] getUserMedia error:', err);
@@ -204,17 +217,22 @@ export default function Intake() {
   }, [detectionVideoRef]);
 
   const stopCamera = useCallback(() => {
+    // Stop the tracked stream first — it stays valid even after a phase change
+    // unmounts the <video> element it was attached to.
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    // Also detach from any currently-mounted element (defensive).
     const el = videoRef.current;
     const detEl = detectionVideoRef.current;
     if (el) {
-      const stream = el.srcObject as MediaStream | null;
+      (el.srcObject as MediaStream | null)?.getTracks().forEach((t) => t.stop());
       el.srcObject = null;
-      stream?.getTracks().forEach((t) => t.stop());
     }
     if (detEl && detEl !== el) {
-      const stream = detEl.srcObject as MediaStream | null;
+      (detEl.srcObject as MediaStream | null)?.getTracks().forEach((t) => t.stop());
       detEl.srcObject = null;
-      stream?.getTracks().forEach((t) => t.stop());
     }
     setCameraOn(false);
   }, [detectionVideoRef]);
@@ -224,7 +242,21 @@ export default function Intake() {
     fetchIntakes();
     return () => {
       mountedRef.current = false;
+      // Release the camera on unmount (e.g. navigating away after taking a pill)
+      // so the webcam stream/light doesn't stay on once the user leaves the flow.
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      [videoRef.current, detectionVideoRef.current].forEach((el) => {
+        const stream = el?.srcObject as MediaStream | null;
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          if (el) el.srcObject = null;
+        }
+      });
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
