@@ -16,11 +16,13 @@ import {
   X,
   User,
   Settings,
+  Send,
 } from 'lucide-react';
 
 interface GlobalNotifySettings {
   notify_family_on_missed: boolean;
   notify_family_on_bad_mood: boolean;
+  notify_family_on_taken: boolean;
 }
 
 interface FamilyContact {
@@ -34,6 +36,7 @@ interface FamilyContact {
   notify_missed: boolean;
   notify_emotion: boolean;
   notify_weekly: boolean;
+  notify_taken: boolean;
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -76,6 +79,8 @@ export default function Family() {
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [generatingCode, setGeneratingCode] = useState<number | null>(null);
+  const [testingId, setTestingId] = useState<number | null>(null);
+  const [testFeedback, setTestFeedback] = useState<{ id: number; ok: boolean } | null>(null);
   const [verificationCode, setVerificationCode] = useState<string | null>(null);
   const [codeContactName, setCodeContactName] = useState('');
 
@@ -88,6 +93,7 @@ export default function Family() {
     notify_missed: true,
     notify_emotion: true,
     notify_weekly: false,
+    notify_taken: true,
   });
 
   useEffect(() => {
@@ -114,15 +120,17 @@ export default function Family() {
       setGlobalSettings({
         notify_family_on_missed: !!data.notify_family_on_missed,
         notify_family_on_bad_mood: !!data.notify_family_on_bad_mood,
+        notify_family_on_taken: !!data.notify_family_on_taken,
       });
     }
   };
 
   const missedOffGlobal = !!globalSettings && !globalSettings.notify_family_on_missed;
   const moodOffGlobal = !!globalSettings && !globalSettings.notify_family_on_bad_mood;
+  const takenOffGlobal = !!globalSettings && !globalSettings.notify_family_on_taken;
 
   const resetForm = () => {
-    setForm({ name: '', relationship: '', phone: '', notify_missed: true, notify_emotion: true, notify_weekly: false });
+    setForm({ name: '', relationship: '', phone: '', notify_missed: true, notify_emotion: true, notify_weekly: false, notify_taken: true });
     setEditingId(null);
     setModalCode(null);
     setShowForm(false);
@@ -136,6 +144,7 @@ export default function Family() {
       notify_missed: c.notify_missed,
       notify_emotion: c.notify_emotion,
       notify_weekly: c.notify_weekly,
+      notify_taken: c.notify_taken,
     });
     setEditingId(c.id);
     setShowForm(true);
@@ -206,6 +215,25 @@ export default function Family() {
     }
     setGeneratingCode(null);
     fetchContacts();
+  };
+
+  const sendTestNotification = async (contactId: number) => {
+    setTestingId(contactId);
+    setTestFeedback(null);
+    const headers = getAuthHeaders();
+    let ok = false;
+    try {
+      const resp = await fetch(`/api/family/contacts/${contactId}/test`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+      });
+      ok = resp.ok;
+    } catch {
+      ok = false;
+    }
+    setTestingId(null);
+    setTestFeedback({ id: contactId, ok });
+    setTimeout(() => setTestFeedback((f) => (f && f.id === contactId ? null : f)), 4000);
   };
 
   const copyCode = () => {
@@ -330,6 +358,7 @@ export default function Family() {
                 <p className="text-sm font-medium text-gray-700">{t('family.notifications')}</p>
                 {[
                   { key: 'notify_missed' as const, label: t('family.notifyMissed'), offGlobal: missedOffGlobal, hint: t('family.missedAlertsOffGlobal') },
+                  { key: 'notify_taken' as const, label: t('family.notifyTaken'), offGlobal: takenOffGlobal, hint: t('family.takenAlertsOffGlobal') },
                   { key: 'notify_emotion' as const, label: t('family.notifyEmotion'), offGlobal: moodOffGlobal, hint: t('family.moodAlertsOffGlobal') },
                   { key: 'notify_weekly' as const, label: t('family.notifyWeekly'), offGlobal: false, hint: '' },
                 ].map((item) => (
@@ -449,6 +478,11 @@ export default function Family() {
                         <Bell className={`w-3.5 h-3.5 ${missedOffGlobal ? 'text-gray-300' : 'text-[#0057B8]'}`} />
                       </span>
                     )}
+                    {c.notify_taken && (
+                      <span title={takenOffGlobal ? t('family.takenAlertsOffGlobal') : t('family.notifyTaken')} className="flex">
+                        <Bell className={`w-3.5 h-3.5 ${takenOffGlobal ? 'text-gray-300' : 'text-green-600'}`} />
+                      </span>
+                    )}
                     {c.notify_emotion && (
                       <span title={moodOffGlobal ? t('family.moodAlertsOffGlobal') : t('family.notifyEmotion')} className="flex">
                         <Bell className={`w-3.5 h-3.5 ${moodOffGlobal ? 'text-gray-300' : 'text-amber-500'}`} />
@@ -459,7 +493,7 @@ export default function Family() {
                         <Bell className="w-3.5 h-3.5 text-green-500" />
                       </span>
                     )}
-                    {!c.notify_missed && !c.notify_emotion && !c.notify_weekly && (
+                    {!c.notify_missed && !c.notify_taken && !c.notify_emotion && !c.notify_weekly && (
                       <span className="flex items-center gap-1 text-sm text-gray-400">
                         <BellOff className="w-3.5 h-3.5" /> {t('family.noNotifications')}
                       </span>
@@ -476,7 +510,25 @@ export default function Family() {
                   )}
                 </div>
               </div>
-              <div className="flex items-center justify-end gap-1 mt-3 pt-3 border-t border-gray-50">
+              <div className="flex items-center gap-1 mt-3 pt-3 border-t border-gray-50">
+                {c.verified && c.line_id && (
+                  <div className="flex items-center gap-2 mr-auto">
+                    <button
+                      onClick={() => sendTestNotification(c.id)}
+                      disabled={testingId === c.id}
+                      className="text-sm px-3 py-2 bg-blue-50 border border-blue-200 text-[#0057B8] rounded-lg hover:bg-blue-100 transition-colors disabled:opacity-50 flex items-center gap-1.5 touch-target"
+                    >
+                      {testingId === c.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                      {t('family.sendTest')}
+                    </button>
+                    {testFeedback && testFeedback.id === c.id && (
+                      <span className={`text-xs font-medium flex items-center gap-1 ${testFeedback.ok ? 'text-green-600' : 'text-red-500'}`}>
+                        {testFeedback.ok ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                        {testFeedback.ok ? t('family.testSent') : t('family.testFailed')}
+                      </span>
+                    )}
+                  </div>
+                )}
                 <button onClick={() => handleEdit(c)} className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors">
                   <Edit3 className="w-4 h-4" />
                 </button>

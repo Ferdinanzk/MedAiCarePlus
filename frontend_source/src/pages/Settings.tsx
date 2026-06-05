@@ -9,6 +9,7 @@ interface NotificationSettings {
   remind_after_retries: number;
   notify_family_on_missed: boolean;
   notify_family_on_bad_mood: boolean;
+  notify_family_on_taken: boolean;
 }
 
 const TOGGLE_CLASS =
@@ -27,6 +28,7 @@ export default function Settings() {
     remind_after_retries: 3,
     notify_family_on_missed: true,
     notify_family_on_bad_mood: true,
+    notify_family_on_taken: true,
   });
 
   const [loading, setLoading] = useState(true);
@@ -244,6 +246,22 @@ export default function Settings() {
                   className="sr-only peer"
                   checked={settings.notify_family_on_bad_mood}
                   onChange={(e) => setSettings({ ...settings, notify_family_on_bad_mood: e.target.checked })}
+                />
+                <div className={TOGGLE_CLASS}></div>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <label className="block text-sm font-medium text-gray-800">{t('settings.alertOnTaken')}</label>
+                <span className="text-xs text-gray-400">{t('settings.alertOnTakenDesc')}</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="sr-only peer"
+                  checked={settings.notify_family_on_taken}
+                  onChange={(e) => setSettings({ ...settings, notify_family_on_taken: e.target.checked })}
                 />
                 <div className={TOGGLE_CLASS}></div>
               </label>

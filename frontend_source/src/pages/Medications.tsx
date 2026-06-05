@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
+import { getExpiryStatus } from '../lib/expiry';
 import TimeSection from '../components/ui/TimeSection';
 import {
   Pill,
@@ -321,6 +322,22 @@ export default function Medications() {
                     className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
                     placeholder="e.g. 114年08月22日"
                   />
+                  {(() => {
+                    const exp = getExpiryStatus(form.use_before);
+                    if (exp.status !== 'expired' && exp.status !== 'soon') return null;
+                    const msg =
+                      exp.status === 'expired'
+                        ? t('medications.expiredOn', { date: exp.iso })
+                        : exp.daysLeft === 0
+                          ? t('medications.expiresToday', { date: exp.iso })
+                          : t('medications.expiresInDays', { days: exp.daysLeft, date: exp.iso });
+                    return (
+                      <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        <p className="text-sm text-amber-800">{msg}</p>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -419,12 +436,22 @@ export default function Medications() {
                             </span>
                           )}
                         </div>
-                        {med.use_before && (
-                          <p className="text-sm text-gray-400 mt-1 flex items-center gap-1">
-                            <CalendarClock className="w-3 h-3" />
-                            {med.use_before}
-                          </p>
-                        )}
+                        {med.use_before && (() => {
+                          const exp = getExpiryStatus(med.use_before);
+                          const alert = exp.status === 'expired' || exp.status === 'soon';
+                          return (
+                            <p className={`text-sm mt-1 flex items-center gap-1 ${alert ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>
+                              <CalendarClock className="w-3 h-3 shrink-0" />
+                              {med.use_before}
+                              {exp.status === 'expired' && <span>· {t('medications.expiredOn', { date: exp.iso })}</span>}
+                              {exp.status === 'soon' && (
+                                <span>· {exp.daysLeft === 0
+                                  ? t('medications.expiresToday', { date: exp.iso })
+                                  : t('medications.expiresInDays', { days: exp.daysLeft, date: exp.iso })}</span>
+                              )}
+                            </p>
+                          );
+                        })()}
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button

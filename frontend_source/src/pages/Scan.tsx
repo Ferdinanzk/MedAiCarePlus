@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
 import { aiApi } from '../lib/ai-api';
+import { getExpiryStatus } from '../lib/expiry';
 import {
   Camera,
   RotateCcw,
@@ -440,6 +441,22 @@ export default function Scan() {
                   <span className="text-gray-900 font-medium text-right max-w-[60%]">{value}</span>
                 </div>
               ))}
+            {(() => {
+              const exp = getExpiryStatus(parsed.use_before);
+              if (exp.status !== 'expired' && exp.status !== 'soon') return null;
+              const msg =
+                exp.status === 'expired'
+                  ? t('medications.expiredOn', { date: exp.iso })
+                  : exp.daysLeft === 0
+                    ? t('medications.expiresToday', { date: exp.iso })
+                    : t('medications.expiresInDays', { days: exp.daysLeft, date: exp.iso });
+              return (
+                <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <p className="text-sm text-amber-800">{msg}</p>
+                </div>
+              );
+            })()}
           </div>
 
           {/* Actions */}

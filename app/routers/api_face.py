@@ -157,4 +157,44 @@ async def enroll_face(
         saved.append(str(path))
 
     svc.reload_gallery()
+
+    # Persist the backend source of truth so onboarding never asks for a
+    # re-enroll after localStorage is lost (logout / new device / cleared cache).
+    async with pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE "user" SET face_enrolled = TRUE WHERE u_id = $1',
+            row["u_id"],
+        )
+
     return {"saved": saved, "face_label": label}
+
+
+@router.get("/enrollment-status")
+async def enrollment_status(user: dict = Depends(get_current_user)):
+    """Report whether the authenticated user already has an enrolled face.
+
+    Used by the onboarding wizard to skip the 3-pose capture when the gallery
+    already holds this user's photos. Checks the DB flag first, then falls back
+    to the gallery files on disk (the recognizer's actual source of truth)."""
+    from app.config import FACE_GALLERY_DIR
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if "u_id" in user:
+            row = await conn.fetchrow(
+                'SELECT face_label, face_enrolled FROM "user" WHERE u_id=$1 AND user_active=TRUE',
+                user["u_id"],
+            )
+        else:
+            row = await conn.fetchrow(
+                'SELECT face_label, face_enrolled FROM "user" WHERE supabase_id=$1 AND user_active=TRUE',
+                user.get("sub"),
+            )
+
+    if not row or not row["face_label"]:
+        return {"enrolled": False, "count": 0}
+
+    label = row["face_label"]
+    count = len(list(FACE_GALLERY_DIR.glob(f"{label}-*.jpg"))) if FACE_GALLERY_DIR.exists() else 0
+    enrolled = bool(row["face_enrolled"]) or count > 0
+    return {"enrolled": enrolled, "count": count}

@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS "user" (
 ALTER TABLE "user" ADD COLUMN IF NOT EXISTS supabase_id VARCHAR(100) UNIQUE;
 ALTER TABLE "user" ADD COLUMN IF NOT EXISTS email VARCHAR(200) UNIQUE;
 ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(200);
+-- Onboarding state — backend source of truth so the setup wizard never repeats
+-- already-completed steps after logout / new device / cleared localStorage.
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS face_enrolled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS detail (
     detail_id  SERIAL PRIMARY KEY,
@@ -128,7 +132,16 @@ CREATE TABLE IF NOT EXISTS notification (
     id SERIAL PRIMARY KEY,
     u_id INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
     category VARCHAR(20) NOT NULL CHECK (category IN ('user', 'family')),
-    type VARCHAR(50) NOT NULL, -- 'upcoming_reminder', 'missed_reminder', 'missed_alert', 'emotion_alert'
+    type VARCHAR(50) NOT NULL, -- 'upcoming_reminder', 'missed_reminder', 'missed_alert', 'emotion_alert', 'taken_confirmation'
     message TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ─────────────────────────────────────────────
+-- Taken-confirmation (batched success notifications to family)
+-- ─────────────────────────────────────────────
+-- Per-intake flag so a "taken" confirmation is pushed to family only once.
+ALTER TABLE intake ADD COLUMN IF NOT EXISTS taken_notified BOOLEAN NOT NULL DEFAULT FALSE;
+-- Per-user master toggle + per-contact toggle (mirrors notify_family_on_missed / notify_skipped).
+ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS notify_family_on_taken BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE family_contacts ADD COLUMN IF NOT EXISTS notify_taken BOOLEAN DEFAULT TRUE;

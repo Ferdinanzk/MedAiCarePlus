@@ -20,6 +20,7 @@ class NotificationSettingsPayload(BaseModel):
     remind_after_retries: int
     notify_family_on_missed: bool
     notify_family_on_bad_mood: bool
+    notify_family_on_taken: bool = True
 
 
 router = APIRouter(prefix="/api/notify", tags=["notify-api"])
@@ -190,7 +191,7 @@ async def get_notification_settings(user: dict = Depends(get_current_user)):
         row = await conn.fetchrow(
             """
             SELECT remind_before_minutes, remind_after_minutes, remind_after_retries,
-                   notify_family_on_missed, notify_family_on_bad_mood
+                   notify_family_on_missed, notify_family_on_bad_mood, notify_family_on_taken
             FROM notification_settings
             WHERE u_id = $1
             """,
@@ -207,7 +208,8 @@ async def get_notification_settings(user: dict = Depends(get_current_user)):
                 "remind_after_minutes": 10,
                 "remind_after_retries": 3,
                 "notify_family_on_missed": True,
-                "notify_family_on_bad_mood": True
+                "notify_family_on_bad_mood": True,
+                "notify_family_on_taken": True
             }
         return dict(row)
 
@@ -220,17 +222,19 @@ async def update_notification_settings(payload: NotificationSettingsPayload, use
             """
             INSERT INTO notification_settings (u_id, remind_before_minutes, remind_after_minutes,
                                                 remind_after_retries, notify_family_on_missed,
-                                                notify_family_on_bad_mood)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                                                notify_family_on_bad_mood, notify_family_on_taken)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (u_id) DO UPDATE SET
                 remind_before_minutes = EXCLUDED.remind_before_minutes,
                 remind_after_minutes = EXCLUDED.remind_after_minutes,
                 remind_after_retries = EXCLUDED.remind_after_retries,
                 notify_family_on_missed = EXCLUDED.notify_family_on_missed,
-                notify_family_on_bad_mood = EXCLUDED.notify_family_on_bad_mood
+                notify_family_on_bad_mood = EXCLUDED.notify_family_on_bad_mood,
+                notify_family_on_taken = EXCLUDED.notify_family_on_taken
             """,
             user["u_id"], payload.remind_before_minutes, payload.remind_after_minutes,
-            payload.remind_after_retries, payload.notify_family_on_missed, payload.notify_family_on_bad_mood
+            payload.remind_after_retries, payload.notify_family_on_missed, payload.notify_family_on_bad_mood,
+            payload.notify_family_on_taken
         )
     return {"success": True}
 

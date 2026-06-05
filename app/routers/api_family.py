@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from app.dependencies import get_current_user
 from app.database import get_pool
+from app.services.line_service import LineService
 
 router = APIRouter(prefix="/api/family", tags=["family-api"])
 
@@ -35,6 +36,7 @@ class ContactPayload(BaseModel):
     notify_emotion: bool = True
     notify_weekly: bool = False
     notify_skipped: bool = True
+    notify_taken: bool = True
 
 
 @router.post("/contacts")
@@ -57,8 +59,8 @@ async def create_contact(
                 """
                 INSERT INTO family_contacts
                     (u_id, name, relationship, phone, verification_code,
-                     notify_missed, notify_emotion, notify_weekly, notify_skipped)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                     notify_missed, notify_emotion, notify_weekly, notify_skipped, notify_taken)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                 RETURNING id
                 """,
                 u_id,
@@ -70,6 +72,7 @@ async def create_contact(
                 payload.notify_emotion,
                 payload.notify_weekly,
                 payload.notify_skipped,
+                payload.notify_taken,
             )
         except Exception as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
@@ -88,7 +91,7 @@ async def list_contacts(user: dict = Depends(get_current_user)):
         rows = await conn.fetch(
             """
             SELECT id, name, relationship, phone, line_id,
-                   verified, verified_at, notify_missed, notify_emotion, notify_weekly, notify_skipped
+                   verified, verified_at, notify_missed, notify_emotion, notify_weekly, notify_skipped, notify_taken
             FROM family_contacts
             WHERE u_id = $1
             ORDER BY created_at
@@ -114,8 +117,8 @@ async def update_contact(
             """
             UPDATE family_contacts
             SET name=$1, relationship=$2, phone=$3,
-                notify_missed=$4, notify_emotion=$5, notify_weekly=$6, notify_skipped=$7
-            WHERE id=$8 AND u_id=$9
+                notify_missed=$4, notify_emotion=$5, notify_weekly=$6, notify_skipped=$7, notify_taken=$8
+            WHERE id=$9 AND u_id=$10
             RETURNING id
             """,
             payload.name.strip(),
@@ -125,12 +128,46 @@ async def update_contact(
             payload.notify_emotion,
             payload.notify_weekly,
             payload.notify_skipped,
+            payload.notify_taken,
             contact_id,
             u_id,
         )
     if not updated:
         return JSONResponse({"detail": "Contact not found"}, status_code=404)
     return {"id": updated}
+
+
+@router.post("/contacts/{contact_id}/test")
+async def send_test_notification(contact_id: int, user: dict = Depends(get_current_user)):
+    """Send a simple test message to a verified contact's LINE to confirm the sync works."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT fc.line_id, fc.verified, u.name AS patient_name
+            FROM family_contacts fc
+            JOIN "user" u ON u.u_id = fc.u_id
+            WHERE fc.id = $1 AND fc.u_id = $2
+            """,
+            contact_id, u_id,
+        )
+    if not row:
+        return JSONResponse({"detail": "Contact not found"}, status_code=404)
+    if not row["verified"] or not row["line_id"]:
+        return JSONResponse({"detail": "not_linked"}, status_code=400)
+
+    result = LineService.get_instance().send_test_notification(
+        row["line_id"], row["patient_name"] or "the patient"
+    )
+    if not result.get("sent"):
+        return JSONResponse(
+            {"detail": result.get("error", "LINE send failed")}, status_code=502
+        )
+    return {"sent": True, "message_id": result.get("message_id", "")}
 
 
 @router.delete("/contacts/{contact_id}")

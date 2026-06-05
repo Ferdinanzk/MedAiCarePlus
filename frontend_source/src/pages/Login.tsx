@@ -178,7 +178,6 @@ export default function Login() {
               <Shield className="w-10 h-10 text-white" />
             </div>
             <h1 className="text-2xl font-bold text-gray-900">{t('login.welcome')}</h1>
-            <p className="text-gray-500 mt-1.5 text-base">Secure, private, HIPAA-aligned</p>
           </div>
 
           {/* Mode toggle: Email first, Face second */}

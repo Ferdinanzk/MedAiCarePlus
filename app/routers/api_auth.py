@@ -265,3 +265,47 @@ async def link_account(
 async def logout(response: Response):
     response.delete_cookie(SESSION_COOKIE)
     return {"success": True}
+
+
+async def _resolve_user_row(conn, user: dict):
+    """Fetch the user row for either a face token (u_id) or Supabase token (sub)."""
+    if "u_id" in user:
+        return await conn.fetchrow(
+            'SELECT u_id, face_enrolled, onboarding_complete FROM "user" WHERE u_id=$1 AND user_active=TRUE',
+            user["u_id"],
+        )
+    return await conn.fetchrow(
+        'SELECT u_id, face_enrolled, onboarding_complete FROM "user" WHERE supabase_id=$1 AND user_active=TRUE',
+        user.get("sub"),
+    )
+
+
+@router.get("/onboarding-status")
+async def onboarding_status(user: dict = Depends(get_current_user)):
+    """Return the backend-persisted onboarding state so the wizard can resume
+    at the right step instead of restarting after localStorage is lost."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await _resolve_user_row(conn, user)
+    if not row:
+        return {"onboarding_complete": False, "face_enrolled": False}
+    return {
+        "onboarding_complete": bool(row["onboarding_complete"]),
+        "face_enrolled": bool(row["face_enrolled"]),
+    }
+
+
+@router.post("/onboarding-complete")
+async def onboarding_complete(user: dict = Depends(get_current_user)):
+    """Persist that the user finished (or skipped through) the setup wizard.
+    Survives logout / new device / cleared cache."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await _resolve_user_row(conn, user)
+        if not row:
+            return JSONResponse({"success": False, "error": "User not found"}, status_code=404)
+        await conn.execute(
+            'UPDATE "user" SET onboarding_complete = TRUE WHERE u_id = $1',
+            row["u_id"],
+        )
+    return {"success": True}

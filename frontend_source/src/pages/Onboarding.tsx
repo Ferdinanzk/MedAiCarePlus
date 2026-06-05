@@ -95,10 +95,16 @@ export default function Onboarding() {
   const [verificationCode, setVerificationCode] = useState('');
   const [familyError, setFamilyError] = useState('');
 
-  // Mark onboarding complete when reaching the Done screen (step 3)
+  // Mark onboarding complete when reaching the Done screen (step 3).
+  // Persist to the backend too so the wizard never reappears after the
+  // localStorage flags are lost (logout / new device / cleared cache).
   useEffect(() => {
     if (step === 3) {
       setStorage('onboarding_complete', '1');
+      const headers = getAuthHeaders();
+      if (headers.Authorization) {
+        fetch('/api/auth/onboarding-complete', { method: 'POST', headers }).catch(() => {});
+      }
     }
   }, [step]);
 
@@ -115,7 +121,10 @@ export default function Onboarding() {
     window.location.href = '/login';
   };
 
-  // On mount: query backend to detect already-completed steps
+  // On mount: query backend to detect already-completed steps. The backend is
+  // the source of truth — localStorage is only a cache. This stops the wizard
+  // from forcing a re-enroll of a face that is already in the gallery after
+  // logout / new device / cleared storage.
   useEffect(() => {
     const checkBackend = async () => {
       const headers = getAuthHeaders();
@@ -123,6 +132,33 @@ export default function Onboarding() {
         setSessionExpired(true);
         return;
       }
+
+      // Face already enrolled? Skip the 3-pose capture step.
+      try {
+        const faceRes = await fetch('/api/face/enrollment-status', { headers });
+        if (faceRes.status === 401) {
+          setSessionExpired(true);
+          return;
+        }
+        if (faceRes.ok) {
+          const face = await faceRes.json();
+          if (face.enrolled) setStorage('onboarding_face_done', '1');
+        }
+      } catch { /* offline — fall back to localStorage */ }
+
+      // Whole wizard already finished on a previous device/session?
+      let serverComplete = false;
+      try {
+        const obRes = await fetch('/api/auth/onboarding-status', { headers });
+        if (obRes.ok) {
+          const ob = await obRes.json();
+          if (ob.face_enrolled) setStorage('onboarding_face_done', '1');
+          if (ob.onboarding_complete) {
+            serverComplete = true;
+            setStorage('onboarding_complete', '1');
+          }
+        }
+      } catch { /* offline — fall back to localStorage */ }
 
       const contactsRes = await fetch('/api/family/contacts', { headers });
 
@@ -135,8 +171,20 @@ export default function Onboarding() {
         const contacts = await contactsRes.json();
         if (contacts.length > 0) {
           setHasContacts(true);
-          setStorage('onboarding_complete', '1');
+          // Legacy users predate the onboarding_complete column. Having a
+          // linked contact means they finished setup before — migrate them.
+          if (!serverComplete) {
+            serverComplete = true;
+            setStorage('onboarding_complete', '1');
+            fetch('/api/auth/onboarding-complete', { method: 'POST', headers }).catch(() => {});
+          }
         }
+      }
+
+      // If the backend says onboarding is already done, leave the wizard.
+      if (serverComplete) {
+        window.location.replace('/dashboard');
+        return;
       }
 
       setStep(getSavedStep());

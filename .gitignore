@@ -67,6 +67,11 @@ ruvector.db
 test_face.jpg
 tmp_gen_token.py
 
+# Enrolled face photos (personal biometric data — never commit; only .gitkeep is tracked)
+models/face_recognition/face_gallery/*.jpg
+models/face_recognition/face_gallery/*.png
+models/face_recognition/face_gallery/*.jpeg
+
 # Model files — OpenVINO public downloads and other large binaries
 *.task
 *.onnx

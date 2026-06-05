@@ -14,11 +14,18 @@ def start_scheduler():
     from app.jobs.weekly_summary_job import send_weekly_summaries
     from app.jobs.refill_reminder_job import check_refill_reminders
     from app.jobs.emotion_alert_job import check_negative_emotions
+    from app.jobs.taken_confirmation_job import check_taken_confirmations
 
     scheduler.add_job(
         check_missed_doses,
         IntervalTrigger(minutes=1),
         id="missed_doses",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        check_taken_confirmations,
+        IntervalTrigger(minutes=1),
+        id="taken_confirmations",
         replace_existing=True,
     )
     scheduler.add_job(

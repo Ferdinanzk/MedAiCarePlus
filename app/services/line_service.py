@@ -48,9 +48,18 @@ class LineService:
         text = (
             f"⚠️ 用藥提醒\n"
             f"{patient_name} 錯過了預定用藥\n"
-            f"藥物: {medication_name}\n"
-            f"預定時間: {scheduled_time}\n"
+            f"藥物：\n{medication_name}\n"
+            f"預定時間：{scheduled_time}\n"
             f"請關心確認狀況。"
+        )
+        return self.send_text(to, text)
+
+    def send_taken_confirmation(self, to: str, patient_name: str, medication_names: str, slot_time: str) -> dict:
+        text = (
+            f"✅ 用藥完成通知\n"
+            f"{patient_name} 已服用 {slot_time} 的藥物：\n"
+            f"{medication_names}\n"
+            f"感謝您的關心。"
         )
         return self.send_text(to, text)
 
@@ -69,6 +78,14 @@ class LineService:
             f"{patient_name} 本週用藥順從率: {adherence:.0%}\n"
             f"情緒狀態: {emotion_summary}\n"
             f"保持健康！"
+        )
+        return self.send_text(to, text)
+
+    def send_test_notification(self, to: str, patient_name: str) -> dict:
+        text = (
+            f"🔔 測試通知 / Test Notification\n"
+            f"如果您看到這則訊息，代表您的 LINE 已成功連結為 {patient_name} 的家人聯絡人。\n"
+            f"If you can see this message, your LINE is synced as a family contact of {patient_name}."
         )
         return self.send_text(to, text)
 
