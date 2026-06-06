@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { setFaceSession } from '../lib/face-auth';
 import LanguageSwitcher from '../components/LanguageSwitcher';
-import { Loader2, UserPlus, Mail, Lock, User, CheckCircle2, Shield, ChevronRight, FileText } from 'lucide-react';
+import { Loader2, UserPlus, Mail, Lock, User, CheckCircle2, ChevronRight, FileText } from 'lucide-react';
 
 type RegStep = 1 | 2;
 
@@ -84,9 +84,7 @@ export default function Register() {
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-8">
         <div className="w-full max-w-sm mx-auto">
           <div className="text-center mb-8">
-            <div className="w-20 h-20 bg-[#0057B8] rounded-2xl flex items-center justify-center mx-auto mb-5 shadow-lg">
-              <Shield className="w-10 h-10 text-white" />
-            </div>
+            <img src="/healsmart-logo.png" alt="HealSmart" className="w-60 max-w-[75%] mx-auto mb-4" />
             <h1 className="text-2xl font-bold text-gray-900">{t('register.title')}</h1>
             <p className="text-gray-500 mt-1">{t('register.subtitle')}</p>
           </div>

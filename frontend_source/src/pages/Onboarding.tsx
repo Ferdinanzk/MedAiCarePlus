@@ -91,7 +91,6 @@ export default function Onboarding() {
 
   // Step 2: Family contact
   const [familyName, setFamilyName] = useState('');
-  const [familyPhone, setFamilyPhone] = useState('');
   const [verificationCode, setVerificationCode] = useState('');
   const [familyError, setFamilyError] = useState('');
 
@@ -423,7 +422,7 @@ export default function Onboarding() {
       const res = await fetch('/api/family/contacts', {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: familyName, phone: familyPhone || '' }),
+        body: JSON.stringify({ name: familyName, relationship: 'user' }),
       });
 
       const data = await res.json();
@@ -628,13 +627,13 @@ export default function Onboarding() {
         {/* ── Step 2: Family Contact ── */}
         {step === 2 && (
           <div className="space-y-4">
-            <h2 className="text-lg font-semibold text-[#0b1c30]">Step 2: Add Family Contact</h2>
-            <p className="text-sm text-[#3d4a3e]">Add someone who can receive alerts.</p>
+            <h2 className="text-lg font-semibold text-[#0b1c30]">Step 2: Link Your LINE</h2>
+            <p className="text-sm text-[#3d4a3e]">Sync your own LINE to receive medication reminders.</p>
 
             {verificationCode ? (
               <div className="bg-[#f8f9ff] rounded-xl p-6 text-center space-y-4">
                 <p className="text-base font-medium text-[#3d4a3e]">
-                  1. Ask {familyName} to scan this QR code to add the LINE bot:
+                  1. Scan this QR code with your LINE to add the bot:
                 </p>
                 <img
                   src="/line-bot-qr.png"
@@ -642,13 +641,13 @@ export default function Onboarding() {
                   className="w-44 h-44 mx-auto rounded-xl border border-[#dce9ff] shadow-sm"
                 />
                 <p className="text-base font-medium text-[#3d4a3e]">
-                  2. Then have them send this code to the bot:
+                  2. Then send this code to the bot:
                 </p>
                 <div className="bg-white border-2 border-[#006d36] rounded-2xl p-4">
                   <p className="text-4xl font-bold text-[#006d36] tracking-[0.3em]">{verificationCode}</p>
                 </div>
                 <p className="text-sm text-[#6d7b6d]">
-                  When {familyName} sends this code, their LINE will be linked automatically.
+                  Once you send this code, your LINE will be linked automatically.
                 </p>
                 <button
                   onClick={() => setStep(3)}
@@ -673,14 +672,7 @@ export default function Onboarding() {
                   type="text"
                   value={familyName}
                   onChange={(e) => setFamilyName(e.target.value)}
-                  placeholder="Contact name"
-                  className="w-full px-4 py-3 border border-[#bccabb] rounded-xl focus:ring-2 focus:ring-[#006d36] outline-none"
-                />
-                <input
-                  type="tel"
-                  value={familyPhone}
-                  onChange={(e) => setFamilyPhone(e.target.value)}
-                  placeholder="Phone number"
+                  placeholder="Your name"
                   className="w-full px-4 py-3 border border-[#bccabb] rounded-xl focus:ring-2 focus:ring-[#006d36] outline-none"
                 />
                 <button

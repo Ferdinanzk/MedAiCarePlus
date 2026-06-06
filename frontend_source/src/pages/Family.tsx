@@ -88,8 +88,7 @@ export default function Family() {
 
   const [form, setForm] = useState({
     name: '',
-    relationship: '',
-    phone: '',
+    relationship: 'family',
     notify_missed: true,
     notify_emotion: true,
     notify_weekly: false,
@@ -130,7 +129,7 @@ export default function Family() {
   const takenOffGlobal = !!globalSettings && !globalSettings.notify_family_on_taken;
 
   const resetForm = () => {
-    setForm({ name: '', relationship: '', phone: '', notify_missed: true, notify_emotion: true, notify_weekly: false, notify_taken: true });
+    setForm({ name: '', relationship: 'family', notify_missed: true, notify_emotion: true, notify_weekly: false, notify_taken: true });
     setEditingId(null);
     setModalCode(null);
     setShowForm(false);
@@ -139,8 +138,7 @@ export default function Family() {
   const handleEdit = (c: FamilyContact) => {
     setForm({
       name: c.name,
-      relationship: c.relationship,
-      phone: c.phone || '',
+      relationship: c.relationship || 'family',
       notify_missed: c.notify_missed,
       notify_emotion: c.notify_emotion,
       notify_weekly: c.notify_weekly,
@@ -163,7 +161,7 @@ export default function Family() {
     const headers = getAuthHeaders();
     if (!headers.Authorization) { setSaving(false); return; }
 
-    const payload = { ...form, phone: form.phone || '' };
+    const payload = { ...form };
 
     if (editingId) {
       await fetch(`/api/family/contacts/${editingId}`, {
@@ -333,26 +331,16 @@ export default function Family() {
                   required
                 />
               </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1.5">{t('family.relationship')}</label>
-                  <input
-                    type="text"
-                    value={form.relationship}
-                    onChange={(e) => setForm({ ...form, relationship: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
-                    placeholder="e.g., Son"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1.5">{t('family.phone')}</label>
-                  <input
-                    type="tel"
-                    value={form.phone}
-                    onChange={(e) => setForm({ ...form, phone: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
-                  />
-                </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">{t('family.relationship')}</label>
+                <select
+                  value={form.relationship}
+                  onChange={(e) => setForm({ ...form, relationship: e.target.value })}
+                  className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                >
+                  <option value="family">{t('family.roleFamily')}</option>
+                  <option value="user">{t('family.roleUser')}</option>
+                </select>
               </div>
               <div className="space-y-2">
                 <p className="text-sm font-medium text-gray-700">{t('family.notifications')}</p>
@@ -455,7 +443,7 @@ export default function Family() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <p className="font-semibold text-gray-900 text-base">{c.name}</p>
-                    <span className="text-2xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full">{c.relationship}</span>
+                    <span className="text-2xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full">{c.relationship === 'user' ? t('family.roleUser') : t('family.roleFamily')}</span>
                   </div>
                   <div className="flex items-center gap-2 mt-1">
                     {c.verified ? (
@@ -469,7 +457,6 @@ export default function Family() {
                     )}
                   </div>
                   <div className="mt-2 space-y-1">
-                    {c.phone && <p className="text-sm text-gray-500">{c.phone}</p>}
                     {c.line_id && <p className="text-sm text-gray-500">LINE: {c.line_id}</p>}
                   </div>
                   <div className="flex items-center gap-2 mt-2">

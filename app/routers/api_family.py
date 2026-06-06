@@ -132,8 +132,22 @@ async def update_contact(
             contact_id,
             u_id,
         )
-    if not updated:
-        return JSONResponse({"detail": "Contact not found"}, status_code=404)
+        if not updated:
+            return JSONResponse({"detail": "Contact not found"}, status_code=404)
+
+        # If this contact is the patient's own ('user') role and already has a verified
+        # LINE, mirror it onto the user record so patient-facing reminders deliver
+        # (no re-verification needed).
+        if payload.relationship == "user":
+            await conn.execute(
+                '''
+                UPDATE "user" SET line_id = fc.line_id
+                FROM family_contacts fc
+                WHERE fc.id = $1 AND fc.u_id = $2 AND fc.verified = TRUE
+                  AND fc.line_id IS NOT NULL AND "user".u_id = $2
+                ''',
+                contact_id, u_id,
+            )
     return {"id": updated}
 
 

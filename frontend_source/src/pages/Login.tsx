@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { aiApi } from '../lib/ai-api';
 import { setFaceSession } from '../lib/face-auth';
-import { Camera, ScanFace, Loader2, Shield, Mail, Lock, LogIn } from 'lucide-react';
+import { Camera, ScanFace, Loader2, Mail, Lock, LogIn } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import LanguageSwitcher from '../components/LanguageSwitcher';
 
@@ -174,9 +174,7 @@ export default function Login() {
         <div className="w-full max-w-sm mx-auto">
           {/* Logo & Welcome */}
           <div className="text-center mb-8">
-            <div className="w-20 h-20 bg-[#0057B8] rounded-2xl flex items-center justify-center mx-auto mb-5 shadow-hero">
-              <Shield className="w-10 h-10 text-white" />
-            </div>
+            <img src="/healsmart-logo.png" alt="HealSmart" className="w-60 max-w-[75%] mx-auto mb-4" />
             <h1 className="text-2xl font-bold text-gray-900">{t('login.welcome')}</h1>
           </div>
 

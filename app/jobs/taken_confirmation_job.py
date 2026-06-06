@@ -90,7 +90,8 @@ async def check_taken_confirmations():
             if u_id not in family_cache:
                 family_cache[u_id] = await conn.fetch(
                     "SELECT line_id, name FROM family_contacts "
-                    "WHERE u_id = $1 AND notify_taken = TRUE AND verified = TRUE",
+                    "WHERE u_id = $1 AND notify_taken = TRUE AND verified = TRUE "
+                    "AND relationship IS DISTINCT FROM 'user'",
                     u_id,
                 )
 

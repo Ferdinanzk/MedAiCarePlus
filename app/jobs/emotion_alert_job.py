@@ -47,6 +47,7 @@ async def check_negative_emotions():
                     SELECT line_id, name
                     FROM family_contacts
                     WHERE u_id = $1 AND notify_emotion = TRUE AND verified = TRUE
+                      AND relationship IS DISTINCT FROM 'user'
                     """,
                     row["u_id"],
                 )

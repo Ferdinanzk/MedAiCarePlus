@@ -87,7 +87,7 @@ async def line_webhook(request: Request):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, u_id, name
+                SELECT id, u_id, name, relationship
                 FROM family_contacts
                 WHERE verification_code = $1
                 """,
@@ -109,15 +109,27 @@ async def line_webhook(request: Request):
                 )
                 patient_name = patient["name"] if patient else "Patient"
 
-                # Notify family member (the one who just verified)
-                line_svc.send_verification_success(line_user_id, patient_name)
-
-                # Notify patient that someone successfully synced with them
-                if patient and patient.get("line_id"):
-                    line_svc.send_sync_success_to_patient(
-                        patient["line_id"],
-                        row["name"],
+                if row["relationship"] == "user":
+                    # 'user' role = the patient linking their OWN LINE → mirror it onto the
+                    # user record so patient-facing reminders have a recipient.
+                    await conn.execute(
+                        'UPDATE "user" SET line_id = $1 WHERE u_id = $2',
+                        line_user_id, row["u_id"],
                     )
+                    line_svc.send_text(
+                        line_user_id,
+                        "✅ 連結成功！\n您的 LINE 已連結，將接收您的用藥提醒。\n"
+                        "Your LINE is now linked to receive your medication reminders.",
+                    )
+                else:
+                    # Family member verified
+                    line_svc.send_verification_success(line_user_id, patient_name)
+                    # Notify patient that someone successfully synced with them
+                    if patient and patient.get("line_id"):
+                        line_svc.send_sync_success_to_patient(
+                            patient["line_id"],
+                            row["name"],
+                        )
             else:
                 line_svc.send_text(
                     line_user_id,

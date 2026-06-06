@@ -38,9 +38,7 @@ export default function Layout({ faceUser }: LayoutProps) {
         <header className="lg:hidden sticky top-0 z-50 bg-white/90 backdrop-blur-xl border-b border-gray-100 safe-area-top">
           <div className="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <div className="w-7 h-7 bg-[#0057B8] rounded-lg flex items-center justify-center shadow-sm">
-                <span className="text-white font-bold text-2xs">M+</span>
-              </div>
+              <img src="/healsmart-mark.png" alt="HealSmart" className="w-7 h-7 rounded-lg object-contain" />
               <span className="font-semibold text-gray-900">MedAiCarePlus</span>
             </div>
 

@@ -121,6 +121,7 @@ async def skip_intake(payload: RecordPayload, user: dict = Depends(get_current_u
             SELECT line_id, name
             FROM family_contacts
             WHERE u_id = $1 AND notify_skipped = TRUE AND verified = TRUE
+              AND relationship IS DISTINCT FROM 'user'
             """,
             u_id,
         )

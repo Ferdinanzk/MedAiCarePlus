@@ -33,15 +33,10 @@ export default function Sidebar({ faceUser }: SidebarProps) {
   return (
     <aside className="hidden lg:flex w-64 flex-col h-screen bg-white border-r border-gray-200 fixed left-0 top-0 z-40">
       {/* Logo Header */}
-      <div className="h-16 flex items-center justify-between px-6 border-b border-gray-100">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-[#0057B8] rounded-lg flex items-center justify-center">
-            <span className="text-white font-bold text-sm">M+</span>
-          </div>
-          <span className="font-bold text-gray-900 text-lg">MedAiCarePlus</span>
-        </div>
-        <div className="flex items-center">
-          <LanguageSwitcher />
+      <div className="h-16 flex items-center px-6 border-b border-gray-100">
+        <div className="flex items-center gap-3 min-w-0">
+          <img src="/healsmart-mark.png" alt="HealSmart" className="w-8 h-8 rounded-lg object-contain shrink-0" />
+          <span className="font-bold text-gray-900 text-lg truncate">MedAiCarePlus</span>
         </div>
       </div>
 
@@ -108,6 +103,11 @@ export default function Sidebar({ faceUser }: SidebarProps) {
             </div>
           </div>
         )}
+
+        {/* Language Switcher */}
+        <div className="px-1">
+          <LanguageSwitcher />
+        </div>
 
         {/* Logout Button */}
         <button

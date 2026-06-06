@@ -46,6 +46,7 @@ async def send_weekly_summaries():
                 """
                 SELECT line_id FROM family_contacts
                 WHERE u_id = $1 AND notify_weekly = TRUE AND verified = TRUE
+                  AND relationship IS DISTINCT FROM 'user'
                 """,
                 patient["id"],
             )
