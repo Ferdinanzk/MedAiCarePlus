@@ -21,13 +21,16 @@ interface Landmarker {
 
 export function useIntakeDetection(
   sessionId: string,
-  onDetect: (confidence: number) => void,
+  onConfirmed: (confidence: number) => void,
+  onUncertain?: (confidence: number) => void,
   onError?: (err: string) => void
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [confidence, setConfidence] = useState(0);
+  const [peakConfidence, setPeakConfidence] = useState(0);
   const [isDetecting, setIsDetecting] = useState(false);
   const [status, setStatus] = useState('IDLE');
+  const [debug, setDebug] = useState<Record<string, unknown> | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
 
@@ -102,20 +105,39 @@ export function useIntakeDetection(
 
           const conf = Math.round((result.confidence || 0) * 100);
           setConfidence(conf);
+          setPeakConfidence(Math.round((result.peak_confidence || 0) * 100));
           setStatus(result.status || 'DETECTING');
 
+          // DEBUG: the on-screen meter is the decaying frame_confidence; the
+          // event_confidence / peak_confidence are the values that actually
+          // drive the confirm/uncertain decision. Log both to diagnose why the
+          // visible % stays low.
+          if (result.debug) {
+            setDebug(result.debug);
+            // eslint-disable-next-line no-console
+            console.debug('[intake]', result.debug);
+          }
+
           const detectionConfidence = result.confidence || 0;
-          if (result.event_detected && detectionConfidence >= 0.50 && result.mouth_open) {
+          // Prefer the explicit decision band; fall back to the legacy
+          // event_detected gate if an older backend omits `decision`.
+          const decision =
+            result.decision ?? (result.event_detected ? 'confirmed' : 'none');
+
+          if (decision === 'confirmed') {
             stop();
-            onDetect(detectionConfidence);
+            onConfirmed(detectionConfidence);
+          } else if (decision === 'uncertain') {
+            stop();
+            onUncertain?.(detectionConfidence);
           }
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : 'Detection request failed';
           onError?.(msg);
         }
-      }, 200);
+      }, 100);
     },
-    [sessionId, onDetect, onError, stop]
+    [sessionId, onConfirmed, onUncertain, onError, stop]
   );
 
   useEffect(() => {
@@ -126,5 +148,5 @@ export function useIntakeDetection(
     };
   }, []);
 
-  return { videoRef, confidence, isDetecting, status, start, stop };
+  return { videoRef, confidence, peakConfidence, isDetecting, status, debug, start, stop };
 }

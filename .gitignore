@@ -88,3 +88,12 @@ models/face_recognition/face_gallery/*.jpeg
 # *.bin outside models/ stays ignored (large public downloads)
 !models/face_recognition/**/*.bin
 !models/face_recognition/**/*.xml
+
+# Enrolled face images / test identities (PII — never commit). Keep folder only.
+models/face_recognition/face_gallery/*
+!models/face_recognition/face_gallery/.gitkeep
+
+# Session planning + benchmark/experiment artifacts (not source code)
+.hermes/
+attachments/
+confusion_results*.json
