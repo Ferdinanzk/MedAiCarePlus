@@ -16,6 +16,7 @@ import {
   Heart,
 } from 'lucide-react';
 import ServiceCard from '../components/ui/ServiceCard';
+import EmotionTrendChart from '../components/EmotionTrendChart';
 
 interface TodayMedication {
   id: number;
@@ -25,13 +26,6 @@ interface TodayMedication {
   status: 'pending' | 'taken' | 'skipped' | 'missed';
   scheduled_time: string | null;
   pills_remaining: number;
-}
-
-interface EmotionRecord {
-  id: number;
-  emotion_type: string;
-  emotion_score: number;
-  recorded_at: string;
 }
 
 interface RawMedItem {
@@ -48,7 +42,6 @@ export default function Dashboard() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [medications, setMedications] = useState<TodayMedication[]>([]);
-  const [emotions, setEmotions] = useState<EmotionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [adherenceRate, setAdherenceRate] = useState(0);
   const [takenCount, setTakenCount] = useState(0);
@@ -93,17 +86,6 @@ export default function Dashboard() {
         const total = formatted.length;
         setTakenCount(taken);
         setAdherenceRate(total > 0 ? Math.round((taken / total) * 100) : 0);
-      }
-    } catch {
-      // network error — leave state unchanged
-    }
-
-    // Fetch recent emotions
-    try {
-      const resp = await fetch('/api/history/emotions', { headers });
-      if (resp.ok) {
-        const emotionData: EmotionRecord[] = await resp.json();
-        setEmotions(emotionData.slice(0, 7));
       }
     } catch {
       // network error — leave state unchanged
@@ -200,42 +182,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Services Grid */}
-      <section className="slide-up">
-        <h3 className="text-lg font-semibold text-gray-900 mb-3 px-1">{t('dashboard.services') || 'Services'}</h3>
-        <div className="grid grid-cols-2 gap-4 lg:gap-6">
-          <ServiceCard
-            icon={Pill}
-            title={t('medications.title')}
-            subtitle={t('dashboard.activeMedications', { count: medications.length })}
-            color="bg-blue-50 text-[#0057B8]"
-            onClick={() => navigate('/medications')}
-          />
-          <ServiceCard
-            icon={Users}
-            title={t('family.title')}
-            subtitle={t('dashboard.familySubtitle') || 'Manage contacts'}
-            color="bg-green-50 text-green-600"
-            onClick={() => navigate('/family')}
-          />
-          <ServiceCard
-            icon={Activity}
-            title={t('emotion.title')}
-            subtitle={t('dashboard.vitalsSubtitle') || 'Track mood'}
-            color="bg-purple-50 text-purple-600"
-            onClick={() => navigate('/emotion')}
-          />
-          <ServiceCard
-            icon={FileText}
-            title={t('history.title')}
-            subtitle={t('dashboard.reportsSubtitle') || 'View all'}
-            color="bg-orange-50 text-orange-600"
-            onClick={() => navigate('/history')}
-          />
-        </div>
-      </section>
-
-      {/* Today's Medications Preview */}
+      {/* Today's Medications Preview — surfaced near the top for quick action */}
       <section className="space-y-3">
         <div className="flex items-center justify-between px-1">
           <h3 className="text-lg font-semibold text-gray-900">{t('dashboard.todayMedications') || "Today's Medications"}</h3>
@@ -292,39 +239,43 @@ export default function Dashboard() {
         )}
       </section>
 
-      {/* Recent Emotions */}
-      {emotions.length > 0 && (
-        <section className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all duration-300">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold text-gray-900">{t('emotion.history')}</h3>
-            <span className="text-base text-gray-500 font-medium">{t('dashboard.last7Days') || 'Last 7 days'}</span>
-          </div>
-          <div className="flex items-end gap-2 h-24">
-            {emotions.map((emotion) => {
-              const colors: Record<string, string> = {
-                Angry: 'bg-red-400',
-                Sad: 'bg-blue-400',
-                Neutral: 'bg-gray-400',
-                Happy: 'bg-green-400',
-              };
-              return (
-                <div
-                  key={emotion.id}
-                  className="flex-1 flex flex-col items-center gap-1"
-                >
-                  <div
-                    className={`w-full rounded-t-lg ${colors[emotion.emotion_type] || 'bg-gray-400'} transition-all`}
-                    style={{ height: `${Math.max(20, emotion.emotion_score * 100)}%` }}
-                  />
-                  <span className="text-sm text-gray-400">
-                    {new Date(emotion.recorded_at).toLocaleDateString('zh-TW', { weekday: 'narrow' })}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
+      {/* Services Grid */}
+      <section className="slide-up">
+        <h3 className="text-lg font-semibold text-gray-900 mb-3 px-1">{t('dashboard.services') || 'Services'}</h3>
+        <div className="grid grid-cols-2 gap-4 lg:gap-6">
+          <ServiceCard
+            icon={Pill}
+            title={t('medications.title')}
+            subtitle={t('dashboard.activeMedications', { count: medications.length })}
+            color="bg-blue-50 text-[#0057B8]"
+            onClick={() => navigate('/medications')}
+          />
+          <ServiceCard
+            icon={Users}
+            title={t('family.title')}
+            subtitle={t('dashboard.familySubtitle') || 'Manage contacts'}
+            color="bg-green-50 text-green-600"
+            onClick={() => navigate('/family')}
+          />
+          <ServiceCard
+            icon={Activity}
+            title={t('emotion.title')}
+            subtitle={t('dashboard.vitalsSubtitle') || 'Track mood'}
+            color="bg-purple-50 text-purple-600"
+            onClick={() => navigate('/emotion')}
+          />
+          <ServiceCard
+            icon={FileText}
+            title={t('history.title')}
+            subtitle={t('dashboard.reportsSubtitle') || 'View all'}
+            color="bg-orange-50 text-orange-600"
+            onClick={() => navigate('/history')}
+          />
+        </div>
+      </section>
+
+      {/* Mood × Adherence trend */}
+      <EmotionTrendChart />
     </div>
   );
 }

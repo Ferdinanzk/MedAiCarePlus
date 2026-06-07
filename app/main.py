@@ -15,7 +15,7 @@ from app.services.ocr_service import OCRService
 from app.services.line_service import LineService
 from app.services.intake_detection import IntakeDetectionService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
-from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake
+from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_analytics
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 
@@ -75,6 +75,7 @@ app.include_router(api_family.router,        tags=["api-family"])
 app.include_router(api_medications.router,   tags=["api-medications"])
 app.include_router(api_history.router,       tags=["api-history"])
 app.include_router(api_intake.router,        tags=["api-intake"])
+app.include_router(api_analytics.router,     tags=["api-analytics"])
 app.include_router(line_router,              tags=["line-webhook"])
 
 
