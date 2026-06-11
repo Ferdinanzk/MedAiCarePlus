@@ -44,14 +44,17 @@ OCCLUSION_FLAT_PALM_PENALTY = 0.15
 # Decision band thresholds. Patient-safety design: auto-log ("confirmed") a
 # delivery, route ambiguous events to "uncertain" so the patient confirms with
 # one tap, and ignore everything else ("none").
-# CONFIRM_THRESHOLD is set to lean POSITIVE: genuine intakes (which scored as low
-# as ~0.45 on the dev benchmark, and lower still under live camera lag) should
-# auto-confirm rather than getting stuck below the bar. False positives are held
-# at 0 not by this threshold but by the semantic contradiction flags
-# (`unknown_open_mouth_no_delivery`, wide-yawn mouth-cover) and the base gates,
-# which the only gate-passing FALSE videos (False3/False10) still trip.
-CONFIRM_THRESHOLD = 0.45
-UNCERTAIN_FLOOR = 0.38
+# CONFIRM_THRESHOLD leans POSITIVE: genuine intakes (which scored as low as ~0.45
+# on the dev benchmark, and lower still under live camera lag) should auto-confirm
+# rather than getting stuck below the bar. Lowered 0.45 -> 0.40 so real intakes
+# confirm more easily under live-camera conditions; UNCERTAIN_FLOOR lowered
+# 0.38 -> 0.33 so more borderline events surface as one-tap prompts. False
+# positives are still held back NOT by this threshold but by the semantic
+# contradiction flags (`unknown_open_mouth_no_delivery`, wide-yawn mouth-cover)
+# and the base gates (peak_mouth_contact >= 0.5 + mouth-open/recovery), which are
+# unchanged.
+CONFIRM_THRESHOLD = 0.40
+UNCERTAIN_FLOOR = 0.33
 WIDE_OPEN_MOUTH_COVER_RATIO = 0.75
 
 HEAD_TILT_BACK_DELTA_THRESHOLD = 0.08

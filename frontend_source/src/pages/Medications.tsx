@@ -42,6 +42,7 @@ interface Medication {
   pill_description: string | null;
   use_before: string | null;
   schedule_time: ScheduleTime | null;
+  custom_intake_times: Record<string, string> | null;
   is_active: boolean;
 }
 
@@ -58,6 +59,18 @@ const EMPTY_SCHEDULE: ScheduleTime = {
   morning: false, noon: false, night: false,
   bedtime: false, before_meals: false, after_meals: false,
 };
+
+// Timed slots (the only ones that produce a clock time) + their default times — mirrors
+// the backend _SLOT_TIMES. before_meals/after_meals are untimed context chips.
+const SLOT_DEFAULT_TIME: Record<string, string> = {
+  morning: '08:00', noon: '12:00', night: '20:00', bedtime: '22:00',
+};
+const TIMED_SLOTS: { key: keyof ScheduleTime; label: string }[] = [
+  { key: 'morning', label: '早上' },
+  { key: 'noon',    label: '中午' },
+  { key: 'night',   label: '晚上' },
+  { key: 'bedtime', label: '睡前' },
+];
 
 const PERIOD_CONFIG = {
   morning:   { icon: Sun,    label: 'Morning',    timeRange: '6:00-10:00',  iconColor: 'text-amber-500',  bgColor: 'bg-amber-50' },
@@ -90,6 +103,7 @@ export default function Medications() {
     use_before: '',
     is_active: true,
     schedule_time: { ...EMPTY_SCHEDULE },
+    custom_intake_times: {} as Record<string, string>,
   });
 
   useEffect(() => { fetchMedications(); }, []);
@@ -103,7 +117,7 @@ export default function Medications() {
   };
 
   const resetForm = () => {
-    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE } });
+    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE }, custom_intake_times: {} });
     setEditingId(null);
     setShowForm(false);
   };
@@ -120,6 +134,7 @@ export default function Medications() {
       use_before: med.use_before || '',
       is_active: med.is_active,
       schedule_time: med.schedule_time ? { ...EMPTY_SCHEDULE, ...med.schedule_time } : { ...EMPTY_SCHEDULE },
+      custom_intake_times: med.custom_intake_times ? { ...med.custom_intake_times } : {},
     });
     setEditingId(med.id);
     setShowForm(true);
@@ -136,6 +151,10 @@ export default function Medications() {
     setForm(f => ({ ...f, schedule_time: { ...f.schedule_time, [key]: !f.schedule_time[key] } }));
   };
 
+  const setSlotTime = (key: string, value: string) => {
+    setForm(f => ({ ...f, custom_intake_times: { ...f.custom_intake_times, [key]: value } }));
+  };
+
   const hasSchedule = Object.values(form.schedule_time).some(Boolean);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -143,6 +162,14 @@ export default function Medications() {
     setSaving(true);
     const headers = getAuthHeaders();
     if (!headers.Authorization) { setSaving(false); return; }
+
+    // Resolve a clock time for each enabled timed slot (custom value, else default).
+    const customTimes: Record<string, string> = {};
+    for (const { key } of TIMED_SLOTS) {
+      if (form.schedule_time[key]) {
+        customTimes[key] = form.custom_intake_times[key] || SLOT_DEFAULT_TIME[key];
+      }
+    }
 
     const payload = {
       name: form.name,
@@ -155,6 +182,7 @@ export default function Medications() {
       use_before: form.use_before || null,
       is_active: form.is_active,
       schedule_time: hasSchedule ? form.schedule_time : null,
+      custom_intake_times: Object.keys(customTimes).length ? customTimes : null,
     };
 
     const url = editingId ? `/api/medications/${editingId}` : '/api/medications';
@@ -299,6 +327,24 @@ export default function Medications() {
                     </button>
                   ))}
                 </div>
+
+                {/* Per-slot intake time (HH:MM) for each enabled timed slot */}
+                {TIMED_SLOTS.some(({ key }) => form.schedule_time[key]) && (
+                  <div className="mt-3 space-y-2 rounded-xl bg-gray-50 border border-gray-100 p-3">
+                    <p className="text-xs text-gray-500">{t('medications.intakeTimeHint')}</p>
+                    {TIMED_SLOTS.filter(({ key }) => form.schedule_time[key]).map(({ key, label }) => (
+                      <div key={key} className="flex items-center justify-between gap-3">
+                        <span className="text-base text-gray-700">{label}</span>
+                        <input
+                          type="time"
+                          value={form.custom_intake_times[key] || SLOT_DEFAULT_TIME[key]}
+                          onChange={(e) => setSlotTime(key, e.target.value)}
+                          className="px-3 py-2 rounded-lg bg-white border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Instructions + use before */}

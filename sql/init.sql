@@ -58,6 +58,8 @@ ALTER TABLE medication ADD COLUMN IF NOT EXISTS warning          TEXT;
 ALTER TABLE medication ADD COLUMN IF NOT EXISTS pill_description TEXT;
 ALTER TABLE medication ADD COLUMN IF NOT EXISTS use_before       VARCHAR(50);
 ALTER TABLE medication ADD COLUMN IF NOT EXISTS prescription_meta  JSONB;
+-- Per-slot "HH:MM" intake-time overrides, e.g. {"morning":"08:30"}; null = use default slot times.
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS custom_intake_times JSONB;
 
 CREATE TABLE IF NOT EXISTS intake (
     intk_id           SERIAL PRIMARY KEY,

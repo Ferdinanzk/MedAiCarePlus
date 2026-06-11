@@ -1,16 +1,25 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.database import get_pool
 from app.services.line_service import LineService
+
+# Minimum model confidence for a Sad/Angry reading to alert family. The emotion
+# model's real-world Sad/Angry scores top out around ~0.45 (the original 0.6 was
+# calibrated against a dev set that produced 0.6–0.9), so 0.6 was unreachable and
+# the alert NEVER fired in production. Lowered to 0.4 to match the model's actual
+# output. Treat this as a model-dependent hyperparameter: re-calibrate whenever
+# the emotion model / its input pipeline changes. See bug note
+# 60-bug-fixes/2026-06-11_medaicareplus_emotion-alert-threshold-too-high.
+EMOTION_ALERT_MIN_SCORE = 0.4
 
 
 async def check_negative_emotions():
     """
-    Check recent emotion logs. If Sad or Angry detected with score >= 0.6,
-    send LINE alerts to family contacts with notify_emotion=TRUE.
-    Run every 30 minutes via scheduler.
+    Check recent emotion logs. If Sad or Angry detected with score >=
+    EMOTION_ALERT_MIN_SCORE, send LINE alerts to family contacts with
+    notify_emotion=TRUE. Run every 30 minutes via scheduler.
     """
     pool = get_pool()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=30)
 
     async with pool.acquire() as conn:
@@ -22,12 +31,25 @@ async def check_negative_emotions():
             JOIN "user" u ON u.u_id = e.u_id
             WHERE e.emotion_type IN ('Sad', 'Angry')
               AND e.time_stamp >= $1
-              AND e.emotion_score >= 0.6
+              AND e.emotion_score >= $2
             """,
-            cutoff,
+            cutoff, EMOTION_ALERT_MIN_SCORE,
         )
 
         if not rows:
+            # Observability: if Sad/Angry readings exist in the window but all fell
+            # below the threshold, log it so a too-high threshold can't silently
+            # disable the whole feature (this is exactly how the 0.6 bug hid).
+            below = await conn.fetchval(
+                "SELECT COUNT(*) FROM emotion WHERE emotion_type IN ('Sad','Angry') "
+                "AND time_stamp >= $1 AND emotion_score < $2",
+                cutoff, EMOTION_ALERT_MIN_SCORE,
+            )
+            if below:
+                print(
+                    f"[emotion_alert] {below} Sad/Angry reading(s) in the last 30min "
+                    f"below threshold {EMOTION_ALERT_MIN_SCORE}; no family alert sent."
+                )
             return
 
         line_svc = LineService.get_instance()

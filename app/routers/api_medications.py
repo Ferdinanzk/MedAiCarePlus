@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends
@@ -10,13 +11,31 @@ from app.database import get_pool
 router = APIRouter(prefix="/api/medications", tags=["medications-api"])
 
 
-def _enabled_slots(schedule_time: dict | None) -> list[dict]:
-    """Convert schedule_time booleans into slot objects with clock times."""
+def _valid_hhmm(s) -> bool:
+    """True if s is a valid 'HH:MM' clock time (00:00–23:59)."""
+    if not isinstance(s, str):
+        return False
+    m = re.fullmatch(r"(\d{2}):(\d{2})", s.strip())
+    if not m:
+        return False
+    h, mn = int(m.group(1)), int(m.group(2))
+    return 0 <= h <= 23 and 0 <= mn <= 59
+
+
+def _enabled_slots(schedule_time: dict | None, custom_times: dict | None = None) -> list[dict]:
+    """Convert schedule_time booleans into slot objects with clock times.
+
+    A per-slot custom "HH:MM" override (custom_times) takes precedence over the fixed
+    _SLOT_TIMES default; a missing/invalid override falls back to the default.
+    """
     if not schedule_time:
         return []
+    custom_times = custom_times or {}
     slots = []
-    for key, time_str in _SLOT_TIMES.items():
+    for key, default_time in _SLOT_TIMES.items():
         if schedule_time.get(key):
+            ct = custom_times.get(key)
+            time_str = ct.strip() if _valid_hhmm(ct) else default_time
             slots.append({"key": key, "time": time_str, "label": _slot_label(key)})
     return slots
 
@@ -32,10 +51,11 @@ def _slot_label(key: str) -> str:
 
 
 async def _generate_intake_schedule(
-    conn, med_id: int, u_id: int, schedule_time: dict | None, use_before: str | None
+    conn, med_id: int, u_id: int, schedule_time: dict | None, use_before: str | None,
+    custom_times: dict | None = None,
 ):
     """Generate intake rows for the next 30 days (or until use_before)."""
-    slots = _enabled_slots(schedule_time)
+    slots = _enabled_slots(schedule_time, custom_times)
     if not slots:
         return
 
@@ -105,6 +125,7 @@ class MedicationPayload(BaseModel):
     use_before: Optional[str] = None
     is_active: bool = True
     schedule_time: Optional[dict] = None
+    custom_intake_times: Optional[dict] = None
     prescription_meta: Optional[dict] = None
 
 
@@ -242,7 +263,7 @@ async def list_medications(user: dict = Depends(get_current_user)):
             """
             SELECT med_id AS id, med_name AS name, dosage, pill_prescribed AS total_pills,
                    pills_remaining, instructions, warning, pill_description, use_before,
-                   is_active, schedule_time, prescription_meta, created_at
+                   is_active, schedule_time, custom_intake_times, prescription_meta, created_at
             FROM medication
             WHERE u_id = $1
             ORDER BY is_active DESC, created_at DESC
@@ -272,8 +293,8 @@ async def create_medication(
                 INSERT INTO medication
                     (u_id, med_name, dosage, pill_prescribed, pills_remaining,
                      instructions, warning, pill_description, use_before,
-                     is_active, schedule_time, prescription_meta)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                     is_active, schedule_time, custom_intake_times, prescription_meta)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                 RETURNING med_id
                 """,
                 u_id,
@@ -287,11 +308,13 @@ async def create_medication(
                 payload.use_before,
                 payload.is_active,
                 json.dumps(payload.schedule_time) if payload.schedule_time else None,
+                json.dumps(payload.custom_intake_times) if payload.custom_intake_times else None,
                 json.dumps(payload.prescription_meta) if payload.prescription_meta else None,
             )
             # Auto-generate intake schedule rows
             await _generate_intake_schedule(
-                conn, med_id, u_id, payload.schedule_time, payload.use_before
+                conn, med_id, u_id, payload.schedule_time, payload.use_before,
+                payload.custom_intake_times,
             )
         except Exception as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
@@ -314,8 +337,8 @@ async def update_medication(
             UPDATE medication
             SET med_name=$1, dosage=$2, pill_prescribed=$3, pills_remaining=$4,
                 instructions=$5, warning=$6, pill_description=$7, use_before=$8,
-                is_active=$9, schedule_time=$10, prescription_meta=$11
-            WHERE med_id=$12 AND u_id=$13
+                is_active=$9, schedule_time=$10, custom_intake_times=$11, prescription_meta=$12
+            WHERE med_id=$13 AND u_id=$14
             RETURNING med_id
             """,
             payload.name.strip(),
@@ -328,12 +351,24 @@ async def update_medication(
             payload.use_before,
             payload.is_active,
             json.dumps(payload.schedule_time) if payload.schedule_time else None,
+            json.dumps(payload.custom_intake_times) if payload.custom_intake_times else None,
             json.dumps(payload.prescription_meta) if payload.prescription_meta else None,
             med_id,
             u_id,
         )
-    if not updated:
-        return JSONResponse({"detail": "Medication not found"}, status_code=404)
+        if not updated:
+            return JSONResponse({"detail": "Medication not found"}, status_code=404)
+
+        # Re-time future doses so schedule/custom-time edits take effect. Only drop
+        # not-yet-acted-on (pending) intakes; taken/missed/skipped history is preserved.
+        await conn.execute(
+            "DELETE FROM intake WHERE med_id=$1 AND u_id=$2 AND intake_stats='pending'",
+            med_id, u_id,
+        )
+        await _generate_intake_schedule(
+            conn, med_id, u_id, payload.schedule_time, payload.use_before,
+            payload.custom_intake_times,
+        )
     return {"id": updated}
 
 

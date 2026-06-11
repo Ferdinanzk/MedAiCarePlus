@@ -9,8 +9,9 @@ from app.jobs.missed_dose_job import _slot_key, _format_med_list
 # A family "taken" batch is flushed once this many minutes have elapsed since the
 # earliest still-unconfirmed taken pill in a slot — so pills taken close together
 # (it takes time to swallow several pills) collapse into ONE message, and later
-# takes start the next batch.
-BATCH_WINDOW_MINUTES = 5
+# takes start the next batch. Shortened 5 -> 2 min so family is notified sooner
+# while still batching pills taken within the same ~2-minute session.
+BATCH_WINDOW_MINUTES = 2
 
 # Only confirm recently-taken pills. Prevents a flood of confirmations for
 # historical 'taken' rows the first time taken_notified is introduced, and keeps
@@ -76,9 +77,9 @@ async def check_taken_confirmations():
                 )
                 continue
 
-            # 5-minute batch gate: wait until the window has elapsed since the
-            # earliest unconfirmed taken pill in this slot, so more pills taken in
-            # the same session join the same batch.
+            # Batch gate: wait until the window has elapsed since the earliest
+            # still-unconfirmed taken pill in this slot, so pills taken close
+            # together in the same session collapse into ONE message.
             earliest = min(r["actual_intake_time"] for r in group_rows)
             if (now - earliest).total_seconds() < BATCH_WINDOW_MINUTES * 60:
                 continue

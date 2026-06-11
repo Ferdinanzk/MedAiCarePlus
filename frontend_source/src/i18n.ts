@@ -111,6 +111,7 @@ const resources = {
         expiredOn: 'Expired on {{date}}',
         expiresInDays: 'Expires in {{days}} day(s) — {{date}}',
         expiresToday: 'Expires today — {{date}}',
+        intakeTimeHint: 'Set a precise time for each slot',
       },
       schedule: {
         title: 'Schedule',
@@ -391,6 +392,7 @@ const resources = {
         expiredOn: '已於 {{date}} 過期',
         expiresInDays: '{{days}} 天後到期（{{date}}）',
         expiresToday: '今日到期（{{date}}）',
+        intakeTimeHint: '可自訂每個時段的精確時間',
       },
       schedule: {
         title: '用藥排程',
