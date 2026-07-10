@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from app.database import get_pool
 from app.services.emotion_service import EmotionService
+from app.services.emotion_labels import APP_EMOTION_LABELS, normalize_emotion_label
 from app.routers.auth import current_user
 
 router = APIRouter()
@@ -34,7 +35,7 @@ async def emotion_history(request: Request, limit: int = 20):
             "FROM emotion WHERE u_id=$1 ORDER BY time_stamp DESC LIMIT $2",
             user["u_id"], limit
         )
-    return [dict(r) for r in rows]
+    return [{**dict(row), "emotion_type": normalize_emotion_label(row["emotion_type"], default="neutral")} for row in rows]
 
 
 @router.post("/save")
@@ -43,10 +44,10 @@ async def save_emotion(request: Request):
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     body = await request.json()
-    emotion_type = body.get("emotion_type")
+    emotion_type = normalize_emotion_label(body.get("emotion_type"))
     emotion_score = float(body.get("emotion_score", 0))
     note = body.get("note")
-    if emotion_type not in ("Angry", "Happy", "Neutral", "Sad"):
+    if emotion_type not in APP_EMOTION_LABELS:
         return JSONResponse({"error": "Invalid emotion_type"}, status_code=400)
     pool = get_pool()
     async with pool.acquire() as conn:

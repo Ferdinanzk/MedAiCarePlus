@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta
 from app.database import get_pool
 from app.services.line_service import LineService
+from app.services.emotion_labels import ALERT_WORTHY_EMOTIONS
 
 
 async def check_negative_emotions():
     """
-    Check recent emotion logs. If Sad or Angry detected with score >= 0.6,
+    Check recent emotion logs. If sad, angry, or disgust is detected with score >= 0.6,
     send LINE alerts to family contacts with notify_emotion=TRUE.
     Run every 30 minutes via scheduler.
     """
@@ -20,11 +21,11 @@ async def check_negative_emotions():
                    u.name AS patient_name, u.line_id AS patient_line_id
             FROM emotion e
             JOIN "user" u ON u.u_id = e.u_id
-            WHERE e.emotion_type IN ('Sad', 'Angry')
+            WHERE e.emotion_type = ANY($2::varchar[])
               AND e.time_stamp >= $1
               AND e.emotion_score >= 0.6
             """,
-            cutoff,
+            cutoff, sorted(ALERT_WORTHY_EMOTIONS),
         )
 
         if not rows:

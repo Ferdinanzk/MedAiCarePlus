@@ -3,6 +3,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from app.database import get_pool
+from app.services.emotion_labels import normalize_emotion_label
 from app.routers.auth import current_user
 
 router = APIRouter()
@@ -46,7 +47,7 @@ async def today_intake(request: Request):
                ORDER BY m.created_at""",
             user["u_id"], today
         )
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
 @router.get("/emotion-summary")
@@ -62,4 +63,4 @@ async def emotion_summary(request: Request, days: int = 7):
             "FROM emotion WHERE u_id=$1 ORDER BY time_stamp DESC LIMIT $2",
             user["u_id"], days
         )
-    return [dict(r) for r in rows]
+    return [{**dict(row), "emotion_type": normalize_emotion_label(row["emotion_type"], default="neutral")} for row in rows]

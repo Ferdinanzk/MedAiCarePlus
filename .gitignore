@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+models/emotion_hf/**/.cache/
 *.py[cod]
 *.pyo
 *.pyd

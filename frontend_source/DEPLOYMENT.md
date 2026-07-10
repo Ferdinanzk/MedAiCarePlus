@@ -25,7 +25,7 @@ SUPABASE_JWT_SECRET=your-jwt-secret
 FRONTEND_URL=https://your-frontend.vercel.app
 LINE_CHANNEL_ACCESS_TOKEN=your-line-token
 FACE_REC_BASE=/path/to/face_recognition
-EMOTION_MODEL_PATH=/path/to/model.pth
+EMOTION_HF_MODEL_PATH=/path/to/Facial-Emotion-Detection-SigLIP2
 YOLO_MODEL_PATH=/path/to/prescription_best.pt
 OLLAMA_URL=http://localhost:11434/api/generate
 ```

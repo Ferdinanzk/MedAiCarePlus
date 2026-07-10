@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.dependencies import get_current_user
 from app.database import get_pool
+from app.services.emotion_labels import normalize_emotion_label
 
 router = APIRouter(prefix="/api/history", tags=["history-api"])
 
@@ -40,7 +41,7 @@ async def get_intake_history(user: dict = Depends(get_current_user)):
             """,
             u_id,
         )
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
 @router.get("/emotions")
@@ -63,4 +64,4 @@ async def get_emotion_history(user: dict = Depends(get_current_user)):
             """,
             u_id,
         )
-    return [dict(r) for r in rows]
+    return [{**dict(row), "emotion_type": normalize_emotion_label(row["emotion_type"], default="neutral")} for row in rows]

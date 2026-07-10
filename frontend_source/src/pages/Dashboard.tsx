@@ -302,10 +302,12 @@ export default function Dashboard() {
           <div className="flex items-end gap-2 h-24">
             {emotions.map((emotion) => {
               const colors: Record<string, string> = {
-                Angry: 'bg-red-400',
-                Sad: 'bg-blue-400',
-                Neutral: 'bg-gray-400',
-                Happy: 'bg-green-400',
+                angry: 'bg-red-400',
+                sad: 'bg-blue-400',
+                neutral: 'bg-gray-400',
+                happy: 'bg-green-400',
+                surprised: 'bg-amber-400',
+                disgust: 'bg-purple-400',
               };
               return (
                 <div

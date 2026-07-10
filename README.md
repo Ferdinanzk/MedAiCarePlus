@@ -5,7 +5,7 @@ Full-stack medical care app with face recognition login, prescription OCR, medic
 ## Features
 
 - **Face login** — OpenVINO 3-stage pipeline (detect → landmark → re-id)
-- **Emotion detection** — Custom PyTorch CNN via webcam
+- **Emotion detection** — Local Hugging Face SigLIP classifier via webcam
 - **Prescription OCR** — YOLOv8-seg + Ollama vision (19 fields extracted)
 - **Medication tracking** — CRUD with schedule, use-before dates, warnings
 - **Intake scheduling** — Auto-generates 30-day intake records on medication add
@@ -64,10 +64,14 @@ omz_downloader --name face-reidentification-retail-0095 --output_dir models/face
 
 > Docs: [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)
 
-#### B. Emotion detection — `models/emotion/model4.2.2.pth`
+#### B. Emotion detection — local SigLIP classifier
 
-Custom PyTorch CNN (4 classes: Angry, Happy, Neutral, Sad).
-Downloaded automatically by `git lfs pull`.
+The live classifier is loaded from
+`models/emotion_hf/Facial-Emotion-Detection-SigLIP2/` using Hugging Face
+Transformers in offline mode. Run `git lfs pull` to obtain the checkpoint.
+Application outputs are normalized to `happy`, `sad`, `angry`, `neutral`,
+`surprised`, and `disgust`. The current checkpoint does not directly predict
+`disgust`.
 
 #### C. Prescription YOLO — `models/segmentation/prescription_best_100_epo.pt`
 
@@ -108,6 +112,7 @@ Copy `.env.example` → `.env` and fill in your values.
 | `SECRET_KEY` | Signs face auth tokens — `python -c "import secrets; print(secrets.token_hex(32))"` |
 | `SUPABASE_JWT_SECRET` | Validates Supabase JWTs — Supabase Dashboard → Settings → API |
 | `SUPABASE_URL` | Your Supabase project URL |
+| `EMOTION_HF_MODEL_PATH` | Local Hugging Face SigLIP model directory |
 | `LINE_CHANNEL_ACCESS_TOKEN` | LINE bot token — leave empty to disable notifications |
 | `OLLAMA_URL` | Ollama API — default works with Docker Desktop |
 
@@ -157,7 +162,7 @@ MedAiCarePlus/
 │   └── dependencies.py   # JWT auth (Supabase + face token)
 ├── models/
 │   ├── face_recognition/ # OpenVINO models + face gallery (download via omz_downloader)
-│   ├── emotion/          # model4.2.2.pth (Git LFS)
+│   ├── emotion_hf/       # local SigLIP classifier (Git LFS)
 │   └── segmentation/     # prescription_best_100_epo.pt (Git LFS)
 ├── frontend_source/      # React source — Docker build input
 ├── medaicareplus-web/    # React source — local editing copy

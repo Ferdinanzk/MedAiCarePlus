@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.dependencies import get_current_user
 from app.database import get_pool
 from app.services.emotion_service import EmotionService
+from app.services.emotion_labels import APP_EMOTION_LABELS, normalize_emotion_label
 
 router = APIRouter(prefix="/api/emotion", tags=["emotion-api"])
 
@@ -47,7 +48,9 @@ def _aggregate_batch_results(all_results: list[dict]) -> dict:
             continue
 
         detected_count += 1
-        emotion = emotion_type.capitalize()
+        emotion = normalize_emotion_label(emotion_type)
+        if emotion is None:
+            continue
         try:
             confidence = float(result.get("emotion_score") or 0.0)
         except (TypeError, ValueError):
@@ -132,12 +135,10 @@ async def log_emotion(payload: EmotionLogPayload, user: dict = Depends(get_curre
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)
 
-    # FIX: Normalize emotion type to Title Case
-    emotion_type = payload.emotion_type.capitalize() if payload.emotion_type else "Neutral"
-    valid_emotions = {"Angry", "Happy", "Neutral", "Sad"}
-    if emotion_type not in valid_emotions:
+    emotion_type = normalize_emotion_label(payload.emotion_type)
+    if emotion_type not in APP_EMOTION_LABELS:
         return JSONResponse(
-            {"detail": f"Invalid emotion_type '{emotion_type}'. Must be one of: {valid_emotions}"},
+            {"detail": f"Invalid emotion_type. Must be one of: {sorted(APP_EMOTION_LABELS)}"},
             status_code=400
         )
 
@@ -167,7 +168,7 @@ async def emotion_history(user: dict = Depends(get_current_user)):
             """,
             u_id,
         )
-    return [dict(r) for r in rows]
+    return [{**dict(row), "emotion_type": normalize_emotion_label(row["emotion_type"], default="neutral")} for row in rows]
 
 
 @router.post("/analyze")
@@ -186,9 +187,8 @@ async def analyze_emotion(
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, svc.predict_frame, frame)
 
-    # FIX: Defensively normalize emotion_type to Title Case
     if result.get("emotion_type"):
-        result["emotion_type"] = result["emotion_type"].capitalize()
+        result["emotion_type"] = normalize_emotion_label(result["emotion_type"])
     return result
 
 
@@ -243,5 +243,5 @@ async def analyze_emotion_debug(
     result = await loop.run_in_executor(None, svc.predict_frame_debug, frame)
 
     if result.get("emotion_type"):
-        result["emotion_type"] = result["emotion_type"].capitalize()
+        result["emotion_type"] = normalize_emotion_label(result["emotion_type"])
     return result

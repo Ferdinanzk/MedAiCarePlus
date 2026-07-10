@@ -62,7 +62,7 @@ export type Database = {
           id: number;
           patient_id: string;
           intake_id: number | null;
-          emotion_type: 'Angry' | 'Happy' | 'Neutral' | 'Sad';
+          emotion_type: 'happy' | 'sad' | 'angry' | 'neutral' | 'surprised' | 'disgust';
           emotion_score: number;
           note: string | null;
           image_url: string | null;

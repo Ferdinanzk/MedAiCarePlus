@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getFaceToken } from '../lib/face-auth';
 import { aiApi } from '../lib/ai-api';
-import { Smile, Frown, Meh, Angry, TrendingUp, Camera, ScanFace, Loader2, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+import { Smile, Frown, Meh, Angry, Sparkles, ShieldAlert, TrendingUp, Camera, ScanFace, Loader2, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+
+type EmotionLabel = 'happy' | 'sad' | 'angry' | 'neutral' | 'surprised' | 'disgust';
 
 interface EmotionRecord {
   id: number;
-  emotion_type: 'Angry' | 'Happy' | 'Neutral' | 'Sad';
+  emotion_type: EmotionLabel;
   emotion_score: number;
   recorded_at: string;
 }
@@ -17,10 +19,12 @@ function getAuthHeaders(): Record<string, string> {
 }
 
 const emotions = [
-  { type: 'Happy' as const, label: 'happy', icon: Smile, color: 'bg-green-50 text-green-600 border-green-200', bar: 'bg-green-400' },
-  { type: 'Neutral' as const, label: 'neutral', icon: Meh, color: 'bg-gray-50 text-gray-600 border-gray-200', bar: 'bg-gray-400' },
-  { type: 'Sad' as const, label: 'sad', icon: Frown, color: 'bg-blue-50 text-blue-600 border-blue-200', bar: 'bg-blue-400' },
-  { type: 'Angry' as const, label: 'angry', icon: Angry, color: 'bg-red-50 text-red-600 border-red-200', bar: 'bg-red-400' },
+  { type: 'happy' as const, label: 'happy', icon: Smile, color: 'bg-green-50 text-green-600 border-green-200', bar: 'bg-green-400' },
+  { type: 'neutral' as const, label: 'neutral', icon: Meh, color: 'bg-gray-50 text-gray-600 border-gray-200', bar: 'bg-gray-400' },
+  { type: 'sad' as const, label: 'sad', icon: Frown, color: 'bg-blue-50 text-blue-600 border-blue-200', bar: 'bg-blue-400' },
+  { type: 'angry' as const, label: 'angry', icon: Angry, color: 'bg-red-50 text-red-600 border-red-200', bar: 'bg-red-400' },
+  { type: 'surprised' as const, label: 'surprised', icon: Sparkles, color: 'bg-amber-50 text-amber-700 border-amber-200', bar: 'bg-amber-400' },
+  { type: 'disgust' as const, label: 'disgust', icon: ShieldAlert, color: 'bg-purple-50 text-purple-700 border-purple-200', bar: 'bg-purple-400' },
 ];
 
 export default function Emotion() {
@@ -119,7 +123,7 @@ export default function Emotion() {
     if (!selected) return;
     setSubmitting(true);
     setAlertStatus(null);
-    const score = aiResult?.emotion_score ?? ({ Happy: 0.9, Neutral: 0.5, Sad: 0.25, Angry: 0.1 }[selected] || 0.5);
+    const score = aiResult?.emotion_score ?? 0.5;
     const res = await fetch('/api/emotion/log', {
       method: 'POST',
       headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
@@ -129,7 +133,7 @@ export default function Emotion() {
       setAlertStatus('failed');
     } else {
       // Backend handles LINE notifications server-side
-      setAlertStatus(selected === 'Sad' || selected === 'Angry' ? 'sent' : null);
+      setAlertStatus(['sad', 'angry', 'disgust'].includes(selected) ? 'sent' : null);
     }
     setSelected(null);
     setNote('');

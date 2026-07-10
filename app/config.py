@@ -14,9 +14,9 @@ FACE_DET_MODEL    = INTEL_MODELS_DIR / "face-detection-adas-0001" / "FP32" / "fa
 FACE_REID_MODEL   = INTEL_MODELS_DIR / "face-reidentification-retail-0095" / "FP32" / "face-reidentification-retail-0095.xml"
 LANDMARKS_MODEL   = INTEL_MODELS_DIR / "landmarks-regression-retail-0009" / "FP32" / "landmarks-regression-retail-0009.xml"
 
-EMOTION_MODEL_PATH = Path(os.getenv(
-    "EMOTION_MODEL_PATH",
-    str(_AI_ROOT / "FaceEmotionDetector" / "FaceEmotionDetector" / "model4.2.2.pth")
+EMOTION_HF_MODEL_PATH = Path(os.getenv(
+    "EMOTION_HF_MODEL_PATH",
+    str(_HERE / "models" / "emotion_hf" / "Facial-Emotion-Detection-SigLIP2")
 ))
 
 YOLO_MODEL_PATH = Path(os.getenv(

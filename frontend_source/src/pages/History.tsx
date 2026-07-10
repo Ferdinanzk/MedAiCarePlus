@@ -83,10 +83,12 @@ export default function History() {
   ];
 
   const emotionColors: Record<string, string> = {
-    Angry: 'bg-red-100 text-red-700',
-    Sad: 'bg-blue-100 text-blue-700',
-    Neutral: 'bg-gray-100 text-gray-700',
-    Happy: 'bg-green-100 text-green-700',
+    angry: 'bg-red-100 text-red-700',
+    sad: 'bg-blue-100 text-blue-700',
+    neutral: 'bg-gray-100 text-gray-700',
+    happy: 'bg-green-100 text-green-700',
+    surprised: 'bg-amber-100 text-amber-700',
+    disgust: 'bg-purple-100 text-purple-700',
   };
 
   if (loading) {

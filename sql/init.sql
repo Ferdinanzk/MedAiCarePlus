@@ -28,12 +28,33 @@ CREATE TABLE IF NOT EXISTS emotion (
     emot_id       SERIAL PRIMARY KEY,
     u_id          INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
     emotion_type  VARCHAR(20) NOT NULL
-        CHECK (emotion_type IN ('Angry','Happy','Neutral','Sad')),
+        CHECK (emotion_type IN ('happy','sad','angry','neutral','surprised','disgust')),
     emotion_score REAL NOT NULL,
     note          TEXT,
     context       VARCHAR(50),
     time_stamp    TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Replace the old four-label check before normalizing legacy data.
+DO $$
+DECLARE constraint_name text;
+BEGIN
+    FOR constraint_name IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'emotion'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) ILIKE '%emotion_type%'
+    LOOP
+        EXECUTE format('ALTER TABLE emotion DROP CONSTRAINT %I', constraint_name);
+    END LOOP;
+END $$;
+ALTER TABLE emotion DROP CONSTRAINT IF EXISTS emotion_type_allowed;
+UPDATE emotion SET emotion_type = CASE lower(emotion_type)
+    WHEN 'surprise' THEN 'surprised'
+    WHEN 'ahegao' THEN 'surprised'
+    ELSE lower(emotion_type)
+END;
+ALTER TABLE emotion ADD CONSTRAINT emotion_type_allowed
+    CHECK (emotion_type IN ('happy','sad','angry','neutral','surprised','disgust'));
 
 CREATE TABLE IF NOT EXISTS medication (
     med_id             SERIAL PRIMARY KEY,

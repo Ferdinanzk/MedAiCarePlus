@@ -153,7 +153,7 @@ async function markDose(medId, status) {
 async function loadEmotionChart() {
   const data = await fetch('/display/emotion-summary?days=14').then(r => r.json());
   if (!data.length) return;
-  const colorMap = { Angry: '#dc3545', Happy: '#28a745', Neutral: '#6c757d', Sad: '#007bff' };
+  const colorMap = { angry: '#dc3545', happy: '#28a745', neutral: '#6c757d', sad: '#007bff', surprised: '#f59e0b', disgust: '#9333ea' };
   const sorted = [...data].reverse();
   new Chart(document.getElementById('emotionChart'), {
     type: 'bar',

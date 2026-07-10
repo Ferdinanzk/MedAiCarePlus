@@ -1,0 +1,36 @@
+{
+  "_name_or_path": "google/siglip2-base-patch16-224",
+  "architectures": [
+    "SiglipForImageClassification"
+  ],
+  "id2label": {
+    "0": "Ahegao",
+    "1": "Angry",
+    "2": "Happy",
+    "3": "Neutral",
+    "4": "Sad",
+    "5": "Surprise"
+  },
+  "initializer_factor": 1.0,
+  "label2id": {
+    "Ahegao": 0,
+    "Angry": 1,
+    "Happy": 2,
+    "Neutral": 3,
+    "Sad": 4,
+    "Surprise": 5
+  },
+  "model_type": "siglip",
+  "problem_type": "single_label_classification",
+  "text_config": {
+    "model_type": "siglip_text_model",
+    "torch_dtype": "float32",
+    "vocab_size": 256000
+  },
+  "torch_dtype": "float32",
+  "transformers_version": "4.50.0.dev0",
+  "vision_config": {
+    "model_type": "siglip_vision_model",
+    "torch_dtype": "float32"
+  }
+}
