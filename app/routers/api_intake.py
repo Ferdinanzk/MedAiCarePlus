@@ -13,6 +13,7 @@ router = APIRouter(prefix="/api/intake", tags=["api-intake"])
 
 class DetectPayload(BaseModel):
     session_id: str
+    frame_seq: int
     width: int = 640
     height: int = 480
     face_landmarks: list = []

@@ -140,7 +140,14 @@ export default function Intake() {
     if (cameraStartingRef.current) return;
     cameraStartingRef.current = true;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 1280, min: 640 },
+          height: { ideal: 720, min: 480 },
+          aspectRatio: { ideal: 16 / 9 },
+        },
+      });
       if (!mountedRef.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -533,9 +540,22 @@ export default function Intake() {
   };
 
   const getGuidanceText = () => {
-    if (confidence >= 50) return t('intake.guidanceAlmost');
-    if (detectionStatus === 'HAND_AT_MOUTH') return t('intake.guidanceHand');
-    return t('intake.guidanceIdle');
+    const waitingReason = String(detectionDebug?.waiting_reason || '');
+    if (waitingReason === 'waiting_for_exit_zone') return 'Contact detected — move your hand away until it is outside the guide.';
+    if (waitingReason === 'waiting_for_hand_reacquisition_or_loss_completion') return 'Your hand is briefly hidden — move it back into view away from your mouth.';
+    if (waitingReason === 'waiting_for_contact_zone') return 'Hand approaching — continue naturally toward your mouth.';
+    const guidance: Record<string, string> = {
+      CALIBRATING: 'Keep your face visible while the camera gets ready.',
+      READY: 'Ready — take your pill naturally when comfortable.',
+      APPROACHING: 'Hand approaching.',
+      AT_MOUTH: 'Contact detected.',
+      OCCLUDED: 'Contact detected — keep moving naturally.',
+      WITHDRAWING: 'Withdrawal detected — keep your hand in view.',
+      COMPLETE_CANDIDATE: 'Intake movement captured.',
+      COOLDOWN: 'Movement captured — please wait.',
+      RESET: 'Ready for one natural pill-taking movement.',
+    };
+    return guidance[detectionStatus] || t('intake.guidanceIdle');
   };
 
   const handleCancelDetection = () => {
@@ -583,15 +603,21 @@ export default function Intake() {
   // Detection overlay UI
   if (phase === 'detecting' && activeItem) {
     return (
-      <div className="fixed inset-0 bg-black z-50 flex items-center justify-center">
-        <div className="w-full max-w-lg h-full flex flex-col relative">
+      <div className="fixed inset-0 bg-black z-50 flex items-center justify-center p-2 sm:p-6">
+        <div className="w-full max-w-6xl aspect-video max-h-full flex flex-col relative bg-black overflow-hidden rounded-xl">
           <video
             ref={setVideoRefs}
             autoPlay
             playsInline
             muted
-            className="w-full h-full object-cover"
+            className="w-full h-full object-contain"
           />
+          <div className="absolute inset-[8%] border-2 border-dashed border-cyan-300/60 rounded-[2rem] pointer-events-none">
+            <div className="absolute left-[35%] right-[35%] top-[12%] bottom-[38%] border border-white/40 rounded-full" />
+            <div className="absolute bottom-2 left-2 right-2 text-center text-white/90 text-sm leading-snug bg-black/60 px-3 py-2 rounded-lg">
+              Keep face, hand, and withdrawal path inside this frame
+            </div>
+          </div>
           <div className={`absolute inset-0 flex flex-col items-center justify-center text-white transition-opacity duration-300 ${cameraOn || aiError ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
             <Camera className="w-12 h-12 mb-3 opacity-60" />
             <p className="text-sm opacity-80">Camera starting...</p>
@@ -625,20 +651,30 @@ export default function Intake() {
           {/* DEBUG panel: the "Confidence" meter below is the decaying live
               signal; peak/event are the real scores driving the decision. */}
           {detectionDebug && (
-            <div className="absolute top-20 left-2 z-20 bg-black/70 text-green-300 font-mono text-[10px] leading-tight p-2 rounded-md max-w-[60%] space-y-0.5">
+            <details className="absolute top-20 right-2 z-[5] max-w-[min(90%,28rem)] rounded-md bg-black/75 text-green-300 font-mono text-[10px] leading-tight backdrop-blur-sm">
+              <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-green-200">Developer diagnostics</summary>
+              <div className="max-h-[35vh] overflow-y-auto border-t border-white/10 p-3 space-y-0.5">
               <div>decision: {String(detectionDebug.decision)} ({String(detectionDebug.decision_reason ?? '')})</div>
               <div>peak: {String(detectionDebug.peak_confidence)} | event: {String(detectionDebug.event_confidence)} | frame: {String(detectionDebug.frame_confidence)}</div>
               <div>confirm@ {String(detectionDebug.confirm_threshold)} | raw: {String(detectionDebug.raw_event_score)}</div>
               <div>style: {String(detectionDebug.event_style)} | contact: {String(detectionDebug.peak_mouth_contact)}</div>
               <div>mouthOpen: {String(detectionDebug.mouth_open)} ({String(detectionDebug.mouth_open_ratio)}) | withdrew: {String(detectionDebug.withdrew_enough)}</div>
               <div>dwell: {String(detectionDebug.dwell)} | nearMouth: {String(detectionDebug.hand_near_mouth)} | hands: {String(detectionDebug.hands)}</div>
-              <div>winClosed: {String(detectionDebug.event_window_closed)} | status: {String(detectionDebug.status)}</div>
-            </div>
+              <div>state: {String(detectionDebug.stage)} | wait: {String(detectionDebug.waiting_reason)}</div>
+              <div>transition: {String(detectionDebug.transition_reason)}</div>
+              <div>face: {String(detectionDebug.face_visible)} | hand: {String(detectionDebug.hand_visible)} | lost/reacq: {String(detectionDebug.hand_lost)}/{String(detectionDebug.reacquired)}</div>
+              <div>distance: {String(detectionDebug.contact_distance)} | entry/exit: {String(detectionDebug.entry_distance)}/{String(detectionDebug.exit_distance)}</div>
+              <div>velocity in/out: {String(detectionDebug.approach_velocity)}/{String(detectionDebug.withdrawal_velocity)} | occ: {String(detectionDebug.occlusion_duration)}s</div>
+              <div>seq: {String(detectionDebug.frame_seq)} | input: {String(detectionDebug.video_width)}x{String(detectionDebug.video_height)}</div>
+              </div>
+            </details>
           )}
 
-          {/* Confidence meter */}
-          <div className="absolute bottom-24 left-4 right-4">
-            <div className="bg-black/50 rounded-xl p-4 backdrop-blur-sm space-y-2">
+          {/* One bottom dock prevents confidence, helper text, and actions from
+              competing for the same absolute space on short viewports. */}
+          <div className="absolute bottom-2 left-2 right-2 z-[6] max-h-[48%] overflow-y-auto rounded-xl bg-black/60 p-3 sm:bottom-4 sm:left-4 sm:right-4 sm:p-4 backdrop-blur-md">
+            <div className="space-y-3">
+              <div className="space-y-2">
               <div className="flex justify-between text-white text-sm mb-2">
                 <span>Confidence</span>
                 <span className="font-mono">{confidence}% <span className="text-white/50">(peak {peakConfidence}%)</span></span>
@@ -662,28 +698,49 @@ export default function Intake() {
               {mediaPipeError && (
                 <p className="text-red-300 text-xs">{mediaPipeError}</p>
               )}
-            </div>          </div>
+              </div>
+              {elapsedSeconds >= 15 && (
+                <div className="space-y-2 border-t border-white/15 pt-3">
+                  <button
+                    onClick={handleManualConfirm}
+                    className="w-full py-3 sm:py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large"
+                  >
+                    {t('intake.manualConfirm')}
+                  </button>
+                  <p className="px-2 text-center text-sm leading-relaxed text-white/90">
+                    If you already took the pill, use manual confirmation. Otherwise, keep your face and hand inside the guide.
+                  </p>
+                </div>
+              )}
+              <button
+                onClick={handleCancelDetection}
+                className="w-full py-3 sm:py-4 bg-white/10 text-white/90 text-base rounded-xl font-medium hover:bg-white/20 active:scale-95 transition-all touch-target-large"
+              >
+                {t('common.cancel')}
+              </button>
+            </div>
+          </div>
 
           {/* Ambiguous-detection confirmation prompt (patient safety: never auto-log) */}
           {uncertainPrompt !== null && (
-            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm p-8 text-white">
-              <AlertTriangle className="w-12 h-12 mb-4 text-yellow-400" />
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center overflow-y-auto bg-black/75 backdrop-blur-sm p-4 sm:p-8 text-white">
+              <AlertTriangle className="w-10 h-10 sm:w-12 sm:h-12 shrink-0 mb-3 sm:mb-4 text-yellow-400" />
               <h3 className="text-xl font-semibold text-center mb-2">需要確認 / Please confirm</h3>
-              <p className="text-base text-center mb-8 opacity-90">
+              <p className="max-w-lg text-sm sm:text-base leading-relaxed text-center mb-5 sm:mb-8 text-white/90">
                 系統偵測到您可能已服藥，但無法完全確定。請確認您是否已服下藥物。
                 <br />
                 We detected a possible intake but aren't certain. Did you take your medication?
               </p>
-              <div className="space-y-3 w-full max-w-xs">
+              <div className="space-y-3 w-full max-w-sm shrink-0">
                 <button
                   onClick={handleUncertainConfirm}
-                  className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
+                  className="w-full px-4 py-3 sm:py-4 bg-[#0057B8] text-white text-base leading-snug rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
                 >
                   是的，我已服藥 / Yes, I took it
                 </button>
                 <button
                   onClick={handleUncertainReject}
-                  className="w-full py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
+                  className="w-full px-4 py-3 sm:py-4 bg-white/20 text-white text-base leading-snug rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large"
                 >
                   尚未服藥，繼續偵測 / Not yet, keep detecting
                 </button>
@@ -691,23 +748,6 @@ export default function Intake() {
             </div>
           )}
 
-          {/* Cancel + Manual buttons */}
-          <div className="absolute bottom-4 left-4 right-4 space-y-2">
-            {elapsedSeconds >= 15 && (
-              <button
-                onClick={handleManualConfirm}
-                className="w-full py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
-              >
-                {t('intake.manualConfirm')}
-              </button>
-            )}
-            <button
-              onClick={handleCancelDetection}
-              className="w-full py-4 bg-white/10 text-white/80 text-base rounded-xl font-medium hover:bg-white/20 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
-            >
-              {t('common.cancel')}
-            </button>
-          </div>
         </div>
       </div>
     );

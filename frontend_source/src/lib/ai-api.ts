@@ -152,16 +152,30 @@ export const aiApi = {
 
   async detectIntake(payload: {
     session_id: string;
+    frame_seq: number;
     width: number;
     height: number;
     face_landmarks: Landmark[];
     hand_landmarks: Landmark[][];
     timestamp: number;
-  }): Promise<{
+  }, signal?: AbortSignal): Promise<{
     confidence?: number;
     mouth_open?: boolean;
     hand_near_mouth?: boolean;
     status?: string;
+    stage?: string;
+    missing_observation?: string | null;
+    accepted?: boolean;
+    frame_seq?: number;
+    candidate_id?: number;
+    waiting_reason?: string;
+    transition_reason?: string;
+    approach_velocity?: number;
+    withdrawal_velocity?: number;
+    occlusion_duration?: number;
+    contact_distance?: number | null;
+    entry_distance?: number;
+    exit_distance?: number;
     event_detected?: boolean;
     decision?: 'confirmed' | 'uncertain' | 'none';
     decision_reason?: string;
@@ -175,6 +189,7 @@ export const aiApi = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal,
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));

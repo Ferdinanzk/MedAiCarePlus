@@ -9,6 +9,7 @@ from app.services.intake_detection_style import (
     EventStyleClassification,
     classify_event_style,
 )
+from app.services.intake_temporal import Observation, TemporalIntakePipeline
 
 # =========================================================
 # Configuration
@@ -1122,6 +1123,8 @@ class IntakeDetectionService:
 
     def __init__(self):
         self._detectors: Dict[str, PillIngestionDetector] = {}
+        self._temporal: Dict[str, TemporalIntakePipeline] = {}
+        self._last_frame_seq: Dict[str, int] = {}
         self._last_active: Dict[str, float] = {}
         self._lock = asyncio.Lock()
         IntakeDetectionService._available = True
@@ -1143,18 +1146,34 @@ class IntakeDetectionService:
         ]
         for k in stale_keys:
             self._detectors.pop(k, None)
+            self._temporal.pop(k, None)
+            self._last_frame_seq.pop(k, None)
             self._last_active.pop(k, None)
 
     async def process_frame(self, u_id: int, session_id: str, payload: dict) -> dict:
         key = self._key(u_id, session_id)
         current_time = time.time()
 
+        frame_seq = int(payload.get("frame_seq", -1))
         async with self._lock:
             self._cleanup_stale(current_time)
+            last_seq = self._last_frame_seq.get(key, -1)
+            if frame_seq <= last_seq:
+                pipeline = self._temporal.get(key)
+                result = pipeline.result("stale_frame", accepted=False) if pipeline else {
+                    "stage": "CALIBRATING", "status": "CALIBRATING",
+                    "missing_observation": "stale_frame", "accepted": False,
+                    "decision": "none", "event_detected": False, "confidence": 0.0,
+                }
+                result["frame_seq"] = frame_seq
+                result["last_accepted_frame_seq"] = last_seq
+                return result
+            self._last_frame_seq[key] = frame_seq
             self._last_active[key] = current_time
 
             if key not in self._detectors:
                 self._detectors[key] = PillIngestionDetector()
+                self._temporal[key] = TemporalIntakePipeline()
 
             detector = self._detectors[key]
 
@@ -1164,30 +1183,57 @@ class IntakeDetectionService:
         hand_landmarks = payload.get("hand_landmarks", [])
         timestamp = payload.get("timestamp", current_time)
 
+        pipeline = self._temporal[key]
         if not face_landmarks:
-            return {
-                "confidence": 0.0,
-                "mouth_open": False,
-                "hand_near_mouth": False,
-                "status": "NO_FACE",
-                "event_detected": False,
-                "ingestion_detected": False,
-                "decision": "none",
-                "decision_reason": "",
-            }
+            result = pipeline.process(timestamp, False, [])
+            result.update({"frame_seq": frame_seq, "last_accepted_frame_seq": frame_seq,
+                           "debug": {"stage": result["stage"], "waiting_reason": result.get("waiting_reason"),
+                                     "transition_reason": result.get("transition_reason"), "face_visible": False,
+                                     "hand_visible": bool(hand_landmarks), "hands": len(hand_landmarks),
+                                     "frame_seq": frame_seq, "video_width": width, "video_height": height,
+                                     "occlusion_duration": result.get("occlusion_duration"),
+                                     "hand_lost": result.get("hand_lost"), "reacquired": result.get("reacquired")}})
+            return result
 
         mouth_geom = detector.compute_mouth_geometry(face_landmarks, width, height)
 
-        best_result = {
-            "confidence": 0.0,
+        observations = []
+        for hand_lm in hand_landmarks:
+            features = detector.compute_hand_features(hand_lm, mouth_geom, width, height)
+            palm = features["palm_center"]
+            observations.append(Observation(
+                center=(palm[0] / width, palm[1] / height),
+                distance=float(features["fingertip_to_mouth_norm"]),
+                mouth_open=bool(features["mouth_open"]),
+                pinch=bool(features["holding_object"]),
+                flat_palm=bool(features["flat_palm"]),
+                occlusion=float(features["mouth_occlusion_score"]),
+            ))
+        best_result = pipeline.process(timestamp, True, observations)
+        best_result.update({
+            "frame_seq": frame_seq, "last_accepted_frame_seq": frame_seq,
             "mouth_open": mouth_geom["mouth_open"],
-            "hand_near_mouth": False,
-            "status": detector.last_status,
-            "event_detected": False,
-            "ingestion_detected": False,
-            "decision": "none",
-            "decision_reason": "",
-        }
+            "hand_near_mouth": any(o.distance <= pipeline.EXIT_DISTANCE for o in observations),
+            "peak_confidence": max(detector.peak_event_confidence, best_result.get("confidence", 0.0)),
+            "debug": {
+                "stage": best_result["stage"], "waiting_reason": best_result.get("waiting_reason"),
+                "transition_reason": best_result.get("transition_reason"),
+                "missing_observation": best_result.get("missing_observation"),
+                "face_visible": True, "hand_visible": bool(observations), "hands": len(observations),
+                "contact_distance": best_result.get("contact_distance"),
+                "entry_distance": best_result.get("entry_distance"), "exit_distance": best_result.get("exit_distance"),
+                "approach_velocity": best_result.get("approach_velocity"),
+                "withdrawal_velocity": best_result.get("withdrawal_velocity"),
+                "occlusion_duration": best_result.get("occlusion_duration"),
+                "hand_lost": best_result.get("hand_lost"), "reacquired": best_result.get("reacquired"),
+                "frame_seq": frame_seq, "video_width": width, "video_height": height,
+                "completion_reason": best_result.get("completion_reason"),
+            },
+        })
+        return best_result
+
+        # Legacy scorer retained below for offline comparison while the live
+        # control plane is assembled by TemporalIntakePipeline.
 
         # Rank bands so an "uncertain" event is surfaced even when other hands
         # produced nothing, while a "confirmed" event always wins.
@@ -1267,4 +1313,6 @@ class IntakeDetectionService:
         key = self._key(u_id, session_id)
         async with self._lock:
             self._detectors.pop(key, None)
+            self._temporal.pop(key, None)
+            self._last_frame_seq.pop(key, None)
             self._last_active.pop(key, None)
