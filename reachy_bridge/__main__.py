@@ -25,7 +25,7 @@ def make_robot(settings: Settings):
 
 async def main() -> None:
     settings = Settings.from_env()
-    from reachy_bridge.vision import VisionEngine   # imports mediapipe
+    from reachy_bridge.vision import VisionEngine   # imports onnxruntime
 
     robot = make_robot(settings)
     engine = VisionEngine(settings.models_dir)
