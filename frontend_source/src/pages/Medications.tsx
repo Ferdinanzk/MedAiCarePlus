@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
 import { getExpiryStatus } from '../lib/expiry';
 import TimeSection from '../components/ui/TimeSection';
@@ -20,6 +20,7 @@ import {
   Sunset,
   Moon,
   Bed,
+  Camera,
 } from 'lucide-react';
 
 interface ScheduleTime {
@@ -43,7 +44,12 @@ interface Medication {
   use_before: string | null;
   schedule_time: ScheduleTime | null;
   is_active: boolean;
+  dose_form?: DoseForm;
+  units_per_dose?: number;
 }
+
+type DoseForm = 'solid_oral' | 'liquid' | 'inhaler' | 'injection' | 'topical' | 'other';
+const DOSE_FORMS: DoseForm[] = ['solid_oral', 'liquid', 'inhaler', 'injection', 'topical', 'other'];
 
 const SCHEDULE_OPTIONS: { key: keyof ScheduleTime; label: string }[] = [
   { key: 'morning',      label: '早上' },
@@ -59,6 +65,44 @@ const EMPTY_SCHEDULE: ScheduleTime = {
   bedtime: false, before_meals: false, after_meals: false,
 };
 
+/** Normalize JSON fields returned by asyncpg into the UI's object shape. */
+function normalizeScheduleTime(value: unknown): ScheduleTime | null {
+  let candidate = value;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+
+  // Older builds spread a serialized schedule string into an object while
+  // editing. Recover that payload when it is still present in the database
+  // (for example, keys "0", "1", ... containing the JSON characters).
+  const raw = candidate as Record<string, unknown>;
+  const numericKeys = Object.keys(raw)
+    .filter((key) => /^\d+$/.test(key))
+    .sort((a, b) => Number(a) - Number(b));
+  if (numericKeys.length >= 2 && numericKeys.every((key) => typeof raw[key] === 'string' && String(raw[key]).length <= 1)) {
+    try {
+      candidate = JSON.parse(numericKeys.map((key) => String(raw[key])).join(''));
+    } catch {
+      // Fall through to the known boolean fields below.
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const source = candidate as Record<string, unknown>;
+  return {
+    morning: Boolean(source.morning),
+    noon: Boolean(source.noon),
+    night: Boolean(source.night),
+    bedtime: Boolean(source.bedtime),
+    before_meals: Boolean(source.before_meals),
+    after_meals: Boolean(source.after_meals),
+  };
+}
+
 const PERIOD_CONFIG = {
   morning:   { icon: Sun,    label: 'Morning',    timeRange: '6:00-10:00',  iconColor: 'text-amber-500',  bgColor: 'bg-amber-50' },
   afternoon: { icon: Sunset, label: 'Afternoon',  timeRange: '12:00-15:00', iconColor: 'text-orange-500', bgColor: 'bg-orange-50' },
@@ -73,6 +117,7 @@ function getAuthHeaders(): Record<string, string> {
 
 export default function Medications() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const [medications, setMedications] = useState<Medication[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -90,6 +135,8 @@ export default function Medications() {
     use_before: '',
     is_active: true,
     schedule_time: { ...EMPTY_SCHEDULE },
+    dose_form: 'solid_oral' as DoseForm,
+    units_per_dose: 1,
   });
 
   useEffect(() => { fetchMedications(); }, []);
@@ -98,12 +145,18 @@ export default function Medications() {
     setLoading(true);
     const headers = getAuthHeaders();
     const resp = await fetch('/api/medications', { headers }).catch(() => null);
-    if (resp?.ok) setMedications(await resp.json());
+    if (resp?.ok) {
+      const rows = await resp.json() as Array<Omit<Medication, 'schedule_time'> & { schedule_time?: unknown }>;
+      setMedications(rows.map((row) => ({
+        ...row,
+        schedule_time: normalizeScheduleTime(row.schedule_time),
+      })));
+    }
     setLoading(false);
   };
 
   const resetForm = () => {
-    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE } });
+    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE }, dose_form: 'solid_oral', units_per_dose: 1 });
     setEditingId(null);
     setShowForm(false);
   };
@@ -119,7 +172,9 @@ export default function Medications() {
       pill_description: med.pill_description || '',
       use_before: med.use_before || '',
       is_active: med.is_active,
-      schedule_time: med.schedule_time ? { ...EMPTY_SCHEDULE, ...med.schedule_time } : { ...EMPTY_SCHEDULE },
+      schedule_time: normalizeScheduleTime(med.schedule_time) || { ...EMPTY_SCHEDULE },
+      dose_form: med.dose_form || 'solid_oral',
+      units_per_dose: Number(med.units_per_dose ?? 1),
     });
     setEditingId(med.id);
     setShowForm(true);
@@ -132,11 +187,14 @@ export default function Medications() {
     fetchMedications();
   };
 
+  const handleTakeNow = (med: Medication) => {
+    if (med.pills_remaining <= 0) return;
+    navigate(`/intake?med=${med.id}&start=1`);
+  };
+
   const toggleSchedule = (key: keyof ScheduleTime) => {
     setForm(f => ({ ...f, schedule_time: { ...f.schedule_time, [key]: !f.schedule_time[key] } }));
   };
-
-  const hasSchedule = Object.values(form.schedule_time).some(Boolean);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -144,6 +202,7 @@ export default function Medications() {
     const headers = getAuthHeaders();
     if (!headers.Authorization) { setSaving(false); return; }
 
+    const normalizedSchedule = normalizeScheduleTime(form.schedule_time);
     const payload = {
       name: form.name,
       dosage: form.dosage || null,
@@ -154,7 +213,11 @@ export default function Medications() {
       pill_description: form.pill_description || null,
       use_before: form.use_before || null,
       is_active: form.is_active,
-      schedule_time: hasSchedule ? form.schedule_time : null,
+      dose_form: form.dose_form,
+      units_per_dose: form.units_per_dose,
+      schedule_time: normalizedSchedule && Object.values(normalizedSchedule).some(Boolean)
+        ? normalizedSchedule
+        : null,
     };
 
     const url = editingId ? `/api/medications/${editingId}` : '/api/medications';
@@ -254,6 +317,36 @@ export default function Medications() {
                     />
                   </div>
                 </div>
+                {/* Reachy records automatically only one tablet/capsule per prompt. */}
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <div>
+                    <label htmlFor="dose-form" className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.doseForm')}</label>
+                    <select
+                      id="dose-form"
+                      value={form.dose_form}
+                      onChange={e => setForm({ ...form, dose_form: e.target.value as DoseForm })}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    >
+                      {DOSE_FORMS.map(value => <option key={value} value={value}>{t(`medications.doseForms.${value}`)}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="units-per-dose" className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.unitsPerDose')}</label>
+                    <input
+                      id="units-per-dose"
+                      type="number"
+                      min={0.25}
+                      max={20}
+                      step={0.25}
+                      value={form.units_per_dose}
+                      onChange={e => setForm({ ...form, units_per_dose: Number(e.target.value) })}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    />
+                  </div>
+                </div>
+                {!(form.dose_form === 'solid_oral' && form.units_per_dose === 1) && (
+                  <p className="mt-2 text-sm text-amber-700">{t('medications.reachyConfirmHint')}</p>
+                )}
               </div>
 
               {/* Quantity */}
@@ -455,6 +548,15 @@ export default function Medications() {
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button
+                          onClick={() => handleTakeNow(med)}
+                          disabled={med.pills_remaining <= 0}
+                          aria-label={`${t('intake.take')}: ${med.name}`}
+                          className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
+                        >
+                          <Camera className="w-4 h-4" />
+                          {med.pills_remaining > 0 ? t('intake.take') : t('intake.cannotTake')}
+                        </button>
+                        <button
                           onClick={() => handleEdit(med)}
                           className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"
                         >
@@ -497,6 +599,15 @@ export default function Medications() {
                       {med.dosage && <p className="text-sm text-gray-500">{med.dosage}</p>}
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => handleTakeNow(med)}
+                        disabled={med.pills_remaining <= 0}
+                        aria-label={`${t('intake.take')}: ${med.name}`}
+                        className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
+                      >
+                        <Camera className="w-4 h-4" />
+                        {med.pills_remaining > 0 ? t('intake.take') : t('intake.cannotTake')}
+                      </button>
                       <button
                         onClick={() => handleEdit(med)}
                         className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"

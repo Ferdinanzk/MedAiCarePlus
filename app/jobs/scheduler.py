@@ -15,6 +15,8 @@ def start_scheduler():
     from app.jobs.refill_reminder_job import check_refill_reminders
     from app.jobs.emotion_alert_job import check_negative_emotions
     from app.jobs.taken_confirmation_job import check_taken_confirmations
+    from app.jobs.reachy_task_job import run_reachy_task_maintenance
+    from app.jobs.dose_confirmation_job import run_dose_confirmation_maintenance
 
     scheduler.add_job(
         check_missed_doses,
@@ -44,6 +46,18 @@ def start_scheduler():
         check_negative_emotions,
         IntervalTrigger(minutes=30),
         id="emotion_alerts",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_reachy_task_maintenance,
+        IntervalTrigger(minutes=1),
+        id="reachy_tasks",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_dose_confirmation_maintenance,
+        IntervalTrigger(minutes=1),
+        id="dose_confirmations",
         replace_existing=True,
     )
     scheduler.start()

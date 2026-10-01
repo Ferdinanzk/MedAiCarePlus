@@ -1,192 +1,45 @@
-# MedAiCarePlus — AIOT CAREBOX
+﻿# MedAiCarePlus concurrent intake monitor
 
-Full-stack medical care app with face recognition login, prescription OCR, medication tracking, and LINE notifications.
+This local web app uses one camera session to identify the signed-in person, follow that person's pill intake gesture, and sample their facial expression. A bystander can remain in view; the monitor only feeds hands associated with the signed-in person's face and pose to the intake detector.
 
-## Features
+## Run in Docker
 
-- **Face login** — OpenVINO 3-stage pipeline (detect → landmark → re-id)
-- **Emotion detection** — Custom PyTorch CNN via webcam
-- **Prescription OCR** — YOLOv8-seg + Ollama vision (19 fields extracted)
-- **Medication tracking** — CRUD with schedule, use-before dates, warnings
-- **Intake scheduling** — Auto-generates 30-day intake records on medication add
-- **LINE notifications** — Missed-dose alerts, emotion alerts, weekly summaries
-- **Family contacts** — Verification code-based contact management
-
-## Stack
-
-| Layer | Tech |
-|-------|------|
-| Backend | FastAPI + asyncpg (raw SQL, no ORM) |
-| Frontend | React + Vite + Tailwind (served by FastAPI) |
-| Database | PostgreSQL 16 (via Supabase or local Docker) |
-| Auth | Supabase JWT + itsdangerous face token |
-| ML | OpenVINO 2024.5, PyTorch, MediaPipe, YOLOv8 |
-| OCR | Ollama (minicpm-v / Gemini Flash cloud) |
-| Notifications | LINE Messaging API |
-
----
-
-## Prerequisites
-
-- Docker Desktop
-- Python 3.10+ (for local dev outside Docker)
-- [Ollama](https://ollama.com) installed and running locally
-- A [Supabase](https://supabase.com) project (free tier works)
-- Git LFS: `git lfs install`
-
----
-
-## Setup
-
-### 1. Clone and configure environment
-
-```bash
-git clone <repo-url>
-cd MedAiCarePlus
-git lfs pull          # downloads ML model files tracked by LFS
-
-cp .env.example .env
-# Edit .env — fill in SUPABASE_URL, SUPABASE_JWT_SECRET, SECRET_KEY
-```
-
-### 2. Download ML models
-
-Place model files in the `models/` directory as shown below.
-
-#### A. Face recognition — OpenVINO (Intel Open Model Zoo, free & public)
-
-```bash
-pip install openvino-dev
-omz_downloader --name face-detection-adas-0001          --output_dir models/face_recognition/intel
-omz_downloader --name landmarks-regression-retail-0009  --output_dir models/face_recognition/intel
-omz_downloader --name face-reidentification-retail-0095 --output_dir models/face_recognition/intel
-```
-
-> Docs: [Intel Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo)
-
-#### B. Emotion detection — `models/emotion/model4.2.2.pth`
-
-Custom PyTorch CNN (4 classes: Angry, Happy, Neutral, Sad).
-Downloaded automatically by `git lfs pull`.
-
-#### C. Prescription YOLO — `models/segmentation/prescription_best_100_epo.pt`
-
-Custom YOLOv8-seg model trained on prescription documents.
-Downloaded automatically by `git lfs pull`.
-
-#### D. Ollama vision model
-
-```bash
-ollama pull minicpm-v
-# Cloud OCR (gemini-3-flash-preview:cloud) needs no local pull — internet required
-```
-
-### 3. Set up the database
-
-```bash
-# Supabase: Dashboard → SQL Editor → paste sql/init.sql → Run
-# Local Docker: psql -U medai -d medaicare -f sql/init.sql
-```
-
-### 4. Start the stack
-
-```bash
-docker compose -f docker-compose.dev.yml up -d
-```
-
-App runs at: **http://localhost:8000**
-
----
-
-## Environment Variables
-
-Copy `.env.example` → `.env` and fill in your values.
-
-| Variable | Purpose |
-|----------|---------|
-| `DATABASE_URL` | Postgres — use port **5432** (not Supabase pooler 6543) |
-| `SECRET_KEY` | Signs face auth tokens — `python -c "import secrets; print(secrets.token_hex(32))"` |
-| `SUPABASE_JWT_SECRET` | Validates Supabase JWTs — Supabase Dashboard → Settings → API |
-| `SUPABASE_URL` | Your Supabase project URL |
-| `LINE_CHANNEL_ACCESS_TOKEN` | LINE bot token — leave empty to disable notifications |
-| `OLLAMA_URL` | Ollama API — default works with Docker Desktop |
-
----
-
-## LINE Webhook Setup (optional)
-
-LINE requires a public HTTPS URL. On local dev, use ngrok:
-
-```bash
-ngrok http 8000
-# Copy HTTPS URL → LINE Developers Console → Webhook URL:
-# https://<id>.ngrok-free.app/api/notify/webhook
-```
-
-> Free ngrok gives a new URL on each restart. A paid plan or fixed domain gives a persistent URL.
-
----
-
-## Development Workflow
+From `D:\medcareai2_20260920\app` in PowerShell:
 
 ```powershell
-# Rebuild backend after Python changes:
-docker compose -f docker-compose.dev.yml up -d --build medaicare
-
-# Rebuild frontend (sync source first):
-Copy-Item "medaicareplus-web\src\pages\*.tsx" "frontend_source\src\pages\" -Force
-docker compose -f docker-compose.dev.yml up -d --build medaicare
-
-# Health check:
-curl http://localhost:8000/health
+docker compose up -d --build
+docker compose ps
+Invoke-RestMethod http://localhost:8000/health
 ```
 
-> **React source lives in two places:** `medaicareplus-web/src/` (edit here) and `frontend_source/src/` (Docker build input). Always sync before rebuilding.
+Open **http://localhost:8000** on this PC. The app and its dedicated PostgreSQL database run in the `medcareai2` Compose project. The first build can take several minutes. A prepared `.env` in this workspace contains a randomly generated signing key. If recreating this workspace, copy `.env.example` to `.env` and replace `SECRET_KEY` with a random value before starting.
 
----
+The Compose services run with `Asia/Taipei` as their local timezone, matching this PC. Existing database data is preserved when the services are rebuilt.
 
-## Project Structure
+Register or sign in, complete face enrollment, add a medication and schedule, then open **Medication intake** and select **Start camera** for one scheduled dose. Allow camera access. The app shows identity, expression, and intake progress together. Strong detector events (score at least 0.75) record the selected dose automatically; eligible uncertain events (at least 0.30) ask for confirmation. **Not taken — undo** reverses an automated record and restores stock. Manual marking and skipping remain available.
 
+The browser must access the app through `localhost` or HTTPS to use the camera. The detector recognizes a hand-to-mouth intake gesture; it cannot verify the pill's identity, number of pills, or swallowing. Review uncertain results and correct wrong records with the on-screen controls.
+
+## Model sources
+
+| Function | Source used in this build |
+| --- | --- |
+| Face identification | MedAiCarePlus OpenVINO face detection, landmarks, and re-identification models, source revision `562d558a5769a72e26822e39a1295db32ff8e791` |
+| Pill intake gesture | `D:\clone\medcareai-original-intake-performance`, revision `419dd7187a00c4a84f0d0a70a88bce5aca423db5` |
+| Expression | `D:\newEmotion` seed 43 ONNX export, `models/emotion_seed43/model_fp32.onnx`, SHA-256 `0caaedf04b60d1c95d89ee2162c8bf207ccd669b88865f155b17987cc15ffbad` |
+| Face, hand, and pose landmarks | Browser MediaPipe task models in `frontend_source/public/models` |
+
+Only the original repository's **face identification** weights are loaded. The new expression model predicts Angry, Disgust, Fear, Happy, Sad, Surprise, and Neutral. The Docker health endpoint reports `ocr: false` and `line: false` in the default local setup because their optional services are not configured.
+
+Model binaries are included in this working directory and copied into the Docker image at build time. The face gallery is bind mounted from `models/face_recognition/face_gallery`, so enrollments survive container rebuilds. PostgreSQL data is in the `medcareai2_pgdata` volume.
+
+## Checks and maintenance
+
+```powershell
+docker compose logs --tail 80 app
+docker compose down
 ```
-MedAiCarePlus/
-├── app/
-│   ├── routers/          # API endpoints
-│   ├── services/         # ML services (face, emotion, OCR, LINE)
-│   ├── jobs/             # APScheduler jobs (missed dose, weekly summary)
-│   ├── config.py         # Env var loading + model paths
-│   └── dependencies.py   # JWT auth (Supabase + face token)
-├── models/
-│   ├── face_recognition/ # OpenVINO models + face gallery (download via omz_downloader)
-│   ├── emotion/          # model4.2.2.pth (Git LFS)
-│   └── segmentation/     # prescription_best_100_epo.pt (Git LFS)
-├── frontend_source/      # React source — Docker build input
-├── medaicareplus-web/    # React source — local editing copy
-├── sql/init.sql          # Database schema
-├── docker-compose.dev.yml
-└── Dockerfile
-```
 
----
+`docker compose down` stops the app and database while preserving the database volume. To apply source changes, run `docker compose up -d --build` again. Run frontend type checking and build from `frontend_source` with `npm run build`.
 
-## Database Schema
-
-| Table | Description |
-|-------|-------------|
-| `user` | Registered patients (name, face_label, supabase_id) |
-| `detail` | Extended profile (age, gender, address) |
-| `emotion` | Emotion check-in records |
-| `medication` | Prescriptions (med_name, schedule_time JSONB) |
-| `intake` | Daily dose events (taken/skipped/pending) |
-| `family_contacts` | Family members with notification preferences |
-
----
-
-## Common Issues
-
-| Symptom | Fix |
-|---------|-----|
-| OCR returns all N/A | Remove `num_predict` from Ollama options for `:cloud` models |
-| Face auth token expired | 8h TTL — re-login via face scan |
-| asyncpg JSONB error | Wrap `dict` in `json.dumps()` before passing to asyncpg |
-| Model not loading | Check `/health`; verify `models/` paths are mounted correctly |
-| LINE webhook not firing | Update webhook URL in LINE Developer Console after ngrok restart |
+The monitor API is under `/api/intake/monitor`: `start`, `landmarks`, `vision`, `outcome`, `end`, `recent`, and `undo`. All routes require the existing user session. The server records one selected scheduled dose and its expression summary in one transaction; repeating a recorded event does not decrement stock again.

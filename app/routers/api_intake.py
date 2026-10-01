@@ -3,9 +3,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.services.intake_detection import IntakeDetectionService
+from app.services.intake_repository import transition_intake
 from app.services.line_service import LineService
 
 router = APIRouter(prefix="/api/intake", tags=["api-intake"])
@@ -38,50 +39,27 @@ async def _get_u_id(user: dict) -> int | None:
 
 
 @router.post("/detect")
-async def detect_intake(payload: DetectPayload, user: dict = Depends(get_current_user)):
-    u_id = await _get_u_id(user)
-    if not u_id:
-        return JSONResponse({"detail": "User not found"}, status_code=404)
-
-    svc = IntakeDetectionService.get_instance()
-    result = await svc.process_frame(u_id, payload.session_id, payload.model_dump())
-    return result
+async def detect_intake(payload: DetectPayload, user: dict = Depends(get_consented_user)):
+    return JSONResponse({"detail": "Use the authenticated /api/intake/monitor session"}, status_code=410)
 
 
 @router.post("/record")
-async def record_intake(payload: RecordPayload, user: dict = Depends(get_current_user)):
+async def record_intake(payload: RecordPayload, user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT intk_id FROM intake WHERE intk_id = $1 AND u_id = $2",
-            payload.intk_id, u_id,
-        )
-        if not row:
-            return JSONResponse({"detail": "Intake record not found"}, status_code=404)
-
-        await conn.execute(
-            """
-            UPDATE intake
-            SET detection_confidence = $1,
-                detection_method = $2,
-                intake_stats = 'taken',
-                actual_intake_time = NOW()
-            WHERE intk_id = $3
-            """,
-            payload.detection_confidence,
-            payload.detection_method,
-            payload.intk_id,
-        )
-
-    return {"success": True, "intk_id": payload.intk_id}
+    if payload.detection_method != "manual":
+        return JSONResponse({"detail": "Automatic intake requires a monitored event"}, status_code=400)
+    try:
+        result = await transition_intake(u_id, payload.intk_id, "taken")
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+    return {"success": True, **result}
 
 
 @router.post("/skip")
-async def skip_intake(payload: RecordPayload, user: dict = Depends(get_current_user)):
+async def skip_intake(payload: RecordPayload, user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)
@@ -95,15 +73,10 @@ async def skip_intake(payload: RecordPayload, user: dict = Depends(get_current_u
         if not row:
             return JSONResponse({"detail": "Intake record not found"}, status_code=404)
 
-        await conn.execute(
-            """
-            UPDATE intake
-            SET intake_stats = 'skipped',
-                actual_intake_time = NOW()
-            WHERE intk_id = $1
-            """,
-            payload.intk_id,
-        )
+        try:
+            await transition_intake(u_id, payload.intk_id, "skipped")
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=409)
 
         # Notify family contacts with notify_skipped = TRUE
         med_row = await conn.fetchrow(
@@ -143,7 +116,7 @@ async def skip_intake(payload: RecordPayload, user: dict = Depends(get_current_u
 
 
 @router.post("/end")
-async def end_session(payload: dict, user: dict = Depends(get_current_user)):
+async def end_session(payload: dict, user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)

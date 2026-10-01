@@ -7,8 +7,9 @@ import string
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from app.config import LINE_CHANNEL_SECRET
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.services.line_service import LineService
+from app.services import dose_confirmation
 from app.database import get_pool
 from pydantic import BaseModel
 from typing import Optional
@@ -37,7 +38,7 @@ def _generate_code(length: int = 8) -> str:
 @router.post("/generate-code")
 async def generate_verification_code(
     contact_id: int,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Generate a verification code for a family contact."""
     code = _generate_code()
@@ -59,13 +60,14 @@ async def line_webhook(request: Request):
     raw_body = await request.body()
 
     # Verify X-Line-Signature before processing any events
-    if LINE_CHANNEL_SECRET:
-        signature = request.headers.get("X-Line-Signature", "")
-        expected = base64.b64encode(
-            hmac.new(LINE_CHANNEL_SECRET.encode(), raw_body, hashlib.sha256).digest()
-        ).decode()
-        if not hmac.compare_digest(expected, signature):
-            return JSONResponse({"error": "Invalid signature"}, status_code=401)
+    if not LINE_CHANNEL_SECRET:
+        return JSONResponse({"error": "LINE channel secret not configured"}, status_code=401)
+    signature = request.headers.get("X-Line-Signature", "")
+    expected = base64.b64encode(
+        hmac.new(LINE_CHANNEL_SECRET.encode(), raw_body, hashlib.sha256).digest()
+    )
+    if not hmac.compare_digest(expected, signature.encode("utf-8")):
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
 
     body = json.loads(raw_body)
     events = body.get("events", [])
@@ -74,6 +76,20 @@ async def line_webhook(request: Request):
     line_svc = LineService.get_instance()
 
     for event in events:
+        if event.get("type") == "postback":
+            # Caregiver confirmation buttons. Invalid or unauthorised postbacks
+            # change nothing and get no reply; replies go through the outbox.
+            try:
+                async with pool.acquire() as conn:
+                    await dose_confirmation.handle_postback(
+                        conn,
+                        (event.get("postback") or {}).get("data", ""),
+                        (event.get("source") or {}).get("userId", ""),
+                    )
+            except Exception as exc:
+                print(f"[LINE] postback handling failed: {exc}")
+            continue
+
         if event.get("type") != "message":
             continue
 
@@ -151,7 +167,7 @@ async def notify_missed_dose(
     patient_name: str,
     medication_name: str,
     scheduled_time: str,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Send a missed-dose alert to a family contact's LINE."""
     svc = LineService.get_instance()
@@ -165,7 +181,7 @@ async def notify_emotion_alert(
     patient_name: str,
     emotion: str,
     score: float,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Send a low-emotion alert to a family contact's LINE."""
     svc = LineService.get_instance()
@@ -179,7 +195,7 @@ async def notify_weekly_summary(
     patient_name: str,
     adherence: float,
     emotion_summary: str,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Send a weekly health summary to a family contact's LINE."""
     svc = LineService.get_instance()
@@ -188,7 +204,7 @@ async def notify_weekly_summary(
 
 
 @router.get("/status")
-async def notify_status(user: dict = Depends(get_current_user)):
+async def notify_status(user: dict = Depends(get_consented_user)):
     """Check if LINE notifications are configured."""
     return {
         "configured": LineService._available,
@@ -197,7 +213,7 @@ async def notify_status(user: dict = Depends(get_current_user)):
 
 
 @router.get("/settings")
-async def get_notification_settings(user: dict = Depends(get_current_user)):
+async def get_notification_settings(user: dict = Depends(get_consented_user)):
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -227,7 +243,7 @@ async def get_notification_settings(user: dict = Depends(get_current_user)):
 
 
 @router.post("/settings")
-async def update_notification_settings(payload: NotificationSettingsPayload, user: dict = Depends(get_current_user)):
+async def update_notification_settings(payload: NotificationSettingsPayload, user: dict = Depends(get_consented_user)):
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -252,7 +268,7 @@ async def update_notification_settings(payload: NotificationSettingsPayload, use
 
 
 @router.get("/list")
-async def list_notifications(category: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def list_notifications(category: Optional[str] = None, user: dict = Depends(get_consented_user)):
     pool = get_pool()
     async with pool.acquire() as conn:
         if category:

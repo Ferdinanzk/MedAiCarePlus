@@ -6,7 +6,7 @@ import { Smile, Frown, Meh, Angry, TrendingUp, Camera, ScanFace, Loader2, AlertT
 
 interface EmotionRecord {
   id: number;
-  emotion_type: 'Angry' | 'Happy' | 'Neutral' | 'Sad';
+  emotion_type: 'Angry' | 'Disgust' | 'Fear' | 'Happy' | 'Sad' | 'Surprise' | 'Neutral';
   emotion_score: number;
   recorded_at: string;
 }
@@ -21,6 +21,9 @@ const emotions = [
   { type: 'Neutral' as const, label: 'neutral', icon: Meh, color: 'bg-gray-50 text-gray-600 border-gray-200', bar: 'bg-gray-400' },
   { type: 'Sad' as const, label: 'sad', icon: Frown, color: 'bg-blue-50 text-blue-600 border-blue-200', bar: 'bg-blue-400' },
   { type: 'Angry' as const, label: 'angry', icon: Angry, color: 'bg-red-50 text-red-600 border-red-200', bar: 'bg-red-400' },
+  { type: 'Disgust' as const, label: 'disgust', icon: Frown, color: 'bg-lime-50 text-lime-700 border-lime-200', bar: 'bg-lime-400' },
+  { type: 'Fear' as const, label: 'fear', icon: Frown, color: 'bg-purple-50 text-purple-700 border-purple-200', bar: 'bg-purple-400' },
+  { type: 'Surprise' as const, label: 'surprise', icon: Smile, color: 'bg-yellow-50 text-yellow-700 border-yellow-200', bar: 'bg-yellow-400' },
 ];
 
 export default function Emotion() {
@@ -119,7 +122,15 @@ export default function Emotion() {
     if (!selected) return;
     setSubmitting(true);
     setAlertStatus(null);
-    const score = aiResult?.emotion_score ?? ({ Happy: 0.9, Neutral: 0.5, Sad: 0.25, Angry: 0.1 }[selected] || 0.5);
+    const score = aiResult?.emotion_score ?? ({
+      Happy: 0.9,
+      Neutral: 0.5,
+      Surprise: 0.75,
+      Fear: 0.35,
+      Sad: 0.25,
+      Disgust: 0.2,
+      Angry: 0.1,
+    }[selected] || 0.5);
     const res = await fetch('/api/emotion/log', {
       method: 'POST',
       headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },

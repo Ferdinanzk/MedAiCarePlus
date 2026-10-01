@@ -1,0 +1,126 @@
+{
+  "kind": "core",
+  "version": "2026-10",
+  "language": "en",
+  "title": "MedAiCarePlus Terms of Service and Privacy Notice",
+  "what_changed": [
+    "We now keep a record of which version of this notice you accepted, and when.",
+    "The notice now says who operates this installation and how to contact them.",
+    "Face enrollment photos, backups, and where each kind of data is processed are now described.",
+    "You can now export or delete your data in Settings → Privacy & data.",
+    "Optional Reachy robot features, when offered, have their own notice that you accept separately."
+  ],
+  "sections": [
+    {
+      "id": "operator",
+      "heading": "1. Who is responsible for your data",
+      "blocks": [
+        {"type": "p", "text": "This installation of MedAiCarePlus is operated by **{OPERATOR_NAME}**. Contact: **{OPERATOR_CONTACT}**."}
+      ]
+    },
+    {
+      "id": "service",
+      "heading": "2. What the service does, and does not do",
+      "blocks": [
+        {"type": "p", "text": "MedAiCarePlus helps you manage medication: reminders, recording when medicine is taken, mood tracking, and messages to family members you choose."},
+        {"type": "p", "text": "Detection of medicine taking and of mood is automated and can be wrong. The camera observes hand-to-mouth movement; **it cannot identify which pill you took or how many.** Do not rely on the app alone to decide whether you have taken a medicine."},
+        {"type": "p", "text": "MedAiCarePlus does not diagnose or treat, and does not replace your doctor, pharmacist, or a mental-health professional."},
+        {"type": "p", "text": "**It is not an emergency service and cannot call emergency services. In an emergency call 119.** If you are thinking about harming yourself, call **1925** (24 hours, free), **1995**, or **1980**."}
+      ]
+    },
+    {
+      "id": "purposes",
+      "heading": "3. Why we use your data",
+      "blocks": [
+        {"type": "list", "items": [
+          "Medication management, reminders, and recording doses.",
+          "Mood tracking.",
+          "Messages and alerts to family members you choose.",
+          "Signing you in, including face login.",
+          "Keeping the service secure and working."
+        ]}
+      ]
+    },
+    {
+      "id": "data",
+      "heading": "4. Data we collect",
+      "blocks": [
+        {"type": "list", "items": [
+          "Account: name, email, and your password, stored only as a one-way hash.",
+          "**Face enrollment photos** you take for face login: stored on the home server until you delete them or your account.",
+          "Medication records: names, doses, schedules, times taken, confirmations, and remaining stock.",
+          "Mood: facial-expression analysis results at medication time.",
+          "Live camera images while the app watches you take medicine: **analysed in memory and never saved.**",
+          "Family contacts: names, phone numbers, LINE IDs, and their responses to messages.",
+          "Sign-in history and the notifications sent to you and your family."
+        ]}
+      ]
+    },
+    {
+      "id": "processing",
+      "heading": "5. Where your data is processed, and by whom",
+      "blocks": [
+        {"type": "table",
+         "header": ["Data", "Processed by", "Location", "Kept"],
+         "rows": [
+           ["Account, medication, mood, face enrollment photos, family contacts", "Home server run by {OPERATOR_NAME}", "Your home, Taiwan", "See section 7"],
+           ["Reminders and alerts to you and your family", "LINE (LY Corporation)", "Under LINE's terms", "Under LINE's terms"],
+           ["Secure connection for LINE and remote access", "{TUNNEL_PROVIDER}", "In transit only", "Not stored by us"]
+         ]},
+        {"type": "p", "text": "Your records are kept on the home server, not in a cloud database."}
+      ]
+    },
+    {
+      "id": "sharing",
+      "heading": "6. Who can see what",
+      "blocks": [
+        {"type": "list", "items": [
+          "You: all of your data.",
+          "Family contacts you verify: only the reminders, alerts, and summaries you switch on for them in Settings and Family."
+        ]}
+      ]
+    },
+    {
+      "id": "retention",
+      "heading": "7. How long we keep data",
+      "blocks": [
+        {"type": "table",
+         "header": ["Data", "Kept"],
+         "rows": [
+           ["Medication records, mood, face enrollment photos", "Until you delete them or your account"],
+           ["Live camera images", "Never stored"],
+           ["Server backups", "Nightly copies for 14 days, weekly copies for 4 weeks. Deleted data disappears from backups within 4 weeks, and is deleted again if a backup is ever restored."],
+           ["Messages already sent through LINE", "We cannot delete them from recipients' LINE apps"]
+         ]}
+      ]
+    },
+    {
+      "id": "robot",
+      "heading": "8. Optional Reachy robot",
+      "blocks": [
+        {"type": "p", "text": "If this installation offers the Reachy Mini robot companion, it has a separate notice. The robot's camera, microphone, conversations, and safety alerts are switched on only after you read and accept that notice, and you can switch them off at any time."}
+      ]
+    },
+    {
+      "id": "rights",
+      "heading": "9. Your rights",
+      "blocks": [
+        {"type": "p", "text": "You may ask to view, get a copy of, correct, stop the processing of, or delete your personal data, and you may withdraw any optional consent at any time. Contact **{OPERATOR_CONTACT}**, or use Settings → Privacy & data. Export and deletion are available there even if you have not accepted updated terms."}
+      ]
+    },
+    {
+      "id": "disagree",
+      "heading": "10. If you do not agree",
+      "blocks": [
+        {"type": "p", "text": "You need to accept this notice to use the app. If you do not, you can still export or delete your data and sign out."}
+      ]
+    },
+    {
+      "id": "changes",
+      "heading": "11. Changes to this notice",
+      "blocks": [
+        {"type": "p", "text": "When this notice changes, we will ask you to review and accept it the next time you open the app."}
+      ]
+    }
+  ]
+}

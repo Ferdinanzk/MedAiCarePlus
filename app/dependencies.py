@@ -2,6 +2,7 @@ from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from app.config import SECRET_KEY
+from app.services import consent_service
 
 security = HTTPBearer(auto_error=False)
 
@@ -23,3 +24,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     if face_data and face_data.get("u_id"):
         return {"u_id": face_data["u_id"], "name": face_data.get("name", "")}
     raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+async def get_consented_user(user: dict = Depends(get_current_user)) -> dict:
+    state = await consent_service.get_state(user["u_id"])
+    if not consent_service.is_current(state, "core"):
+        raise HTTPException(status_code=403, detail="consent_required")
+    return user

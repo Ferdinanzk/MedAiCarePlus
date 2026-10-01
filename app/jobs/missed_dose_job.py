@@ -1,7 +1,8 @@
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from app.database import get_pool
 from app.services.line_service import LineService
+from app.services.reachy_tasks import enqueue_reachy_task
 
 # Group size for intake time-slot bucketing. Intakes whose intake_time_stamp
 # falls within the same 5-minute window for the same user are treated as one
@@ -103,6 +104,8 @@ async def check_missed_doses():
 
             time_to_slot = (slot_time - now).total_seconds()
             time_since_slot = (now - slot_time).total_seconds()
+            # A Reachy task for this slot stays useful until the missed window ends.
+            task_expires_at = slot_time + timedelta(minutes=remind_after_minutes * (remind_after_retries + 1))
 
             # --- 1. Upcoming Reminder (one message per slot) ---
             if (
@@ -124,10 +127,13 @@ async def check_missed_doses():
                         u_id,
                         f"Upcoming reminder for {slot_label} slot ({len(med_names)} med(s)): {', '.join(med_names)}",
                     )
-                await conn.execute(
-                    "UPDATE intake SET reminder_sent = TRUE WHERE intk_id = ANY($1::int[])",
-                    intk_ids,
-                )
+                # The reminder flag and the robot task commit together.
+                async with conn.transaction():
+                    await conn.execute(
+                        "UPDATE intake SET reminder_sent = TRUE WHERE intk_id = ANY($1::int[])",
+                        intk_ids,
+                    )
+                    await enqueue_reachy_task(conn, u_id, slot_time, intk_ids, "upcoming", task_expires_at)
 
             # --- 2. Missed Warnings (one message per retry tick per slot) ---
             if time_since_slot > 0:
@@ -150,11 +156,13 @@ async def check_missed_doses():
                             u_id,
                             f"Missed warning ({time_passed_mins}m) for {slot_label} slot ({len(med_names)} med(s)): {', '.join(med_names)}",
                         )
-                    await conn.execute(
-                        "UPDATE intake SET missed_reminders_sent = missed_reminders_sent + 1 "
-                        "WHERE intk_id = ANY($1::int[])",
-                        intk_ids,
-                    )
+                    async with conn.transaction():
+                        await conn.execute(
+                            "UPDATE intake SET missed_reminders_sent = missed_reminders_sent + 1 "
+                            "WHERE intk_id = ANY($1::int[])",
+                            intk_ids,
+                        )
+                        await enqueue_reachy_task(conn, u_id, slot_time, intk_ids, "missed_retry", task_expires_at)
 
                 # --- 3. Final Missed Alert (one per slot per recipient) ---
                 if time_since_slot >= remind_after_retries * remind_after_secs:

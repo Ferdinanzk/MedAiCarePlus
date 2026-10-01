@@ -1,134 +1,84 @@
-import torch
-import torch.nn as nn
-import numpy as np
+"""Seed 43 seven-expression ONNX inference with the original export transform."""
+
+import json
+from pathlib import Path
+
 import cv2
-import math
+import numpy as np
 from PIL import Image
-from torchvision import transforms
+
 from app.config import EMOTION_MODEL_PATH
 
-_CLASS_NAMES = ["Angry", "Happy", "Neutral", "Sad"]
-_IMG_SIZE = 64
-_ROTATION_ALPHA = 0.2
+LABELS = ("angry", "disgust", "fear", "happy", "sad", "surprise", "neutral")
+MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32)[:, None, None]
+STD = np.array((0.229, 0.224, 0.225), dtype=np.float32)[:, None, None]
 
 
-class _CNN(nn.Module):
-    """Exact replica of the training architecture in Facial_Emotion_Detector_Final.py."""
-    def __init__(self, num_classes: int = 4):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 512), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(512, num_classes),
-        )
+def prepare_face(face_bgr: np.ndarray, size: int = 112) -> np.ndarray:
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    image = Image.fromarray(gray).convert("RGB").resize((size, size), resample=Image.Resampling.BILINEAR)
+    values = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / np.float32(255)
+    return ((values - MEAN) / STD)[None, ...]
 
-    def forward(self, x):
-        return self.classifier(self.features(x))
+
+def crop_face(frame_bgr: np.ndarray, box: tuple[int, int, int, int], padding: float = .10) -> np.ndarray:
+    x, y, width, height = box
+    h, w = frame_bgr.shape[:2]
+    left, top = max(0, int(x - width * padding)), max(0, int(y - height * padding))
+    right, bottom = min(w, int(x + width * (1 + padding))), min(h, int(y + height * (1 + padding)))
+    face = frame_bgr[top:bottom, left:right]
+    if face.size == 0:
+        raise ValueError("Face crop is empty")
+    return face
 
 
 class EmotionService:
-    """Singleton wrapping the PyTorch CNN + MediaPipe face mesh."""
-
-    _instance: "EmotionService | None" = None
-    _available: bool = False
+    _instance = None
+    _available = False
 
     def __init__(self):
+        self.error = None
         try:
-            import mediapipe as mp
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            ckpt = torch.load(str(EMOTION_MODEL_PATH), map_location=self.device, weights_only=False)
-            state = ckpt.get("model_state", ckpt)
-            self.class_names = ckpt.get("class_names", _CLASS_NAMES)
-            self.img_size = ckpt.get("img_size", _IMG_SIZE)
-
-            self.model = _CNN(num_classes=len(self.class_names))
-            self.model.load_state_dict(state, strict=False)
-            self.model.to(self.device).eval()
-
-            self.preprocess = transforms.Compose([
-                transforms.Resize((self.img_size, self.img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ])
-            mp_fm = mp.solutions.face_mesh
-            self.face_mesh = mp_fm.FaceMesh(
-                max_num_faces=1, refine_landmarks=True,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5,
-            )
+            import onnxruntime as ort
+            model = Path(EMOTION_MODEL_PATH)
+            metadata = json.loads(model.with_name(model.stem + "_metadata.json").read_text(encoding="utf-8"))
+            if tuple(metadata["labels"]) != LABELS or metadata["preprocess_version"] != "ferplus-gray-rgb-imagenet-v1":
+                raise ValueError("Unexpected seed 43 model metadata")
+            self.size = int(metadata["input_size"])
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            self.session = ort.InferenceSession(str(model), sess_options=options, providers=["CPUExecutionProvider"])
+            self.input_name = self.session.get_inputs()[0].name
             EmotionService._available = True
-            print(f"[Emotion] Loaded on {self.device} — classes: {self.class_names}")
         except Exception as exc:
+            self.error = str(exc)
             EmotionService._available = False
-            print(f"[Emotion] Not available: {exc}")
 
     @classmethod
-    def get_instance(cls) -> "EmotionService":
+    def get_instance(cls):
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
-    def predict_frame(self, frame_bgr: np.ndarray) -> dict:
-        """
-        Returns:
-            {detected, emotion_type, emotion_score, probabilities: {Angry,Happy,Neutral,Sad}, error}
-        """
+    def predict_crop(self, face_bgr: np.ndarray) -> dict:
         if not EmotionService._available:
-            return {"detected": False, "emotion_type": None, "emotion_score": None,
-                    "probabilities": {}, "error": "Model not loaded"}
-        try:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            result = self.face_mesh.process(rgb)
-            if not result.multi_face_landmarks:
-                return {"detected": False, "emotion_type": None, "emotion_score": None,
-                        "probabilities": {}, "error": None}
+            return {"detected": False, "error": self.error or "Seed 43 model unavailable"}
+        logits = np.asarray(self.session.run(None, {self.input_name: prepare_face(face_bgr, self.size)})[0][0], dtype=np.float32)
+        logits -= logits.max()
+        probabilities = np.exp(logits)
+        probabilities /= probabilities.sum()
+        winner = int(probabilities.argmax())
+        return {"detected": True, "emotion_type": LABELS[winner].capitalize(),
+                "emotion_score": float(probabilities[winner]),
+                "probabilities": {name: float(probabilities[i]) for i, name in enumerate(LABELS)}, "error": None}
 
-            H, W = frame_bgr.shape[:2]
-            lms = result.multi_face_landmarks[0].landmark
-            xs = [int(lm.x * W) for lm in lms]
-            ys = [int(lm.y * H) for lm in lms]
-            pad = int(0.3 * max(max(xs) - min(xs), max(ys) - min(ys)))
-            x1 = max(0, min(xs) - pad)
-            y1 = max(0, min(ys) - pad)
-            x2 = min(W, max(xs) + pad)
-            y2 = min(H, max(ys) + pad)
-
-            face = frame_bgr[y1:y2, x1:x2]
-            if face.size == 0:
-                return {"detected": False, "emotion_type": None, "emotion_score": None,
-                        "probabilities": {}, "error": None}
-
-            # Roll alignment using eye keypoints (landmarks 33 = right eye, 263 = left eye)
-            re_x, re_y = int(lms[33].x * W) - x1, int(lms[33].y * H) - y1
-            le_x, le_y = int(lms[263].x * W) - x1, int(lms[263].y * H) - y1
-            dx, dy = le_x - re_x, le_y - re_y
-            if dx > max(10, 0.12 * face.shape[1]):
-                angle = math.degrees(math.atan2(dy, dx))
-                if abs(angle) <= 30:
-                    cx, cy = face.shape[1] // 2, face.shape[0] // 2
-                    M = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
-                    face = cv2.warpAffine(face, M, (face.shape[1], face.shape[0]),
-                                          flags=cv2.INTER_LINEAR,
-                                          borderMode=cv2.BORDER_REPLICATE)
-
-            pil = Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB))
-            inp = self.preprocess(pil).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                probs = torch.softmax(self.model(inp), dim=1).squeeze().cpu().numpy()
-
-            idx = int(np.argmax(probs))
-            return {
-                "detected": True,
-                "emotion_type": self.class_names[idx],
-                "emotion_score": float(probs[idx]),
-                "probabilities": {c: float(p) for c, p in zip(self.class_names, probs)},
-                "error": None,
-            }
-        except Exception as exc:
-            return {"detected": False, "emotion_type": None, "emotion_score": None,
-                    "probabilities": {}, "error": str(exc)}
+    def predict_frame(self, frame_bgr: np.ndarray) -> dict:
+        if not EmotionService._available:
+            return {"detected": False, "error": self.error or "Seed 43 model unavailable"}
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = cascade.detectMultiScale(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), scaleFactor=1.1, minNeighbors=5)
+        if not len(faces):
+            return {"detected": False, "error": None}
+        face = max(faces, key=lambda box: box[2] * box[3])
+        return self.predict_crop(crop_face(frame_bgr, tuple(int(x) for x in face)))

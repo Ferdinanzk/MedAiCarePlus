@@ -1,11 +1,12 @@
 import asyncio
 import cv2
 import numpy as np
+import uuid
 from typing import List
 from fastapi import APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from itsdangerous import URLSafeTimedSerializer
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.config import SECRET_KEY
 from app.database import get_pool
 from app.services.face_recognition_service import FaceRecognitionService
@@ -92,7 +93,7 @@ async def check_pose(file: UploadFile = File(...)):
 @router.post("/enroll")
 async def enroll_face(
     photos: List[UploadFile] = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Save 3 enrollment photos to face gallery.
     face_label is derived from the authenticated user's DB row — never from the request."""
@@ -124,14 +125,22 @@ async def enroll_face(
     label = row["face_label"]
 
     svc = FaceRecognitionService.get_instance()
+    if not FaceRecognitionService._available:
+        return JSONResponse(
+            {"error": "Face recognition model is unavailable"},
+            status_code=503,
+        )
 
     FACE_GALLERY_DIR.mkdir(parents=True, exist_ok=True)
-    saved = []
+    staged: list[tuple[object, object]] = []
+    final_paths = []
     for i, upload in enumerate(photos):
         data = await upload.read()
         nparr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
+            for temp_path, _ in staged:
+                temp_path.unlink(missing_ok=True)
             return JSONResponse({"error": f"Cannot decode photo {i}"}, status_code=400)
 
         # Crop to the detected face before storing. The gallery descriptor is
@@ -140,21 +149,41 @@ async def enroll_face(
         # descriptors to live in the same space and actually match.
         face_img = img
         try:
-            rois = svc.face_det.infer((img,))
-            if rois:
-                roi = rois[0]
-                x, y = int(roi.position[0]), int(roi.position[1])
-                w, h = int(roi.size[0]), int(roi.size[1])
-                crop = img[max(0, y):y + h, max(0, x):x + w]
-                if crop.size:
-                    face_img = crop
+            with svc.lock:
+                rois = svc.face_det.infer((img,))
+            if not rois:
+                for temp_path, _ in staged:
+                    temp_path.unlink(missing_ok=True)
+                return JSONResponse(
+                    {"error": f"No face detected in photo {i}"},
+                    status_code=400,
+                )
+            roi = rois[0]
+            x, y = int(roi.position[0]), int(roi.position[1])
+            w, h = int(roi.size[0]), int(roi.size[1])
+            crop = img[max(0, y):y + h, max(0, x):x + w]
+            if crop.size:
+                face_img = crop
         except Exception:
-            # If detection is unavailable, fall back to the full frame.
-            pass
+            for temp_path, _ in staged:
+                temp_path.unlink(missing_ok=True)
+            return JSONResponse(
+                {"error": f"Face detection failed for photo {i}"},
+                status_code=503,
+            )
 
-        path = FACE_GALLERY_DIR / f"{label}-{i}.jpg"
-        cv2.imwrite(str(path), face_img)
-        saved.append(str(path))
+        temp_path = FACE_GALLERY_DIR / f".{label}-{uuid.uuid4().hex}-{i}.jpg"
+        if not cv2.imwrite(str(temp_path), face_img):
+            for old_temp, _ in staged:
+                old_temp.unlink(missing_ok=True)
+            temp_path.unlink(missing_ok=True)
+            return JSONResponse({"error": f"Cannot save photo {i}"}, status_code=500)
+        final_path = FACE_GALLERY_DIR / f"{label}-{i}.jpg"
+        staged.append((temp_path, final_path))
+        final_paths.append(final_path)
+
+    for temp_path, final_path in staged:
+        temp_path.replace(final_path)
 
     svc.reload_gallery()
 
@@ -166,11 +195,11 @@ async def enroll_face(
             row["u_id"],
         )
 
-    return {"saved": saved, "face_label": label}
+    return {"saved": [str(path) for path in final_paths], "face_label": label}
 
 
 @router.get("/enrollment-status")
-async def enrollment_status(user: dict = Depends(get_current_user)):
+async def enrollment_status(user: dict = Depends(get_consented_user)):
     """Report whether the authenticated user already has an enrolled face.
 
     Used by the onboarding wizard to skip the 3-pose capture when the gallery

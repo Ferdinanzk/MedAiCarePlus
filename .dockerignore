@@ -3,3 +3,6 @@ frontend_source/dist
 .git
 .env
 *.log
+
+backups/
+ledger/

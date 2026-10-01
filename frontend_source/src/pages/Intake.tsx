@@ -1,941 +1,574 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useParams, useSearchParams } from 'react-router-dom';
+import { Bot, Camera, CheckCircle2, Clock, Pill, ScanFace, ShieldCheck, TriangleAlert, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useSearchParams, useParams } from 'react-router-dom';
-import { getFaceToken } from '../lib/face-auth';
-import { aiApi } from '../lib/ai-api';
-import { useMediaPipe } from '../hooks/useMediaPipe';
-import { useIntakeDetection } from '../hooks/useIntakeDetection';
-import { useTTS } from '../hooks/useTTS';
-import {
-  Pill,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  AlertCircle,
-  Loader2,
-  Camera,
-  ScanFace,
-  AlertTriangle,
-  RefreshCw,
-  Volume2,
-} from 'lucide-react';
+import { fetchReachyStatus, queueReachyTask } from '../lib/reachy-api';
+import { getFaceAuthHeaders } from '../lib/face-auth';
 
 interface IntakeItem {
   id: number;
-  medication_id: number;
-  medication_name: string;
+  med_id: number;
+  name: string;
   dosage: string | null;
   scheduled_time: string | null;
-  status: 'pending' | 'taken' | 'skipped' | 'missed';
+  status: 'pending' | 'missed' | 'taken' | 'skipped' | 'pending_confirmation';
   pills_remaining: number;
-  dosage_amount: number;
-  warning?: string | null;
+  warning: string | null;
 }
 
-interface RawIntakeItem {
-  id: number;
-  med_id?: number;
-  medication_id?: number;
-  medication_name?: string;
-  name?: string;
-  dosage?: string | null;
-  scheduled_time?: string | null;
-  status?: string;
-  pills_remaining?: number;
-  dosage_amount?: number;
-  warning?: string | null;
+interface Candidate {
+  event_id: string;
+  decision: 'confirmed' | 'uncertain';
+  confidence: number;
+  ready: boolean;
 }
 
-type Phase = 'list' | 'ready' | 'detecting' | 'pre' | 'post' | 'complete';
+interface MonitorStatus {
+  session_id: string;
+  generation: string;
+  name: string;
+  intk_id: number;
+  frame_seq: number;
+  identity_status: string;
+  identity_distance: number | null;
+  emotion: { emotion_type: string; emotion_score: number; probabilities: Record<string, number> } | null;
+  detector: { stage: string; decision: string; event_confidence: number } | null;
+  candidate: Candidate | null;
+  recorded: { event_id: string; status: string; emotion_id?: number } | null;
+}
 
-function getAuthHeaders(): Record<string, string> {
-  const token = getFaceToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
+interface RecentEvent { event_id: string; intk_id: number; recorded_at: string }
+interface WorkerResult {
+  type: string;
+  frame_seq: number;
+  generation: string;
+  timestamp: number;
+  width: number;
+  height: number;
+  faces: unknown[];
+  hands: unknown[];
+  poses: unknown[];
+  error?: string;
+}
+
+const MAX_FRAME_WIDTH = 640;
+const MAX_FRAME_HEIGHT = 480;
+const FRAME_ERROR_MESSAGE = 'Camera frame unavailable. Retrying…';
+
+async function api<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(url, { ...init, headers: { ...getFaceAuthHeaders(), ...init.headers } });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`);
+  return body as T;
+}
+
+function detectorMessage(stage: string | undefined, name: string, engineReady: boolean): string {
+  if (!engineReady) return 'Loading camera models';
+  const possessive = name.endsWith('s') ? `${name}'` : `${name}'s`;
+  switch (stage) {
+    case 'WAITING_FOR_PEARL': return `Waiting for ${possessive} face`;
+    case 'APPROACHING': return 'Monitoring pill movement';
+    case 'AT_MOUTH': return 'Checking the pill at the mouth';
+    case 'OCCLUDED': return 'Hand near face; checking intake';
+    case 'WITHDRAWING': return 'Checking pill withdrawal';
+    default: return 'Waiting for intake movement';
+  }
 }
 
 export default function Intake() {
-  const { t, i18n } = useTranslation();
-  const { speak, stop: stopTTS, isSpeaking } = useTTS();
-  const [searchParams] = useSearchParams();
   const params = useParams();
-  const highlightMedId = searchParams.get('med') || params.medicationId || null;
-  const [intakes, setIntakes] = useState<IntakeItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [skippingId, setSkippingId] = useState<number | null>(null);
-  const [skipNote, setSkipNote] = useState('');
-
-  // Phase-based flow
-  const [phase, setPhase] = useState<Phase>('list');
-  const [activeItem, setActiveItem] = useState<IntakeItem | null>(null);
-  const [sessionId] = useState(() => crypto.randomUUID());
-
-  // Emotion modal state
-  const [, setPreEmotionId] = useState<number | null>(null);
-
-  // AI emotion detection state
+  const [searchParams] = useSearchParams();
+  const highlight = params.medicationId || searchParams.get('med');
+  const startNow = searchParams.get('start') === '1';
+  const [items, setItems] = useState<IntakeItem[]>([]);
+  const [active, setActive] = useState<IntakeItem | null>(null);
+  const [status, setStatus] = useState<MonitorStatus | null>(null);
+  const [recent, setRecent] = useState<RecentEvent | null>(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [engineReady, setEngineReady] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const { t } = useTranslation();
+  const [reachyPaired, setReachyPaired] = useState(false);
+  const [reachyNotice, setReachyNotice] = useState('');
   const videoRef = useRef<HTMLVideoElement>(null);
-  const mountedRef = useRef(true);
-  const cameraStartingRef = useRef(false);
-  const [cameraOn, setCameraOn] = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState('');
-  const [aiResult, setAiResult] = useState<{
-    emotion_type?: string;
-    emotion_score?: number;
-    probabilities?: Record<string, number>;
-  } | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionRef = useRef<MonitorStatus | null>(null);
+  const sequenceRef = useRef(0);
+  const workerBusyRef = useRef(false);
+  const landmarkBusyRef = useRef(false);
+  const visionBusyRef = useRef(false);
+  const lastVisionRef = useRef(0);
+  const blobRef = useRef<{ sequence: number; promise: Promise<Blob | null> } | null>(null);
+  const latestStatusFrameRef = useRef(0);
+  const latestStatusRef = useRef<MonitorStatus | null>(null);
+  const lastRecordedEventRef = useRef<string | null>(null);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshQueuedRef = useRef(false);
+  const autoStartedRef = useRef(false);
+  const frameFailureRef = useRef({ count: 0, lastReportedAt: 0 });
+  const frameRetryAfterRef = useRef(0);
 
-  // Detection timing
-  const [detectionStartTime, setDetectionStartTime] = useState<number | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const reportFrameError = useCallback((cause: unknown) => {
+    const failure = frameFailureRef.current;
+    failure.count += 1;
+    const now = Date.now();
+    frameRetryAfterRef.current = now + Math.min(1000, 100 * (2 ** Math.min(failure.count - 1, 3)));
+    // A camera allocation/read failure is recoverable. Keep retrying, but do
+    // not turn a transient browser resource limit into a render/error loop.
+    if (failure.count === 1 || now - failure.lastReportedAt >= 5000) {
+      failure.lastReportedAt = now;
+      setError(FRAME_ERROR_MESSAGE);
+    }
+    void cause;
+  }, []);
 
-  // Store detection confidence for recording after pre-emotion
-  const detectionConfidenceRef = useRef<number>(0);
+  const clearFrameError = useCallback(() => {
+    const failure = frameFailureRef.current;
+    if (!failure.count) return;
+    failure.count = 0;
+    frameRetryAfterRef.current = 0;
+    setError((current) => current === FRAME_ERROR_MESSAGE ? '' : current);
+  }, []);
 
-  // MediaPipe + Detection
-  const { handLandmarker, faceLandmarker, isLoaded: mediaPipeLoaded, error: mediaPipeError } = useMediaPipe();
-  const {
-    videoRef: detectionVideoRef,
-    confidence,
-    status: detectionStatus,
-    start: startDetection,
-    stop: stopDetection,
-  } = useIntakeDetection(
-    sessionId,
-    (conf) => {
-      stopCamera();
-      stopDetection();
-      detectionConfidenceRef.current = conf;
-      // Record intake after detection succeeds, then go to post-emotion
-      if (activeItem) {
-        aiApi.recordIntake({
-          intk_id: activeItem.id,
-          detection_confidence: conf,
-          detection_method: 'auto',
-        }).then(() => {
-          updateStatus(activeItem.id, 'taken');
-        });
-      }
-      setPhase('post');
-      resetAiState();
-      startCamera();
-    },
-    (err) => setAiError(err)
-  );
-
-  const startCamera = useCallback(async () => {
-    if (cameraStartingRef.current) return;
-    cameraStartingRef.current = true;
+  const refresh = useCallback(async () => {
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true;
+      return refreshInFlightRef.current;
+    }
+    const request = (async () => {
+      do {
+        refreshQueuedRef.current = false;
+        try {
+          const rows = await api<IntakeItem[]>('/api/medications/today');
+          setItems(rows);
+          const events = await api<RecentEvent[]>('/api/intake/monitor/recent');
+          setRecent(events[0] || null);
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : 'Could not load medication schedule');
+        }
+      } while (refreshQueuedRef.current);
+    })();
+    refreshInFlightRef.current = request;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
-      if (!mountedRef.current) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      // Wait for DOM to settle after phase transition (200ms)
-      await new Promise((r) => setTimeout(r, 200));
-
-      let videoReady = false;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        try {
-          await videoRef.current.play();
-          // Wait for loadedmetadata to confirm frames are flowing
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('video metadata timeout')), 2000);
-            const handler = () => {
-              clearTimeout(timeout);
-              videoRef.current?.removeEventListener('loadedmetadata', handler);
-              resolve();
-            };
-            if (videoRef.current!.readyState >= 1) {
-              clearTimeout(timeout);
-              resolve(); // already loaded
-            } else {
-              videoRef.current!.addEventListener('loadedmetadata', handler);
-            }
-          });
-          videoReady = true;
-        } catch (e) {
-          console.error('[Intake] videoRef play error:', e);
-        }
-      }
-
-      if (detectionVideoRef.current) {
-        detectionVideoRef.current.srcObject = stream;
-        try {
-          await detectionVideoRef.current.play();
-        } catch (e) {
-          console.error('[Intake] detectionVideoRef play error:', e);
-        }
-      }
-
-      // Only mark camera as ON after video confirmed ready
-      if (videoReady) {
-        setCameraOn(true);
-        setAiError('');
-      } else {
-        setAiError('Camera stream started but video not ready. Please retry.');
-        stream.getTracks().forEach((t) => t.stop());
-      }
-    } catch (err) {
-      console.error('[Intake] getUserMedia error:', err);
-      if (mountedRef.current) {
-        setAiError('Camera access denied or not available');
-      }
+      await request;
     } finally {
-      cameraStartingRef.current = false;
+      if (refreshInFlightRef.current === request) refreshInFlightRef.current = null;
     }
-  }, [detectionVideoRef]);
+  }, []);
 
-  const stopCamera = useCallback(() => {
-    const el = videoRef.current;
-    const detEl = detectionVideoRef.current;
-    if (el) {
-      const stream = el.srcObject as MediaStream | null;
-      el.srcObject = null;
-      stream?.getTracks().forEach((t) => t.stop());
-    }
-    if (detEl && detEl !== el) {
-      const stream = detEl.srcObject as MediaStream | null;
-      detEl.srcObject = null;
-      stream?.getTracks().forEach((t) => t.stop());
-    }
-    setCameraOn(false);
-  }, [detectionVideoRef]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    fetchIntakes();
-    return () => {
-      mountedRef.current = false;
-    };
+  const releaseResources = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    workerBusyRef.current = false;
+    landmarkBusyRef.current = false;
+    visionBusyRef.current = false;
+    blobRef.current = null;
+    frameFailureRef.current = { count: 0, lastReportedAt: 0 };
+    frameRetryAfterRef.current = 0;
   }, []);
 
   useEffect(() => {
-    if ((phase === 'pre' || phase === 'post') && !cameraOn) {
-      startCamera();
-    } else if (phase === 'list' || phase === 'complete' || phase === 'ready') {
-      stopCamera();
-    }
-  }, [phase, cameraOn, startCamera, stopCamera]);
+    let active = true;
+    fetchReachyStatus().then(status => { if (active) setReachyPaired(status.paired); }, () => undefined);
+    return () => { active = false; };
+  }, []);
 
-  // Elapsed timer during detection
-  useEffect(() => {
-    if (phase !== 'detecting' || !detectionStartTime) {
-      setElapsedSeconds(0);
-      return;
-    }
-    const interval = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - detectionStartTime) / 1000));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [phase, detectionStartTime]);
-
-  // Auto-speak the medication warning when entering the 'ready' phase.
-  useEffect(() => {
-    if (phase === 'ready' && activeItem) {
-      const warningText = activeItem.warning
-        ? t('intake.tts.warningPrefix') + activeItem.warning
-        : t('intake.tts.genericWarning');
-      const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
-      speak(warningText, lang);
-    }
-    return () => stopTTS();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, activeItem]);
-
-  // Auto-speak the cheerful encouragement when entering the 'complete' phase.
-  useEffect(() => {
-    if (phase === 'complete') {
-      const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
-      speak(t('intake.tts.cheerUp'), lang);
-    }
-    return () => stopTTS();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
-
-  const captureVideoAndAnalyze = async () => {
-    if (!videoRef.current || !cameraOn) {
-      console.error('[Intake] captureVideoAndAnalyze early return. videoRef=', !!videoRef.current, 'cameraOn=', cameraOn);
-      setAiError('Camera not ready. Please retry.');
-      return;
-    }
-
-    setAiLoading(true);
-    setAiError('');
-    setAiResult(null);
-
-    const video = videoRef.current;
-
-    // Guard: ensure camera has real frames using loadedmetadata
+  const startWithReachy = async (item: IntakeItem) => {
+    setError('');
     try {
-      await new Promise<void>((resolve, reject) => {
-        if (video.videoWidth && video.videoHeight) {
-          resolve(); // already ready
-          return;
-        }
-        const timeout = setTimeout(() => reject(new Error('Camera not ready after 3s')), 3000);
-        const handler = () => {
-          clearTimeout(timeout);
-          video.removeEventListener('loadedmetadata', handler);
-          resolve();
-        };
-        video.addEventListener('loadedmetadata', handler);
-      });
-    } catch (e) {
-      console.error('[Intake] Camera readiness error:', e);
-      setAiError('Camera still initializing. Please wait a moment and try again.');
-      setAiLoading(false);
-      return;
+      await queueReachyTask(item.id);
+      setReachyNotice(t('reachy.taskQueued', { name: item.name }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not start Reachy');
     }
+  };
 
-    // Multi-frame capture
-    const frames: Blob[] = [];
-    const frameCount = 10;
-    const intervalMs = 300;
+  useEffect(() => {
+    void refresh();
+    return () => {
+      releaseResources();
+      const session = sessionRef.current;
+      if (session) {
+        void api('/api/intake/monitor/end', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: session.session_id, generation: session.generation }),
+        }).catch(() => {});
+      }
+      sessionRef.current = null;
+    };
+  }, [refresh, releaseResources]);
 
-    for (let i = 0; i < frameCount; i++) {
-      await new Promise((r) => setTimeout(r, intervalMs));
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx2d = canvas.getContext('2d');
-      ctx2d?.drawImage(video, 0, 0);
-      const blob = await new Promise<Blob | null>((resolve) =>
-        canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.9)
-      );
-      if (blob) frames.push(blob);
+  const stop = useCallback(() => {
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    releaseResources();
+    setActive(null);
+    setStatus(null);
+    setCameraReady(false);
+    setEngineReady(false);
+    if (session) {
+      void api('/api/intake/monitor/end', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id, generation: session.generation }),
+      }).catch(() => {});
     }
+    void refresh();
+  }, [releaseResources, refresh]);
 
+  const acceptStatus = (next: MonitorStatus, session: MonitorStatus) => {
+    if (sessionRef.current?.generation !== session.generation) return;
+    // Landmark and image requests can complete in a different order. Keep a
+    // response from an older frame from moving the UI back to an earlier state.
+    if (next.frame_seq < latestStatusFrameRef.current) return;
+    if (next.frame_seq === latestStatusFrameRef.current && latestStatusRef.current?.recorded && !next.recorded) return;
+    latestStatusFrameRef.current = next.frame_seq;
+    latestStatusRef.current = next;
+    setStatus(next);
+    const recordedEventId = next.recorded?.status === 'taken' ? next.recorded.event_id : null;
+    if (recordedEventId && lastRecordedEventRef.current !== recordedEventId) {
+      lastRecordedEventRef.current = recordedEventId;
+      setRecent({ event_id: recordedEventId, intk_id: next.intk_id, recorded_at: new Date().toISOString() });
+      void refresh();
+    }
+  };
+
+  const sendVision = async (session: MonitorStatus, sequence: number, blob: Blob) => {
+    if (visionBusyRef.current) return;
+    visionBusyRef.current = true;
     try {
-      const form = new FormData();
-      const ctx = phase === 'pre' ? 'pre_ingestion' : 'post_ingestion';
-      form.append('context', ctx);
-      frames.forEach((blob, idx) => form.append('frames', blob, `frame_${idx}.jpg`));
-
-      const res = await fetch('/api/emotion/analyze-batch', {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: form,
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+      const body = new FormData();
+      body.append('session_id', session.session_id);
+      body.append('generation', session.generation);
+      body.append('frame_seq', String(sequence));
+      body.append('file', blob, 'frame.jpg');
+      const result = await api<MonitorStatus>('/api/intake/monitor/vision', { method: 'POST', body });
+      acceptStatus(result, session);
+    } catch (cause) {
+      if (sessionRef.current?.generation === session.generation) {
+        setError(cause instanceof Error ? cause.message : 'Face verification failed');
       }
-
-      const result = await res.json();
-      if (!result.detected) {
-        throw new Error(result.error || 'No face detected');
-      }
-
-      setAiResult(result);
-    } catch (err) {
-      console.error('[Intake] Batch analysis error:', err);
-      setAiError(err instanceof Error ? err.message : 'Analysis failed');
     } finally {
-      setAiLoading(false);
+      visionBusyRef.current = false;
     }
   };
 
-  const fetchIntakes = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/medications/today', { headers: getAuthHeaders() });
-      if (res.ok) {
-        const data = await res.json() as RawIntakeItem[];
-        setIntakes(data.map((item: RawIntakeItem) => ({
-          id: item.id,
-          medication_id: item.med_id || item.medication_id || item.id,
-          medication_name: item.medication_name ?? item.name ?? '',
-          dosage: item.dosage ?? null,
-          scheduled_time: item.scheduled_time ?? null,
-          status: (item.status || 'pending') as IntakeItem['status'],
-          pills_remaining: item.pills_remaining ?? 999,
-          dosage_amount: item.dosage_amount ?? 1,
-          warning: item.warning ?? null,
-        })));
-      }
-    } catch {
-      // network or parse error — leave state unchanged
-    }
-    setLoading(false);
-  };
-
-  const updateStatus = async (id: number, status: 'taken' | 'skipped') => {
-    await fetch(`/api/medications/intake/${id}`, {
-      method: 'PATCH',
-      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status }),
-    });
-    fetchIntakes();
-  };
-
-  const saveEmotion = async (emotionType: string, score: number, _note: string, _intakeId: number | null, ctx?: string): Promise<boolean> => {
-    try {
-      const res = await fetch('/api/emotion/log', {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emotion_type: emotionType, emotion_score: score, note: _note || '', context: ctx }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        console.error('Failed to save emotion:', err);
-        return false;
-      }
-      return true;
-    } catch (e) {
-      console.error('saveEmotion exception:', e);
-      return false;
-    }
-  };
-
-  const confirmAiEmotion = async () => {
-    if (!aiResult?.emotion_type || !activeItem) return;
-    const ctx = phase === 'pre' ? 'pre_ingestion' : 'post_ingestion';
-    const success = await saveEmotion(aiResult.emotion_type, aiResult.emotion_score ?? 0.5, '', null, ctx);
-    if (!success) {
-      setAiError('Failed to save emotion. Please try again.');
+  const handleResult = async (message: WorkerResult, session: MonitorStatus) => {
+    workerBusyRef.current = false;
+    if (message.type === 'error') {
+      reportFrameError(message.error || 'Camera model failed');
       return;
     }
-    if (phase === 'pre') {
-      resetAiState();
-      setPhase('detecting');
-      setDetectionStartTime(Date.now());
-      setElapsedSeconds(0);
-      // Defer camera start so the detecting-phase video element mounts first,
-      // ensuring the stream is attached to the correct DOM node.
-      setTimeout(() => {
-        startCamera().then(() => {
-          if (handLandmarker.current && faceLandmarker.current) {
-            startDetection(handLandmarker.current, faceLandmarker.current);
-          }
-        });
-      }, 0);
-    } else {
-      resetAiState();
-      setPhase('complete');
-    }
-  };
-
-  const resetAiState = () => {
-    setAiResult(null);
-    setAiError('');
-    setAiLoading(false);
-  };
-
-  const handleTakeClick = (item: IntakeItem) => {
-    if (item.pills_remaining <= 0) return;
-    setActiveItem(item);
-    setPhase('ready');
-    resetAiState();
-    setAiError('');
-  };
-
-  const setVideoRefs = useCallback((el: HTMLVideoElement | null) => {
-    (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
-    (detectionVideoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
-  }, [detectionVideoRef]);
-
-  const handleReadyConfirm = () => {
-    setPhase('pre');
-    setDetectionStartTime(null);
-    setElapsedSeconds(0);
-    resetAiState();
-    setAiError('');
-    startCamera();
-  };
-
-  const handleReadyCancel = () => {
-    stopTTS();
-    setPhase('list');
-    setActiveItem(null);
-    resetAiState();
-    setAiError('');
-  };
-
-  const replayWarning = () => {
-    if (!activeItem) return;
-    const warningText = activeItem.warning
-      ? t('intake.tts.warningPrefix') + activeItem.warning
-      : t('intake.tts.genericWarning');
-    const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
-    speak(warningText, lang);
-  };
-
-  const replayCheerUp = () => {
-    const lang = i18n.language === 'en' ? 'en-US' : 'zh-TW';
-    speak(t('intake.tts.cheerUp'), lang);
-  };
-
-  const handleManualConfirm = () => {
-    stopDetection();
-    stopCamera();
-    detectionConfidenceRef.current = 0;
-    setPhase('post');
-    setDetectionStartTime(null);
-    setElapsedSeconds(0);
-    resetAiState();
-    if (activeItem) {
-      aiApi.recordIntake({
-        intk_id: activeItem.id,
-        detection_confidence: 0,
-        detection_method: 'manual',
-      }).then(() => {
-        updateStatus(activeItem.id, 'taken');
+    if (message.type !== 'result' || message.generation !== session.generation ||
+        sessionRef.current?.generation !== session.generation) return;
+    landmarkBusyRef.current = true;
+    try {
+      const result = await api<MonitorStatus>('/api/intake/monitor/landmarks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: session.session_id, generation: session.generation,
+          frame_seq: message.frame_seq, timestamp: message.timestamp,
+          width: message.width, height: message.height,
+          faces: message.faces, hands: message.hands, poses: message.poses,
+        }),
       });
-    }
-    startCamera();
-  };
-
-  const getGuidanceText = () => {
-    if (confidence >= 50) return t('intake.guidanceAlmost');
-    if (detectionStatus === 'HAND_AT_MOUTH') return t('intake.guidanceHand');
-    return t('intake.guidanceIdle');
-  };
-
-  const handleCancelDetection = () => {
-    stopTTS();
-    stopDetection();
-    stopCamera();
-    setPhase('list');
-    setActiveItem(null);
-    setDetectionStartTime(null);
-    setElapsedSeconds(0);
-  };
-
-  const handleSkipConfirm = async (item: IntakeItem) => {
-    await updateStatus(item.id, 'skipped');
-    setSkippingId(null);
-    setSkipNote('');
-  };
-
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case 'taken':
-        return <CheckCircle2 className="w-5 h-5 text-green-500" />;
-      case 'skipped':
-        return <XCircle className="w-5 h-5 text-orange-500" />;
-      case 'missed':
-        return <AlertCircle className="w-5 h-5 text-red-500" />;
-      default:
-        return <Clock className="w-5 h-5 text-gray-400" />;
+      acceptStatus(result, session);
+      const pending = blobRef.current;
+      if (pending?.sequence === message.frame_seq) {
+        blobRef.current = null;
+        const blob = await pending.promise;
+        if (blob && sessionRef.current?.generation === session.generation) {
+          void sendVision(session, message.frame_seq, blob);
+        }
+      }
+    } catch (cause) {
+      if (sessionRef.current?.generation === session.generation) {
+        setError(cause instanceof Error ? cause.message : 'Intake detector failed');
+      }
+    } finally {
+      landmarkBusyRef.current = false;
     }
   };
 
-  const getStatusBadge = (status: string) => {
-    switch (status) {
-      case 'taken':
-        return <span className="text-2xs font-medium px-2 py-1 rounded-full bg-green-50 text-green-600">{t('intake.taken')}</span>;
-      case 'skipped':
-        return <span className="text-2xs font-medium px-2 py-1 rounded-full bg-orange-50 text-orange-600">{t('intake.skipped')}</span>;
-      case 'missed':
-        return <span className="text-2xs font-medium px-2 py-1 rounded-full bg-red-50 text-red-600">{t('intake.missed')}</span>;
-      default:
-        return <span className="text-2xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-600">{t('intake.pending')}</span>;
+  const tick = async (session: MonitorStatus) => {
+    const video = videoRef.current;
+    if (sessionRef.current?.generation !== session.generation || !video ||
+        video.readyState < 2 || workerBusyRef.current || landmarkBusyRef.current ||
+        Date.now() < frameRetryAfterRef.current) return;
+    const worker = workerRef.current;
+    const canvas = canvasRef.current;
+    if (!worker || !canvas) return;
+    workerBusyRef.current = true;
+    try {
+      // Read a bounded frame from one reusable canvas. Transferring the pixel
+      // buffer keeps at most one frame in flight and avoids allocating an
+      // ImageBitmap for every timer tick (which can fail on mobile browsers).
+      const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+      if (!context) throw new Error('Camera canvas is unavailable');
+      const sourceWidth = video.videoWidth || video.clientWidth || MAX_FRAME_WIDTH;
+      const sourceHeight = video.videoHeight || video.clientHeight || MAX_FRAME_HEIGHT;
+      const scale = Math.min(1, MAX_FRAME_WIDTH / sourceWidth, MAX_FRAME_HEIGHT / sourceHeight);
+      const width = Math.max(1, Math.round(sourceWidth * scale));
+      const height = Math.max(1, Math.round(sourceHeight * scale));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      context.drawImage(video, 0, 0, width, height);
+      const sequence = ++sequenceRef.current;
+      const now = performance.now();
+      const captureVision = !visionBusyRef.current && now - lastVisionRef.current >= 200;
+      const pixels = context.getImageData(0, 0, width, height);
+      worker.postMessage(
+        { type: 'frame', frame_data: pixels.data.buffer, width, height,
+          frame_seq: sequence, generation: session.generation, timestamp: now },
+        [pixels.data.buffer]
+      );
+      // Register the JPEG only after the worker owns the frame successfully;
+      // a failed post cannot leave an orphaned blob waiting for a result.
+      if (captureVision) {
+        blobRef.current = { sequence, promise: new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', .75)) };
+        lastVisionRef.current = now;
+      }
+      clearFrameError();
+    } catch (cause) {
+      workerBusyRef.current = false;
+      reportFrameError(cause);
     }
   };
 
-  // Detection overlay UI
-  if (phase === 'detecting' && activeItem) {
-    return (
-      <div className="fixed inset-0 bg-black z-50 flex items-center justify-center">
-        <div className="w-full max-w-lg h-full flex flex-col relative">
-          <video
-            ref={setVideoRefs}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-cover"
-          />
-          <div className={`absolute inset-0 flex flex-col items-center justify-center text-white transition-opacity duration-300 ${cameraOn || aiError ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
-            <Camera className="w-12 h-12 mb-3 opacity-60" />
-            <p className="text-sm opacity-80">Camera starting...</p>
-          </div>
+  const start = async (item: IntakeItem) => {
+    if (loading || sessionRef.current) return;
+    setLoading(true);
+    setError('');
+    setActive(item);
+    latestStatusFrameRef.current = 0;
+    latestStatusRef.current = null;
+    lastRecordedEventRef.current = null;
+    try {
+      const session = await api<MonitorStatus>('/api/intake/monitor/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intk_id: item.id }),
+      });
+      sessionRef.current = session;
+      latestStatusFrameRef.current = session.frame_seq;
+      latestStatusRef.current = session;
+      setStatus(session);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false, video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      streamRef.current = stream;
+      if (!videoRef.current) throw new Error('Camera view is unavailable');
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+      setCameraReady(true);
+      // The MediaPipe WASM loader uses importScripts, so this must stay a
+      // classic worker. Vite emits this worker as an IIFE bundle.
+      const worker = new Worker(new URL('../workers/monitorWorker.ts', import.meta.url));
+      workerRef.current = worker;
+      worker.onmessage = (event: MessageEvent<WorkerResult>) => {
+        if (event.data.type === 'ready') {
+          setEngineReady(true);
+          timerRef.current = setInterval(() => void tick(session), 66);
+        } else if (event.data.type === 'error') {
+          setError(event.data.error || 'Camera model failed');
+          void stop();
+        } else {
+          void handleResult(event.data, session);
+        }
+      };
+      worker.onerror = (event) => {
+        setError(event.message || 'Camera worker could not start');
+        void stop();
+      };
+      worker.postMessage({ type: 'init' });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not start monitoring');
+      stop();
+    } finally {
+      setLoading(false);
+    }
+  };
 
-          <div className={`absolute inset-0 flex flex-col items-center justify-center text-white p-8 transition-opacity duration-300 ${aiError ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-            <AlertTriangle className="w-12 h-12 mb-3 text-yellow-400" />
-            <p className="text-base text-center mb-6">{aiError}</p>
-            <div className="space-y-3 w-full max-w-xs">
-              <button
-                onClick={() => { setAiError(''); startCamera(); }}
-                className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
-              >
-                {t('intake.retryCamera')}
-              </button>
-              <button
-                onClick={handleManualConfirm}
-                className="w-full py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
-              >
-                {t('intake.skipDetection')}
-              </button>
-            </div>
-          </div>
-
-          {/* Overlay info */}
-          <div className="absolute top-0 left-0 right-0 p-4 bg-gradient-to-b from-black/60 to-transparent">
-            <h3 className="text-white font-semibold text-lg">{activeItem.medication_name}</h3>
-            <p className="text-white/80 text-sm">{getGuidanceText()}</p>
-          </div>
-
-          {/* Confidence meter */}
-          <div className="absolute bottom-24 left-4 right-4">
-            <div className="bg-black/50 rounded-xl p-4 backdrop-blur-sm space-y-2">
-              <div className="flex justify-between text-white text-sm mb-2">
-                <span>Confidence</span>
-                <span className="font-mono">{confidence}%</span>
-              </div>
-              <div className="w-full h-3 bg-gray-700 rounded-full overflow-hidden">
-                <div
-                  className="h-full transition-all duration-200 rounded-full"
-                  style={{
-                    width: `${confidence}%`,
-                    backgroundColor: confidence >= 50 ? '#22c55e' : confidence >= 25 ? '#eab308' : '#ef4444',
-                  }}
-                />
-              </div>
-              <div className="flex justify-between items-center">
-                <p className="text-white/70 text-xs">{detectionStatus}</p>
-                <p className="text-white/60 text-xs">{t('intake.elapsed')}: {Math.floor(elapsedSeconds / 60)}:{String(elapsedSeconds % 60).padStart(2, '0')}</p>
-              </div>
-              {!mediaPipeLoaded && !mediaPipeError && (
-                <p className="text-yellow-300 text-xs">Loading MediaPipe...</p>
-              )}
-              {mediaPipeError && (
-                <p className="text-red-300 text-xs">{mediaPipeError}</p>
-              )}
-            </div>          </div>
-
-          {/* Cancel + Manual buttons */}
-          <div className="absolute bottom-4 left-4 right-4 space-y-2">
-            {elapsedSeconds >= 15 && (
-              <button
-                onClick={handleManualConfirm}
-                className="w-full py-4 bg-white/20 text-white text-base rounded-xl font-medium hover:bg-white/30 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
-              >
-                {t('intake.manualConfirm')}
-              </button>
-            )}
-            <button
-              onClick={handleCancelDetection}
-              className="w-full py-4 bg-white/10 text-white/80 text-base rounded-xl font-medium hover:bg-white/20 active:scale-95 transition-all touch-target-large backdrop-blur-sm"
-            >
-              {t('common.cancel')}
-            </button>
-          </div>
-        </div>
-      </div>
+  // Medication cards can request an immediate camera session. Resolve the
+  // highlighted medication to an existing due row, or ask the backend for a
+  // locked pending row at the current time when today's schedule has passed
+  // or the medication is unscheduled.
+  useEffect(() => {
+    if (!startNow || !highlight || autoStartedRef.current || active || loading) return;
+    const medId = Number(highlight);
+    if (!Number.isInteger(medId) || medId <= 0) {
+      autoStartedRef.current = true;
+      setError('The selected medication could not be found');
+      return;
+    }
+    const due = items.find((item) =>
+      item.med_id === medId && (item.status === 'pending' || item.status === 'missed') && item.pills_remaining > 0
     );
-  }
+    autoStartedRef.current = true;
+    if (due) {
+      void start(due);
+      return;
+    }
+    void api<IntakeItem>(`/api/medications/${medId}/intake-now`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    }).then((item) => {
+      setItems((current) => current.some((candidate) => candidate.id === item.id)
+        ? current
+        : [...current, item].sort((a, b) =>
+          (a.scheduled_time || '').localeCompare(b.scheduled_time || '')));
+      return start(item);
+    }).catch((cause) => {
+      setError(cause instanceof Error ? cause.message : 'Could not prepare this dose');
+    });
+  }, [active, highlight, items, loading, start, startNow]);
 
-  // Ready confirmation modal
-  if (phase === 'ready' && activeItem) {
-    return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-2xl text-center">
-          <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center mx-auto">
-            <Pill className="w-6 h-6 text-[#0057B8]" />
-          </div>
-          <div>
-            <h3 className="text-lg font-semibold text-gray-900">{t('intake.readyTitle')}</h3>
-            <p className="text-base text-gray-500 mt-1">
-              {activeItem.medication_name}
-              {activeItem.dosage ? ` · ${activeItem.dosage}` : ''}
-            </p>
-          </div>
+  const outcome = async (eventId: string, choice: string) => {
+    const session = sessionRef.current;
+    if (!session) return;
+    try {
+      const result = await api<MonitorStatus>('/api/intake/monitor/outcome', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id, generation: session.generation,
+                               event_id: eventId, outcome: choice }),
+      });
+      acceptStatus(result, session);
+      if (choice === 'undo') { stop(); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save correction'); }
+  };
 
-          {/* Warning box (amber) */}
-          {activeItem.warning && (
-            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-base text-amber-800 text-left">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
-                <p className="flex-1">{activeItem.warning}</p>
-              </div>
-              <button
-                onClick={replayWarning}
-                aria-label={t('intake.tts.speakerLabel')}
-                className="mt-3 ml-auto flex items-center gap-2 px-4 py-3 bg-amber-100 text-amber-800 text-base font-medium rounded-lg hover:bg-amber-200 active:scale-95 transition-all touch-target-large"
-              >
-                <Volume2 className="w-5 h-5" />
-                {t('intake.tts.speakerLabel')}
-              </button>
-            </div>
-          )}
+  const undoRecent = async () => {
+    if (!recent) return;
+    try {
+      await api('/api/intake/monitor/undo', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event_id: recent.event_id }),
+      });
+      setRecent(null);
+      if (sessionRef.current) stop();
+      void refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not undo dose'); }
+  };
 
-          <div className="space-y-3 pt-2">
-            <button
-              onClick={handleReadyConfirm}
-              className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
-            >
-              {t('intake.readyButton')}
-            </button>
-            <button
-              onClick={handleReadyCancel}
-              className="w-full py-4 bg-gray-100 text-gray-700 text-base rounded-xl font-medium hover:bg-gray-200 active:scale-95 transition-all touch-target-large"
-            >
-              {t('common.cancel')}
-            </button>
-            {isSpeaking && (
-              <p className="flex items-center justify-center gap-2 text-base text-[#0057B8] font-medium">
-                <Volume2 className="w-5 h-5 animate-pulse" />
-                {t('intake.tts.speakerLabel')}...
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const manual = async (item: IntakeItem) => {
+    try {
+      await api('/api/intake/record', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intk_id: item.id, detection_method: 'manual' }),
+      });
+      if (sessionRef.current) stop();
+      void refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save dose'); }
+  };
 
-  // Completion screen
-  if (phase === 'complete' && activeItem) {
-    return (
-      <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl p-8 w-full max-w-sm space-y-6 shadow-2xl text-center">
-          <div className="w-16 h-16 bg-green-50 rounded-full flex items-center justify-center mx-auto">
-            <CheckCircle2 className="w-8 h-8 text-green-500" />
-          </div>
-          <div>
-            <h3 className="text-xl font-semibold text-gray-900">Intake Complete</h3>
-            <p className="text-gray-500 mt-1">{activeItem.medication_name} has been recorded.</p>
-          </div>
+  const skip = async (item: IntakeItem) => {
+    try {
+      await api(`/api/medications/intake/${item.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'skipped' }),
+      });
+      void refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not skip dose'); }
+  };
 
-          {/* Encouragement box (green) */}
-          <div className="p-3 bg-green-50 border border-green-200 rounded-xl text-base text-green-700 text-left">
-            <p>🎉 {t('intake.tts.cheerUp')}</p>
-            <button
-              onClick={replayCheerUp}
-              aria-label={t('intake.tts.speakerLabel')}
-              className="mt-3 ml-auto flex items-center gap-2 px-4 py-3 bg-green-100 text-green-700 text-base font-medium rounded-lg hover:bg-green-200 active:scale-95 transition-all touch-target-large"
-            >
-              <Volume2 className="w-5 h-5" />
-              {t('intake.tts.speakerLabel')}
-            </button>
-          </div>
-
-          <button
-            onClick={() => {
-              stopTTS();
-              setPhase('list');
-              setActiveItem(null);
-              resetAiState();
-            }}
-            className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
-          >
-            Back to Schedule
-          </button>
-          {isSpeaking && (
-            <p className="flex items-center justify-center gap-2 text-base text-green-700 font-medium">
-              <Volume2 className="w-5 h-5 animate-pulse" />
-              {t('intake.tts.speakerLabel')}...
-            </p>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3">
-        <Loader2 className="w-8 h-8 animate-spin text-[#0057B8]" />
-        <span className="text-gray-500 text-base">{t('common.loading')}</span>
-      </div>
-    );
-  }
-
+  const candidate = status?.candidate;
+  const recorded = status?.recorded?.status === 'taken';
+  const name = status?.name || 'the signed-in person';
   return (
-    <div className="space-y-6">
+    <div className="max-w-5xl mx-auto px-4 py-8 space-y-6">
       <div>
-        <h2 className="text-2xl font-bold text-gray-900">{t('intake.title')}</h2>
-        <p className="text-base text-gray-500 mt-0.5">{new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+        <p className="text-sm font-semibold tracking-wide uppercase text-blue-700">Medication intake</p>
+        <h1 className="text-3xl font-bold text-slate-900 mt-1">One camera, one care session</h1>
+        <p className="text-slate-600 mt-2">The camera checks who is taking the dose, the intake gesture, and their facial expression together.</p>
       </div>
-
-      {intakes.length === 0 ? (
-        <div className="bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md transition-all duration-300 hover:border-gray-200 p-8 text-center">
-          <Pill className="w-12 h-12 text-gray-300 mx-auto mb-3" />
-          <p className="text-gray-500">{t('schedule.noSchedule')}</p>
+      {reachyNotice && <div role="status" className="flex items-start gap-2 rounded-xl bg-blue-50 border border-blue-200 p-4 text-blue-800">
+        <Bot className="w-5 h-5 shrink-0" />{reachyNotice}
+      </div>}
+      {error && <div role="alert" className="flex items-start gap-2 rounded-xl bg-red-50 border border-red-200 p-4 text-red-700">
+        <TriangleAlert className="w-5 h-5 shrink-0" />{error === 'busy_other_client' ? t('reachy.busyOtherClient') : error}
+      </div>}
+      {recent && <div className="flex flex-wrap justify-between items-center gap-3 rounded-xl bg-emerald-50 border border-emerald-200 p-4">
+        <span className="flex items-center gap-2 text-emerald-800"><CheckCircle2 className="w-5 h-5" /> Dose recorded</span>
+        <button onClick={() => void undoRecent()} className="font-medium underline text-emerald-900">Not taken — undo</button>
+      </div>}
+      <div className={active ? 'grid gap-5 lg:grid-cols-[minmax(0,1.4fr)_minmax(260px,1fr)]' : 'hidden'}>
+        <div className="rounded-2xl bg-slate-950 overflow-hidden relative aspect-[4/3]">
+          <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+          {!cameraReady && <div className="absolute inset-0 flex items-center justify-center text-white gap-2">
+            <Camera className="w-6 h-6" /> Starting camera…
+          </div>}
         </div>
-      ) : (
-        <div className="space-y-2">
-          {intakes.map((item) => (
-            <div key={item.id} className="space-y-2">
-              <div
-                className={`p-4 bg-white rounded-xl border shadow-sm hover:shadow-md transition-all duration-300 flex items-center gap-3 ${
-                  highlightMedId && String(item.medication_id) === highlightMedId ? 'ring-2 ring-[#0057B8]' : 'border-gray-100 hover:border-gray-200'
-                }`}
-              >
-                <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
-                  item.status === 'taken' ? 'bg-green-50' :
-                  item.status === 'missed' ? 'bg-red-50' :
-                  item.status === 'skipped' ? 'bg-orange-50' :
-                  'bg-blue-50'
-                }`}>
-                  {getStatusIcon(item.status)}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium text-gray-900">{item.medication_name}</p>
-                  <p className="text-base text-gray-500">{item.dosage} · {item.pills_remaining} pills left</p>
-                  {item.scheduled_time && (
-                    <p className="text-sm text-gray-400 mt-0.5">
-                      {new Date(item.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </p>
-                  )}
-                  {item.pills_remaining <= 0 && (
-                    <p className="text-sm text-red-600 mt-1 flex items-center gap-1">
-                      <AlertTriangle className="w-3 h-3" />
-                      {t('intake.overdoseWarning')}
-                    </p>
-                  )}
-                </div>
-                {item.status === 'pending' && skippingId !== item.id && (
-                  <div className="flex gap-2 shrink-0">
-                    <button
-                      onClick={() => handleTakeClick(item)}
-                      disabled={item.pills_remaining <= 0 || !mediaPipeLoaded}
-                      className="px-4 py-3 bg-[#0057B8] text-white text-base font-medium rounded-lg hover:bg-[#003D82] active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed touch-target-large"
-                    >
-                      {item.pills_remaining <= 0 ? t('intake.cannotTake') : t('intake.take')}
-                    </button>
-                    <button
-                      onClick={() => { setSkippingId(item.id); setSkipNote(''); }}
-                      className="px-4 py-3 bg-gray-100 text-gray-700 text-base font-medium rounded-lg hover:bg-gray-200 active:scale-95 transition-all touch-target-large"
-                    >
-                      {t('intake.skip')}
-                    </button>
-                  </div>
-                )}
-                {item.status !== 'pending' && getStatusBadge(item.status)}
-              </div>
-
-              {/* Skip confirmation panel */}
-              {skippingId === item.id && (
-                <div className="p-4 bg-gray-50 rounded-xl border border-gray-200 space-y-3">
-                  <div>
-                    <label className="block text-base font-medium text-gray-700 mb-1">{t('intake.whySkip')}</label>
-                    <textarea
-                      value={skipNote}
-                      onChange={(e) => setSkipNote(e.target.value)}
-                      className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] outline-none bg-white"
-                      rows={2}
-                      placeholder="Optional reason..."
-                    />
-                  </div>
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => handleSkipConfirm(item)}
-                      className="flex-1 py-4 bg-orange-500 text-white text-base rounded-xl font-medium hover:bg-orange-600 active:scale-95 transition-all flex items-center justify-center gap-2 touch-target-large"
-                    >
-                      {t('intake.skip')}
-                    </button>
-                    <button
-                      onClick={() => { setSkippingId(null); setSkipNote(''); }}
-                      className="flex-1 py-4 bg-gray-100 text-gray-700 text-base rounded-xl font-medium hover:bg-gray-200 active:scale-95 transition-all touch-target-large"
-                    >
-                      {t('common.cancel')}
-                    </button>
-                  </div>
-                </div>
-              )}
+        <div className="rounded-2xl border bg-white p-5 space-y-4">
+          <div className="flex justify-between items-start gap-2">
+            <div>
+              <p className="text-sm text-slate-500">Monitoring</p>
+              <h2 className="text-xl font-semibold">{active?.name}</h2>
+              <p className="text-sm text-slate-500">
+                {active?.dosage || 'Dose'} · {active?.pills_remaining} pills left
+                {active?.scheduled_time && <> · <Clock className="inline w-3 h-3" /> {new Date(active.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</>}
+              </p>
             </div>
-          ))}
-        </div>
-      )}
-
-      {/* Emotion Modal for pre/post */}
-      {(phase === 'pre' || phase === 'post') && activeItem && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-2xl">
-            <h3 className="text-lg font-semibold text-gray-900">
-              {phase === 'pre' ? t('intake.preEmotion') : t('intake.postEmotion')}
-            </h3>
-            <p className="text-base text-gray-500">{activeItem.medication_name}</p>
-
-            <div className="relative aspect-[4/3] bg-gray-900 rounded-2xl overflow-hidden">
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="w-full h-full object-cover"
-              />
-              <div className={`absolute inset-0 flex flex-col items-center justify-center text-white transition-opacity duration-300 ${cameraOn ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
-                <Camera className="w-12 h-12 mb-3 opacity-60" />
-                <p className="text-sm opacity-80">Camera starting...</p>
-              </div>
-              <div className="absolute inset-0 border-2 border-[#0057B8]/40 rounded-xl opacity-50 pointer-events-none" />
-              <div className="absolute top-4 left-4 text-white text-sm bg-black/40 px-2 py-1 rounded">
-                Look at camera
-              </div>
-            </div>
-
-            {!aiResult ? (
-              <button
-                onClick={captureVideoAndAnalyze}
-                disabled={aiLoading || !cameraOn}
-                className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-2 touch-target-large"
-              >
-                {aiLoading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  <ScanFace className="w-5 h-5" />
-                )}
-                {aiLoading ? t('common.loading') : 'Detect Emotion'}
-              </button>
-            ) : (
-              <div className="p-4 bg-blue-50 border border-blue-200 rounded-xl space-y-3">
-                <div className="text-center">
-                  <p className="font-medium text-gray-900">
-                    Detected: {t(`emotion.${(aiResult.emotion_type || '').toLowerCase()}`)}
-                  </p>
-                  <p className="text-base text-gray-600">
-                    Confidence: {((aiResult.emotion_score || 0) * 100).toFixed(1)}%
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={confirmAiEmotion}
-                    className="flex-1 py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all flex items-center justify-center gap-2 touch-target-large"
-                  >
-                    <CheckCircle2 className="w-4 h-4" />
-                    Confirm
-                  </button>
-                  <button
-                    onClick={resetAiState}
-                    className="flex-1 py-4 bg-gray-100 text-gray-700 text-base rounded-xl font-medium hover:bg-gray-200 active:scale-95 transition-all flex items-center justify-center gap-2 touch-target-large"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    Retake
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {aiError && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-base text-red-600 flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4" />
-                {aiError}
-              </div>
-            )}
-
-            <button
-              onClick={() => {
-                stopTTS();
-                stopCamera();
-                resetAiState();
-                setPhase('list');
-                setActiveItem(null);
-                setPreEmotionId(null);
-              }}
-              className="w-full py-4 bg-gray-100 text-gray-700 text-base rounded-xl font-medium hover:bg-gray-200 active:scale-95 transition-all touch-target-large"
-            >
-              {t('common.cancel')}
-            </button>
+            <button onClick={stop} className="text-sm font-medium text-slate-600 underline">End session</button>
           </div>
+          <div className="flex items-center gap-2"><ShieldCheck className="w-5 h-5 text-blue-700" />
+            <span>{name}: {status?.identity_status === 'verified' ? 'Face verified' : status?.identity_status || 'Searching for face'}</span>
+          </div>
+          <div className="flex items-center gap-2"><ScanFace className="w-5 h-5 text-violet-700" />
+            <span>{status?.emotion ? `${status.emotion.emotion_type} · ${Math.round(status.emotion.emotion_score * 100)}%` : 'Expression unavailable'}</span>
+          </div>
+          <div className="flex items-center gap-2"><Pill className="w-5 h-5 text-cyan-700" />
+            <span>{recorded ? 'Dose recorded' : candidate?.ready ? 'Intake event detected' :
+              detectorMessage(status?.detector?.stage, name, engineReady)}</span>
+          </div>
+          {active?.warning && <p className="text-sm rounded-lg p-3 bg-amber-50 text-amber-900">{active.warning}</p>}
+          {candidate?.ready && !recorded && candidate.decision === 'uncertain' && <div className="rounded-xl bg-amber-50 p-4 space-y-3">
+            <p className="font-medium">Did you take this medication?</p>
+            <div className="flex gap-2">
+              <button onClick={() => void outcome(candidate.event_id, 'taken_confirmed')} className="flex-1 rounded-lg p-3 bg-blue-700 text-white">Yes, taken</button>
+              <button onClick={() => void outcome(candidate.event_id, 'not_taken')} className="flex-1 rounded-lg p-3 bg-white border">No</button>
+            </div>
+          </div>}
+          {!recorded && <button onClick={() => active && void manual(active)} className="text-sm text-slate-600 underline">
+            Mark this dose taken manually
+          </button>}
         </div>
-      )}
+      </div>
+      <div className="space-y-3">
+        <h2 className="text-xl font-semibold text-slate-900">Today's doses</h2>
+        {items.length === 0 && <p className="text-slate-500">No medication is scheduled today.</p>}
+        {items.map((item) => <div key={item.id} className={`rounded-xl border bg-white p-4 flex flex-wrap items-center gap-4 justify-between ${String(item.med_id) === highlight ? 'ring-2 ring-blue-600' : ''}`}>
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="rounded-full bg-blue-50 p-3 text-blue-700"><Pill className="w-5 h-5" /></div>
+            <div><p className="font-semibold text-slate-900">{item.name}</p>
+              <p className="text-sm text-slate-500">{item.dosage || 'Dose'} · {item.pills_remaining} pills left
+                {item.scheduled_time && <> · <Clock className="inline w-3 h-3" /> {new Date(item.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</>}
+              </p></div>
+          </div>
+          {(item.status === 'pending' || item.status === 'missed') && item.pills_remaining > 0 ?
+            <div className="flex gap-2">
+              <button disabled={loading || !!active} onClick={() => void start(item)}
+                className="rounded-lg bg-blue-700 text-white px-4 py-3 disabled:opacity-50">Start camera</button>
+              {reachyPaired && <button disabled={loading || !!active} onClick={() => void startWithReachy(item)}
+                className="rounded-lg border border-blue-700 text-blue-700 px-4 py-3 flex items-center gap-2 disabled:opacity-50">
+                <Bot className="w-4 h-4" />{t('reachy.useReachy')}</button>}
+              <button disabled={!!active} onClick={() => void skip(item)}
+                className="rounded-lg border px-4 py-3 disabled:opacity-50">Skip</button>
+            </div> :
+            <span className="flex items-center gap-1 text-sm font-medium">{item.status === 'taken' ?
+              <CheckCircle2 className="w-4 h-4 text-green-600" /> : item.status === 'pending_confirmation' ?
+              <Clock className="w-4 h-4 text-amber-600" /> : <XCircle className="w-4 h-4" />}
+              {item.status === 'pending_confirmation' ? t('intake.pendingConfirmation') : item.status}</span>}
+        </div>)}
+      </div>
+      <canvas ref={canvasRef} className="hidden" />
     </div>
   );
 }

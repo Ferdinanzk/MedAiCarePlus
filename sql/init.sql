@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS emotion (
     context       VARCHAR(50),
     time_stamp    TIMESTAMPTZ DEFAULT NOW()
 );
+-- Seed 43 predicts seven expressions; retain existing emotion rows.
+ALTER TABLE emotion DROP CONSTRAINT IF EXISTS emotion_emotion_type_check;
+ALTER TABLE emotion ADD CONSTRAINT emotion_emotion_type_check
+    CHECK (emotion_type IN ('Angry','Disgust','Fear','Happy','Sad','Surprise','Neutral'));
 
 CREATE TABLE IF NOT EXISTS medication (
     med_id             SERIAL PRIMARY KEY,
@@ -75,6 +79,22 @@ CREATE TABLE IF NOT EXISTS intake (
 ALTER TABLE intake ADD COLUMN IF NOT EXISTS detection_confidence FLOAT;
 ALTER TABLE intake ADD COLUMN IF NOT EXISTS detection_method VARCHAR(50);
 ALTER TABLE intake ADD COLUMN IF NOT EXISTS actual_intake_time TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS monitor_event (
+    event_id UUID PRIMARY KEY,
+    session_id UUID NOT NULL,
+    u_id INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    intk_id INTEGER NOT NULL REFERENCES intake(intk_id) ON DELETE CASCADE,
+    previous_status VARCHAR(10) NOT NULL,
+    identity_distance REAL,
+    detector_score REAL NOT NULL,
+    detector_band VARCHAR(20) NOT NULL,
+    emotion_probabilities JSONB,
+    outcome VARCHAR(20) NOT NULL CHECK (outcome IN ('taken','rejected')),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    corrected_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_monitor_event_user ON monitor_event(u_id, recorded_at DESC);
 
 -- ─────────────────────────────────────────────
 -- LOGIN_LOG  (audit trail)
@@ -145,3 +165,150 @@ ALTER TABLE intake ADD COLUMN IF NOT EXISTS taken_notified BOOLEAN NOT NULL DEFA
 -- Per-user master toggle + per-contact toggle (mirrors notify_family_on_missed / notify_skipped).
 ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS notify_family_on_taken BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE family_contacts ADD COLUMN IF NOT EXISTS notify_taken BOOLEAN DEFAULT TRUE;
+
+-- ─────────────────────────────────────────────
+-- Legal notice versions, consent, deletion ledger (Phase 1)
+-- ─────────────────────────────────────────────
+-- One row per exact rendered text: an operator changing a fill-in changes
+-- the hash without changing the version, and consent must reference what
+-- the person actually saw.
+CREATE TABLE IF NOT EXISTS legal_document (
+    kind          VARCHAR(10) NOT NULL CHECK (kind IN ('core','robot')),
+    terms_version VARCHAR(20) NOT NULL,
+    language      VARCHAR(10) NOT NULL,
+    sha256        CHAR(64) NOT NULL,
+    published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (kind, terms_version, language, sha256)
+);
+
+-- Append-only; current state is the highest consent_id per (u_id, scope).
+CREATE TABLE IF NOT EXISTS consent (
+    consent_id      BIGSERIAL PRIMARY KEY,
+    u_id            INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    kind            VARCHAR(10) NOT NULL,
+    terms_version   VARCHAR(20) NOT NULL,
+    language        VARCHAR(10) NOT NULL,
+    document_sha256 CHAR(64) NOT NULL,
+    scope           VARCHAR(40) NOT NULL,
+    granted         BOOLEAN NOT NULL,
+    source          VARCHAR(20) NOT NULL CHECK (source IN ('register','reconsent','settings','pairing')),
+    user_agent      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (kind, terms_version, language, document_sha256)
+        REFERENCES legal_document(kind, terms_version, language, sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_latest ON consent(u_id, scope, consent_id DESC);
+
+-- No FK to "user": entries must survive the account they describe so a
+-- restored backup can re-apply the deletion.
+CREATE TABLE IF NOT EXISTS deletion_ledger (
+    ledger_id  BIGSERIAL PRIMARY KEY,
+    kind       VARCHAR(30) NOT NULL,
+    u_id       INTEGER NOT NULL,
+    object_id  TEXT,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ops_state (
+    key        VARCHAR(40) PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────
+-- Reachy robot: devices, tasks, confirmations, outbox (Phase 2)
+-- ─────────────────────────────────────────────
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS dose_form VARCHAR(20) NOT NULL DEFAULT 'solid_oral';
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS units_per_dose NUMERIC(4,2) NOT NULL DEFAULT 1;
+ALTER TABLE medication DROP CONSTRAINT IF EXISTS medication_dose_form_check;
+ALTER TABLE medication ADD CONSTRAINT medication_dose_form_check
+    CHECK (dose_form IN ('solid_oral','liquid','inhaler','injection','topical','other'));
+
+ALTER TABLE intake DROP CONSTRAINT IF EXISTS intake_intake_stats_check;
+ALTER TABLE intake ALTER COLUMN intake_stats TYPE VARCHAR(20);
+ALTER TABLE intake ADD CONSTRAINT intake_intake_stats_check
+    CHECK (intake_stats IN ('taken','skipped','pending','missed','pending_confirmation'));
+
+-- auto_record defaults to FALSE while decision D2 (recording without pill
+-- identification) is open: every observed event goes to caregiver confirmation.
+CREATE TABLE IF NOT EXISTS reachy_device (
+    device_id    UUID PRIMARY KEY,
+    u_id         INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    token_hash   CHAR(64) NOT NULL UNIQUE,
+    label        VARCHAR(50) NOT NULL DEFAULT 'Reachy Mini',
+    auto_record  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at   TIMESTAMPTZ,
+    last_seen_at TIMESTAMPTZ,
+    robot_reachable BOOLEAN,
+    landmark_fps REAL,
+    status_detail JSONB
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_device_per_user ON reachy_device(u_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS reachy_task (
+    task_id      UUID PRIMARY KEY,
+    u_id         INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    slot_time    TIMESTAMPTZ NOT NULL,
+    intk_ids     INTEGER[] NOT NULL,
+    reason       VARCHAR(20) NOT NULL CHECK (reason IN ('upcoming','missed_retry','manual')),
+    attempt      INTEGER NOT NULL DEFAULT 1,
+    status       VARCHAR(20) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','leased','searching','in_progress','completed','not_found','aborted','expired')),
+    lease_owner  UUID,
+    lease_until  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at  TIMESTAMPTZ,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    detail       JSONB
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_slot ON reachy_task(u_id, slot_time)
+    WHERE status IN ('queued','leased','searching','in_progress');
+
+CREATE TABLE IF NOT EXISTS dose_confirmation (
+    confirmation_id UUID PRIMARY KEY,
+    u_id        INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    task_id     UUID REFERENCES reachy_task(task_id) ON DELETE SET NULL,
+    intk_ids    INTEGER[] NOT NULL,
+    previous_status JSONB NOT NULL,
+    source      VARCHAR(20) NOT NULL
+        CHECK (source IN ('uncertain_detection','unsupported_dose','degraded','auto_record_off','patient_claim')),
+    evidence    JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reminded_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ,
+    resolution  VARCHAR(10) CHECK (resolution IN ('confirmed','denied','expired')),
+    resolved_by INTEGER REFERENCES family_contacts(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS monitor_extra_event (
+    extra_id       UUID PRIMARY KEY,
+    u_id           INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    task_id        UUID REFERENCES reachy_task(task_id) ON DELETE SET NULL,
+    detector_band  VARCHAR(20) NOT NULL,
+    detector_score REAL NOT NULL,
+    observed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Every LINE push added from Phase 2 on goes through this table so a crash
+-- between commit and send never loses a message.
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    outbox_id    BIGSERIAL PRIMARY KEY,
+    dedupe_key   VARCHAR(160) NOT NULL UNIQUE,
+    u_id         INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    recipient_contact_id INTEGER REFERENCES family_contacts(id) ON DELETE CASCADE,
+    recipient_line_id VARCHAR(100) NOT NULL,
+    kind         VARCHAR(30) NOT NULL,
+    priority     SMALLINT NOT NULL,
+    payload      JSONB NOT NULL,
+    status       VARCHAR(12) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','sending','accepted','failed','cancelled')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    line_request_id VARCHAR(64),
+    last_error   TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    accepted_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_due ON notification_outbox(priority, next_attempt_at)
+    WHERE status IN ('queued','failed');

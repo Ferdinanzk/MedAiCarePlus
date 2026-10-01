@@ -3,7 +3,7 @@ import string
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.services.line_service import LineService
 
@@ -42,7 +42,7 @@ class ContactPayload(BaseModel):
 @router.post("/contacts")
 async def create_contact(
     payload: ContactPayload,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     u_id = await _get_u_id(user)
     if not u_id:
@@ -81,7 +81,7 @@ async def create_contact(
 
 
 @router.get("/contacts")
-async def list_contacts(user: dict = Depends(get_current_user)):
+async def list_contacts(user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return []
@@ -105,7 +105,7 @@ async def list_contacts(user: dict = Depends(get_current_user)):
 async def update_contact(
     contact_id: int,
     payload: ContactPayload,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     u_id = await _get_u_id(user)
     if not u_id:
@@ -152,7 +152,7 @@ async def update_contact(
 
 
 @router.post("/contacts/{contact_id}/test")
-async def send_test_notification(contact_id: int, user: dict = Depends(get_current_user)):
+async def send_test_notification(contact_id: int, user: dict = Depends(get_consented_user)):
     """Send a simple test message to a verified contact's LINE to confirm the sync works."""
     u_id = await _get_u_id(user)
     if not u_id:
@@ -185,7 +185,7 @@ async def send_test_notification(contact_id: int, user: dict = Depends(get_curre
 
 
 @router.delete("/contacts/{contact_id}")
-async def delete_contact(contact_id: int, user: dict = Depends(get_current_user)):
+async def delete_contact(contact_id: int, user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)

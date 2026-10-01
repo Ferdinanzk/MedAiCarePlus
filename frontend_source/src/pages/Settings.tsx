@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import ReachyCard from '../components/ReachyCard';
 import { getFaceToken } from '../lib/face-auth';
 import { Bell, ShieldAlert, Users, Save, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
 
@@ -104,6 +106,13 @@ export default function Settings() {
         <h1 className="text-2xl font-bold text-gray-900">{t('settings.title')}</h1>
         <p className="text-sm text-gray-500">{t('settings.subtitle')}</p>
       </div>
+
+      <Link to="/privacy-settings" className="block bg-white rounded-2xl border border-gray-100 p-5 shadow-sm hover:border-[#0057B8] transition-colors">
+        <h2 className="text-base font-semibold text-[#0057B8]">{t('legal.privacyCardTitle')}</h2>
+        <p className="text-sm text-gray-500 mt-1">{t('legal.privacyCardDesc')}</p>
+      </Link>
+
+      <ReachyCard />
 
       {message && (
         <div className={`p-4 rounded-2xl flex items-center gap-3 border ${

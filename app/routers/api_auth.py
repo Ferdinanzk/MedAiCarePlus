@@ -6,8 +6,9 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature
 import bcrypt as _bcrypt
 from app.config import SECRET_KEY
 from app.database import get_pool
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, get_consented_user
 from app.services.face_recognition_service import FaceRecognitionService
+from app.services import consent_service
 
 router = APIRouter(prefix="/api/auth", tags=["auth-api"])
 _signer = URLSafeTimedSerializer(SECRET_KEY)
@@ -141,7 +142,14 @@ async def me(request: Request):
     }
 
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool
+
+
+class RegistrationConsent(BaseModel):
+    terms_version: str
+    language: str
+    document_sha256: str
+    scopes: dict[str, StrictBool] = Field(default_factory=dict)
 
 class RegisterPayload(BaseModel):
     name: str
@@ -152,32 +160,55 @@ class RegisterPayload(BaseModel):
     age: str = ""
     gender: str = ""
     addres: str = ""
+    consent: RegistrationConsent | None = None
     # supabase_id intentionally excluded — use POST /link-account after
     # registration to bind a Supabase identity (requires face_token proof)
 
 @router.post("/register")
-async def register(payload: RegisterPayload):
+async def register(payload: RegisterPayload, request: Request):
     """Create a local DB user so face-login can find them later.
     Supabase identity is bound separately via /link-account to prevent spoofing."""
+    if payload.consent is None or payload.consent.scopes.get("core") is not True:
+        return JSONResponse(
+            {"success": False, "error": "core_required"},
+            status_code=400,
+        )
+    name = payload.name.strip()
+    face_label = payload.face_label.strip().lower()
+    if not name or not face_label:
+        return JSONResponse(
+            {"success": False, "error": "name and face_label are required"},
+            status_code=400,
+        )
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
-            password_hash = _hash_password(payload.password) if payload.password else None
-            u_id = await conn.fetchval(
-                'INSERT INTO "user" (name, face_label, email, password_hash, line_id) VALUES ($1,$2,$3,$4,$5) RETURNING u_id',
-                payload.name.strip(),
-                payload.face_label.strip().lower(),
-                payload.email.strip().lower() if payload.email else None,
-                password_hash,
-                payload.line_id or None,
-            )
-            age_val = int(payload.age) if payload.age.isdigit() else None
-            await conn.execute(
-                "INSERT INTO detail (u_id, age, gender, addres) VALUES ($1,$2,$3,$4)",
-                u_id,
-                age_val,
-                payload.gender or None,
-                payload.addres or None,
+            async with conn.transaction():
+                password_hash = _hash_password(payload.password) if payload.password else None
+                u_id = await conn.fetchval(
+                    'INSERT INTO "user" (name, face_label, email, password_hash, line_id) VALUES ($1,$2,$3,$4,$5) RETURNING u_id',
+                    name,
+                    face_label,
+                    payload.email.strip().lower() if payload.email else None,
+                    password_hash,
+                    payload.line_id or None,
+                )
+                age_val = int(payload.age) if payload.age.isdigit() else None
+                await conn.execute(
+                    "INSERT INTO detail (u_id, age, gender, addres) VALUES ($1,$2,$3,$4)",
+                    u_id,
+                    age_val,
+                    payload.gender or None,
+                    payload.addres or None,
+                )
+                await consent_service.record(
+                    conn, u_id, kind="core", **payload.consent.model_dump(), source="register",
+                    user_agent=request.headers.get("user-agent"),
+                )
+        except consent_service.ConsentError as exc:
+            return JSONResponse(
+                {"success": False, "error": exc.code},
+                status_code=409 if exc.code in ("stale_terms_version", "document_hash_mismatch") else 400,
             )
         except Exception as exc:
             return JSONResponse(
@@ -185,7 +216,8 @@ async def register(payload: RegisterPayload):
                 status_code=400,
             )
 
-    token = _sign({"u_id": u_id, "name": payload.name.strip()})
+    consent_service.invalidate(u_id)
+    token = _sign({"u_id": u_id, "name": name})
     return {"success": True, "u_id": u_id, "token": token}
 
 
@@ -217,7 +249,7 @@ class LinkPayload(BaseModel):
 @router.post("/link-account")
 async def link_account(
     payload: LinkPayload,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Link an existing local DB user (by face_label) to the current Supabase account.
     Requires a fresh face_token from /face-login as proof of face ownership to prevent IDOR."""
@@ -296,7 +328,7 @@ async def onboarding_status(user: dict = Depends(get_current_user)):
 
 
 @router.post("/onboarding-complete")
-async def onboarding_complete(user: dict = Depends(get_current_user)):
+async def onboarding_complete(user: dict = Depends(get_consented_user)):
     """Persist that the user finished (or skipped through) the setup wizard.
     Survives logout / new device / cleared cache."""
     pool = get_pool()

@@ -44,6 +44,33 @@ class LineService:
         except Exception as exc:
             return {"sent": False, "error": str(exc)}
 
+    def push_messages(self, to: str, messages: list[dict], retry_key: str) -> dict:
+        """Push up to five messages with an idempotency key (used by the outbox dispatcher).
+
+        LINE answers 409 when a request with the same X-Line-Retry-Key was
+        already accepted, so a duplicate counts as accepted by the caller.
+        """
+        if not LineService._available:
+            return {"status": "disabled", "http_status": None, "request_id": None, "error": "LINE not configured"}
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "X-Line-Retry-Key": retry_key,
+        }
+        try:
+            resp = requests.post(LINE_API_URL, json={"to": to, "messages": messages}, headers=headers, timeout=30)
+        except Exception as exc:
+            return {"status": "failed", "http_status": None, "request_id": None, "error": str(exc)}
+        request_id = resp.headers.get("x-line-request-id") or None
+        if 200 <= resp.status_code < 300:
+            return {"status": "accepted", "http_status": resp.status_code, "request_id": request_id, "error": None}
+        if resp.status_code == 409:
+            accepted_id = resp.headers.get("x-line-accepted-request-id") or request_id
+            return {"status": "duplicate", "http_status": 409, "request_id": accepted_id, "error": None}
+        return {"status": "failed", "http_status": resp.status_code, "request_id": request_id,
+                "error": f"LINE API {resp.status_code}: {resp.text[:500]}"}
+
     def send_missed_dose_alert(self, to: str, patient_name: str, medication_name: str, scheduled_time: str) -> dict:
         text = (
             f"⚠️ 用藥提醒\n"

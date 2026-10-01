@@ -84,7 +84,10 @@ export default function History() {
 
   const emotionColors: Record<string, string> = {
     Angry: 'bg-red-100 text-red-700',
+    Disgust: 'bg-lime-100 text-lime-700',
+    Fear: 'bg-purple-100 text-purple-700',
     Sad: 'bg-blue-100 text-blue-700',
+    Surprise: 'bg-yellow-100 text-yellow-700',
     Neutral: 'bg-gray-100 text-gray-700',
     Happy: 'bg-green-100 text-green-700',
   };
@@ -152,6 +155,8 @@ export default function History() {
                       ? 'bg-orange-500'
                       : item.status === 'missed'
                       ? 'bg-red-500'
+                      : item.status === 'pending_confirmation'
+                      ? 'bg-amber-500'
                       : 'bg-gray-300'
                   }`}
                 />
@@ -169,10 +174,12 @@ export default function History() {
                       ? 'bg-orange-50 text-orange-700'
                       : item.status === 'missed'
                       ? 'bg-red-50 text-red-700'
+                      : item.status === 'pending_confirmation'
+                      ? 'bg-amber-50 text-amber-700'
                       : 'bg-gray-100 text-gray-700'
                   }`}
                 >
-                  {item.status}
+                  {item.status === 'pending_confirmation' ? t('intake.pendingConfirmation') : item.status}
                 </span>
               </div>
             ))

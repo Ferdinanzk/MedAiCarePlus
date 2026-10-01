@@ -28,6 +28,8 @@ async def send_weekly_summaries():
             )
 
             total = len(rows)
+            # Only verified doses count: 'pending_confirmation' (awaiting a
+            # caregiver's answer) is not taken for adherence.
             taken = sum(1 for r in rows if r["status"] == "taken")
             adherence = (taken / total * 100) if total > 0 else 0
 

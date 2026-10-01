@@ -46,7 +46,7 @@ async def save_emotion(request: Request):
     emotion_type = body.get("emotion_type")
     emotion_score = float(body.get("emotion_score", 0))
     note = body.get("note")
-    if emotion_type not in ("Angry", "Happy", "Neutral", "Sad"):
+    if emotion_type not in ("Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"):
         return JSONResponse({"error": "Invalid emotion_type"}, status_code=400)
     pool = get_pool()
     async with pool.acquire() as conn:

@@ -1,0 +1,159 @@
+{
+  "kind": "robot",
+  "version": "2026-10",
+  "language": "en",
+  "title": "Reachy Robot Companion Notice",
+  "what_changed": [
+    "First version of the notice for the optional Reachy Mini robot."
+  ],
+  "sections": [
+    {
+      "id": "robot-service",
+      "heading": "1. What Reachy does, and does not do",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "At medication time, Reachy reminds you, looks for you, asks you to take each medicine, and observes you taking it. If you switch on check-ins, it then has a short conversation with you."
+        },
+        {
+          "type": "p",
+          "text": "Reachy **observes hand-to-mouth movement. It cannot identify which pill you took or how many.** Some records are therefore marked \"observed, pill not verified\", and some are sent to a family member to confirm."
+        },
+        {
+          "type": "p",
+          "text": "Reachy is not a doctor, counsellor, or emergency service, and cannot call emergency services. **In an emergency call 119.** If you are thinking about harming yourself, call **1925** (24 hours, free), **1995**, or **1980**."
+        }
+      ]
+    },
+    {
+      "id": "robot-data",
+      "heading": "2. Data Reachy collects",
+      "blocks": [
+        {
+          "type": "list",
+          "items": [
+            "Camera images at medication time: **analysed in memory and never saved.** People other than you are not identified.",
+            "With check-ins on: your voice is turned into text **on the robot itself**; the audio never leaves your home and is never stored. We keep the text transcripts, summaries, conversation mood, and safety flags."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "robot-processing",
+      "heading": "3. Where it is processed, by whom, and for how long",
+      "blocks": [
+        {
+          "type": "table",
+          "header": [
+            "Data",
+            "Processed by",
+            "Location",
+            "Kept"
+          ],
+          "rows": [
+            [
+              "Camera analysis, speech-to-text and Reachy's voice",
+              "The Reachy robot and the home server run by {OPERATOR_NAME}",
+              "Your home, Taiwan",
+              "See section 5"
+            ],
+            [
+              "Conversation text, used to write Reachy's replies",
+              "{LLM_SERVICE}, which passes it to {LLM_PROVIDER}",
+              "{LLM_PROVIDER_REGION}",
+              "{LLM_RETENTION}"
+            ],
+            [
+              "Conversation text, used for summaries and safety screening",
+              "The home server, via {LLM_SERVICE} and {LLM_PROVIDER}",
+              "{LLM_PROVIDER_REGION}",
+              "{LLM_RETENTION}"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "No audio leaves your home: speech is converted to text on the robot, and we never store recordings. Only the text of the conversation is sent to {LLM_SERVICE} and {LLM_PROVIDER}, under the retention terms above."
+        }
+      ]
+    },
+    {
+      "id": "robot-sharing",
+      "heading": "4. Who can see what",
+      "blocks": [
+        {
+          "type": "list",
+          "items": [
+            "You: everything, including full transcripts for 30 days.",
+            "Family contacts you verify: daily check-in summaries **only if you switch sharing on for that person** (topics and mood, never the full conversation), requests to confirm doses, and safety alerts (section 6)."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "robot-retention",
+      "heading": "5. How long we keep it",
+      "blocks": [
+        {
+          "type": "table",
+          "header": [
+            "Data",
+            "Kept"
+          ],
+          "rows": [
+            [
+              "Conversation transcripts",
+              "30 days"
+            ],
+            [
+              "Words quoted in a safety alert",
+              "180 days"
+            ],
+            [
+              "Check-in summaries and conversation mood",
+              "Until you delete them or your account"
+            ],
+            [
+              "Camera images; audio on our server",
+              "Never stored"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "safety-alerts",
+      "heading": "6. Safety alerts (please read)",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "If a check-in suggests you may be at **serious risk of harming yourself**, or that you may have **taken too much medicine** (even by accident), Reachy will give you help-line numbers and **all your verified family contacts will be alerted immediately, with the specific words that raised concern, even if you turned other alerts off.**"
+        },
+        {
+          "type": "p",
+          "text": "Alerts repeat until a family member responds. If you withdraw consent while an alert is active, that alert still continues until someone responds. Check-ins are only available with safety alerts on. Automated detection can miss things and can raise false alarms."
+        }
+      ]
+    },
+    {
+      "id": "confirmation",
+      "heading": "7. Medicine you say you took, or that Reachy could not verify",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "The dose is marked \"waiting for confirmation\" and a family member is asked to check the pill box. This helps prevent taking the same dose twice."
+        }
+      ]
+    },
+    {
+      "id": "robot-withdraw",
+      "heading": "8. Switching Reachy off",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "You can withdraw each Reachy consent at any time in Settings. The robot stops within seconds, and you can choose to delete your transcripts and summaries at the same time."
+        }
+      ]
+    }
+  ]
+}

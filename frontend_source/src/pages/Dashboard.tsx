@@ -22,7 +22,7 @@ interface TodayMedication {
   medication_id?: number;
   name: string;
   dosage: string | null;
-  status: 'pending' | 'taken' | 'skipped' | 'missed';
+  status: 'pending' | 'taken' | 'skipped' | 'missed' | 'pending_confirmation';
   scheduled_time: string | null;
   pills_remaining: number;
 }
@@ -120,6 +120,8 @@ export default function Dashboard() {
         return <XCircle className="w-5 h-5 text-orange-500" />;
       case 'missed':
         return <AlertCircle className="w-5 h-5 text-red-500" />;
+      case 'pending_confirmation':
+        return <Clock className="w-5 h-5 text-amber-500" />;
       default:
         return <Clock className="w-5 h-5 text-gray-400" />;
     }
@@ -133,6 +135,8 @@ export default function Dashboard() {
         return <span className="text-sm font-medium px-2 py-1 rounded-full bg-orange-50 text-orange-600">{t('intake.skipped')}</span>;
       case 'missed':
         return <span className="text-sm font-medium px-2 py-1 rounded-full bg-red-50 text-red-600">{t('intake.missed')}</span>;
+      case 'pending_confirmation':
+        return <span className="text-sm font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700">{t('intake.pendingConfirmation')}</span>;
       default:
         return <span className="text-sm font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-600">{t('intake.pending')}</span>;
     }
@@ -303,7 +307,10 @@ export default function Dashboard() {
             {emotions.map((emotion) => {
               const colors: Record<string, string> = {
                 Angry: 'bg-red-400',
+                Disgust: 'bg-lime-400',
+                Fear: 'bg-purple-400',
                 Sad: 'bg-blue-400',
+                Surprise: 'bg-yellow-400',
                 Neutral: 'bg-gray-400',
                 Happy: 'bg-green-400',
               };

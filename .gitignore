@@ -88,3 +88,12 @@ models/face_recognition/face_gallery/*.jpeg
 # *.bin outside models/ stays ignored (large public downloads)
 !models/face_recognition/**/*.bin
 !models/face_recognition/**/*.xml
+
+# Patient data written by the backup service and the deletion ledger — never commit or bake into images
+backups/
+ledger/
+
+# Local test artefacts: browser-session snapshots and camera recordings (may contain people); never commit
+.playwright-cli/
+.playwright-mcp/
+output/

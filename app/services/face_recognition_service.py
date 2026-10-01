@@ -1,4 +1,6 @@
 import sys
+import threading
+from functools import wraps
 import numpy as np
 from app.config import (
     FACE_REC_BASE, FACE_DET_MODEL, FACE_REID_MODEL,
@@ -9,6 +11,14 @@ from app.config import (
 # Lazy imports — only resolved when models are available
 _models_loaded = False
 FaceDetector = FaceIdentifier = LandmarksDetector = FacesDatabase = Core = None
+
+
+def synchronized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 def _load_imports():
@@ -32,6 +42,7 @@ class FaceRecognitionService:
     _available: bool = False
 
     def __init__(self):
+        self.lock = threading.RLock()
         try:
             _load_imports()
             core = Core()
@@ -65,6 +76,7 @@ class FaceRecognitionService:
             cls._instance = cls()
         return cls._instance
 
+    @synchronized
     def reload_gallery(self):
         """Reload faces database from disk after new enrollments."""
         if not FaceRecognitionService._available:
@@ -76,6 +88,7 @@ class FaceRecognitionService:
         except Exception as exc:
             print(f"[FaceRecognition] Gallery reload failed: {exc}")
 
+    @synchronized
     def get_face_direction(self, frame_bgr: np.ndarray) -> dict:
         """
         Detect face and determine head orientation (front/left/right) from landmarks.
@@ -149,6 +162,7 @@ class FaceRecognitionService:
             print(f"[FaceRecognition] get_face_direction error: {exc}")
             return {"detected": False, "direction": "none", "stub": True, "face_size_ratio": 0.0}
 
+    @synchronized
     def identify_frame(self, frame_bgr: np.ndarray) -> dict:
         """
         Returns:
@@ -181,3 +195,28 @@ class FaceRecognitionService:
         except Exception as exc:
             return {"identified": False, "name": None, "distance": None,
                     "face_count": 0, "error": str(exc)}
+
+    @synchronized
+    def identify_faces(self, frame_bgr: np.ndarray) -> dict:
+        """Return one label and ROI for each face; never choose a global best match."""
+        if not self._available:
+            return {"faces": [], "error": "Face recognition model unavailable", "saturated": False}
+        try:
+            rois = self.face_det.infer((frame_bgr,))
+            if len(rois) >= 4:
+                return {"faces": [], "error": None, "saturated": True}
+            if not rois:
+                return {"faces": [], "error": None, "saturated": False}
+            landmarks = self.lm_det.infer((frame_bgr, rois))
+            self.face_id.clear()
+            self.face_id.start_async(frame_bgr, rois, landmarks)
+            results, _ = self.face_id.postprocess()
+            faces = []
+            for roi, result in zip(rois, results):
+                faces.append({"box": [int(roi.position[0]), int(roi.position[1]),
+                                      int(roi.size[0]), int(roi.size[1])],
+                              "label": self.face_id.get_identity_label(result.id),
+                              "distance": float(result.distance)})
+            return {"faces": faces, "error": None, "saturated": False}
+        except Exception as exc:
+            return {"faces": [], "error": str(exc), "saturated": False}

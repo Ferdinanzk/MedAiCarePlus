@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.services.ocr_service import OCRService
 
 router = APIRouter(prefix="/api/ocr", tags=["ocr-api"])
@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/ocr", tags=["ocr-api"])
 @router.post("/parse")
 async def parse_prescription(
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Upload a prescription image, return structured JSON via YOLO + Ollama."""
     image_bytes = await file.read()

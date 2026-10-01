@@ -6,7 +6,7 @@ from collections import defaultdict
 from fastapi import APIRouter, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.services.emotion_service import EmotionService
 
@@ -34,14 +34,14 @@ async def _get_u_id(user: dict) -> int | None:
 
 
 @router.post("/log")
-async def log_emotion(payload: EmotionLogPayload, user: dict = Depends(get_current_user)):
+async def log_emotion(payload: EmotionLogPayload, user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)
 
     # FIX: Normalize emotion type to Title Case
     emotion_type = payload.emotion_type.capitalize() if payload.emotion_type else "Neutral"
-    valid_emotions = {"Angry", "Happy", "Neutral", "Sad"}
+    valid_emotions = {"Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"}
     if emotion_type not in valid_emotions:
         return JSONResponse(
             {"detail": f"Invalid emotion_type '{emotion_type}'. Must be one of: {valid_emotions}"},
@@ -58,7 +58,7 @@ async def log_emotion(payload: EmotionLogPayload, user: dict = Depends(get_curre
 
 
 @router.get("/history")
-async def emotion_history(user: dict = Depends(get_current_user)):
+async def emotion_history(user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         return []
@@ -80,7 +80,7 @@ async def emotion_history(user: dict = Depends(get_current_user)):
 @router.post("/analyze")
 async def analyze_emotion(
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Upload a photo, return detected emotion and confidence scores."""
     image_bytes = await file.read()
@@ -103,7 +103,7 @@ async def analyze_emotion(
 async def analyze_emotion_batch(
     frames: list[UploadFile] = File(...),
     context: str = "",
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_consented_user),
 ):
     """Analyze multiple frames from a video stream, return aggregated best emotion."""
     svc = EmotionService.get_instance()

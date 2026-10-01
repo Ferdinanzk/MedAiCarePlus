@@ -78,7 +78,9 @@ export default function Onboarding() {
   const [proximity, setProximity] = useState<'too_close' | 'too_far' | 'good' | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);  // 3,2,1 or null
   const [enrolling, setEnrolling] = useState(false);
+  const [faceError, setFaceError] = useState('');
   const stagePhotosRef = useRef<string[]>([]);
+  const captureInFlightRef = useRef(false);
   const holdStartRef = useRef<number | null>(null);
   const poseIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevFrameRef = useRef<ImageData | null>(null);
@@ -255,13 +257,24 @@ export default function Onboarding() {
   };
 
   const captureAndAdvance = () => {
+    // The pose loop runs on an interval and can finish two successful checks
+    // before React has rendered the next stage. Serialize captures so the
+    // gallery always receives exactly one photo per pose.
+    if (captureInFlightRef.current) return;
+    captureInFlightRef.current = true;
     const video = videoRef.current;
-    if (!video) return;
+    if (!video) {
+      captureInFlightRef.current = false;
+      return;
+    }
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth || 640;
     canvas.height = video.videoHeight || 480;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!ctx) {
+      captureInFlightRef.current = false;
+      return;
+    }
     ctx.drawImage(video, 0, 0);
     const cropped = cropPortraitCenter(canvas);  // Auto-crop to portrait 2:3
     const dataUrl = cropped.toDataURL('image/jpeg');
@@ -272,12 +285,14 @@ export default function Onboarding() {
     if (nextIdx >= 3) {
       // All 3 captured
       stopPoseLoop();
-      handleEnroll(stagePhotosRef.current);
+      void handleEnroll(stagePhotosRef.current);
     } else {
       setPoseStageIdx(nextIdx);
       holdStartRef.current = null;
       prevFrameRef.current = null;
     }
+    // Allow the next pose to capture after state/ref updates have settled.
+    captureInFlightRef.current = false;
   };
 
   const startPoseLoop = () => {
@@ -356,6 +371,7 @@ export default function Onboarding() {
 
   const startCamera = async () => {
     try {
+      setFaceError('');
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
       if (videoRef.current) videoRef.current.srcObject = stream;
       setCameraOn(true);
@@ -394,14 +410,30 @@ export default function Onboarding() {
 
   const handleEnroll = async (photos: string[]) => {
     setEnrolling(true);
+    setFaceError('');
     const faceSession = JSON.parse(localStorage.getItem('face_auth_user') || '{}');
     const faceLabel = faceSession.name || 'user';
     const files = photos.map((p, i) => dataUrlToFile(p, `face-${i}.jpg`));
-    await aiApi.enrollFace(faceLabel, files);
-    setEnrolling(false);
-    setStorage('onboarding_face_done', '1');
-    stopCamera();
-    setStep(2);
+    try {
+      const result = await aiApi.enrollFace(faceLabel, files);
+      if (result.error || !result.saved || result.saved.length !== 3) {
+        throw new Error(result.error || 'Face enrollment did not save all three photos. Please try again.');
+      }
+      setStorage('onboarding_face_done', '1');
+      stopCamera();
+      setStep(2);
+    } catch (cause) {
+      setFaceError(cause instanceof Error ? cause.message : 'Face enrollment failed. Please try again.');
+      // Keep the camera available for a retry, while clearing the old poses.
+      stagePhotosRef.current = [];
+      setCapturedPhotos([]);
+      setPoseStageIdx(0);
+      holdStartRef.current = null;
+      prevFrameRef.current = null;
+      startPoseLoop();
+    } finally {
+      setEnrolling(false);
+    }
   };
 
   // ── Family ─────────────────────────────────────────────────────────────────
@@ -619,6 +651,12 @@ export default function Onboarding() {
               <div className="flex items-center justify-center gap-2 py-2">
                 <Loader2 className="w-5 h-5 animate-spin text-[#006d36]" />
                 <span className="text-base text-gray-600">Enrolling face...</span>
+              </div>
+            )}
+
+            {faceError && (
+              <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+                {faceError}
               </div>
             )}
           </div>

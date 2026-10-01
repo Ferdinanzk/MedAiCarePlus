@@ -1,0 +1,6 @@
+FROM postgres:16-alpine
+RUN apk add --no-cache gnupg tzdata
+COPY backup.sh /usr/local/bin/backup.sh
+RUN chmod 755 /usr/local/bin/backup.sh
+ENV TZ=Asia/Taipei
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/backup.sh"]

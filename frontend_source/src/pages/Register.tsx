@@ -2,13 +2,16 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { setFaceSession } from '../lib/face-auth';
+import { legalLanguage, useLegalDocument, type LegalResponse } from '../lib/consent-api';
 import LanguageSwitcher from '../components/LanguageSwitcher';
+import LegalDocument from '../components/LegalDocument';
 import { Loader2, UserPlus, Mail, Lock, User, CheckCircle2, ChevronRight, FileText } from 'lucide-react';
 
 type RegStep = 1 | 2;
 
 export default function Register() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const { legal, loading: legalLoading, failed: legalFailed, reload: reloadLegal } = useLegalDocument(i18n.language);
   const [step, setStep] = useState<RegStep>(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -16,8 +19,9 @@ export default function Register() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [agreed, setAgreed] = useState(false);
+  const [agreedDocument, setAgreedDocument] = useState<LegalResponse | null>(null);
   const [showTerms, setShowTerms] = useState(false);
+  const agreed = !!legal && agreedDocument === legal;
 
   const validate = () => {
     if (!name.trim()) return 'Please enter your name';
@@ -30,6 +34,13 @@ export default function Register() {
 
   const handleRegister = async (e: { preventDefault: () => void }) => {
     e.preventDefault();
+    if (loading) return;
+    if (!legal || legal.language !== legalLanguage(i18n.language)) {
+      reloadLegal();
+      setAgreedDocument(null);
+      setShowTerms(true);
+      return;
+    }
     const err = validate();
     if (err) { setError(err); return; }
     setLoading(true);
@@ -44,12 +55,26 @@ export default function Register() {
           face_label: name.trim(),
           email: email.trim().toLowerCase(),
           password,
+          consent: {
+            terms_version: legal.terms_version,
+            language: legal.language,
+            document_sha256: legal.sha256,
+            scopes: { core: true },
+          },
         }),
       });
 
       const data = await res.json();
 
       if (!res.ok || !data.success) {
+        if (res.status === 409 || ['stale_terms_version', 'document_hash_mismatch'].includes(data.error || data.detail)) {
+          reloadLegal();
+          setAgreedDocument(null);
+          setShowTerms(true);
+          setError(t('legal.documentChanged'));
+          setLoading(false);
+          return;
+        }
         setError(data.error || data.detail || 'Registration failed. Please try again.');
         setLoading(false);
         return;
@@ -147,7 +172,8 @@ export default function Register() {
                     type="checkbox"
                     id="agree-terms"
                     checked={agreed}
-                    onChange={(e) => setAgreed(e.target.checked)}
+                    onChange={(e) => setAgreedDocument(e.target.checked ? legal : null)}
+                    disabled={!legal || loading}
                     className="mt-1 w-5 h-5 rounded border-gray-300 text-[#0057B8] focus:ring-[#0057B8]"
                   />
                   <label htmlFor="agree-terms" className="text-sm text-gray-600">
@@ -164,13 +190,15 @@ export default function Register() {
 
                 <button
                   type="submit"
-                  disabled={loading || !agreed}
+                  disabled={loading || !agreed || !legal}
                   onClick={(e) => { e.preventDefault(); handleRegister(e); }}
                   className="w-full py-4 rounded-xl bg-[#0057B8] text-white text-base font-semibold hover:bg-[#003D82] active:scale-95 transition-all flex items-center justify-center gap-2 touch-target-large disabled:opacity-50"
                 >
                   {loading ? <><Loader2 className="w-5 h-5 animate-spin" />{t('common.loading')}</> : <><UserPlus className="w-5 h-5" />{t('register.next')}<ChevronRight className="w-4 h-4" /></>}
                 </button>
                 {error && <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-base text-red-600">{error}</div>}
+                {legalLoading && <p role="status" className="text-sm text-gray-500">{t('common.loading')}</p>}
+                {legalFailed && <div role="alert" className="space-y-2 text-red-700"><p>{t('legal.loadFailed')}</p><button type="button" onClick={reloadLegal} className="min-h-12 text-[#0057B8] font-medium">{t('legal.retry')}</button></div>}
               </form>
             )}
 
@@ -197,57 +225,31 @@ export default function Register() {
       {/* Terms & Conditions Modal */}
       {showTerms && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md max-h-[80vh] flex flex-col shadow-2xl">
+          <div role="dialog" aria-modal="true" aria-labelledby="register-terms-title" className="bg-white rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl">
             {/* Header */}
             <div className="p-6 border-b border-gray-100 flex items-center justify-between">
-              <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+              <h2 id="register-terms-title" className="text-lg font-bold text-gray-900 flex items-center gap-2">
                 <FileText className="w-5 h-5 text-[#0057B8]" />
                 {t('register.terms.modalTitle')}
               </h2>
-              <button onClick={() => setShowTerms(false)} className="p-2 hover:bg-gray-100 rounded-lg">
+              <button onClick={() => setShowTerms(false)} aria-label={t('register.terms.closeButton')} className="p-2 hover:bg-gray-100 rounded-lg">
                 ✕
               </button>
             </div>
 
             {/* Scrollable Content */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {/* Section 1: Terms of Service */}
-              <div>
-                <h3 className="text-base font-semibold text-gray-900 mb-2">{t('register.terms.tosTitle')}</h3>
-                <p className="text-sm text-gray-600 leading-relaxed">{t('register.terms.tosContent')}</p>
-              </div>
-
-              {/* Section 2: Privacy Policy */}
-              <div>
-                <h3 className="text-base font-semibold text-gray-900 mb-2">{t('register.terms.privacyTitle')}</h3>
-                <p className="text-sm text-gray-600 leading-relaxed">{t('register.terms.privacyContent')}</p>
-              </div>
-
-              {/* Section 3: Data Collection */}
-              <div>
-                <h3 className="text-base font-semibold text-gray-900 mb-2">{t('register.terms.dataTitle')}</h3>
-                <ul className="space-y-2">
-                  {(t('register.terms.dataItems', { returnObjects: true }) as string[]).map((item, i) => (
-                    <li key={i} className="flex items-start gap-2 text-sm text-gray-600">
-                      <span className="text-[#0057B8] mt-0.5">•</span>
-                      {item}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              {/* Section 4: User Rights */}
-              <div>
-                <h3 className="text-base font-semibold text-gray-900 mb-2">{t('register.terms.rightsTitle')}</h3>
-                <p className="text-sm text-gray-600 leading-relaxed">{t('register.terms.rightsContent')}</p>
-              </div>
+            <div className="flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 space-y-6">
+              {legalLoading && <p role="status">{t('common.loading')}</p>}
+              {legalFailed && <div role="alert"><p>{t('legal.loadFailed')}</p><button onClick={reloadLegal} className="min-h-12 text-[#0057B8] font-medium">{t('legal.retry')}</button></div>}
+              {legal && <LegalDocument document={legal.document} />}
             </div>
 
             {/* Footer */}
             <div className="p-6 border-t border-gray-100 space-y-3">
               <button
-                onClick={() => { setAgreed(true); setShowTerms(false); }}
-                className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
+                onClick={() => { setAgreedDocument(legal); setShowTerms(false); }}
+                disabled={!legal || loading}
+                className="w-full py-4 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large disabled:opacity-50"
               >
                 {t('register.terms.agreeButton')}
               </button>

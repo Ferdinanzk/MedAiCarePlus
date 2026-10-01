@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.dependencies import get_current_user
+from app.dependencies import get_consented_user
 from app.database import get_pool
 
 router = APIRouter(prefix="/api/history", tags=["history-api"])
@@ -17,7 +17,7 @@ async def _get_u_id(user: dict) -> int | None:
 
 
 @router.get("/intakes")
-async def get_intake_history(user: dict = Depends(get_current_user)):
+async def get_intake_history(user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         raise HTTPException(status_code=401, detail="User not found")
@@ -44,7 +44,7 @@ async def get_intake_history(user: dict = Depends(get_current_user)):
 
 
 @router.get("/emotions")
-async def get_emotion_history(user: dict = Depends(get_current_user)):
+async def get_emotion_history(user: dict = Depends(get_consented_user)):
     u_id = await _get_u_id(user)
     if not u_id:
         raise HTTPException(status_code=401, detail="User not found")

@@ -1,11 +1,9 @@
-from app import ml_stubs; ml_stubs.install()  # dev: stubs for heavy ML packages
-
 from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from app.database import init_pool, close_pool
 from app.config import FRONTEND_URL
@@ -15,26 +13,50 @@ from app.services.ocr_service import OCRService
 from app.services.line_service import LineService
 from app.services.intake_detection import IntakeDetectionService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
-from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake
+from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
+from app.routers import api_legal, api_consent, api_account, api_reachy, api_device
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
+from app.database import get_pool
+from app.services.legal_service import register_documents
+from app.startup_checks import run_startup_checks, check_restore_state
+from app.config import DEVICE_PORT
+from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    run_startup_checks()
     await init_pool()
+    async with get_pool().acquire() as conn:
+        await check_restore_state(conn)
+        await register_documents(conn)
     FaceRecognitionService.get_instance()
     EmotionService.get_instance()
-    OCRService.get_instance()
     LineService.get_instance()
     IntakeDetectionService.get_instance()
     start_scheduler()
+    await start_dispatcher()
     yield
+    await stop_dispatcher()
     stop_scheduler()
     await close_pool()
 
 
 app = FastAPI(title="MedAiCarePlus", version="1.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def device_port_isolation(request, call_next):
+    """Device routes exist only on the private port; device tokens never work on the public one."""
+    server = request.scope.get("server")
+    on_device_port = bool(server) and server[1] == DEVICE_PORT
+    path = request.url.path
+    if path.startswith("/api/device/") != on_device_port:
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    if not on_device_port and request.headers.get("authorization", "").lower().startswith("bearer rdv1."):
+        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+    return await call_next(request)
 
 # CORS for React frontend (local dev + Vercel production)
 _cors_origins = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]
@@ -75,7 +97,13 @@ app.include_router(api_family.router,        tags=["api-family"])
 app.include_router(api_medications.router,   tags=["api-medications"])
 app.include_router(api_history.router,       tags=["api-history"])
 app.include_router(api_intake.router,        tags=["api-intake"])
+app.include_router(api_monitor.router,       tags=["intake-monitor"])
 app.include_router(line_router,              tags=["line-webhook"])
+app.include_router(api_legal.router,         tags=["legal"])
+app.include_router(api_consent.router,       tags=["consent"])
+app.include_router(api_account.router,       tags=["account"])
+app.include_router(api_reachy.router,        tags=["reachy"])
+app.include_router(api_device.router,        tags=["device"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────
