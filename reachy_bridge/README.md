@@ -58,7 +58,9 @@ are `med_<med_id>.wav`; otherwise `med_prompt_generic` plays.
 
 - `session.py` — pure `SlotSession` state machine (injected clock, robot, clips, stream, app client)
 - `runner.py` — task long-poll, 10 s heartbeat (`stop_all`), 15 fps capture → landmarks every frame,
-  JPEG ≤ 5 fps, one request in flight per stream
+  identity-only JPEG ≤ 2 fps, one request in flight per stream
+- `emotion.py` — the server's seed-43 emotion model on the robot (≤ 2 fps, only the face the server verified, never
+  with a hand over the mouth); the score rides on the landmark packet as `emotion` and the server re-checks it
 - `app_client.py` — httpx client; 409 → `SessionLost` (`BusyOtherClient` for `busy_other_client`),
   401/403 → `NotAuthorised`, network/5xx → `AppUnreachable`, 503 → `ServiceUnavailable`
 - `vision.py` / `mp_geometry.py` — the Tasks face/hand/pose landmarkers on ONNX Runtime (anchors, NMS, rotated

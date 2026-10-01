@@ -164,11 +164,44 @@ class MonitorSession:
                 "identity_status": "verified" if self.verified() else self.identity_status,
                 "identity_distance": self.identity_distance,
                 "emotion": self.emotion if self.verified() else None,
+                # The verified patient's face box (normalized): a robot scores emotion on this face itself.
+                "target_box": self.target_box if self.verified() else None,
                 "detector": self.latest_detector,
                 "candidate": self.candidate, "recorded": self.recorded,
                 "mode": self.mode, "client_type": self.client_type, "auto_commit": self.auto_commit,
                 "degraded": self.degraded, "landmark_fps": self.landmark_fps,
                 "extra_events": list(self.extra_events)}
+
+
+def _mouth_hidden(selected: dict, hands: list, box: list) -> bool:
+    """True when the owned face's mouth can't be scored: no mouth points, or a hand over it."""
+    mouth_points = [selected["face"][index] for index in (5, 8)
+                    if len(selected["face"]) > index and len(selected["face"][index]) >= 2]
+    if not mouth_points:
+        return True
+    mouth = (sum(point[0] for point in mouth_points) / len(mouth_points),
+             sum(point[1] for point in mouth_points) / len(mouth_points))
+    return any(point_distance(hand[0], mouth) < max(.04, box[2] * .6) for hand in hands if hand)
+
+
+def _accept_robot_emotion(state: "MonitorSession", packet: dict, now: float) -> None:
+    """A robot scores emotion on its own camera. Accept it under the same gates as the server's own model:
+    identity verified, the scored face is the owned (enrolled) face, and its mouth is not covered."""
+    report = packet.get("emotion")
+    if report is None:
+        return
+    selected = (select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box)
+                if state.verified(now) and state.target_box is not None else None)
+    if (selected is None or selected["face_index"] != report["face_index"]
+            or _mouth_hidden(selected, packet["hands"], state.target_box)):
+        state.emotion = None
+        return
+    probabilities = {name: float(report["probabilities"][name]) for name in LABELS}
+    winner = max(LABELS, key=lambda name: probabilities[name])
+    state.emotion = {"detected": True, "emotion_type": winner.capitalize(), "emotion_score": probabilities[winner],
+                     "probabilities": probabilities, "error": None, "source": "robot"}
+    state.emotion_samples.append((now, probabilities))
+    state.emotion_samples = state.emotion_samples[-50:]
 
 
 def _expire_candidate(state: MonitorSession, now: float) -> None:
@@ -305,6 +338,8 @@ class MonitorRegistry:
                 if old_seq < cutoff:
                     del state.packets[old_seq]
             _expire_candidate(state, now)
+            if state.client_type == "reachy":
+                _accept_robot_emotion(state, packet, now)
             # A dose session pauses detection while its candidate is resolved.
             # After a record the session is in observe mode and keeps detecting.
             if state.mode == "dose" and (state.recorded or state.candidate):
@@ -421,25 +456,20 @@ class MonitorRegistry:
             if selected is None:
                 state.emotion = None
                 return state.public()
-            mouth_points = [selected["face"][index] for index in (5, 8)
-                            if len(selected["face"]) > index and len(selected["face"][index]) >= 2]
-            if not mouth_points:
+            if _mouth_hidden(selected, packet["hands"], box):
                 state.emotion = None
                 return state.public()
-            mouth = (sum(point[0] for point in mouth_points) / len(mouth_points),
-                     sum(point[1] for point in mouth_points) / len(mouth_points))
-            occluded = any(point_distance(hand[0], mouth) < max(.04, box[2] * .6) for hand in packet["hands"] if hand)
-            if occluded:
-                state.emotion = None
-                return state.public()
-        emotion = await loop.run_in_executor(None, EmotionService.get_instance().predict_crop, crop_face(frame, pixel_box))
+        # Robots score emotion on the robot and send it with their landmark packets; their snapshot is identity-only.
+        emotion = None if state.client_type == "reachy" else await loop.run_in_executor(
+            None, EmotionService.get_instance().predict_crop, crop_face(frame, pixel_box))
         async with state.lock:
             if not state.verified() or state.ended or state.last_vision_seq != frame_seq:
                 return state.public()
-            state.emotion = emotion if emotion.get("detected") else None
-            if state.emotion:
-                state.emotion_samples.append((time.monotonic(), emotion["probabilities"]))
-                state.emotion_samples = state.emotion_samples[-50:]
+            if emotion is not None:
+                state.emotion = emotion if emotion.get("detected") else None
+                if state.emotion:
+                    state.emotion_samples.append((time.monotonic(), emotion["probabilities"]))
+                    state.emotion_samples = state.emotion_samples[-50:]
             if state.candidate and not state.candidate["ready"]:
                 if time.monotonic() - state.candidate["created_at"] > CANDIDATE_TIMEOUT_SECONDS:
                     state.candidate = None

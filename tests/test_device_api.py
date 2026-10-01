@@ -167,7 +167,7 @@ def env(monkeypatch):
     monkeypatch.setattr(reachy_tasks, "enqueue_reachy_task", enqueue_reachy_task)
     monkeypatch.setattr(monitor_service.IntakeDetectionService, "get_instance", classmethod(lambda cls: _Detector()))
     monkeypatch.setattr(api_device.FaceRecognitionService, "_available", True)
-    monkeypatch.setattr(api_device.EmotionService, "_available", True)
+    monkeypatch.setattr(api_monitor.EmotionService, "_available", True)   # browser sessions still need it
     return types.SimpleNamespace(app=app, conn=conn, registry=registry, device=device, notices=notices,
                                  confirmations=confirmations, enqueued=enqueued,
                                  robot=TestClient(app, base_url=f"http://testserver:{DEVICE_PORT}"),
@@ -385,3 +385,31 @@ def test_manual_task_errors(env, monkeypatch):
     env.conn.device_row = None
     response = env.browser.post("/api/reachy/tasks", json={"intk_id": 101})
     assert response.status_code == 409 and response.json() == {"detail": "robot_not_paired"}
+
+
+# ── Emotion scored on the robot ──────────────────────────────────────────────
+
+def test_device_landmarks_validate_the_robot_emotion_report(env):
+    robot = _start(env, mode="observe").json()
+    ids = {"session_id": robot["session_id"], "generation": robot["generation"]}
+    face = {"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}
+    probabilities = {name: 1 / 7 for name in ("angry", "disgust", "fear", "happy", "sad", "surprise", "neutral")}
+    packet = {**ids, "frame_seq": 1, "timestamp": 0.0, "width": 640, "height": 480, "faces": [face]}
+    ok = env.robot.post("/api/device/monitor/landmarks",
+                        json={**packet, "emotion": {"face_index": 0, "probabilities": probabilities}})
+    assert ok.status_code == 200 and "target_box" in ok.json()
+    bad = [
+        {"face_index": 1, "probabilities": probabilities},                         # no such face in the packet
+        {"face_index": 0, "probabilities": {**probabilities, "happy": 0.9}},       # doesn't sum to 1
+        {"face_index": 0, "probabilities": {"happy": 1.0}},                        # missing labels
+    ]
+    for seq, emotion in enumerate(bad, start=2):
+        response = env.robot.post("/api/device/monitor/landmarks", json={**packet, "frame_seq": seq, "emotion": emotion})
+        assert response.status_code == 422, emotion
+
+
+def test_device_start_needs_only_the_identity_model(env, monkeypatch):
+    from app.services.emotion_service import EmotionService
+
+    monkeypatch.setattr(EmotionService, "_available", False)
+    assert _start(env, mode="observe").status_code == 200

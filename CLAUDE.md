@@ -79,6 +79,12 @@ Practical floor is ~8fps. The frontend self-throttles (`tick()` returns early wh
 - Unverifiable doses go to `pending_confirmation`, and a caregiver answers with LINE buttons (a postback HMAC-signed with `SECRET_KEY`; the sender must be that verified contact). `transition_intake` refuses to change a `pending_confirmation` dose under the row lock. Confirmations expire after max(missed window, 2 h).
 - **Every LINE push added from Phase 2 on goes through `notification_outbox`** (`app/services/outbox.py` to enqueue; `outbox_dispatcher` delivers with `X-Line-Retry-Key`). Don't call `LineService.send_*` directly for new notifications.
 - Withdrawing `robot_camera` consent (or unpairing) calls `reachy_tasks.revoke_devices` in the same transaction.
+- **Robots do their own vision.** The robot app runs the landmark models (MediaPipe models converted to ONNX, on
+  ONNX Runtime; the MediaPipe library can't load on the robot's Pi 4) **and the emotion model**. A reachy session's
+  JPEGs (≤ 2 fps) are identity-only: `vision()` skips `EmotionService` for them. Emotion arrives as an optional
+  `emotion: {face_index, probabilities}` on `/api/device/monitor/landmarks` and is accepted only for the verified,
+  owned face with an uncovered mouth (`_accept_robot_emotion`). `public()` exposes `target_box` so the robot knows
+  which face to score. The device API no longer requires `EmotionService` to start a session.
 
 ### ML services are singletons warmed at startup
 `main.py` lifespan calls `get_instance()` on FaceRecognition, Emotion, Line, and IntakeDetection. Endpoints then check the **class attribute** `_available` *without* calling `get_instance()` (e.g. `api_monitor.start` returns 503 if either is False). **If you add a service, warm it in lifespan** or its endpoints will 503 forever.
