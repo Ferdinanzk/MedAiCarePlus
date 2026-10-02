@@ -1,0 +1,363 @@
+"""Long-running loops: task polling, heartbeat, and the camera -> landmarks/JPEG pipeline."""
+
+import asyncio
+import logging
+import time
+from collections import deque
+
+from medcare_reachy.bridge import __version__
+from medcare_reachy.bridge.app_client import BridgeError, NotAuthorised
+from medcare_reachy.bridge.session import SlotSession
+
+log = logging.getLogger(__name__)
+
+CAPTURE_FPS = 15.0
+FRAME_WAIT_STEPS = 100         # up to ~0.5 s (5 ms polls) for a free slot before dropping a frame
+# On a phone hotspot one 45 KB frame took ~0.2 s to reach the laptop and come back, so with one frame in flight the
+# stream topped out near 5 fps. Smaller frames and a few in flight keep it near the 15 fps the server needs.
+MAX_FRAMES_IN_FLIGHT = 3
+STREAM_SIZE = (480, 360)
+STREAM_JPEG_QUALITY = 70
+VISION_INTERVAL = 0.5          # identity-only snapshots, 2 fps (the server re-checks identity every 0.5 s)
+EMOTION_INTERVAL = 0.5         # emotion is scored on the robot, at most 2 fps, only for the verified face
+JPEG_QUALITY = 75
+FPS_WINDOW = 10.0
+HEARTBEAT_SECONDS = 10.0
+TICK_SECONDS = 0.2
+TASK_WAIT = 25
+RESUMABLE = frozenset({"app_unreachable"})   # slot results that leave the task leased to us
+
+
+def encode_stream_jpeg(frame) -> bytes:
+    """BGR 640x480 frame -> a smaller JPEG for the server-side landmark stream (about half the bytes)."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    image = Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
+    if image.size != STREAM_SIZE:
+        image = image.resize(STREAM_SIZE, Image.Resampling.BILINEAR)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=STREAM_JPEG_QUALITY)
+    return buffer.getvalue()
+
+
+def encode_jpeg(frame) -> bytes:
+    """BGR frame -> JPEG bytes."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1])).save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return buffer.getvalue()
+
+
+class MonitorStream:
+    """Streams frames to the attached monitor session and keeps its latest public() state.
+
+    With no `engine`, the server computes the landmarks: each frame goes out as a JPEG to
+    /monitor/frame, with up to MAX_FRAMES_IN_FLIGHT requests outstanding (the server keeps them in
+    order and ignores a frame older than one it already has).
+    With an `engine`, the robot computes landmarks itself and posts them plus a 2 fps JPEG; then at
+    most one landmark request and one vision request are in flight.
+    A frame that finds no free slot is dropped rather than queued. frame_seq restarts at 1 for every
+    session; timestamps are capture times.
+    """
+
+    def __init__(self, app, robot, engine, *, clock=time.monotonic, run_blocking=asyncio.to_thread,
+                 encode=encode_jpeg, stream_encode=encode_stream_jpeg, fps=CAPTURE_FPS,
+                 vision_interval=VISION_INTERVAL, emotion=None, emotion_interval=EMOTION_INTERVAL,
+                 max_in_flight=MAX_FRAMES_IN_FLIGHT):
+        self.app, self.robot, self.engine = app, robot, engine
+        self.emotion, self.emotion_interval = emotion, emotion_interval
+        self._last_emotion = float("-inf")
+        self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
+        self.max_in_flight = max_in_flight
+        self._frames_in_flight = 0
+        self.interval = 1.0 / fps
+        self.vision_interval = vision_interval
+        self.session: dict | None = None
+        self.latest: dict | None = None
+        self.frame_seq = 0
+        self._latest_seq = 0
+        self._error: Exception | None = None
+        self._landmark_busy = False
+        self._vision_busy = False
+        self._last_vision = float("-inf")
+        self._landmark_times: deque = deque()
+        self._vision_times: deque = deque()
+        self._tasks: set = set()
+
+    # ── the SlotSession-facing interface ─────────────────────────────────
+    def attach(self, monitor: dict) -> None:
+        self.session = {"session_id": monitor["session_id"], "generation": monitor["generation"]}
+        self.latest = dict(monitor)
+        self.frame_seq = 0
+        self._latest_seq = 0
+        self._error = None
+
+    def detach(self) -> None:
+        self.session = None
+        self.latest = None
+
+    def take_error(self) -> Exception | None:
+        error, self._error = self._error, None
+        return error
+
+    # ── rates for the heartbeat ──────────────────────────────────────────
+    def _rate(self, times: deque) -> float:
+        cutoff = self.clock() - FPS_WINDOW
+        while times and times[0] < cutoff:
+            times.popleft()
+        return round(len(times) / FPS_WINDOW, 1)
+
+    def landmark_fps(self) -> float:
+        return self._rate(self._landmark_times)
+
+    def vision_fps(self) -> float:
+        return self._rate(self._vision_times)
+
+    # ── pipeline ─────────────────────────────────────────────────────────
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            started = self.clock()
+            try:
+                await self.step()
+            except Exception:
+                log.exception("capture step failed")
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(max(0.0, self.interval - (self.clock() - started)))
+
+    async def step(self) -> None:
+        session = self.session
+        if session is not None and self.engine is None:
+            await self._stream_frame(session)
+            return
+        if session is None or self._landmark_busy:
+            return
+        frame = await self.run_blocking(self.robot.get_frame)
+        captured = self.clock()
+        if frame is None or self.session is not session:
+            return
+        self.frame_seq += 1
+        seq = self.frame_seq
+        packet = await self.run_blocking(self.engine.process, frame, seq, captured * 1000.0)
+        if self.session is not session:
+            return   # session changed while the landmark models ran: this frame is stale
+        packet = await self._with_emotion(frame, packet, captured)
+        jpeg = None
+        if not self._vision_busy and captured - self._last_vision >= self.vision_interval:
+            self._last_vision = captured
+            jpeg = await self.run_blocking(self.encode, frame)
+        self._landmark_busy = True
+        self._spawn(self._send_landmarks(session, {**session, **packet}, seq, jpeg))
+
+    async def _stream_frame(self, session) -> None:
+        frame = await self.run_blocking(self.robot.get_frame)
+        captured = self.clock()
+        if frame is None or self.session is not session:
+            return
+        jpeg = await self.run_blocking(self.stream_encode, frame)
+        for _ in range(FRAME_WAIT_STEPS):
+            if self._frames_in_flight < self.max_in_flight or self.session is not session:
+                break
+            await asyncio.sleep(0.005)
+        if self._frames_in_flight >= self.max_in_flight or self.session is not session:
+            return
+        self.frame_seq += 1
+        self._frames_in_flight += 1
+        self._spawn(self._send_frame(session, self.frame_seq, captured, jpeg))
+
+    async def _send_frame(self, session, seq: int, captured: float, jpeg: bytes) -> None:
+        try:
+            response = await self.app.monitor_frame(session["session_id"], session["generation"], seq, captured, jpeg)
+            self._landmark_times.append(self.clock())
+            self._accept(session, response)
+        except BridgeError as exc:
+            self._fail(session, exc)
+        finally:
+            self._frames_in_flight -= 1
+
+    async def _with_emotion(self, frame, packet: dict, captured: float) -> dict:
+        """Attach the robot-scored emotion of the server-verified face (the server re-checks it)."""
+        target = (self.latest or {}).get("target_box")
+        if self.emotion is None or not target or captured - self._last_emotion < self.emotion_interval:
+            return packet
+        self._last_emotion = captured
+        try:
+            report = await self.run_blocking(self.emotion.score, frame, packet, target)
+        except Exception:   # emotion is optional; never lose the landmark frame over it
+            log.exception("emotion scoring failed")
+            return packet
+        return packet if report is None else {**packet, "emotion": report}
+
+    async def drain(self) -> None:
+        while self._tasks:
+            await asyncio.gather(*tuple(self._tasks))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _send_landmarks(self, session, packet, seq, jpeg) -> None:
+        try:
+            response = await self.app.monitor_landmarks(packet)
+            self._landmark_times.append(self.clock())
+            self._accept(session, response)
+            # Like the browser: the JPEG follows its landmark packet, so the server can pair them.
+            if jpeg is not None and self.session is session and not self._vision_busy:
+                self._vision_busy = True
+                self._spawn(self._send_vision(session, seq, jpeg))
+        except BridgeError as exc:
+            self._fail(session, exc)
+        finally:
+            self._landmark_busy = False
+
+    async def _send_vision(self, session, seq, jpeg) -> None:
+        try:
+            response = await self.app.monitor_vision(session["session_id"], session["generation"], seq, jpeg)
+            self._vision_times.append(self.clock())
+            self._accept(session, response)
+        except BridgeError as exc:
+            self._fail(session, exc)
+        finally:
+            self._vision_busy = False
+
+    def _accept(self, session, response) -> None:
+        # Mirrors Intake.tsx acceptStatus: never move back to an older frame's state,
+        # and never let a same-frame response without `recorded` hide one with it.
+        if self.session is not session or not response:
+            return
+        seq = int(response.get("frame_seq") or 0)
+        if seq < self._latest_seq:
+            return
+        if seq == self._latest_seq and self.latest and self.latest.get("recorded") and not response.get("recorded"):
+            return
+        self._latest_seq = seq
+        self.latest = response
+
+    def _fail(self, session, exc: Exception) -> None:
+        if self.session is session:
+            self._error = exc
+
+
+class Runner:
+    def __init__(self, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
+                 heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread):
+        self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
+        self.speaker, self.language = speaker, language
+        self.heartbeat_seconds = heartbeat_seconds
+        self.tick_seconds = tick_seconds
+        self.run_blocking = run_blocking
+        self.slot: SlotSession | None = None
+        self.stopping = asyncio.Event()
+        self.robot_reachable: bool | None = None
+
+    def request_shutdown(self) -> None:
+        """Process exit: leave the task leased so it is resumed (tasks/current) or re-queued on lease expiry."""
+        self.stopping.set()
+        if self.slot:
+            self.slot.stop("bridge_shutdown", abort=False)
+
+    async def run(self) -> None:
+        loops = [asyncio.create_task(self.stream.run(self.stopping)),
+                 asyncio.create_task(self._heartbeat_loop())]
+        tasks = asyncio.create_task(self._task_loop())
+        stopping = asyncio.create_task(self.stopping.wait())
+        try:
+            await asyncio.wait({tasks, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if not tasks.done():
+                # Don't sit out a 25 s long poll on shutdown; a running slot ends itself on cancellation
+                # (session ended, robot asleep, task left leased for recovery).
+                tasks.cancel()
+                await asyncio.gather(tasks, return_exceptions=True)
+            elif not tasks.cancelled():
+                tasks.result()
+        finally:
+            stopping.cancel()
+            self.stopping.set()
+            for loop in loops:
+                loop.cancel()
+            await asyncio.gather(*loops, return_exceptions=True)
+
+    async def _task_loop(self) -> None:
+        # Restart recovery: a task this device already holds comes first. The same applies after
+        # failing closed on app loss: the lease is still ours, so tasks/next would never return it.
+        check_current = True
+        while not self.stopping.is_set():
+            try:
+                if check_current:
+                    task = await self.app.tasks_current()
+                    check_current = False
+                else:
+                    task = await self.app.tasks_next(TASK_WAIT)
+            except NotAuthorised as exc:
+                log.error("device token rejected (%s); pair the robot again or restore consent", exc.detail)
+                await self._pause(60)
+                continue
+            except BridgeError as exc:
+                log.warning("task poll failed: %s", exc)
+                await self._pause(5)
+                continue
+            if task:
+                slot = await self.run_slot(task)
+                check_current = slot.result in RESUMABLE
+
+    async def _pause(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self.stopping.wait(), seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def run_slot(self, task: dict) -> SlotSession:
+        log.info("task %s (%s): %d dose(s)", task.get("task_id"), task.get("reason"), len(task.get("doses", [])))
+        slot = SlotSession(task, app=self.app, robot=self.robot, clips=self.clips, stream=self.stream,
+                           voice=self.voice, speaker=self.speaker, language=self.language,
+                           run_blocking=self.run_blocking)
+        self.slot = slot
+        if self.stopping.is_set():
+            slot.stop("bridge_shutdown", abort=False)
+        try:
+            while not slot.done:
+                await slot.tick()
+                if not slot.done:
+                    await asyncio.sleep(self.tick_seconds)
+        except asyncio.CancelledError:
+            slot.stop("bridge_shutdown", abort=False)   # end the session and sleep the robot, keep the lease
+            await slot.tick()
+            raise
+        finally:
+            self.slot = None
+        return slot
+
+    async def heartbeat_once(self) -> dict | None:
+        try:
+            self.robot_reachable = bool(await self.run_blocking(self.robot.is_reachable))
+        except Exception:
+            self.robot_reachable = False
+        payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
+                   "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
+                   "missing_clips": self.clips.missing_count}
+        try:
+            response = await self.app.heartbeat(payload)
+        except NotAuthorised:
+            response = {"stop_all": True, "microphone": False}   # revoked device or withdrawn consent
+        except BridgeError as exc:
+            log.warning("heartbeat failed: %s", exc)
+            return None
+        if response.get("stop_all") and self.slot:
+            log.warning("stop_all from app: stopping the current slot")
+            self.slot.stop("stop_all")
+        if self.slot and "microphone" in response:
+            # Withdrawn microphone consent takes effect within one heartbeat, not only at the next task.
+            self.slot.task["microphone"] = bool(response["microphone"])
+        return response
+
+    async def _heartbeat_loop(self) -> None:
+        while not self.stopping.is_set():
+            await self.heartbeat_once()
+            await self._pause(self.heartbeat_seconds)

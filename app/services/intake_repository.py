@@ -6,6 +6,23 @@ from app.database import get_pool
 from app.services.emotion_service import LABELS
 
 
+async def take_stock(conn, med_id: int, u_id: int):
+    """Remove one dose (units_per_dose) from stock. (remaining, units) or None when too little is left."""
+    row = await conn.fetchrow(
+        "UPDATE medication SET pills_remaining=pills_remaining-units_per_dose "
+        "WHERE med_id=$1 AND u_id=$2 AND pills_remaining>=units_per_dose "
+        "RETURNING pills_remaining, units_per_dose",
+        med_id, u_id)
+    return (row["pills_remaining"], row["units_per_dose"]) if row else None
+
+
+async def return_stock(conn, med_id: int, units_taken) -> None:
+    """Undo a taken dose: put back what it removed (rows taken before units_taken existed removed 1)."""
+    await conn.execute(
+        "UPDATE medication SET pills_remaining=pills_remaining+COALESCE($2::numeric, 1) WHERE med_id=$1",
+        med_id, units_taken)
+
+
 async def commit_monitored(state, candidate: dict, method: str) -> dict:
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -28,12 +45,10 @@ async def commit_monitored(state, candidate: dict, method: str) -> dict:
             candidate["event_id"], state.u_id)
         if existing:
             return {"event_id": str(existing["event_id"]), "status": existing["outcome"], "already_recorded": True}
-        stock = await conn.fetchval(
-            "UPDATE medication SET pills_remaining=pills_remaining-1 "
-            "WHERE med_id=$1 AND u_id=$2 AND pills_remaining>0 RETURNING pills_remaining",
-            row["med_id"], state.u_id)
-        if stock is None:
+        used = await take_stock(conn, row["med_id"], state.u_id)
+        if used is None:
             raise ValueError("No pills remain for this medication")
+        stock, units = used
         probabilities = candidate.get("emotion_probabilities")
         emot_id = None
         if probabilities:
@@ -44,8 +59,8 @@ async def commit_monitored(state, candidate: dict, method: str) -> dict:
                 state.u_id, label.capitalize(), float(probabilities[label]))
         await conn.execute(
             "UPDATE intake SET intake_stats='taken', actual_intake_time=NOW(), "
-            "detection_confidence=$1, detection_method=$2, emot_id=$3 WHERE intk_id=$4",
-            candidate["confidence"], method, emot_id, state.intk_id)
+            "detection_confidence=$1, detection_method=$2, emot_id=$3, units_taken=$5 WHERE intk_id=$4",
+            candidate["confidence"], method, emot_id, state.intk_id, units)
         await conn.execute(
             "INSERT INTO monitor_event (event_id, session_id, u_id, intk_id, previous_status, "
             "identity_distance, detector_score, detector_band, emotion_probabilities, outcome) "
@@ -70,15 +85,16 @@ async def undo_monitored(state, event_id: str) -> dict:
         if event["outcome"] == "rejected":
             return {"event_id": event_id, "status": "rejected", "already_corrected": True}
         row = await conn.fetchrow(
-            "SELECT med_id, intake_stats FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
+            "SELECT med_id, intake_stats, units_taken FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
             event["intk_id"], state.u_id)
         if not row or row["intake_stats"] != "taken":
             raise ValueError("Dose status changed after this event")
         await conn.execute(
             "UPDATE intake SET intake_stats=$1, actual_intake_time=NULL, emot_id=NULL, "
-            "detection_confidence=NULL, detection_method=NULL, taken_notified=FALSE WHERE intk_id=$2",
+            "detection_confidence=NULL, detection_method=NULL, taken_notified=FALSE, units_taken=NULL "
+            "WHERE intk_id=$2",
             event["previous_status"], event["intk_id"])
-        await conn.execute("UPDATE medication SET pills_remaining=pills_remaining+1 WHERE med_id=$1", row["med_id"])
+        await return_stock(conn, row["med_id"], row["units_taken"])
         await conn.execute("UPDATE monitor_event SET outcome='rejected', corrected_at=NOW() WHERE event_id=$1::uuid",
                            event_id)
         return {"event_id": event_id, "status": "rejected", "already_corrected": False}
@@ -90,7 +106,7 @@ async def transition_intake(u_id: int, intk_id: int, new_status: str, *, method:
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
-            "SELECT intk_id, med_id, intake_stats FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
+            "SELECT intk_id, med_id, intake_stats, units_taken FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
             intk_id, u_id)
         if not row:
             raise ValueError("Intake record not found")
@@ -101,20 +117,20 @@ async def transition_intake(u_id: int, intk_id: int, new_status: str, *, method:
             raise ValueError("awaiting_caregiver_confirmation")
         if previous == new_status:
             return {"intk_id": intk_id, "status": new_status, "changed": False}
+        units = None
         if new_status == "taken":
-            stock = await conn.fetchval(
-                "UPDATE medication SET pills_remaining=pills_remaining-1 WHERE med_id=$1 "
-                "AND u_id=$2 AND pills_remaining>0 RETURNING pills_remaining", row["med_id"], u_id)
-            if stock is None:
+            used = await take_stock(conn, row["med_id"], u_id)
+            if used is None:
                 raise ValueError("No pills remain for this medication")
+            units = used[1]
         elif previous == "taken":
-            await conn.execute("UPDATE medication SET pills_remaining=pills_remaining+1 WHERE med_id=$1", row["med_id"])
+            await return_stock(conn, row["med_id"], row["units_taken"])
         await conn.execute(
             "UPDATE intake SET intake_stats=$1::varchar, "
             "actual_intake_time=CASE WHEN $1::varchar='taken' THEN NOW() ELSE NULL END, "
             "detection_method=CASE WHEN $1::varchar='taken' THEN $2::varchar ELSE NULL END, "
-            "detection_confidence=NULL WHERE intk_id=$3::int",
-            new_status, method, intk_id)
+            "detection_confidence=NULL, units_taken=$4 WHERE intk_id=$3::int",
+            new_status, method, intk_id, units)
         if previous == "taken" and new_status != "taken":
             # A later manual correction must retire the evidence row. Without
             # this, /recent and the global undo endpoint can act on a stale

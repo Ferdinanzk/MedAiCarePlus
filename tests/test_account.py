@@ -132,7 +132,7 @@ def test_export_contains_owned_rows_and_photos_without_password(setup_account):
         assert "password_hash" not in account["user"][0]
         assert account["monitor_event"][0]["event_id"] == str(uuid.UUID(int=1))
         assert archive.read("face/pearl-0.jpg") == b"face"
-    assert len(conn.queries) == 11
+    assert len(conn.queries) == len(api_account.EXPORT_TABLES)
 
 
 def test_account_routes_use_identity_without_consent():

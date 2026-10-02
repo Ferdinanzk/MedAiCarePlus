@@ -19,6 +19,12 @@ EMOTION_MODEL_PATH = Path(os.getenv(
     str(_HERE / "models" / "emotion_seed43" / "model_fp32.onnx")
 ))
 
+# MediaPipe face/hand/pose landmark models as ONNX, for camera frames the Reachy streams to the server.
+LANDMARK_MODEL_DIR = Path(os.getenv(
+    "LANDMARK_MODEL_DIR",
+    str(_HERE / "models" / "landmarks")
+))
+
 YOLO_MODEL_PATH = Path(os.getenv(
     "YOLO_MODEL_PATH",
     str(_AI_ROOT / "segmentation" / "prescription_best_100_epo.pt")
@@ -60,6 +66,8 @@ LLM_SERVICE              = os.getenv("LLM_SERVICE", "OpenRouter")
 LLM_PROVIDER             = os.getenv("LLM_PROVIDER", "")
 LLM_PROVIDER_REGION      = os.getenv("LLM_PROVIDER_REGION", "")
 LLM_RETENTION            = os.getenv("LLM_RETENTION", "")
+OPENROUTER_API_KEY       = os.getenv("OPENROUTER_API_KEY", "")
+LLM_MODEL                = os.getenv("LLM_MODEL", "")
 
 REACHY_FEATURE_ENABLED  = os.getenv("REACHY_FEATURE_ENABLED", "").strip().lower() in ("1", "true", "yes")
 RISK_CLASSIFIER_API_KEY = os.getenv("RISK_CLASSIFIER_API_KEY", "")

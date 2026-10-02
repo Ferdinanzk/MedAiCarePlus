@@ -1,14 +1,19 @@
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
+from app.services import adherence as adherence_rules
 from app.services.line_service import LineService
 
 
 async def send_weekly_summaries():
     """
-    Sundays 9am: calculate weekly adherence and send summary to family contacts.
+    Sundays 9am: calculate the past week's adherence and send summary to family contacts.
+    Only doses that were already due count (adherence.daily_counts); future doses never do.
     """
     pool = get_pool()
-    now = datetime.utcnow()
+    now = datetime.now(ZoneInfo(MEDCARE_TIMEZONE))
     week_ago = now - timedelta(days=7)
 
     async with pool.acquire() as conn:
@@ -19,19 +24,11 @@ async def send_weekly_summaries():
         line_svc = LineService.get_instance()
 
         for patient in patients:
-            rows = await conn.fetch(
-                """
-                SELECT intake_stats AS status FROM intake
-                WHERE u_id = $1 AND intake_time_stamp >= $2
-                """,
-                patient["id"], week_ago,
-            )
-
-            total = len(rows)
             # Only verified doses count: 'pending_confirmation' (awaiting a
             # caregiver's answer) is not taken for adherence.
-            taken = sum(1 for r in rows if r["status"] == "taken")
-            adherence = (taken / total * 100) if total > 0 else 0
+            week = adherence_rules.totals(
+                await adherence_rules.daily_counts(conn, patient["id"], week_ago, now, now))
+            adherence = week["adherence"] or 0
 
             emotion_rows = await conn.fetch(
                 """

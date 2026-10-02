@@ -57,6 +57,11 @@ class FakeConn:
             return None
         raise AssertionError(query)
 
+    async def fetchval(self, query, *args):
+        if "FROM family_contacts" in query:
+            return 0   # contacts that can receive family alerts
+        raise AssertionError(query)
+
     async def execute(self, query, *args):
         self.executed.append((query, args))
         if "UPDATE reachy_device SET revoked_at = NOW()" in query:

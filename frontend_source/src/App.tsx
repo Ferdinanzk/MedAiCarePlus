@@ -17,6 +17,7 @@ import Scan from './pages/Scan';
 import Family from './pages/Family';
 import Onboarding from './pages/Onboarding';
 import HistoryPage from './pages/History';
+import Conversations from './pages/Conversations';
 import Register from './pages/Register';
 import Settings from './pages/Settings';
 import ConsentGate from './components/ConsentGate';
@@ -153,6 +154,10 @@ function App() {
           <Route
             path="/history"
             element={protectedPage(<HistoryPage />)}
+          />
+          <Route
+            path="/conversations"
+            element={protectedPage(<Conversations />)}
           />
           <Route
             path="/settings"

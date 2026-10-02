@@ -54,7 +54,7 @@ async def check_missed_doses():
             JOIN medication m ON m.med_id = i.med_id
             JOIN "user" u ON u.u_id = i.u_id
             LEFT JOIN notification_settings ns ON ns.u_id = i.u_id
-            WHERE i.intake_stats = 'pending'
+            WHERE i.intake_stats = 'pending' AND m.is_active = TRUE
             """
         )
 

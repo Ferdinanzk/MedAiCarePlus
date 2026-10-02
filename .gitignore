@@ -27,6 +27,8 @@ ollama_models/
 .DS_Store
 Thumbs.db
 *.png
+# The LINE bot's add-friend QR, shown on the Family and onboarding pages
+!frontend_source/public/line-bot-qr.png
 
 # IDE
 .vscode/
@@ -48,6 +50,7 @@ node_modules/
 RESEARCH_*.md
 DIAGNOSTIC_*.md
 HANDOFF*.md
+!HANDOFF.md
 ONBOARDING.md
 ELDERLY_FONT_ANALYSIS.md
 
@@ -88,6 +91,12 @@ models/face_recognition/face_gallery/*.jpeg
 # *.bin outside models/ stays ignored (large public downloads)
 !models/face_recognition/**/*.bin
 !models/face_recognition/**/*.xml
+
+# Models the app needs at run time, committed so a fresh clone builds and runs as is
+!models/emotion_seed43/model_fp32.onnx
+!models/landmarks/*.onnx
+!frontend_source/public/models/*.task
+!reachy_app/medcare_reachy/vision_models/*.onnx
 
 # Patient data written by the backup service and the deletion ledger — never commit or bake into images
 backups/

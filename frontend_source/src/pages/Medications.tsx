@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   Clock,
   Package,
+  PackagePlus,
   Edit3,
   Trash2,
   Loader2,
@@ -21,6 +22,8 @@ import {
   Moon,
   Bed,
   Camera,
+  Archive,
+  RotateCcw,
 } from 'lucide-react';
 
 interface ScheduleTime {
@@ -30,6 +33,8 @@ interface ScheduleTime {
   bedtime: boolean;
   before_meals: boolean;
   after_meals: boolean;
+  custom_times: string[];
+  weekdays: number[] | null;   // ISO 1 (Mon) .. 7 (Sun); null = every day
 }
 
 interface Medication {
@@ -46,12 +51,15 @@ interface Medication {
   is_active: boolean;
   dose_form?: DoseForm;
   units_per_dose?: number;
+  days_left?: number | null;
+  run_out_date?: string | null;
 }
 
 type DoseForm = 'solid_oral' | 'liquid' | 'inhaler' | 'injection' | 'topical' | 'other';
 const DOSE_FORMS: DoseForm[] = ['solid_oral', 'liquid', 'inhaler', 'injection', 'topical', 'other'];
 
-const SCHEDULE_OPTIONS: { key: keyof ScheduleTime; label: string }[] = [
+type PresetKey = 'morning' | 'noon' | 'night' | 'bedtime' | 'before_meals' | 'after_meals';
+const SCHEDULE_OPTIONS: { key: PresetKey; label: string }[] = [
   { key: 'morning',      label: '早上' },
   { key: 'noon',         label: '中午' },
   { key: 'night',        label: '晚上' },
@@ -59,10 +67,17 @@ const SCHEDULE_OPTIONS: { key: keyof ScheduleTime; label: string }[] = [
   { key: 'before_meals', label: '飯前' },
   { key: 'after_meals',  label: '飯後' },
 ];
+const PRESET_TIMES: Record<'morning' | 'noon' | 'night' | 'bedtime', string> = {
+  morning: '08:00', noon: '12:00', night: '20:00', bedtime: '22:00',
+};
+const WEEKDAYS = [1, 2, 3, 4, 5, 6, 7];
+const MAX_TIMES = 8;
+const REFILL_SOON_DAYS = 7;
 
 const EMPTY_SCHEDULE: ScheduleTime = {
   morning: false, noon: false, night: false,
   bedtime: false, before_meals: false, after_meals: false,
+  custom_times: [], weekdays: null,
 };
 
 /** Normalize JSON fields returned by asyncpg into the UI's object shape. */
@@ -93,6 +108,12 @@ function normalizeScheduleTime(value: unknown): ScheduleTime | null {
   }
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
   const source = candidate as Record<string, unknown>;
+  const customTimes = Array.isArray(source.custom_times)
+    ? source.custom_times.filter((time): time is string => typeof time === 'string' && /^\d{2}:\d{2}$/.test(time))
+    : [];
+  const weekdays = Array.isArray(source.weekdays)
+    ? source.weekdays.filter((day): day is number => Number.isInteger(day) && day >= 1 && day <= 7)
+    : [];
   return {
     morning: Boolean(source.morning),
     noon: Boolean(source.noon),
@@ -100,20 +121,47 @@ function normalizeScheduleTime(value: unknown): ScheduleTime | null {
     bedtime: Boolean(source.bedtime),
     before_meals: Boolean(source.before_meals),
     after_meals: Boolean(source.after_meals),
+    custom_times: [...new Set(customTimes)].sort(),
+    weekdays: weekdays.length > 0 && weekdays.length < 7 ? [...new Set(weekdays)].sort() : null,
   };
 }
 
+/** Every clock time the schedule creates a dose at. */
+function doseTimes(schedule: ScheduleTime | null): string[] {
+  if (!schedule) return [];
+  const presets = (Object.keys(PRESET_TIMES) as (keyof typeof PRESET_TIMES)[])
+    .filter((key) => schedule[key]).map((key) => PRESET_TIMES[key]);
+  return [...new Set([...presets, ...schedule.custom_times])].sort();
+}
+
+type Period = 'morning' | 'afternoon' | 'evening' | 'bedtime';
+function periodOf(time: string): Period {
+  const hour = Number(time.slice(0, 2));
+  if (hour < 11) return 'morning';
+  if (hour < 17) return 'afternoon';
+  if (hour < 21) return 'evening';
+  return 'bedtime';
+}
+
 const PERIOD_CONFIG = {
-  morning:   { icon: Sun,    label: 'Morning',    timeRange: '6:00-10:00',  iconColor: 'text-amber-500',  bgColor: 'bg-amber-50' },
-  afternoon: { icon: Sunset, label: 'Afternoon',  timeRange: '12:00-15:00', iconColor: 'text-orange-500', bgColor: 'bg-orange-50' },
-  evening:   { icon: Moon,   label: 'Evening',    timeRange: '18:00-21:00', iconColor: 'text-indigo-500', bgColor: 'bg-indigo-50' },
-  bedtime:   { icon: Bed,    label: 'Bedtime',    timeRange: '21:00-23:00', iconColor: 'text-purple-500', bgColor: 'bg-purple-50' },
+  morning:   { icon: Sun,    label: 'Morning',    timeRange: '00:00-11:00', iconColor: 'text-amber-500',  bgColor: 'bg-amber-50' },
+  afternoon: { icon: Sunset, label: 'Afternoon',  timeRange: '11:00-17:00', iconColor: 'text-orange-500', bgColor: 'bg-orange-50' },
+  evening:   { icon: Moon,   label: 'Evening',    timeRange: '17:00-21:00', iconColor: 'text-indigo-500', bgColor: 'bg-indigo-50' },
+  bedtime:   { icon: Bed,    label: 'Bedtime',    timeRange: '21:00-24:00', iconColor: 'text-purple-500', bgColor: 'bg-purple-50' },
 };
 
 function getAuthHeaders(): Record<string, string> {
   const token = getFaceToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
+
+/** 30 -> "30", 29.5 -> "29.5" */
+function amount(value: number | null | undefined): string {
+  return String(Math.round(Number(value ?? 0) * 100) / 100);
+}
+
+const INPUT = 'w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all';
+const LABEL = 'block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5';
 
 export default function Medications() {
   const { t } = useTranslation();
@@ -123,6 +171,10 @@ export default function Medications() {
   const [saving, setSaving] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [newTime, setNewTime] = useState('');
+  const [supplyFor, setSupplyFor] = useState<Medication | null>(null);
+  const [supply, setSupply] = useState({ quantity: 30, note: '' });
+  const [notice, setNotice] = useState('');
 
   const [form, setForm] = useState({
     name: '',
@@ -158,6 +210,7 @@ export default function Medications() {
   const resetForm = () => {
     setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE }, dose_form: 'solid_oral', units_per_dose: 1 });
     setEditingId(null);
+    setNewTime('');
     setShowForm(false);
   };
 
@@ -166,7 +219,7 @@ export default function Medications() {
       name: med.name,
       dosage: med.dosage || '',
       total_pills: med.total_pills,
-      pills_remaining: med.pills_remaining,
+      pills_remaining: Number(med.pills_remaining),
       instructions: med.instructions || '',
       warning: med.warning || '',
       pill_description: med.pill_description || '',
@@ -180,20 +233,75 @@ export default function Medications() {
     setShowForm(true);
   };
 
-  const handleDelete = async (id: number) => {
-    if (!confirm(t('medications.deleteConfirm'))) return;
-    const headers = getAuthHeaders();
-    await fetch(`/api/medications/${id}`, { method: 'DELETE', headers });
+  const post = (url: string, body?: unknown) => fetch(url, {
+    method: 'POST',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const handleStop = async (med: Medication) => {
+    if (!confirm(t('medications.stopConfirm', { name: med.name }))) return;
+    await post(`/api/medications/${med.id}/archive`);
     fetchMedications();
   };
 
+  const handleResume = async (med: Medication) => {
+    await post(`/api/medications/${med.id}/reactivate`);
+    fetchMedications();
+  };
+
+  const handleDelete = async (med: Medication) => {
+    if (!confirm(t('medications.deleteConfirm'))) return;
+    const resp = await fetch(`/api/medications/${med.id}`, { method: 'DELETE', headers: getAuthHeaders() });
+    if (resp.status === 409) setNotice(t('medications.historyKept', { name: med.name }));
+    fetchMedications();
+  };
+
+  const handleAddSupply = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supplyFor || !(supply.quantity > 0)) return;
+    setSaving(true);
+    const resp = await post(`/api/medications/${supplyFor.id}/supply`,
+      { quantity: Math.round(supply.quantity * 100) / 100, note: supply.note || null });
+    setSaving(false);
+    if (resp.ok) {
+      setNotice(t('medications.supplyAdded', { quantity: amount(supply.quantity), name: supplyFor.name }));
+      setSupplyFor(null);
+      fetchMedications();
+    }
+  };
+
   const handleTakeNow = (med: Medication) => {
-    if (med.pills_remaining <= 0) return;
+    if (med.pills_remaining < Number(med.units_per_dose ?? 1)) return;
     navigate(`/intake?med=${med.id}&start=1`);
   };
 
-  const toggleSchedule = (key: keyof ScheduleTime) => {
+  const toggleSchedule = (key: PresetKey) => {
     setForm(f => ({ ...f, schedule_time: { ...f.schedule_time, [key]: !f.schedule_time[key] } }));
+  };
+
+  const addCustomTime = () => {
+    if (!/^\d{2}:\d{2}$/.test(newTime)) return;
+    setForm(f => {
+      const times = [...new Set([...f.schedule_time.custom_times, newTime])].sort();
+      if (doseTimes({ ...f.schedule_time, custom_times: times }).length > MAX_TIMES) return f;
+      return { ...f, schedule_time: { ...f.schedule_time, custom_times: times } };
+    });
+    setNewTime('');
+  };
+
+  const removeCustomTime = (time: string) => {
+    setForm(f => ({ ...f, schedule_time: { ...f.schedule_time,
+      custom_times: f.schedule_time.custom_times.filter((value) => value !== time) } }));
+  };
+
+  const toggleWeekday = (day: number) => {
+    setForm(f => {
+      const current = f.schedule_time.weekdays ?? WEEKDAYS;
+      const next = current.includes(day) ? current.filter((d) => d !== day) : [...current, day].sort();
+      if (next.length === 0) return f;   // at least one day
+      return { ...f, schedule_time: { ...f.schedule_time, weekdays: next.length === 7 ? null : next } };
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -202,12 +310,13 @@ export default function Medications() {
     const headers = getAuthHeaders();
     if (!headers.Authorization) { setSaving(false); return; }
 
-    const normalizedSchedule = normalizeScheduleTime(form.schedule_time);
+    const schedule = normalizeScheduleTime(form.schedule_time);
+    const hasSchedule = !!schedule && (doseTimes(schedule).length > 0 || schedule.before_meals || schedule.after_meals);
     const payload = {
       name: form.name,
       dosage: form.dosage || null,
       total_pills: form.total_pills,
-      pills_remaining: form.pills_remaining,
+      pills_remaining: Math.round(form.pills_remaining * 100) / 100,
       instructions: form.instructions || null,
       warning: form.warning || null,
       pill_description: form.pill_description || null,
@@ -215,8 +324,11 @@ export default function Medications() {
       is_active: form.is_active,
       dose_form: form.dose_form,
       units_per_dose: form.units_per_dose,
-      schedule_time: normalizedSchedule && Object.values(normalizedSchedule).some(Boolean)
-        ? normalizedSchedule
+      schedule_time: hasSchedule && schedule
+        ? { morning: schedule.morning, noon: schedule.noon, night: schedule.night, bedtime: schedule.bedtime,
+            before_meals: schedule.before_meals, after_meals: schedule.after_meals,
+            custom_times: schedule.custom_times,
+            ...(schedule.weekdays ? { weekdays: schedule.weekdays } : {}) }
         : null,
     };
 
@@ -229,20 +341,112 @@ export default function Medications() {
     fetchMedications();
   };
 
-  // Group medications by time period
-  const groupedMeds = {
-    morning: medications.filter(m => m.schedule_time?.morning && m.is_active),
-    afternoon: medications.filter(m => m.schedule_time?.noon && m.is_active),
-    evening: medications.filter(m => m.schedule_time?.night && m.is_active),
-    bedtime: medications.filter(m => m.schedule_time?.bedtime && m.is_active),
+  const activeMeds = medications.filter(m => m.is_active);
+  const groupedMeds: Record<Period, Medication[]> = { morning: [], afternoon: [], evening: [], bedtime: [] };
+  for (const med of activeMeds) {
+    const periods = new Set(doseTimes(med.schedule_time).map(periodOf));
+    periods.forEach((period) => groupedMeds[period].push(med));
+  }
+  const unscheduledMeds = activeMeds.filter(m => doseTimes(m.schedule_time).length === 0);
+  const inactiveMeds = medications.filter(m => !m.is_active);
+
+  const scheduleSummary = (med: Medication) => {
+    const times = doseTimes(med.schedule_time);
+    if (times.length === 0) return null;
+    const days = med.schedule_time?.weekdays;
+    const dayText = days ? days.map((d) => t(`medications.weekday.${d}`)).join(' ') : t('medications.everyDay');
+    return `${times.join(' · ')} — ${dayText}`;
   };
 
-  const unscheduledMeds = medications.filter(m => {
-    const s = m.schedule_time;
-    return m.is_active && (!s || (!s.morning && !s.noon && !s.night && !s.bedtime));
-  });
-
-  const inactiveMeds = medications.filter(m => !m.is_active);
+  const renderCard = (med: Medication) => {
+    const canTake = med.pills_remaining >= Number(med.units_per_dose ?? 1);
+    const lowSupply = med.days_left != null && med.days_left <= REFILL_SOON_DAYS;
+    const summary = scheduleSummary(med);
+    return (
+      <div
+        key={med.id}
+        className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md hover:border-gray-200 transition-all duration-300"
+      >
+        <div className="w-10 h-10 bg-blue-50 rounded-full flex items-center justify-center shrink-0">
+          <Pill className="w-5 h-5 text-[#0057B8]" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="font-semibold text-gray-900 text-base">{med.name}</p>
+            {med.warning && <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />}
+          </div>
+          {med.dosage && <p className="text-sm text-gray-500 font-medium mt-0.5">{med.dosage}</p>}
+          <div className="flex items-center gap-3 mt-1 text-sm text-gray-400 flex-wrap">
+            <span className="flex items-center gap-1">
+              <Package className="w-3 h-3" />
+              {amount(med.pills_remaining)}/{med.total_pills}
+            </span>
+            {summary && (
+              <span className="flex items-center gap-1">
+                <Clock className="w-3 h-3 shrink-0" />
+                {summary}
+              </span>
+            )}
+          </div>
+          {med.days_left != null && med.run_out_date && (
+            <p className={`text-sm mt-1 ${lowSupply ? 'text-amber-700 font-medium' : 'text-gray-500'}`}>
+              {t('medications.daysLeft', { days: med.days_left, date: med.run_out_date })}
+            </p>
+          )}
+          {med.use_before && (() => {
+            const exp = getExpiryStatus(med.use_before);
+            const alert = exp.status === 'expired' || exp.status === 'soon';
+            return (
+              <p className={`text-sm mt-1 flex items-center gap-1 ${alert ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>
+                <CalendarClock className="w-3 h-3 shrink-0" />
+                {med.use_before}
+                {exp.status === 'expired' && <span>· {t('medications.expiredOn', { date: exp.iso })}</span>}
+                {exp.status === 'soon' && (
+                  <span>· {exp.daysLeft === 0
+                    ? t('medications.expiresToday', { date: exp.iso })
+                    : t('medications.expiresInDays', { days: exp.daysLeft, date: exp.iso })}</span>
+                )}
+              </p>
+            );
+          })()}
+        </div>
+        <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
+          <button
+            onClick={() => handleTakeNow(med)}
+            disabled={!canTake}
+            aria-label={`${t('intake.take')}: ${med.name}`}
+            className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
+          >
+            <Camera className="w-4 h-4" />
+            {canTake ? t('intake.take') : t('intake.cannotTake')}
+          </button>
+          <button
+            onClick={() => { setSupply({ quantity: med.total_pills || 30, note: '' }); setSupplyFor(med); }}
+            aria-label={`${t('medications.addSupply')}: ${med.name}`}
+            title={t('medications.addSupply')}
+            className={`p-2 rounded-lg transition-colors ${lowSupply ? 'text-amber-600 bg-amber-50 hover:bg-amber-100' : 'text-gray-400 hover:text-[#0057B8] hover:bg-blue-50'}`}
+          >
+            <PackagePlus className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => handleEdit(med)}
+            aria-label={`${t('medications.edit')}: ${med.name}`}
+            className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"
+          >
+            <Edit3 className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => handleStop(med)}
+            aria-label={`${t('medications.stop')}: ${med.name}`}
+            title={t('medications.stop')}
+            className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+          >
+            <Archive className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   if (loading) {
     return (
@@ -253,6 +457,8 @@ export default function Medications() {
     );
   }
 
+  const formTimes = doseTimes(form.schedule_time);
+
   return (
     <div className="space-y-5 relative">
       {/* Header */}
@@ -262,6 +468,50 @@ export default function Medications() {
           <p className="text-base text-gray-500 mt-0.5">{new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
         </div>
       </div>
+
+      {notice && (
+        <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-blue-50 border border-blue-200 p-4 text-blue-800">
+          <span>{notice}</span>
+          <button onClick={() => setNotice('')} aria-label={t('common.close')} className="shrink-0"><X className="w-4 h-4" /></button>
+        </div>
+      )}
+
+      {/* ── Add supply dialog ── */}
+      {supplyFor && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm px-4 pb-4">
+          <form onSubmit={handleAddSupply} className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-gray-100 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+                <PackagePlus className="w-5 h-5 text-[#0057B8]" />{t('medications.supplyTitle', { name: supplyFor.name })}
+              </h3>
+              <button type="button" onClick={() => setSupplyFor(null)} aria-label={t('common.cancel')} className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-sm text-gray-500">{t('medications.supplyCurrent', { amount: amount(supplyFor.pills_remaining) })}</p>
+            <div>
+              <label htmlFor="supply-quantity" className={LABEL}>{t('medications.supplyQuantity')}</label>
+              <input id="supply-quantity" type="number" min={0.5} max={9999} step={0.5} required
+                value={supply.quantity} onChange={e => setSupply({ ...supply, quantity: Number(e.target.value) })} className={INPUT} />
+            </div>
+            <div>
+              <label htmlFor="supply-note" className={LABEL}>{t('medications.supplyNote')}</label>
+              <input id="supply-note" type="text" maxLength={200} value={supply.note}
+                onChange={e => setSupply({ ...supply, note: e.target.value })} className={INPUT}
+                placeholder={t('medications.supplyNotePlaceholder')} />
+            </div>
+            <div className="flex gap-3">
+              <button type="submit" disabled={saving}
+                className="flex-1 py-3 rounded-xl bg-[#0057B8] text-white font-semibold hover:bg-[#003D82] disabled:opacity-60 flex items-center justify-center gap-2">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : t('medications.addSupply')}
+              </button>
+              <button type="button" onClick={() => setSupplyFor(null)} className="flex-1 py-3 bg-gray-100 text-gray-700 rounded-xl font-medium hover:bg-gray-200">
+                {t('common.cancel')}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* ── Manual Input Form Modal ── */}
       {showForm && (
@@ -285,34 +535,34 @@ export default function Medications() {
               {/* Medication name + dosage */}
               <div className="px-5 py-4 space-y-3">
                 <div>
-                  <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.name')} *</label>
+                  <label className={LABEL}>{t('medications.name')} *</label>
                   <input
                     type="text"
                     value={form.name}
                     onChange={e => setForm({ ...form, name: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    className={INPUT}
                     placeholder="e.g. Allegra (Fexofenadine) 60mg/tab"
                     required
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.dosage')}</label>
+                    <label className={LABEL}>{t('medications.dosage')}</label>
                     <input
                       type="text"
                       value={form.dosage}
                       onChange={e => setForm({ ...form, dosage: e.target.value })}
-                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                      className={INPUT}
                       placeholder="e.g. 60mg/tab"
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">外觀 Appearance</label>
+                    <label className={LABEL}>外觀 Appearance</label>
                     <input
                       type="text"
                       value={form.pill_description}
                       onChange={e => setForm({ ...form, pill_description: e.target.value })}
-                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                      className={INPUT}
                       placeholder="e.g. 橢圓形橘色"
                     />
                   </div>
@@ -320,18 +570,18 @@ export default function Medications() {
                 {/* Reachy records automatically only one tablet/capsule per prompt. */}
                 <div className="grid grid-cols-2 gap-3 mt-3">
                   <div>
-                    <label htmlFor="dose-form" className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.doseForm')}</label>
+                    <label htmlFor="dose-form" className={LABEL}>{t('medications.doseForm')}</label>
                     <select
                       id="dose-form"
                       value={form.dose_form}
                       onChange={e => setForm({ ...form, dose_form: e.target.value as DoseForm })}
-                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                      className={INPUT}
                     >
                       {DOSE_FORMS.map(value => <option key={value} value={value}>{t(`medications.doseForms.${value}`)}</option>)}
                     </select>
                   </div>
                   <div>
-                    <label htmlFor="units-per-dose" className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.unitsPerDose')}</label>
+                    <label htmlFor="units-per-dose" className={LABEL}>{t('medications.unitsPerDose')}</label>
                     <input
                       id="units-per-dose"
                       type="number"
@@ -340,7 +590,7 @@ export default function Medications() {
                       step={0.25}
                       value={form.units_per_dose}
                       onChange={e => setForm({ ...form, units_per_dose: Number(e.target.value) })}
-                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                      className={INPUT}
                     />
                   </div>
                 </div>
@@ -352,67 +602,114 @@ export default function Medications() {
               {/* Quantity */}
               <div className="px-5 py-4 grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">總數量 Total Pills</label>
+                  <label className={LABEL}>總數量 Total Pills</label>
                   <input
                     type="number"
                     value={form.total_pills}
                     onChange={e => setForm({ ...form, total_pills: parseInt(e.target.value) || 0 })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    className={INPUT}
                     min={0}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.pillsLeft')}</label>
+                  <label className={LABEL}>{t('medications.pillsLeft')}</label>
                   <input
                     type="number"
                     value={form.pills_remaining}
-                    onChange={e => setForm({ ...form, pills_remaining: parseInt(e.target.value) || 0 })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    onChange={e => setForm({ ...form, pills_remaining: parseFloat(e.target.value) || 0 })}
+                    className={INPUT}
                     min={0}
+                    step={0.25}
                   />
                 </div>
               </div>
 
               {/* Schedule */}
-              <div className="px-5 py-4">
-                <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">服藥時間 Schedule</label>
-                <div className="flex flex-wrap gap-2 mt-1">
-                  {SCHEDULE_OPTIONS.map(({ key, label }) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => toggleSchedule(key)}
-                      className={`px-4 py-2 rounded-full text-base font-medium border transition-all ${
-                        form.schedule_time[key]
-                          ? 'bg-[#0057B8] border-[#0057B8] text-white shadow-md'
-                          : 'bg-white border-gray-200 text-gray-500 hover:border-gray-300'
-                      }`}
-                    >
-                      {label}
+              <div className="px-5 py-4 space-y-3">
+                <div>
+                  <label className={LABEL}>服藥時間 Schedule</label>
+                  <div className="flex flex-wrap gap-2 mt-1">
+                    {SCHEDULE_OPTIONS.map(({ key, label }) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => toggleSchedule(key)}
+                        aria-pressed={form.schedule_time[key]}
+                        className={`px-4 py-2 rounded-full text-base font-medium border transition-all ${
+                          form.schedule_time[key]
+                            ? 'bg-[#0057B8] border-[#0057B8] text-white shadow-md'
+                            : 'bg-white border-gray-200 text-gray-500 hover:border-gray-300'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label htmlFor="custom-time" className={LABEL}>{t('medications.customTimes')}</label>
+                  <div className="flex gap-2">
+                    <input id="custom-time" type="time" value={newTime} onChange={e => setNewTime(e.target.value)}
+                      className={`${INPUT} flex-1`} />
+                    <button type="button" onClick={addCustomTime} disabled={!newTime || formTimes.length >= MAX_TIMES}
+                      className="px-4 rounded-xl border border-[#0057B8] text-[#0057B8] font-medium disabled:opacity-40">
+                      {t('medications.addTime')}
                     </button>
-                  ))}
+                  </div>
+                  {form.schedule_time.custom_times.length > 0 && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {form.schedule_time.custom_times.map((time) => (
+                        <span key={time} className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-blue-50 text-[#0057B8] font-medium">
+                          {time}
+                          <button type="button" onClick={() => removeCustomTime(time)}
+                            aria-label={t('medications.removeTime', { time })} className="p-0.5"><X className="w-3.5 h-3.5" /></button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <span className={LABEL}>{t('medications.days')}</span>
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label={t('medications.days')}>
+                    {WEEKDAYS.map((day) => {
+                      const on = (form.schedule_time.weekdays ?? WEEKDAYS).includes(day);
+                      return (
+                        <button key={day} type="button" onClick={() => toggleWeekday(day)} aria-pressed={on}
+                          className={`w-11 h-11 rounded-full text-sm font-medium border transition-all ${
+                            on ? 'bg-[#0057B8] border-[#0057B8] text-white' : 'bg-white border-gray-200 text-gray-500'}`}>
+                          {t(`medications.weekday.${day}`)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-sm text-gray-500 mt-1.5">
+                    {formTimes.length === 0 ? t('medications.noTimesYet')
+                      : `${formTimes.join(' · ')} — ${form.schedule_time.weekdays
+                        ? form.schedule_time.weekdays.map((d) => t(`medications.weekday.${d}`)).join(' ')
+                        : t('medications.everyDay')}`}
+                  </p>
                 </div>
               </div>
 
               {/* Instructions + use before */}
               <div className="px-5 py-4 space-y-3">
                 <div>
-                  <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.instructions')}</label>
+                  <label className={LABEL}>{t('medications.instructions')}</label>
                   <textarea
                     value={form.instructions}
                     onChange={e => setForm({ ...form, instructions: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    className={INPUT}
                     rows={2}
                     placeholder="e.g. 每天兩次，早晚飯後使用"
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">有效期限 Use Before</label>
+                  <label className={LABEL}>有效期限 Use Before</label>
                   <input
                     type="text"
                     value={form.use_before}
                     onChange={e => setForm({ ...form, use_before: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all"
+                    className={INPUT}
                     placeholder="e.g. 114年08月22日"
                   />
                   {(() => {
@@ -436,7 +733,7 @@ export default function Medications() {
 
               {/* Warning */}
               <div className="px-5 py-4">
-                <label className="block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5">{t('medications.warning')}</label>
+                <label className={LABEL}>{t('medications.warning')}</label>
                 <textarea
                   value={form.warning}
                   onChange={e => setForm({ ...form, warning: e.target.value })}
@@ -452,6 +749,7 @@ export default function Medications() {
                 <button
                   type="button"
                   onClick={() => setForm(f => ({ ...f, is_active: !f.is_active }))}
+                  aria-pressed={form.is_active}
                   className={`relative w-11 h-6 rounded-full transition-colors ${form.is_active ? 'bg-[#0057B8]' : 'bg-gray-200'}`}
                 >
                   <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${form.is_active ? 'translate-x-5' : ''}`} />
@@ -489,89 +787,19 @@ export default function Medications() {
         </div>
       ) : (
         <div className="space-y-6">
-          {Object.entries(groupedMeds).map(([period, meds]) => {
+          {(Object.entries(groupedMeds) as [Period, Medication[]][]).map(([period, meds]) => {
             if (meds.length === 0) return null;
-            const config = PERIOD_CONFIG[period as keyof typeof PERIOD_CONFIG];
-            const Icon = config.icon;
+            const config = PERIOD_CONFIG[period];
             return (
               <TimeSection
                 key={period}
                 title={config.label}
                 timeRange={config.timeRange}
-                icon={Icon}
+                icon={config.icon}
                 iconColor={config.iconColor}
                 bgColor={config.bgColor}
               >
-                <div className="space-y-2">
-                  {meds.map((med) => (
-                    <div
-                      key={med.id}
-                      className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md hover:border-gray-200 transition-all duration-300"
-                    >
-                      <div className="w-10 h-10 bg-blue-50 rounded-full flex items-center justify-center shrink-0">
-                        <Pill className="w-5 h-5 text-[#0057B8]" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <p className="font-semibold text-gray-900 text-base">{med.name}</p>
-                          {med.warning && <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />}
-                        </div>
-                        {med.dosage && <p className="text-sm text-gray-500 font-medium mt-0.5">{med.dosage}</p>}
-                        <div className="flex items-center gap-3 mt-1 text-sm text-gray-400">
-                          <span className="flex items-center gap-1">
-                            <Package className="w-3 h-3" />
-                            {med.pills_remaining}/{med.total_pills}
-                          </span>
-                          {med.instructions && (
-                            <span className="flex items-center gap-1 truncate max-w-[180px]">
-                              <Clock className="w-3 h-3 shrink-0" />
-                              {med.instructions}
-                            </span>
-                          )}
-                        </div>
-                        {med.use_before && (() => {
-                          const exp = getExpiryStatus(med.use_before);
-                          const alert = exp.status === 'expired' || exp.status === 'soon';
-                          return (
-                            <p className={`text-sm mt-1 flex items-center gap-1 ${alert ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>
-                              <CalendarClock className="w-3 h-3 shrink-0" />
-                              {med.use_before}
-                              {exp.status === 'expired' && <span>· {t('medications.expiredOn', { date: exp.iso })}</span>}
-                              {exp.status === 'soon' && (
-                                <span>· {exp.daysLeft === 0
-                                  ? t('medications.expiresToday', { date: exp.iso })
-                                  : t('medications.expiresInDays', { days: exp.daysLeft, date: exp.iso })}</span>
-                              )}
-                            </p>
-                          );
-                        })()}
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => handleTakeNow(med)}
-                          disabled={med.pills_remaining <= 0}
-                          aria-label={`${t('intake.take')}: ${med.name}`}
-                          className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
-                        >
-                          <Camera className="w-4 h-4" />
-                          {med.pills_remaining > 0 ? t('intake.take') : t('intake.cannotTake')}
-                        </button>
-                        <button
-                          onClick={() => handleEdit(med)}
-                          className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"
-                        >
-                          <Edit3 className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => handleDelete(med.id)}
-                          className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                <div className="space-y-2">{meds.map(renderCard)}</div>
               </TimeSection>
             );
           })}
@@ -579,63 +807,25 @@ export default function Medications() {
           {/* Unscheduled medications */}
           {unscheduledMeds.length > 0 && (
             <TimeSection
-              title="Unscheduled"
-              timeRange="As needed"
+              title={t('medications.unscheduled')}
+              timeRange={t('medications.asNeeded')}
               icon={Clock}
               iconColor="text-gray-500"
               bgColor="bg-gray-50"
             >
-              <div className="space-y-2">
-                {unscheduledMeds.map((med) => (
-                  <div
-                    key={med.id}
-                    className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md hover:border-gray-200 transition-all duration-300"
-                  >
-                    <div className="w-10 h-10 bg-gray-50 rounded-full flex items-center justify-center shrink-0">
-                      <Pill className="w-5 h-5 text-gray-500" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-gray-900 text-base">{med.name}</p>
-                      {med.dosage && <p className="text-sm text-gray-500">{med.dosage}</p>}
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        onClick={() => handleTakeNow(med)}
-                        disabled={med.pills_remaining <= 0}
-                        aria-label={`${t('intake.take')}: ${med.name}`}
-                        className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
-                      >
-                        <Camera className="w-4 h-4" />
-                        {med.pills_remaining > 0 ? t('intake.take') : t('intake.cannotTake')}
-                      </button>
-                      <button
-                        onClick={() => handleEdit(med)}
-                        className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(med.id)}
-                        className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <div className="space-y-2">{unscheduledMeds.map(renderCard)}</div>
             </TimeSection>
           )}
 
-          {/* Inactive medications */}
+          {/* Stopped medications: history kept; resume or (with no history) delete */}
           {inactiveMeds.length > 0 && (
             <div className="pt-4 border-t border-gray-100">
-              <h4 className="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Inactive</h4>
+              <h4 className="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">{t('medications.stopped')}</h4>
               <div className="space-y-2">
                 {inactiveMeds.map((med) => (
                   <div
                     key={med.id}
-                    className="flex items-center gap-3 p-4 bg-gray-50 rounded-xl border border-gray-100 opacity-60"
+                    className="flex items-center gap-3 p-4 bg-gray-50 rounded-xl border border-gray-100"
                   >
                     <div className="w-10 h-10 bg-gray-100 rounded-full flex items-center justify-center shrink-0">
                       <Pill className="w-5 h-5 text-gray-400" />
@@ -646,13 +836,21 @@ export default function Medications() {
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       <button
+                        onClick={() => handleResume(med)}
+                        className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-[#0057B8] border border-[#0057B8] rounded-lg hover:bg-blue-50 transition-colors"
+                      >
+                        <RotateCcw className="w-4 h-4" />{t('medications.resume')}
+                      </button>
+                      <button
                         onClick={() => handleEdit(med)}
+                        aria-label={`${t('medications.edit')}: ${med.name}`}
                         className="p-2 text-gray-400 hover:text-[#0057B8] hover:bg-blue-50 rounded-lg transition-colors"
                       >
                         <Edit3 className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDelete(med.id)}
+                        onClick={() => handleDelete(med)}
+                        aria-label={`${t('common.delete')}: ${med.name}`}
                         className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
                       >
                         <Trash2 className="w-4 h-4" />

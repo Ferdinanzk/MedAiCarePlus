@@ -266,8 +266,10 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     task = run(reachy_tasks.lease_next(7, DEVICE, 0))
     assert task["task_id"] == first and task["status"] == "leased"
     assert set(task) == {"task_id", "slot_time", "reason", "attempt", "status", "expires_at",
-                         "patient_name", "auto_record", "doses"}
+                         "patient_name", "auto_record", "microphone", "checkin", "doses"}
     assert task["patient_name"] == "Pearl" and task["auto_record"] is False
+    assert task["microphone"] is False   # no robot_microphone consent in the fixture
+    assert task["checkin"] is False      # nor the check-in scopes
     assert [d["med_name"] for d in task["doses"]] == ["Aspirin", "Metformin", "Zinc"]
     assert set(task["doses"][0]) == {"intk_id", "med_id", "med_name", "pill_description", "dose_form",
                                      "units_per_dose", "intake_stats", "supported"}

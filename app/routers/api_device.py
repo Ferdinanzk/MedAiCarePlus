@@ -4,27 +4,36 @@ Every route authenticates a device token (device_auth.get_device) and acts only
 for that device's own patient.
 """
 
+import asyncio
+import io
 import json
+import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import outbox, reachy_tasks
+from app.services import consent_service, conversation, outbox, reachy_tasks
 from app.services.device_auth import get_device, get_device_for_heartbeat
 from app.services.emotion_service import EmotionService
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
+from app.services.landmark_service import LandmarkService
 from app.services.monitor_service import BusyOtherClient, registry
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/device", tags=["device"])
 
 CLIENT_TYPE = "reachy"
 MAX_WAIT_SECONDS = 25
+MAX_FRAME_BYTES = 1_000_000
+FRAME_VISION_INTERVAL = 0.5   # identity + emotion on a streamed frame, as often as the server re-checks identity
 
 
 class StatusPayload(BaseModel):
@@ -151,11 +160,157 @@ async def extra_event(task_id: str, payload: ExtraEventPayload, device: dict = D
     return {"extra_id": extra_id, "recorded": inserted is not None, "notified": notified}
 
 
+# ── Check-in conversations ───────────────────────────────────────────────────
+
+class ConversationStartPayload(BaseModel):
+    task_id: str
+    language: Literal["zh-TW", "en"] = "zh-TW"
+
+
+class ConversationTurnPayload(BaseModel):
+    text: str = Field(min_length=1, max_length=conversation.MAX_TEXT)
+
+
+class ConversationEndPayload(BaseModel):
+    reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error"] = "finished"
+
+
+_background: set = set()
+
+
+async def _checkin_consent(device: dict) -> None:
+    if not reachy_tasks.checkin_allowed(await consent_service.get_state(device["u_id"])):
+        raise HTTPException(403, "checkin_consent_required")
+
+
+async def _own_conversation(conn, device: dict, conversation_id: str):
+    try:
+        conversation_id = str(uuid.UUID(conversation_id))
+    except ValueError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+    row = await conn.fetchrow(
+        "SELECT conversation_id, language, ended_at FROM conversation "
+        "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+    return row
+
+
+async def _history(conn, conversation_id) -> list[dict]:
+    rows = await conn.fetch(
+        "SELECT role, text FROM conversation_turn WHERE conversation_id = $1::uuid ORDER BY turn_id",
+        str(conversation_id))
+    return [dict(row) for row in rows]
+
+
+async def _add_turn(conn, conversation_id, u_id: int, role: str, text: str, flagged: bool = False) -> int:
+    return await conn.fetchval(
+        "INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged) "
+        "VALUES ($1::uuid, $2, $3, $4, $5) RETURNING turn_id",
+        str(conversation_id), u_id, role, text, flagged)
+
+
+def _spoken(reply: str, language: str, end: bool, risk: bool = False, conversation_id=None) -> dict:
+    body = {"reply": reply, "speech_text": conversation.speech_text(reply, language), "end": end, "risk": risk}
+    if conversation_id is not None:
+        body["conversation_id"] = str(conversation_id)
+    return body
+
+
+@router.post("/conversations")
+async def conversation_start(payload: ConversationStartPayload, device: dict = Depends(get_device)):
+    """Open a check-in conversation for a task leased by this robot; returns the opening line."""
+    await _checkin_consent(device)
+    language = conversation.language_of(payload.language)
+    conversation_id = str(uuid.uuid4())
+    opening = conversation.OPENING[language]
+    async with get_pool().acquire() as conn, conn.transaction():
+        task = await _leased_task(conn, device, payload.task_id)
+        await conn.execute(
+            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model) "
+            "VALUES ($1::uuid, $2, $3::uuid, $4, $5)",
+            conversation_id, device["u_id"], str(task["task_id"]), language, config.LLM_MODEL or "openrouter/free")
+        await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
+    return _spoken(opening, language, end=False, conversation_id=conversation_id)
+
+
+@router.post("/conversations/{conversation_id}/turn")
+async def conversation_turn(conversation_id: str, payload: ConversationTurnPayload, device: dict = Depends(get_device)):
+    """The patient's words (already text, from the robot) in, Reachy's reply out."""
+    await _checkin_consent(device)
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(422, "Empty turn")
+    risk = conversation.screen(text)
+    async with get_pool().acquire() as conn, conn.transaction():
+        row = await _own_conversation(conn, device, conversation_id)
+        if row["ended_at"] is not None:
+            raise HTTPException(409, "Conversation has ended")
+        language = row["language"]
+        turn_id = await _add_turn(conn, row["conversation_id"], device["u_id"], "patient", text, bool(risk))
+        history = await _history(conn, row["conversation_id"])
+        if risk:
+            # Fixed help-line reply; the words never go to the model. Every verified contact is told,
+            # whatever their other alert settings (robot notice §6).
+            await conn.execute("UPDATE conversation SET risk_flag = TRUE WHERE conversation_id = $1::uuid",
+                               str(row["conversation_id"]))
+            notified = await outbox.enqueue_to_contacts(
+                conn, device["u_id"], kind="safety_alert", priority=0,
+                messages=[{"type": "text", "text": conversation.safety_alert_text(device["name"], text, risk)}],
+                dedupe_prefix=f"safety_alert:{row['conversation_id']}:{turn_id}", contact_flag=None)
+            if not notified:
+                # Nobody to tell (no verified *family* contact; the patient's own LINE is not one): never silent.
+                log.warning("safety alert for user %s reached no family contact", device["u_id"])
+                await conn.execute(
+                    "INSERT INTO notification (u_id, category, type, message) VALUES ($1, 'family', $2, $3)",
+                    device["u_id"], "safety_alert_undelivered",
+                    "A check-in safety alert could not be sent: no verified family contact on LINE.")
+    patient_turns = sum(1 for turn in history if turn["role"] == "patient")
+    if risk:
+        reply, end = conversation.HELPLINE[language], True
+    elif conversation.wants_to_end(text) or patient_turns >= conversation.MAX_PATIENT_TURNS:
+        reply, end = conversation.CLOSING[language], True
+    else:
+        # No connection is held while the (possibly slow, free-tier) model answers.
+        reply, end = await conversation.reply(history, language), False
+    async with get_pool().acquire() as conn:
+        await _add_turn(conn, row["conversation_id"], device["u_id"], "reachy", reply)
+    return _spoken(reply, language, end=end, risk=bool(risk))
+
+
+async def _summarize(conversation_id: str, history: list[dict], language: str) -> None:
+    try:
+        summary, mood = await conversation.summarize(history, language)
+        async with get_pool().acquire() as conn:
+            await conn.execute("UPDATE conversation SET summary = $2, mood = $3 WHERE conversation_id = $1::uuid",
+                               conversation_id, summary, mood)
+    except Exception:
+        log.exception("conversation summary failed")
+
+
+@router.post("/conversations/{conversation_id}/end")
+async def conversation_end(conversation_id: str, payload: ConversationEndPayload, device: dict = Depends(get_device)):
+    """Close the conversation (idempotent); the summary and mood are written in the background."""
+    async with get_pool().acquire() as conn, conn.transaction():
+        row = await _own_conversation(conn, device, conversation_id)
+        if row["ended_at"] is not None:
+            return {"ended": True}
+        await conn.execute(
+            "UPDATE conversation SET ended_at = NOW(), end_reason = $2 WHERE conversation_id = $1::uuid",
+            str(row["conversation_id"]), payload.reason)
+        history = await _history(conn, row["conversation_id"])
+    if any(turn["role"] == "patient" for turn in history):
+        task = asyncio.create_task(_summarize(str(row["conversation_id"]), history, row["language"]))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
+    return {"ended": True}
+
+
 @router.post("/heartbeat")
 async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device_for_heartbeat)):
     server_time = datetime.now(timezone.utc).isoformat()
     if device["revoked"] or not device["consent_current"]:
-        return {"stop_all": True, "server_time": server_time}
+        return {"stop_all": True, "microphone": False, "server_time": server_time}
     detail = {"vision_fps": payload.vision_fps, "bridge_version": payload.bridge_version,
               "missing_clips": payload.missing_clips}
     async with get_pool().acquire() as conn, conn.transaction():
@@ -164,7 +319,8 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",
             device["device_id"], payload.robot_reachable, payload.landmark_fps, json.dumps(detail))
         await reachy_tasks.extend_leases(conn, device["device_id"])
-    return {"stop_all": False, "server_time": server_time}
+    microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
+    return {"stop_all": False, "microphone": microphone, "server_time": server_time}
 
 
 # ── Monitor (same payloads as /api/intake/monitor/*) ─────────────────────────
@@ -193,7 +349,7 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
             row = await conn.fetchrow(
                 "SELECT m.dose_form, m.units_per_dose FROM intake i JOIN medication m ON m.med_id=i.med_id "
                 "WHERE i.intk_id=$1 AND i.u_id=$2 AND i.intake_stats IN ('pending','missed') "
-                "AND m.pills_remaining>0 AND m.is_active=TRUE",
+                "AND m.pills_remaining>=m.units_per_dose AND m.is_active=TRUE",
                 intk_id, device["u_id"])
             if not row:
                 raise HTTPException(409, "Dose is unavailable or does not belong to this account")
@@ -228,6 +384,75 @@ async def monitor_vision(session_id: str = Form(...), generation: str = Form(...
         return await registry.vision(state, frame_seq, data, _reachy_commit)
     except (ValueError, TypeError) as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+def _decode_rgb(data: bytes):
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        image = Image.open(io.BytesIO(data))
+        if image.width > 1920 or image.height > 1080:
+            raise ValueError("Camera frame is too large")
+        return image.convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("Invalid camera frame") from exc
+
+
+async def _frame_vision(state, frame_seq: int, jpeg: bytes) -> None:
+    try:
+        await registry.vision(state, frame_seq, jpeg, _reachy_commit)
+    except Exception:   # a failed identity check only delays verification; the next frame retries
+        log.exception("identity check on streamed frame %s failed", frame_seq)
+
+
+def _maybe_start_vision(state, frame_seq: int, jpeg: bytes) -> None:
+    """Identity/emotion every FRAME_VISION_INTERVAL, and at once while a candidate waits for a fresh face match."""
+    if state.vision_task is not None and not state.vision_task.done():
+        return
+    candidate = state.candidate
+    waiting = candidate is not None and not candidate.get("ready", False)
+    now = time.monotonic()
+    if not waiting and now - state.last_vision_started < FRAME_VISION_INTERVAL:
+        return
+    state.last_vision_started = now
+    state.vision_task = asyncio.create_task(_frame_vision(state, frame_seq, jpeg))
+
+
+@router.post("/monitor/frame")
+async def monitor_frame(session_id: str = Form(...), generation: str = Form(...),
+                        frame_seq: int = Form(..., gt=0), timestamp: float = Form(...),
+                        file: UploadFile = File(...), device: dict = Depends(get_device)):
+    """One camera frame (JPEG, `timestamp` = capture time in seconds on the robot's clock).
+
+    The server computes the landmarks the robot used to compute itself, then feeds the same monitor
+    session as /monitor/landmarks and /monitor/vision do, so recording policy is unchanged.
+    """
+    if not LandmarkService._available:
+        raise HTTPException(503, "Landmark models are not ready")
+    state = get_session(device, session_id, generation, CLIENT_TYPE)
+    data = await file.read(MAX_FRAME_BYTES + 1)
+    if len(data) > MAX_FRAME_BYTES:
+        raise HTTPException(413, "Camera frame is too large")
+    loop = asyncio.get_running_loop()
+    async with state.frame_lock:
+        if state.ended:
+            raise HTTPException(409, "Session expired or belongs to another account")
+        if frame_seq <= state.last_frame_seq:
+            return state.public()
+        try:
+            image = await loop.run_in_executor(None, _decode_rgb, data)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if state.vision_engine is None:
+            state.vision_engine = LandmarkService.get_instance().new_engine()
+        packet = await loop.run_in_executor(None, state.vision_engine.process, image, frame_seq, timestamp * 1000.0)
+        try:
+            payload = LandmarkPayload(session_id=session_id, generation=generation, **packet)
+            response = await registry.landmarks(state, payload.model_dump())
+        except (ValidationError, ValueError, TypeError, IndexError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+    _maybe_start_vision(state, frame_seq, data)
+    return response
 
 
 @router.post("/monitor/end")

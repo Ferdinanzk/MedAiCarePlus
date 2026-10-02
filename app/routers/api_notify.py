@@ -35,19 +35,26 @@ def _generate_code(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+class GenerateCodePayload(BaseModel):
+    contact_id: int
+
+
 @router.post("/generate-code")
 async def generate_verification_code(
-    contact_id: int,
+    payload: GenerateCodePayload,
     user: dict = Depends(get_consented_user),
 ):
-    """Generate a verification code for a family contact."""
+    """Generate a verification code for one of the user's family contacts (JSON body: {"contact_id": n})."""
     code = _generate_code()
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE family_contacts SET verification_code = $1, verified = FALSE WHERE id = $2 AND u_id = $3",
-            code, contact_id, user["u_id"],
+        updated = await conn.fetchval(
+            "UPDATE family_contacts SET verification_code = $1, verified = FALSE WHERE id = $2 AND u_id = $3 "
+            "RETURNING id",
+            code, payload.contact_id, user["u_id"],
         )
+    if updated is None:
+        return JSONResponse({"detail": "Contact not found"}, status_code=404)
     return {"code": code}
 
 

@@ -145,8 +145,19 @@ def test_list_returns_dose_fields(monkeypatch):
     conn = _Conn(rows=[{"id": 1, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": Decimal("1.00")}])
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
     result = asyncio.run(api_medications.list_medications({"u_id": 7}))
-    assert result == [{"id": 1, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": 1.0}]
+    assert result == [{"id": 1, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": 1.0,
+                       "pills_remaining": None, "daily_units": None, "days_left": None, "run_out_date": None}]
     assert "dose_form" in conn.calls[0][1] and "units_per_dose" in conn.calls[0][1]
+
+
+def test_list_reports_days_of_supply_for_active_scheduled_medication(monkeypatch):
+    conn = _Conn(rows=[{"id": 1, "name": "Metformin", "is_active": True, "pills_remaining": Decimal("10.00"),
+                        "units_per_dose": Decimal("0.50"), "schedule_time": {"morning": True, "night": True}}])
+    monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
+    (row,) = asyncio.run(api_medications.list_medications({"u_id": 7}))
+    # two half-tablet doses a day = 1 tablet a day
+    assert row["pills_remaining"] == 10.0 and row["daily_units"] == 1.0 and row["days_left"] == 10
+    assert row["run_out_date"] is not None
 
 
 # ── pending_confirmation propagation ──
@@ -221,14 +232,14 @@ def test_manual_patch_of_other_status_still_transitions(monkeypatch):
 def test_today_and_history_return_pending_confirmation_as_is(monkeypatch):
     stamp = datetime.datetime(2026, 9, 30, 0, 0, tzinfo=datetime.timezone.utc)
     row = {"intake_id": 9, "id": 9, "med_id": 4, "name": "Metformin", "status": "pending_confirmation",
-           "scheduled_time": stamp, "schedule_time": None, "use_before": None}
+           "scheduled_time": stamp, "schedule_time": None, "use_before": None, "total": 1}
     conn = _Conn(rows=[row])
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
     monkeypatch.setattr(api_history, "get_pool", lambda: _Pool(conn))
     today = asyncio.run(api_medications.today_medications({"u_id": 7}, "2026-09-30"))
     assert today[0]["status"] == "pending_confirmation"
-    history = asyncio.run(api_history.get_intake_history({"u_id": 7}))
-    assert history[0]["status"] == "pending_confirmation"
+    history = asyncio.run(api_history.get_intake_history({"u_id": 7}, None, None, 50, 0))
+    assert history["items"][0]["status"] == "pending_confirmation" and history["total"] == 1
 
 
 def test_weekly_adherence_counts_pending_confirmation_as_not_taken(monkeypatch):
@@ -237,8 +248,8 @@ def test_weekly_adherence_counts_pending_confirmation_as_not_taken(monkeypatch):
             if 'FROM "user"' in query:
                 return [{"id": 7, "name": "Pearl"}]
             if "FROM intake" in query:
-                return [{"status": "taken"}, {"status": "pending_confirmation"},
-                        {"status": "pending_confirmation"}, {"status": "taken"}]
+                return [{"day": datetime.date(2026, 9, 28), "taken": 2, "missed": 0, "skipped": 0,
+                         "awaiting": 2, "overdue": 0}]
             if "FROM emotion" in query:
                 return []
             return [{"line_id": "U-amy"}]

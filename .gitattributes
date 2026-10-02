@@ -1,3 +1,6 @@
 models/emotion/*.pth filter=lfs diff=lfs merge=lfs -text
 models/segmentation/*.pt filter=lfs diff=lfs merge=lfs -text
 models/face_recognition/**/*.bin filter=lfs diff=lfs merge=lfs -text
+
+# Shell scripts run inside Linux containers: always LF, even in a Windows checkout
+*.sh text eol=lf
