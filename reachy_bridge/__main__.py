@@ -9,6 +9,8 @@ from reachy_bridge.clips import ClipPlayer
 from reachy_bridge.config import Settings
 from reachy_bridge.runner import MonitorStream, Runner
 
+EMOTION_MODEL = "emotion_seed43.onnx"   # plus emotion_seed43_metadata.json; optional
+
 log = logging.getLogger("reachy_bridge")
 
 
@@ -25,14 +27,21 @@ def make_robot(settings: Settings):
 
 async def main() -> None:
     settings = Settings.from_env()
-    from reachy_bridge.vision import VisionEngine   # imports mediapipe
+    from reachy_bridge.vision import VisionEngine   # imports onnxruntime
 
     robot = make_robot(settings)
     engine = VisionEngine(settings.models_dir)
+    emotion = None
+    if (settings.models_dir / EMOTION_MODEL).is_file():
+        from reachy_bridge.emotion import EmotionEngine
+
+        emotion = EmotionEngine(settings.models_dir / EMOTION_MODEL)
+    else:
+        log.warning("no %s in %s: emotion is not scored", EMOTION_MODEL, settings.models_dir)
     clips = ClipPlayer(robot, settings.clips_dir, settings.language)
     clips.audit()
     async with AppClient(settings.app_url, settings.device_token) as app:
-        runner = Runner(app=app, robot=robot, clips=clips, stream=MonitorStream(app, robot, engine))
+        runner = Runner(app=app, robot=robot, clips=clips, stream=MonitorStream(app, robot, engine, emotion=emotion))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:

@@ -106,3 +106,4 @@ ledger/
 .playwright-cli/
 .playwright-mcp/
 output/
+reachy_bridge/models/
