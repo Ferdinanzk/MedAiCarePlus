@@ -6,3 +6,10 @@ frontend_source/dist
 
 backups/
 ledger/
+
+# Not used by the app image (the robot app ships separately)
+reachy_app/
+# Enrolled face photos are personal biometric data: mounted at run time (docker-compose), never baked into an image
+models/face_recognition/face_gallery/*.jpg
+models/face_recognition/face_gallery/*.jpeg
+models/face_recognition/face_gallery/*.png
