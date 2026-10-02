@@ -14,18 +14,17 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
 from app.services import consent_service, conversation, outbox, reachy_tasks
 from app.services.device_auth import get_device, get_device_for_heartbeat
-from app.services.emotion_service import EmotionService
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
-from app.services.monitor_service import BusyOtherClient, registry
+from app.services.monitor_service import LABELS, BusyOtherClient, registry
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/device", tags=["device"])
@@ -34,6 +33,25 @@ CLIENT_TYPE = "reachy"
 MAX_WAIT_SECONDS = 25
 MAX_FRAME_BYTES = 1_000_000
 FRAME_VISION_INTERVAL = 0.5   # identity + emotion on a streamed frame, as often as the server re-checks identity
+
+
+class EmotionReport(BaseModel):
+    """Emotion the robot scored on its own camera for one face of this landmark packet."""
+    face_index: int = Field(ge=0, le=3)
+    probabilities: dict[str, float]
+
+    @field_validator("probabilities")
+    @classmethod
+    def _seven_probabilities(cls, value: dict[str, float]) -> dict[str, float]:
+        if set(value) != set(LABELS) or any(not 0.0 <= p <= 1.0 for p in value.values()):
+            raise ValueError(f"probabilities must give {', '.join(LABELS)}, each between 0 and 1")
+        if abs(sum(value.values()) - 1.0) > 0.01:
+            raise ValueError("probabilities must sum to 1")
+        return value
+
+
+class DeviceLandmarkPayload(LandmarkPayload):
+    emotion: EmotionReport | None = None
 
 
 class StatusPayload(BaseModel):
@@ -332,8 +350,9 @@ async def _reachy_commit(state, candidate: dict, method: str) -> dict:
 
 @router.post("/monitor/start")
 async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get_device)):
-    if not FaceRecognitionService._available or not EmotionService._available:
-        raise HTTPException(503, "Identity or seed 43 emotion model is not ready")
+    # Robots score emotion themselves; the server only needs its identity model.
+    if not FaceRecognitionService._available:
+        raise HTTPException(503, "Identity model is not ready")
     if payload.mode == "dose" and (payload.intk_id is None or payload.task_id is None):
         raise HTTPException(422, "A dose session needs intk_id and task_id")
     auto_commit = False
@@ -364,10 +383,13 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
 
 
 @router.post("/monitor/landmarks")
-async def monitor_landmarks(payload: LandmarkPayload, device: dict = Depends(get_device)):
+async def monitor_landmarks(payload: DeviceLandmarkPayload, device: dict = Depends(get_device)):
     state = get_session(device, payload.session_id, payload.generation, CLIENT_TYPE)
+    packet = payload.model_dump()
+    if packet["emotion"] is not None and packet["emotion"]["face_index"] >= len(packet["faces"]):
+        raise HTTPException(422, "emotion.face_index does not name a face in this packet")
     try:
-        return await registry.landmarks(state, payload.model_dump())
+        return await registry.landmarks(state, packet)
     except (ValueError, TypeError, IndexError) as exc:
         raise HTTPException(422, str(exc)) from exc
 

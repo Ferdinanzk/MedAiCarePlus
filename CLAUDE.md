@@ -84,6 +84,11 @@ Practical floor is ~8fps. The frontend self-throttles (`tick()` returns early wh
 - The robot app can listen for 「我吃完了」 ("I've finished") with SenseVoice on the robot, but only while the `robot_microphone` consent is current. The server sends `microphone` in the task payload and every heartbeat. It's a claim, not evidence: if the camera resolves nothing within 8 s, the robot files a `patient_claim` confirmation.
 - The robot app's source is in `reachy_app/` (published as the Hugging Face space `pearlyjam21/medcare_reachy`). `reachy_app/tools/deploy_to_robot.py` copies it onto the robot. After deploying, restart the app through the daemon (`POST /api/apps/restart-current-app`): saving settings restarts only its worker thread, and the process keeps running the old code.
 
+- **Two ways a robot can see.**
+  - **Server vision** (robot app 0.4.0 default, `vision_on_server=true`): the robot streams frames to `/monitor/frame` and the server computes landmarks *and* emotion (`MonitorSession.vision_engine` is set).
+  - **On-robot vision** (`vision_on_server=false`, and `reachy_bridge/`): the robot app runs the landmark models (MediaPipe models converted to ONNX, on ONNX Runtime; the MediaPipe library can't load on the robot's Pi 4) **and the emotion model**. That session's JPEGs (≤ 2 fps) are identity-only: `vision()` skips `EmotionService` for reachy sessions *without* a `vision_engine`. Emotion arrives as an optional `emotion: {face_index, probabilities}` on `/api/device/monitor/landmarks` and is accepted only for the verified, owned face with an uncovered mouth (`_accept_robot_emotion`).
+  - `public()` exposes `target_box` so the robot knows which face to score. The device API no longer requires `EmotionService` to start a session.
+
 ### Reachy check-in conversations (demo, Oct 2026)
 - **Consent gate.** Check-ins need all four scopes `robot_microphone`, `cloud_voice`, `conversation_analysis` and `safety_alerts` (`reachy_tasks.checkin_allowed`). The task payload's `checkin` flag carries this to the robot, and every `/api/device/conversations*` call re-checks it (403 `checkin_consent_required`). In the UI, the Reachy card's "Daily check-ins" switch grants or withdraws them.
 - **Flow.**

@@ -1,7 +1,8 @@
 # reachy_bridge
 
 Robot-side SDK for Phase 2 (spec `mdPlanReachy/01-reachy-camera-wake-intake.md`). It pulls camera frames
-from a Reachy Mini Wireless, runs MediaPipe face/hand/pose exactly like the browser worker, drives the
+from a Reachy Mini Wireless, runs the browser worker's MediaPipe face/hand/pose models (converted to ONNX, on
+ONNX Runtime, because the MediaPipe library can't load on the robot's Raspberry Pi 4), drives the
 slot state machine, and plays prerecorded prompts. It talks **only** to the app's private device API
 (`/api/device/*` on port 8001) with the `rdv1.` device token shown once at pairing. It has no DB access
 and makes no recording decisions; the server's policy is authoritative. **No microphone** is opened.
@@ -73,7 +74,7 @@ camera and logs motion/audio.
 | `ROBOT_BACKEND` | `reachy` | `reachy` or `video` |
 | `VIDEO_PATH` | — | required for `video` |
 | `LANGUAGE` | `zh-TW` | `zh-TW` or `en` (clip folder) |
-| `MODELS_DIR` | `frontend_source/public/models` | the same `.task` files as the browser |
+| `MODELS_DIR` | `reachy_bridge/models` | the six ONNX models in `vision.MODEL_FILES` (from the `medcare_reachy` app) |
 | `CLIPS_DIR` | `reachy_bridge/clips` | WAVs at `<CLIPS_DIR>/<LANGUAGE>/<clip_id>.wav` |
 
 ## Clips
@@ -88,10 +89,14 @@ are `med_<med_id>.wav`; otherwise `med_prompt_generic` plays.
 
 - `session.py` — pure `SlotSession` state machine (injected clock, robot, clips, stream, app client)
 - `runner.py` — task long-poll, 10 s heartbeat (`stop_all`), 15 fps capture → landmarks every frame,
-  JPEG ≤ 5 fps, one request in flight per stream
+  identity-only JPEG ≤ 2 fps, one request in flight per stream
+- `emotion.py` — the server's seed-43 emotion model on the robot (≤ 2 fps, only the face the server verified, never
+  with a hand over the mouth); the score rides on the landmark packet as `emotion` and the server re-checks it
 - `app_client.py` — httpx client; 409 → `SessionLost` (`BusyOtherClient` for `busy_other_client`),
   401/403 → `NotAuthorised`, network/5xx → `AppUnreachable`, 503 → `ServiceUnavailable`
-- `packets.py` / `vision.py` — MediaPipe Tasks → the browser worker's landmark packet
+- `vision.py` / `mp_geometry.py` — the Tasks face/hand/pose landmarkers on ONNX Runtime (anchors, NMS, rotated
+  crops, VIDEO-mode tracking); `packets.py` — results → the browser worker's landmark packet
+- `tools/bench_vision.py` — per-model timings and the expected landmark fps on this machine
 - `media.py` — `Robot` protocol, `ReachyRobot` (lazy `reachy_mini` import), `VideoFileRobot`
 
 ## Tests
@@ -100,5 +105,6 @@ are `med_<med_id>.wav`; otherwise `med_prompt_generic` plays.
 python -m pytest reachy_bridge/tests -q
 ```
 
-No network, hardware, `mediapipe`, or `reachy_mini` needed (tests need `httpx`, `numpy`, `opencv-python-headless`).
+No network, hardware, models, or `reachy_mini` needed (tests need `httpx`, `numpy`, `pillow`). The model-accuracy
+test runs only when `MODELS_DIR` holds the ONNX models.
 The index-parity test is skipped when the package is used outside the full app repository.
