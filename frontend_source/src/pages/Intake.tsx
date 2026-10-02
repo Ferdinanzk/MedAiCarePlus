@@ -79,6 +79,7 @@ export default function Intake() {
   const params = useParams();
   const [searchParams] = useSearchParams();
   const highlight = params.medicationId || searchParams.get('med');
+  const doseParam = searchParams.get('intake');
   const startNow = searchParams.get('start') === '1';
   const [items, setItems] = useState<IntakeItem[]>([]);
   const [active, setActive] = useState<IntakeItem | null>(null);
@@ -402,8 +403,20 @@ export default function Intake() {
   // highlighted medication to an existing due row, or ask the backend for a
   // locked pending row at the current time when today's schedule has passed
   // or the medication is unscheduled.
+  // The Today screen opens one exact scheduled dose (?intake=<intk_id>&start=1).
   useEffect(() => {
-    if (!startNow || !highlight || autoStartedRef.current || active || loading) return;
+    if (!startNow || !doseParam || autoStartedRef.current || active || loading || items.length === 0) return;
+    autoStartedRef.current = true;
+    const dose = items.find((item) => String(item.id) === doseParam);
+    if (dose && (dose.status === 'pending' || dose.status === 'missed') && dose.pills_remaining > 0) {
+      void start(dose);
+    } else {
+      setError('This dose is no longer waiting to be taken');
+    }
+  }, [active, doseParam, items, loading, start, startNow]);
+
+  useEffect(() => {
+    if (!startNow || doseParam || !highlight || autoStartedRef.current || active || loading) return;
     const medId = Number(highlight);
     if (!Number.isInteger(medId) || medId <= 0) {
       autoStartedRef.current = true;
@@ -544,7 +557,7 @@ export default function Intake() {
       <div className="space-y-3">
         <h2 className="text-xl font-semibold text-slate-900">Today's doses</h2>
         {items.length === 0 && <p className="text-slate-500">No medication is scheduled today.</p>}
-        {items.map((item) => <div key={item.id} className={`rounded-xl border bg-white p-4 flex flex-wrap items-center gap-4 justify-between ${String(item.med_id) === highlight ? 'ring-2 ring-blue-600' : ''}`}>
+        {items.map((item) => <div key={item.id} className={`rounded-xl border bg-white p-4 flex flex-wrap items-center gap-4 justify-between ${String(item.id) === doseParam || (!doseParam && String(item.med_id) === highlight) ? 'ring-2 ring-blue-600' : ''}`}>
           <div className="flex items-center gap-3 min-w-0">
             <div className="rounded-full bg-blue-50 p-3 text-blue-700"><Pill className="w-5 h-5" /></div>
             <div><p className="font-semibold text-slate-900">{item.name}</p>

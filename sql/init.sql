@@ -229,6 +229,27 @@ ALTER TABLE intake ALTER COLUMN intake_stats TYPE VARCHAR(20);
 ALTER TABLE intake ADD CONSTRAINT intake_intake_stats_check
     CHECK (intake_stats IN ('taken','skipped','pending','missed','pending_confirmation'));
 
+-- ─────────────────────────────────────────────
+-- Stock by dose size, supply records, archived courses
+-- ─────────────────────────────────────────────
+-- A dose can be half a tablet (units_per_dose 0.5), so stock is fractional.
+ALTER TABLE medication ALTER COLUMN pills_remaining TYPE NUMERIC(8,2);
+-- Set when a course is stopped; archived medications keep their history.
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- Units a taken dose removed from stock, so an undo restores exactly that amount
+-- even if units_per_dose was edited in between (NULL on rows taken before this column: 1).
+ALTER TABLE intake ADD COLUMN IF NOT EXISTS units_taken NUMERIC(4,2);
+
+CREATE TABLE IF NOT EXISTS medication_supply (
+    supply_id   SERIAL PRIMARY KEY,
+    u_id        INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    med_id      INTEGER NOT NULL REFERENCES medication(med_id) ON DELETE CASCADE,
+    quantity    NUMERIC(8,2) NOT NULL CHECK (quantity > 0),
+    note        VARCHAR(200),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_medication_supply_med ON medication_supply(med_id, created_at DESC);
+
 -- auto_record defaults to FALSE while decision D2 (recording without pill
 -- identification) is open: every observed event goes to caregiver confirmation.
 CREATE TABLE IF NOT EXISTS reachy_device (
@@ -264,6 +285,39 @@ CREATE TABLE IF NOT EXISTS reachy_task (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_slot ON reachy_task(u_id, slot_time)
     WHERE status IN ('queued','leased','searching','in_progress');
+-- 'checkin': a conversation-only task (no doses), started from the web app.
+ALTER TABLE reachy_task DROP CONSTRAINT IF EXISTS reachy_task_reason_check;
+ALTER TABLE reachy_task ADD CONSTRAINT reachy_task_reason_check
+    CHECK (reason IN ('upcoming','missed_retry','manual','checkin'));
+
+-- Check-in conversations. Speech is turned into text on the robot; only text is stored.
+-- Retention (robot notice §5): turns 30 days, turns quoted in a safety alert 180 days,
+-- summaries and mood until the patient deletes them or the account.
+CREATE TABLE IF NOT EXISTS conversation (
+    conversation_id UUID PRIMARY KEY,
+    u_id        INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    task_id     UUID REFERENCES reachy_task(task_id) ON DELETE SET NULL,
+    language    VARCHAR(10) NOT NULL DEFAULT 'zh-TW',
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at    TIMESTAMPTZ,
+    end_reason  VARCHAR(30),
+    summary     TEXT,
+    mood        VARCHAR(20),
+    risk_flag   BOOLEAN NOT NULL DEFAULT FALSE,
+    model       VARCHAR(100)
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_user ON conversation(u_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_turn (
+    turn_id         SERIAL PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES conversation(conversation_id) ON DELETE CASCADE,
+    u_id            INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    role            VARCHAR(10) NOT NULL CHECK (role IN ('patient','reachy')),
+    text            TEXT NOT NULL,
+    flagged         BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_turn_conv ON conversation_turn(conversation_id, turn_id);
 
 CREATE TABLE IF NOT EXISTS dose_confirmation (
     confirmation_id UUID PRIMARY KEY,

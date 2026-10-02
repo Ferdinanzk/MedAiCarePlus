@@ -22,13 +22,13 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${WEB_PORT:-8080}:8000"
     env_file: .env                  # Loads LINE_CHANNEL_ACCESS_TOKEN, SUPABASE_*, SECRET_KEY
     environment:
       # Override DATABASE_URL to point at the local postgres container
       DATABASE_URL: postgresql://medai:medai@postgres:5432/medaicare
       # Frontend is served by FastAPI itself — not a separate dev server
-      FRONTEND_URL: http://localhost:8000
+      FRONTEND_URL: ${MEDCARE_FRONTEND_URL:-http://localhost:${WEB_PORT:-8080}}
       # Model paths inside container (mapped via volumes below)
       FACE_REC_BASE: /models/face_recognition
       EMOTION_MODEL_PATH: /models/emotion/model4.2.2.pth

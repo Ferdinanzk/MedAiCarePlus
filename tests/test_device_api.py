@@ -74,8 +74,9 @@ class FakeConn:
             return {"task_id": uuid.UUID(args[0]), "status": "queued", "slot_time": SLOT, "intk_ids": [101, 102]}
         if 'SELECT u_id, name, face_label FROM "user"' in query:
             return {"u_id": 7, "name": "Pearl", "face_label": "pearl"}
-        if "SELECT i.intk_id FROM intake i JOIN medication m ON m.med_id=i.med_id" in query:
-            return {"intk_id": args[0]}
+        if "SELECT i.intk_id, m.dose_form, m.units_per_dose FROM intake i JOIN medication m" in query:
+            return {"intk_id": args[0], **self.doses.get(args[0], {"dose_form": "solid_oral",
+                                                                    "units_per_dose": Decimal("1.00")})}
         raise AssertionError(query)
 
     async def fetch(self, query, *args):
@@ -282,6 +283,98 @@ def test_heartbeat_updates_device_and_extends_leases(env, monkeypatch):
     update = next(entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0])
     assert update[1][:3] == (DEVICE_ID, True, 14.8) and update[2] == 1
     assert extended == [(DEVICE_ID, 1)]
+    assert body["microphone"] is False   # no robot_microphone consent
+
+
+def test_heartbeat_reports_microphone_consent(env, monkeypatch):
+    async def extend_leases(conn, device_id):
+        return None
+
+    async def get_state(u_id):
+        return {**CONSENT, "robot_microphone": {"granted": True, "terms_version": config.TERMS_VERSION}}
+
+    monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
+    monkeypatch.setattr(consent_service, "get_state", get_state)
+    assert env.robot.post("/api/device/heartbeat", json={}).json()["microphone"] is True
+
+
+# ── Frame stream: the server computes the landmarks ─────────────────────────
+
+def _jpeg(width=64, height=48) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (90, 90, 90)).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+class _Engine:
+    def __init__(self):
+        self.frames = []
+
+    def process(self, image, frame_seq, timestamp_ms):
+        self.frames.append((frame_seq, image.size, timestamp_ms))
+        return {"frame_seq": frame_seq, "timestamp": timestamp_ms / 1000, "width": image.size[0],
+                "height": image.size[1], "faces": [], "hands": [], "poses": []}
+
+
+@pytest.fixture
+def frames(env, monkeypatch):
+    engines, visions = [], []
+
+    class _Service:
+        def new_engine(self):
+            engines.append(_Engine())
+            return engines[-1]
+
+    async def frame_vision(state, frame_seq, jpeg):
+        visions.append(frame_seq)
+
+    monkeypatch.setattr(api_device.LandmarkService, "_available", True)
+    monkeypatch.setattr(api_device.LandmarkService, "get_instance", classmethod(lambda cls: _Service()))
+    monkeypatch.setattr(api_device, "_frame_vision", frame_vision)
+    session = _start(env, mode="observe").json()
+
+    def post(seq, timestamp, data=None):
+        return env.robot.post("/api/device/monitor/frame", data={
+            "session_id": session["session_id"], "generation": session["generation"],
+            "frame_seq": str(seq), "timestamp": str(timestamp)},
+            files={"file": ("frame.jpg", data if data is not None else _jpeg(), "image/jpeg")})
+    return types.SimpleNamespace(post=post, engines=engines, visions=visions, session=session)
+
+
+def test_frame_stream_feeds_the_monitor_session_at_capture_rate(env, frames):
+    for seq in range(1, 31):
+        response = frames.post(seq, 100 + seq / 15)
+        assert response.status_code == 200
+    body = response.json()
+    assert body["frame_seq"] == 30 and body["landmark_fps"] == 15.0 and body["degraded"] is False
+    assert len(frames.engines) == 1   # one engine (tracker state) per session
+    assert [f[0] for f in frames.engines[0].frames] == list(range(1, 31))
+    assert frames.engines[0].frames[0][1:] == ((64, 48), pytest.approx((100 + 1 / 15) * 1000))
+    assert frames.visions and frames.visions[0] == 1   # identity runs on streamed frames, throttled
+    assert len(frames.visions) < 30
+
+
+def test_frame_stream_ignores_stale_frames_and_rejects_bad_ones(env, frames):
+    assert frames.post(5, 100.0).status_code == 200
+    stale = frames.post(4, 100.1)
+    assert stale.status_code == 200 and stale.json()["frame_seq"] == 5
+    assert [f[0] for f in frames.engines[0].frames] == [5]
+    assert frames.post(6, 100.2, data=b"not a jpeg").status_code == 422
+    assert frames.post(7, 100.3, data=_jpeg(2000, 100)).status_code == 422
+    assert frames.post(8, 100.4, data=b"x" * (api_device.MAX_FRAME_BYTES + 1)).status_code == 413
+
+
+def test_frame_stream_needs_a_live_session_and_the_models(env, frames, monkeypatch):
+    other = env.robot.post("/api/device/monitor/frame", data={
+        "session_id": str(uuid.uuid4()), "generation": str(uuid.uuid4()), "frame_seq": "1", "timestamp": "1"},
+        files={"file": ("frame.jpg", _jpeg(), "image/jpeg")})
+    assert other.status_code == 409
+    monkeypatch.setattr(api_device.LandmarkService, "_available", False)
+    assert frames.post(1, 100.0).status_code == 503
 
 
 # ── Monitor over the device port ────────────────────────────────────────────

@@ -41,7 +41,12 @@ async def _status(conn, u_id: int) -> dict:
         "ORDER BY created_at DESC LIMIT 1", u_id)
     last_seen = device["last_seen_at"]
     online = last_seen is not None and datetime.now(timezone.utc) - last_seen <= timedelta(seconds=ONLINE_SECONDS)
+    # Family alerts (safety, confirmations, missed doses) go only to verified non-patient contacts on LINE.
+    alert_contacts = await conn.fetchval(
+        "SELECT COUNT(*) FROM family_contacts WHERE u_id = $1 AND verified = TRUE AND line_id IS NOT NULL "
+        "AND relationship IS DISTINCT FROM 'user'", u_id)
     return {
+        "alert_contacts": int(alert_contacts or 0),
         "paired": True, "device_id": str(device["device_id"]), "label": device["label"],
         "auto_record": bool(device["auto_record"]), "last_seen_at": _iso(last_seen), "online": online,
         "robot_reachable": device["robot_reachable"],
@@ -91,6 +96,25 @@ async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_
         if updated is None:
             raise HTTPException(409, "robot_not_paired")
         return await _status(conn, user["u_id"])
+
+
+@router.post("/checkin")
+async def checkin_task(user: dict = Depends(get_consented_user)):
+    """'Talk to Reachy now': a conversation-only task; the robot finds the patient, then chats."""
+    u_id = user["u_id"]
+    if not reachy_tasks.checkin_allowed(await consent_service.get_state(u_id)):
+        raise HTTPException(403, "checkin_consent_required")
+    now = datetime.now(timezone.utc)
+    async with get_pool().acquire() as conn, conn.transaction():
+        device = await conn.fetchval(
+            "SELECT device_id FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
+        if device is None:
+            raise HTTPException(409, "robot_not_paired")
+        task_id = await reachy_tasks.enqueue_reachy_task(
+            conn, u_id, now, [], "checkin", now + timedelta(minutes=MANUAL_TASK_MIN_MINUTES))
+        if task_id is None:
+            raise HTTPException(403, "robot_consent_required")
+    return {"task_id": task_id, "status": "queued", "slot_time": _iso(now)}
 
 
 @router.post("/tasks")

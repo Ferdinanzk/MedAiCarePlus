@@ -2,6 +2,7 @@ import asyncio
 import sys
 import time
 import types
+from decimal import Decimal
 
 import cv2
 import numpy as np
@@ -216,7 +217,7 @@ class _Connection:
 
     async def fetchrow(self, query, *args):
         if "FROM intake" in query:
-            return {"intk_id": 9, "med_id": 4, "intake_stats": "taken"}
+            return {"intk_id": 9, "med_id": 4, "intake_stats": "taken", "units_taken": Decimal("0.50")}
         raise AssertionError(f"unexpected query: {query}")
 
     async def execute(self, query, *args):
@@ -250,3 +251,6 @@ def test_manual_status_correction_retires_monitor_event(monkeypatch):
     status_sql = next(query for query, _ in conn.executed if "UPDATE intake SET intake_stats" in query)
     assert "$1::varchar" in status_sql
     assert any("UPDATE monitor_event SET outcome='rejected'" in query for query, _ in conn.executed)
+    # Undoing the taken dose puts back exactly what it removed (half a tablet here).
+    restore = next(args for query, args in conn.executed if "pills_remaining=pills_remaining+" in query)
+    assert restore == (4, Decimal("0.50"))

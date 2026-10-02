@@ -35,7 +35,7 @@ docker compose up -d --build app     # rebuild after ANY backend or frontend edi
 docker compose logs -f app           # tail logs
 ```
 
-App: http://localhost:8000 · Health: http://localhost:8000/health
+App: http://localhost:8080 · Health: http://localhost:8080/health. The host port is `WEB_PORT`, default 8080, because the Reachy Mini daemon owns 8000. The robot's device API is host port 8001, bound to `DEVICE_BIND`.
 
 `docker-compose.dev.yml` is a *different* stack (services `medaicare` + `ollama` + `ngrok`) and is **not** what currently runs. Don't mix them.
 
@@ -79,6 +79,44 @@ Practical floor is ~8fps. The frontend self-throttles (`tick()` returns early wh
 - Unverifiable doses go to `pending_confirmation`, and a caregiver answers with LINE buttons (a postback HMAC-signed with `SECRET_KEY`; the sender must be that verified contact). `transition_intake` refuses to change a `pending_confirmation` dose under the row lock. Confirmations expire after max(missed window, 2 h).
 - **Every LINE push added from Phase 2 on goes through `notification_outbox`** (`app/services/outbox.py` to enqueue; `outbox_dispatcher` delivers with `X-Line-Retry-Key`). Don't call `LineService.send_*` directly for new notifications.
 - Withdrawing `robot_camera` consent (or unpairing) calls `reachy_tasks.revoke_devices` in the same transaction.
+- **The robot streams frames; the server computes the landmarks.** The robot's Pi 4 reached only ~3 fps running the six face/hand/pose models itself, below the 12 fps recording gate. `POST /api/device/monitor/frame` takes one JPEG plus its capture `timestamp` (seconds, robot clock). `LandmarkService` (`services/landmark_service.py`, code in `services/landmarks/`, ported from the robot app's `vision.py`) computes the packet and feeds `registry.landmarks`. Identity and emotion run on the same frames in the background every 0.5 s, or at once while a candidate waits. Each session keeps its own trackers (`MonitorSession.vision_engine`), and its frames are processed in order under `frame_lock`. Measured at about 29 ms per frame on this laptop.
+- The six landmark ONNX files live in `models/landmarks/` and are committed, like the emotion model (`.gitignore` excludes `*.onnx` except these). They're pinned by SHA-256, and `/health` reports `"landmarks"`.
+- The robot app can listen for 「我吃完了」 ("I've finished") with SenseVoice on the robot, but only while the `robot_microphone` consent is current. The server sends `microphone` in the task payload and every heartbeat. It's a claim, not evidence: if the camera resolves nothing within 8 s, the robot files a `patient_claim` confirmation.
+- The robot app's source is in `reachy_app/` (published as the Hugging Face space `pearlyjam21/medcare_reachy`). `reachy_app/tools/deploy_to_robot.py` copies it onto the robot. After deploying, restart the app through the daemon (`POST /api/apps/restart-current-app`): saving settings restarts only its worker thread, and the process keeps running the old code.
+
+### Reachy check-in conversations (demo, Oct 2026)
+- **Consent gate.** Check-ins need all four scopes `robot_microphone`, `cloud_voice`, `conversation_analysis` and `safety_alerts` (`reachy_tasks.checkin_allowed`). The task payload's `checkin` flag carries this to the robot, and every `/api/device/conversations*` call re-checks it (403 `checkin_consent_required`). In the UI, the Reachy card's "Daily check-ins" switch grants or withdraws them.
+- **Flow.**
+  - The robot turns speech into text on the robot (SenseVoice, `voice.py` in "chat" mode).
+  - `POST /api/device/conversations` → `/{id}/turn` → `/{id}/end` sends text only.
+  - The server calls OpenRouter (`services/conversation.py`, model `LLM_MODEL`, default `openrouter/free`) and returns `reply` (Traditional) plus `speech_text` (Simplified, via `zhconv`, for the robot's Matcha voice).
+- **When the model is unavailable:** no key, a 429, or an empty answer gives a fixed reply, so the demo never stalls.
+- **Safety.** `conversation.screen()` runs before any LLM call. A risk word means:
+  - the words never reach the model
+  - a fixed help-line reply (119 / 1925)
+  - the conversation ends
+  - a `safety_alert` goes through the outbox to *every* verified contact (`contact_flag=None`)
+  - the turn is `flagged`
+  
+  Keyword matching is crude, and `NOT_RISK` lists everyday phrases to ignore. Alerts don't repeat yet, although the robot notice §6 promises that they do.
+- **When it happens:** after the last dose of a slot (state `CHECKIN`, then `POST_SLOT_OBSERVE`), or as a conversation-only task (`reason='checkin'`, no doses; `POST /api/reachy/checkin`, the "Talk to Reachy now" button).
+- **Storage.** Tables are `conversation` and `conversation_turn`. `jobs/conversation_retention_job.py` deletes turns after 30 days (flagged ones after 180); summaries and mood stay until the patient deletes them. The patient views them at `/conversations`, with a dashboard section, through `/api/conversations`.
+
+### Schedules, stock, adherence (Oct 2026)
+- **Schedules** live in `services/schedule.py`. `medication.schedule_time` holds the four preset booleans (08:00, 12:00, 20:00, 22:00), plus optional `custom_times` (`"HH:MM"`, at most 8 times a day in total) and `weekdays` (ISO 1 = Monday … 7 = Sunday; missing means every day). Rows are generated 30 days ahead, or until `use_before`. Nothing tops them up yet, so a schedule simply ends 30 days after its last edit.
+- **Stock is `NUMERIC(8,2)`** (half tablets).
+  - Every taken dose removes `units_per_dose` through `intake_repository.take_stock`, and stores the amount in `intake.units_taken`.
+  - Undo calls `return_stock` with that stored amount. Rows taken before the column existed restore 1.
+  - Don't write `pills_remaining-1` anywhere.
+  - Refills go through `POST /api/medications/{id}/supply`, which logs them in `medication_supply`.
+  - The refill alert fires at ≤7 **days** of supply (`schedule.supply`).
+- **Archive, don't delete.** `POST …/archive` stops a course: future pending rows go, history stays, and the missed-dose job skips inactive medications. `…/reactivate` regenerates from now. `DELETE` returns 409 `has_history` unless the medication never had a past or resolved dose.
+- **Adherence** follows one rule (`services/adherence.py`), used by `/api/history/summary` and the weekly LINE summary:
+  - Only due doses count. Future doses never do, and a pending dose counts only once it is more than 1 h overdue.
+  - Only `taken` is adherent; awaiting confirmation is not, yet.
+  - The streak skips days with no doses.
+  - `/api/history/intakes` is past-only and paged (`{items, total, has_more}`).
+- **Browser auto-record** follows the robot's rule: one `solid_oral` unit, otherwise the person confirms.
 
 ### ML services are singletons warmed at startup
 `main.py` lifespan calls `get_instance()` on FaceRecognition, Emotion, Line, and IntakeDetection. Endpoints then check the **class attribute** `_available` *without* calling `get_instance()` (e.g. `api_monitor.start` returns 503 if either is False). **If you add a service, warm it in lifespan** or its endpoints will 503 forever.
@@ -138,6 +176,12 @@ The Dockerfile installs `requirements.txt` and nothing else.
 - `Settings.tsx` has a pre-existing `react-hooks/immutability` lint error (`fetchSettings` used before it's declared).
 
 ## LINE Notifications
-- Webhook URL changes on every ngrok restart (free tier) — update the LINE Developer Console each time.
+- **Channel:** "Care Bot" (`@331ealnq`). Its QR is `frontend_source/public/line-bot-qr.png` (committed; `.gitignore` excludes `*.png` except this one). Keys go in `.env` as `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET`.
+- **Webhook:** `scripts/line-tunnel.ps1` starts the `line` compose profile:
+  - `line-webhook-proxy` (nginx) forwards **only** `POST /api/notify/webhook/line` and returns 404 for everything else.
+  - `line-tunnel` is a Cloudflare quick tunnel to that proxy.
+  
+  The script then sets LINE's webhook URL through the Messaging API and runs LINE's webhook test. The rest of the app is never exposed. Never tunnel port 8080 directly: the legacy routes and the SPA path handling are unsafe on the internet (see the security review).
+- **The quick-tunnel address changes whenever the tunnel container restarts** (reboot, Docker restart). Rerun `scripts/line-tunnel.ps1`, which takes about 30 s and is idempotent.
 - Test: `POST /api/notify/missed-dose?u_id=1&med_name=Aspirin&scheduled_time=08:00`
 - Status: `/api/notify/status` → `{"configured": true/false}`

@@ -72,9 +72,9 @@ class _Connection:
 
     async def fetch(self, query, *args):
         assert "FROM intake i" in query
-        assert args == (7,)
+        assert args[0] == 7
         self.history_reads += 1
-        return [{"id": 11, "medication_name": "Test medication", "status": "taken"}]
+        return [{"id": 11, "medication_name": "Test medication", "status": "taken", "total": 1}]
 
     async def fetchrow(self, query, *args):
         assert 'FROM "user"' in query
@@ -126,7 +126,7 @@ def test_history_blocks_without_current_consent_then_allows_current_consent(app,
     state = {"core": {"granted": True, "terms_version": config.TERMS_VERSION}}
     response = client.get("/api/history/intakes")
     assert response.status_code == 200
-    assert response.json() == [{"id": 11, "medication_name": "Test medication", "status": "taken"}]
+    assert response.json()["items"] == [{"id": 11, "medication_name": "Test medication", "status": "taken"}]
     assert conn.history_reads == 1
     client.close()
 

@@ -3,52 +3,16 @@ import json
 from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.config import MEDCARE_TIMEZONE
+from app.services import schedule
 
 router = APIRouter(prefix="/api/medications", tags=["medications-api"])
 _MEDCARE_TZ = ZoneInfo(MEDCARE_TIMEZONE)
-
-
-def _enabled_slots(schedule_time: dict | None) -> list[dict]:
-    """Convert schedule_time booleans into slot objects with clock times."""
-    if not schedule_time:
-        return []
-    slots = []
-    for key, time_str in _SLOT_TIMES.items():
-        if schedule_time.get(key):
-            slots.append({"key": key, "time": time_str, "label": _slot_label(key)})
-    return slots
-
-
-def _slot_label(key: str) -> str:
-    labels = {
-        "morning": "早上",
-        "noon": "中午",
-        "night": "晚上",
-        "bedtime": "睡前",
-    }
-    return labels.get(key, key)
-
-
-def _normalized_schedule(schedule_time: dict | str | None) -> tuple[tuple[str, bool], ...]:
-    """Return the schedule fields that actually create intake rows.
-
-    The UI also sends display-only keys such as ``before_meals``.  Ignoring
-    those keys prevents a no-op edit from rebuilding the medication's future
-    intake rows.
-    """
-    if isinstance(schedule_time, str):
-        try:
-            schedule_time = json.loads(schedule_time)
-        except (TypeError, ValueError):
-            schedule_time = None
-    schedule_time = schedule_time or {}
-    return tuple((key, bool(schedule_time.get(key))) for key in _SLOT_TIMES)
 
 
 async def _generate_intake_schedule(
@@ -60,39 +24,11 @@ async def _generate_intake_schedule(
     start_at: datetime.datetime | None = None,
 ):
     """Generate future intake rows for the next 30 days (or until use_before)."""
-    slots = _enabled_slots(schedule_time)
-    if not slots:
-        return
-
     now = start_at or datetime.datetime.now(_MEDCARE_TZ)
     if now.tzinfo is None:
         now = now.replace(tzinfo=_MEDCARE_TZ)
-
-    days = 30
-    if use_before:
-        try:
-            # Try parsing ROC date (e.g. 114年08月22日 → 2025-08-22)
-            roc_match = __import__("re").search(r"(\d+)年(\d+)月(\d+)日", use_before)
-            if roc_match:
-                roc_year, month, day = map(int, roc_match.groups())
-                gregorian = datetime.date(roc_year + 1911, month, day)
-                days = min((gregorian - now.date()).days, 30)
-                if days <= 0:
-                    days = 1
-        except Exception:
-            pass
-
-    base = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=_MEDCARE_TZ)
-    values = []
-    for offset in range(days):
-        date = base + datetime.timedelta(days=offset)
-        for slot in slots:
-            hour, minute = map(int, slot["time"].split(":"))
-            ts = date.replace(hour=hour, minute=minute)
-            if ts > now:
-                values.append((u_id, med_id, ts))
-
-    # Bulk insert, ignoring conflicts
+    values = [(u_id, med_id, moment)
+              for moment in schedule.occurrences(schedule_time, now, until=schedule.parse_date(use_before))]
     if values:
         await conn.executemany(
             """
@@ -102,6 +38,20 @@ async def _generate_intake_schedule(
             """,
             values,
         )
+
+
+async def _clear_future_doses(conn, med_id: int, u_id: int) -> None:
+    """Completed and past rows stay as history; only future, unresolved rows are removed."""
+    await conn.execute(
+        """
+        DELETE FROM intake
+        WHERE med_id=$1 AND u_id=$2
+          AND intake_stats IN ('pending', 'missed')
+          AND intake_time_stamp > NOW()
+        """,
+        med_id,
+        u_id,
+    )
 
 
 async def _get_u_id(user: dict) -> int | None:
@@ -117,13 +67,6 @@ async def _get_u_id(user: dict) -> int | None:
         )
 
 
-_SLOT_TIMES = {
-    "morning": "08:00",
-    "noon": "12:00",
-    "night": "20:00",
-    "bedtime": "22:00",
-}
-
 DOSE_FORMS = ("solid_oral", "liquid", "inhaler", "injection", "topical", "other")
 
 
@@ -131,7 +74,7 @@ class MedicationPayload(BaseModel):
     name: str
     dosage: Optional[str] = None
     total_pills: int = 0
-    pills_remaining: Optional[int] = None
+    pills_remaining: Optional[Decimal] = None
     instructions: Optional[str] = None
     warning: Optional[str] = None
     pill_description: Optional[str] = None
@@ -159,9 +102,47 @@ class MedicationPayload(BaseModel):
             raise ValueError("units_per_dose must be > 0 and < 100 with at most two decimals")
         return value
 
+    @field_validator("pills_remaining")
+    @classmethod
+    def _check_remaining(cls, value):
+        # NUMERIC(8,2): half tablets are allowed.
+        if value is not None and (not value.is_finite() or value < 0 or value >= 1_000_000
+                                  or value != value.quantize(Decimal("0.01"))):
+            raise ValueError("pills_remaining must be >= 0 with at most two decimals")
+        return value
 
-def _units_json(value) -> float | None:
+    @field_validator("schedule_time")
+    @classmethod
+    def _check_schedule(cls, value):
+        return schedule.validate(value)
+
+
+class SupplyPayload(BaseModel):
+    quantity: Decimal = Field(gt=0, lt=10_000)
+    note: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("quantity")
+    @classmethod
+    def _two_decimals(cls, value):
+        if value != value.quantize(Decimal("0.01")):
+            raise ValueError("quantity has at most two decimals")
+        return value
+
+
+def _number(value) -> float | None:
     return float(value) if value is not None else None
+
+
+def _expiry_warning(use_before: str | None, today: datetime.date) -> str | None:
+    expires = schedule.parse_date(use_before)
+    if expires is None:
+        return None
+    days_left = (expires - today).days
+    if days_left < 0:
+        return "Expired"
+    if days_left <= 7:
+        return f"Expires in {days_left} days"
+    return None
 
 
 @router.get("/today")
@@ -188,11 +169,14 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
                 m.med_name       AS name,
                 m.dosage,
                 m.pills_remaining,
+                m.units_per_dose,
+                m.dose_form,
                 m.pill_description,
                 m.warning,
                 m.use_before,
                 m.schedule_time,
                 i.intake_time_stamp AS scheduled_time,
+                i.actual_intake_time AS taken_at,
                 i.intake_stats   AS status,
                 i.intk_id        AS id
             FROM medication m
@@ -208,40 +192,11 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
     result = []
     for r in rows:
         row = dict(r)
-        # use_before warning
-        warning = None
-        if row.get("use_before"):
-            try:
-                import re
-                roc_match = re.search(r"(\d+)年(\d+)月(\d+)日", row["use_before"])
-                if roc_match:
-                    roc_year, month, day = map(int, roc_match.groups())
-                    gregorian = datetime.date(roc_year + 1911, month, day)
-                    days_left = (gregorian - today).days
-                    if days_left < 0:
-                        warning = "Expired"
-                    elif days_left <= 7:
-                        warning = f"Expires in {days_left} days"
-            except Exception:
-                pass
-        row["use_before_warning"] = warning
-        # slot label
-        schedule_raw = row.get("schedule_time") or {}
-        if isinstance(schedule_raw, str):
-            try:
-                schedule = json.loads(schedule_raw)
-            except Exception:
-                schedule = {}
-        else:
-            schedule = schedule_raw
-        slot_label = ""
+        row["use_before_warning"] = _expiry_warning(row.get("use_before"), today)
         ts = row.get("scheduled_time")
-        if ts:
-            for key, time_str in _SLOT_TIMES.items():
-                if time_str in ts.strftime("%H:%M") and schedule.get(key):
-                    slot_label = _slot_label(key)
-                    break
-        row["slot_label"] = slot_label
+        row["slot_label"] = schedule.slot_label(row.get("schedule_time"), ts.astimezone(_MEDCARE_TZ)) if ts else ""
+        row["pills_remaining"] = _number(row.get("pills_remaining"))
+        row["units_per_dose"] = _number(row.get("units_per_dose"))
         result.append(row)
     return result
 
@@ -269,7 +224,7 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
         async with conn.transaction():
             medication = await conn.fetchrow(
                 """
-                SELECT med_id, med_name, dosage, pills_remaining, warning,
+                SELECT med_id, med_name, dosage, pills_remaining, units_per_dose, warning,
                        use_before, is_active
                 FROM medication
                 WHERE med_id=$1 AND u_id=$2
@@ -282,7 +237,7 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                 return JSONResponse({"detail": "Medication not found"}, status_code=404)
             if not medication["is_active"]:
                 return JSONResponse({"detail": "Medication is inactive"}, status_code=409)
-            if (medication["pills_remaining"] or 0) <= 0:
+            if (medication["pills_remaining"] or 0) < (medication.get("units_per_dose") or 1):
                 return JSONResponse({"detail": "No pills remain for this medication"}, status_code=409)
 
             # A due row is the medication's existing scheduled dose. Future
@@ -350,6 +305,7 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                 })
             else:
                 row = dict(row)
+            row["pills_remaining"] = _number(row.get("pills_remaining"))
             return row
 
 
@@ -361,7 +317,7 @@ async def update_intake_status(
 ):
     """
     Update an intake record's status (e.g., mark as 'taken').
-    Also decrements pills_remaining on the associated medication if marking as taken.
+    Marking a dose taken removes units_per_dose from stock; undoing it puts that amount back.
     """
     u_id = await _get_u_id(user)
     if not u_id:
@@ -391,7 +347,7 @@ async def list_medications(user: dict = Depends(get_consented_user)):
             """
             SELECT med_id AS id, med_name AS name, dosage, pill_prescribed AS total_pills,
                    pills_remaining, instructions, warning, pill_description, use_before,
-                   is_active, schedule_time, prescription_meta, created_at,
+                   is_active, archived_at, schedule_time, prescription_meta, created_at,
                    dose_form, units_per_dose
             FROM medication
             WHERE u_id = $1
@@ -399,10 +355,17 @@ async def list_medications(user: dict = Depends(get_consented_user)):
             """,
             u_id,
         )
+    today = datetime.datetime.now(_MEDCARE_TZ).date()
     result = []
     for r in rows:
         row = dict(r)
-        row["units_per_dose"] = _units_json(row.get("units_per_dose"))
+        supply = schedule.supply(row.get("pills_remaining"), row.get("units_per_dose"),
+                                 row.get("schedule_time"), today) if row.get("is_active") else {}
+        row["units_per_dose"] = _number(row.get("units_per_dose"))
+        row["pills_remaining"] = _number(row.get("pills_remaining"))
+        row["daily_units"] = supply.get("daily_units")
+        row["days_left"] = supply.get("days_left")
+        row["run_out_date"] = supply.get("run_out_date")
         result.append(row)
     return result
 
@@ -418,7 +381,7 @@ async def create_medication(
             {"detail": "Local user not found. Please link your account first."},
             status_code=404,
         )
-    remaining = payload.pills_remaining if payload.pills_remaining is not None else payload.total_pills
+    remaining = payload.pills_remaining if payload.pills_remaining is not None else Decimal(payload.total_pills)
     dose_form = payload.dose_form or "solid_oral"
     units_per_dose = payload.units_per_dose if payload.units_per_dose is not None else Decimal("1")
     pool = get_pool()
@@ -449,13 +412,14 @@ async def create_medication(
                 units_per_dose,
             )
             # Auto-generate intake schedule rows
-            await _generate_intake_schedule(
-                conn, med_id, u_id, payload.schedule_time, payload.use_before
-            )
+            if payload.is_active:
+                await _generate_intake_schedule(
+                    conn, med_id, u_id, payload.schedule_time, payload.use_before
+                )
         except Exception as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
     return {"id": med_id, "name": payload.name.strip(), "dose_form": dose_form,
-            "units_per_dose": _units_json(units_per_dose)}
+            "units_per_dose": _number(units_per_dose)}
 
 
 @router.patch("/{med_id}")
@@ -472,7 +436,7 @@ async def update_medication(
         async with conn.transaction():
             previous = await conn.fetchrow(
                 """
-                SELECT schedule_time, use_before
+                SELECT schedule_time, use_before, is_active
                 FROM medication
                 WHERE med_id=$1 AND u_id=$2
                 FOR UPDATE
@@ -484,12 +448,14 @@ async def update_medication(
                 updated = None
             else:
                 old_signature = (
-                    _normalized_schedule(previous["schedule_time"]),
+                    schedule.signature(previous["schedule_time"]),
                     (previous["use_before"] or "").strip(),
+                    bool(previous.get("is_active", True)),
                 )
                 new_signature = (
-                    _normalized_schedule(payload.schedule_time),
+                    schedule.signature(payload.schedule_time),
                     (payload.use_before or "").strip(),
+                    payload.is_active,
                 )
                 updated = await conn.fetchval(
                     """
@@ -497,14 +463,15 @@ async def update_medication(
                     SET med_name=$1, dosage=$2, pill_prescribed=$3, pills_remaining=$4,
                         instructions=$5, warning=$6, pill_description=$7, use_before=$8,
                         is_active=$9, schedule_time=$10, prescription_meta=$11,
-                        dose_form=COALESCE($14, dose_form), units_per_dose=COALESCE($15, units_per_dose)
+                        dose_form=COALESCE($14, dose_form), units_per_dose=COALESCE($15, units_per_dose),
+                        archived_at=CASE WHEN $9 THEN NULL ELSE COALESCE(archived_at, NOW()) END
                     WHERE med_id=$12 AND u_id=$13
                     RETURNING med_id
                     """,
                     payload.name.strip(),
                     payload.dosage,
                     payload.total_pills,
-                    payload.pills_remaining if payload.pills_remaining is not None else payload.total_pills,
+                    payload.pills_remaining if payload.pills_remaining is not None else Decimal(payload.total_pills),
                     payload.instructions,
                     payload.warning,
                     payload.pill_description,
@@ -518,42 +485,116 @@ async def update_medication(
                     payload.units_per_dose,
                 )
                 if old_signature != new_signature:
-                    # Completed and historical rows remain part of the audit
-                    # history. Only future rows that have not been confirmed
-                    # are replaced by the new schedule.
-                    await conn.execute(
-                        """
-                        DELETE FROM intake
-                        WHERE med_id=$1 AND u_id=$2
-                          AND intake_stats IN ('pending', 'missed')
-                          AND intake_time_stamp > NOW()
-                        """,
-                        med_id,
-                        u_id,
-                    )
-                    await _generate_intake_schedule(
-                        conn,
-                        med_id,
-                        u_id,
-                        payload.schedule_time,
-                        payload.use_before,
-                    )
+                    await _clear_future_doses(conn, med_id, u_id)
+                    if payload.is_active:
+                        await _generate_intake_schedule(
+                            conn,
+                            med_id,
+                            u_id,
+                            payload.schedule_time,
+                            payload.use_before,
+                        )
     if not updated:
         return JSONResponse({"detail": "Medication not found"}, status_code=404)
     return {"id": updated}
 
 
+@router.post("/{med_id}/archive")
+async def archive_medication(med_id: int, user: dict = Depends(get_consented_user)):
+    """Stop a course: no more doses or reminders, history kept."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            archived = await conn.fetchval(
+                "UPDATE medication SET is_active=FALSE, archived_at=COALESCE(archived_at, NOW()) "
+                "WHERE med_id=$1 AND u_id=$2 RETURNING med_id",
+                med_id, u_id)
+            if archived:
+                await _clear_future_doses(conn, med_id, u_id)
+    if not archived:
+        return JSONResponse({"detail": "Medication not found"}, status_code=404)
+    return {"id": archived, "is_active": False}
+
+
+@router.post("/{med_id}/reactivate")
+async def reactivate_medication(med_id: int, user: dict = Depends(get_consented_user)):
+    """Resume an archived course from now on, with its saved schedule."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "UPDATE medication SET is_active=TRUE, archived_at=NULL "
+                "WHERE med_id=$1 AND u_id=$2 RETURNING med_id, schedule_time, use_before",
+                med_id, u_id)
+            if row:
+                await _generate_intake_schedule(conn, med_id, u_id, schedule.load(row["schedule_time"]),
+                                                row["use_before"])
+    if not row:
+        return JSONResponse({"detail": "Medication not found"}, status_code=404)
+    return {"id": row["med_id"], "is_active": True}
+
+
+@router.post("/{med_id}/supply")
+async def add_supply(med_id: int, payload: SupplyPayload, user: dict = Depends(get_consented_user)):
+    """Record a refill: the quantity is added to stock and kept as a supply record."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "UPDATE medication SET pills_remaining=pills_remaining+$3 WHERE med_id=$1 AND u_id=$2 "
+                "RETURNING pills_remaining, units_per_dose, schedule_time, is_active",
+                med_id, u_id, payload.quantity)
+            if row:
+                await conn.execute(
+                    "INSERT INTO medication_supply (u_id, med_id, quantity, note) VALUES ($1,$2,$3,$4)",
+                    u_id, med_id, payload.quantity, (payload.note or "").strip() or None)
+    if not row:
+        return JSONResponse({"detail": "Medication not found"}, status_code=404)
+    today = datetime.datetime.now(_MEDCARE_TZ).date()
+    supply = schedule.supply(row["pills_remaining"], row["units_per_dose"], row["schedule_time"], today) \
+        if row["is_active"] else {}
+    return {"id": med_id, "pills_remaining": _number(row["pills_remaining"]),
+            "days_left": supply.get("days_left"), "run_out_date": supply.get("run_out_date")}
+
+
+@router.get("/{med_id}/supply")
+async def list_supply(med_id: int, user: dict = Depends(get_consented_user)):
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT supply_id AS id, quantity, note, created_at FROM medication_supply "
+            "WHERE med_id=$1 AND u_id=$2 ORDER BY created_at DESC LIMIT 50",
+            med_id, u_id)
+    return [{**dict(r), "quantity": _number(r["quantity"])} for r in rows]
+
+
 @router.delete("/{med_id}")
 async def delete_medication(med_id: int, user: dict = Depends(get_consented_user)):
+    """Only a medication without any history can be deleted; otherwise archive it."""
     u_id = await _get_u_id(user)
     if not u_id:
         return JSONResponse({"detail": "User not found"}, status_code=404)
     pool = get_pool()
     async with pool.acquire() as conn:
-        deleted = await conn.fetchval(
-            "DELETE FROM medication WHERE med_id=$1 AND u_id=$2 RETURNING med_id",
-            med_id, u_id,
-        )
+        async with conn.transaction():
+            has_history = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM intake WHERE med_id=$1 AND u_id=$2 "
+                "AND (intake_stats NOT IN ('pending') OR intake_time_stamp <= NOW()))",
+                med_id, u_id)
+            if has_history:
+                return JSONResponse({"detail": "has_history"}, status_code=409)
+            deleted = await conn.fetchval(
+                "DELETE FROM medication WHERE med_id=$1 AND u_id=$2 RETURNING med_id",
+                med_id, u_id,
+            )
     if not deleted:
         return JSONResponse({"detail": "Medication not found"}, status_code=404)
     return {"deleted": deleted}

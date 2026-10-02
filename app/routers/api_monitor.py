@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.database import get_pool
 from app.dependencies import get_consented_user
+from app.services import reachy_tasks
 from app.services.emotion_service import EmotionService
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored, undo_monitored
@@ -79,15 +80,18 @@ async def start(payload: StartPayload, account: dict = Depends(current_account))
         raise HTTPException(503, "Identity or seed 43 emotion model is not ready")
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT i.intk_id FROM intake i JOIN medication m ON m.med_id=i.med_id "
+            "SELECT i.intk_id, m.dose_form, m.units_per_dose FROM intake i JOIN medication m ON m.med_id=i.med_id "
             "WHERE i.intk_id=$1 AND i.u_id=$2 AND i.intake_stats IN ('pending','missed') "
-            "AND m.pills_remaining>0 AND m.is_active=TRUE",
+            "AND m.pills_remaining>=m.units_per_dose AND m.is_active=TRUE",
             payload.intk_id, account["u_id"])
     if not row:
         raise HTTPException(409, "Dose is unavailable or does not belong to this account")
+    # Same rule as the robot: a hand-to-mouth gesture can stand for one solid tablet, nothing else,
+    # so other doses always ask the person to confirm.
+    auto_commit = reachy_tasks.is_supported(row.get("dose_form", "solid_oral"), row.get("units_per_dose", 1))
     try:
         state = await registry.replace(account["u_id"], payload.intk_id, account["face_label"], account["name"],
-                                       mode="dose", client_type="browser", auto_commit=True)
+                                       mode="dose", client_type="browser", auto_commit=auto_commit)
     except BusyOtherClient as exc:
         raise HTTPException(409, "busy_other_client") from exc
     return state.public()

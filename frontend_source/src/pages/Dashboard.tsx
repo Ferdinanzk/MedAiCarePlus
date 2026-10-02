@@ -14,8 +14,12 @@ import {
   XCircle,
   AlertCircle,
   Heart,
+  Bot,
+  AlertTriangle,
 } from 'lucide-react';
 import ServiceCard from '../components/ui/ServiceCard';
+import { MoodBadge } from './Conversations';
+import { fetchConversations, startCheckin, type ConversationSummary } from '../lib/reachy-api';
 
 interface TodayMedication {
   id: number;
@@ -24,7 +28,23 @@ interface TodayMedication {
   dosage: string | null;
   status: 'pending' | 'taken' | 'skipped' | 'missed' | 'pending_confirmation';
   scheduled_time: string | null;
+  taken_at: string | null;
   pills_remaining: number;
+  units_per_dose: number;
+}
+
+type TodayGroup = 'due' | 'later' | 'awaiting' | 'done';
+const GROUP_ORDER: TodayGroup[] = ['due', 'later', 'awaiting', 'done'];
+
+function groupOf(dose: TodayMedication, now: number): TodayGroup {
+  if (dose.status === 'taken' || dose.status === 'skipped') return 'done';
+  if (dose.status === 'pending_confirmation') return 'awaiting';
+  if (dose.status === 'missed') return 'due';
+  return dose.scheduled_time && new Date(dose.scheduled_time).getTime() > now ? 'later' : 'due';
+}
+
+function clock(value: string | null): string {
+  return value ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
 }
 
 interface EmotionRecord {
@@ -40,8 +60,10 @@ interface RawMedItem {
   name?: string;
   dosage?: string | null;
   pills_remaining?: number;
+  units_per_dose?: number | null;
   status?: string;
   scheduled_time?: string | null;
+  taken_at?: string | null;
 }
 
 export default function Dashboard() {
@@ -50,9 +72,13 @@ export default function Dashboard() {
   const [medications, setMedications] = useState<TodayMedication[]>([]);
   const [emotions, setEmotions] = useState<EmotionRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [adherenceRate, setAdherenceRate] = useState(0);
+  const [progressRate, setProgressRate] = useState(0);
   const [takenCount, setTakenCount] = useState(0);
   const [greeting, setGreeting] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [busyDose, setBusyDose] = useState<number | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [checkinNotice, setCheckinNotice] = useState('');
 
   const getGreeting = useCallback(() => {
     const hour = new Date().getHours();
@@ -83,19 +109,28 @@ export default function Dashboard() {
           name: item.name || '',
           dosage: item.dosage ?? null,
           pills_remaining: item.pills_remaining ?? 0,
+          units_per_dose: item.units_per_dose ?? 1,
           status: (item.status || 'pending') as TodayMedication['status'],
           scheduled_time: item.scheduled_time ?? null,
+          taken_at: item.taken_at ?? null,
         }));
         setMedications(formatted);
 
-        // Calculate adherence
+        // Today's progress: doses taken out of all of today's doses (later ones included).
         const taken = formatted.filter((m) => m.status === 'taken').length;
         const total = formatted.length;
         setTakenCount(taken);
-        setAdherenceRate(total > 0 ? Math.round((taken / total) * 100) : 0);
+        setProgressRate(total > 0 ? Math.round((taken / total) * 100) : 0);
       }
     } catch {
       // network error — leave state unchanged
+    }
+
+    // Recent check-in conversations with Reachy
+    try {
+      setConversations((await fetchConversations(3)).items);
+    } catch {
+      // no conversations yet or network error
     }
 
     // Fetch recent emotions
@@ -110,6 +145,39 @@ export default function Dashboard() {
     }
 
     setLoading(false);
+  };
+
+  const skipDose = async (dose: TodayMedication) => {
+    const token = localStorage.getItem('face_auth_token');
+    setBusyDose(dose.id);
+    setActionError('');
+    try {
+      const resp = await fetch(`/api/medications/intake/${dose.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ status: 'skipped' }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        setActionError(body.detail === 'awaiting_caregiver_confirmation'
+          ? t('intake.pendingConfirmation') : t('dashboard.actionFailed'));
+      }
+      await fetchTodayData();
+    } finally {
+      setBusyDose(null);
+    }
+  };
+
+  const talkToReachy = async () => {
+    setCheckinNotice('');
+    try {
+      await startCheckin();
+      setCheckinNotice(t('conversations.checkinQueued'));
+    } catch (cause) {
+      const code = cause instanceof Error ? cause.message : '';
+      setCheckinNotice(code === 'checkin_consent_required' ? t('conversations.enableCheckins')
+        : code === 'robot_not_paired' ? t('conversations.notPaired') : t('dashboard.actionFailed'));
+    }
   };
 
   const getStatusIcon = (status: string) => {
@@ -166,14 +234,14 @@ export default function Dashboard() {
       <div className="bg-gradient-to-r from-[#0057B8] to-[#003D82] rounded-2xl p-8 text-white shadow-lg shadow-blue-500/10 hover:shadow-xl hover:shadow-blue-500/15 transition-all duration-300">
         <div className="flex justify-between items-start">
           <div className="flex-1">
-            <p className="text-blue-100 text-base">{t('dashboard.adherence')}</p>
+            <p className="text-blue-100 text-base">{t('dashboard.todayProgress')}</p>
             {medications.length === 0 ? (
               <div className="mt-1">
                 <p className="text-xl font-medium">{t('dashboard.noMedsYet')}</p>
                 <p className="text-base text-blue-200 mt-1">{t('dashboard.addMedsPrompt')}</p>
               </div>
             ) : (
-              <h2 className="text-4xl font-bold mt-1">{adherenceRate}%</h2>
+              <h2 className="text-4xl font-bold mt-1">{progressRate}%</h2>
             )}
             <p className="text-blue-100 text-lg mt-2 font-medium">
               {takenCount} {t('dashboard.of')} {medications.length} {t('dashboard.medicationsTaken')}
@@ -183,7 +251,7 @@ export default function Dashboard() {
             <div className="w-full h-2 bg-white/20 rounded-full mt-4 overflow-hidden">
               <div
                 className="h-full bg-white rounded-full transition-all duration-500"
-                style={{ width: `${adherenceRate}%` }}
+                style={{ width: `${progressRate}%` }}
               />
             </div>
           </div>
@@ -239,10 +307,10 @@ export default function Dashboard() {
         </div>
       </section>
 
-      {/* Today's Medications Preview */}
-      <section className="space-y-3">
+      {/* Today: every dose of the day, grouped by what it needs */}
+      <section className="space-y-3" aria-labelledby="today-title">
         <div className="flex items-center justify-between px-1">
-          <h3 className="text-lg font-semibold text-gray-900">{t('dashboard.todayMedications') || "Today's Medications"}</h3>
+          <h3 id="today-title" className="text-lg font-semibold text-gray-900">{t('dashboard.todayMedications')}</h3>
           <button
             onClick={() => navigate('/medications')}
             className="text-base text-[#0057B8] font-medium flex items-center gap-1 hover:text-[#003D82] transition-colors"
@@ -251,8 +319,10 @@ export default function Dashboard() {
           </button>
         </div>
 
+        {actionError && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{actionError}</p>}
+
         {medications.length === 0 ? (
-          <div className="bg-white rounded-xl border border-gray-100 p-8 text-center shadow-sm hover:shadow-md transition-all duration-300">
+          <div className="bg-white rounded-xl border border-gray-100 p-8 text-center shadow-sm">
             <Pill className="w-12 h-12 text-gray-300 mx-auto mb-3" />
             <p className="text-gray-500 text-base">{t('dashboard.noMedications')}</p>
             <button
@@ -263,37 +333,114 @@ export default function Dashboard() {
             </button>
           </div>
         ) : (
-          <div className="space-y-2">
-            {medications.slice(0, 3).map((med) => (
-              <div
-                key={med.id}
-                className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-100 shadow-sm hover:shadow-md hover:border-gray-200 transition-all duration-300"
-              >
-                <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
-                  med.status === 'taken' ? 'bg-green-50' :
-                  med.status === 'missed' ? 'bg-red-50' :
-                  med.status === 'skipped' ? 'bg-orange-50' :
-                  'bg-blue-50'
-                }`}>
-                  {getStatusIcon(med.status)}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium text-gray-900 text-base truncate">{med.name}</p>
-                  <p className="text-base text-gray-600 font-medium">{med.dosage} · {med.pills_remaining} {t('medications.pillsLeft')}</p>
-                </div>
-                {getStatusBadge(med.status)}
-                {med.status === 'pending' && (
-                  <button
-                    onClick={() => navigate(`/intake?med=${med.medication_id || med.id}`)}
-                    className="px-4 py-2 bg-[#0057B8] text-white text-base font-medium rounded-lg hover:bg-[#003D82] active:scale-95 transition-all shrink-0 touch-target-large"
-                  >
-                    {t('intake.take')}
-                  </button>
-                )}
+          (() => {
+            const now = Date.now();
+            const groups: Record<TodayGroup, TodayMedication[]> = { due: [], later: [], awaiting: [], done: [] };
+            medications.forEach((dose) => groups[groupOf(dose, now)].push(dose));
+            return GROUP_ORDER.filter((group) => groups[group].length > 0).map((group) => (
+              <div key={group} className="space-y-2">
+                <h4 className={`px-1 text-sm font-semibold uppercase tracking-wide ${
+                  group === 'due' ? 'text-[#0057B8]' : group === 'awaiting' ? 'text-amber-700' : 'text-gray-500'}`}>
+                  {t(`dashboard.today.${group}`)} · {groups[group].length}
+                </h4>
+                {groups[group].map((dose) => {
+                  const canTake = dose.pills_remaining >= dose.units_per_dose;
+                  return (
+                    <div
+                      key={dose.id}
+                      className={`flex flex-wrap items-center gap-3 p-4 rounded-xl border shadow-sm ${
+                        group === 'due' ? 'bg-white border-blue-200' : 'bg-white border-gray-100'}`}
+                    >
+                      <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
+                        dose.status === 'taken' ? 'bg-green-50' :
+                        dose.status === 'missed' ? 'bg-red-50' :
+                        dose.status === 'skipped' ? 'bg-orange-50' :
+                        'bg-blue-50'
+                      }`}>
+                        {getStatusIcon(dose.status)}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-gray-900 text-base truncate">
+                          <span className="tabular-nums text-gray-500 mr-2">{clock(dose.scheduled_time)}</span>{dose.name}
+                        </p>
+                        <p className="text-sm text-gray-600">
+                          {dose.dosage ? `${dose.dosage} · ` : ''}{t('dashboard.unitsPerDose', { count: dose.units_per_dose })}
+                          {dose.status === 'taken' && dose.taken_at ? ` · ${t('history.takenAt', { time: clock(dose.taken_at) })}` : ''}
+                        </p>
+                      </div>
+                      {group === 'due' || group === 'later' ? (
+                        <div className="flex gap-2 shrink-0">
+                          <button
+                            onClick={() => navigate(`/intake?intake=${dose.id}&start=1`)}
+                            disabled={!canTake}
+                            className="px-4 py-2 bg-[#0057B8] text-white text-base font-medium rounded-lg hover:bg-[#003D82] active:scale-95 transition-all touch-target-large disabled:bg-gray-200 disabled:text-gray-400"
+                          >
+                            {canTake ? t('intake.take') : t('intake.cannotTake')}
+                          </button>
+                          {group === 'due' && (
+                            <button
+                              onClick={() => void skipDose(dose)}
+                              disabled={busyDose === dose.id}
+                              className="px-4 py-2 border border-gray-200 text-gray-700 text-base rounded-lg hover:bg-gray-50 touch-target-large disabled:opacity-50"
+                            >
+                              {t('intake.skip')}
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        getStatusBadge(dose.status)
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-            ))}
-          </div>
+            ));
+          })()
         )}
+      </section>
+
+      {/* Conversations with Reachy */}
+      <section className="space-y-3" aria-labelledby="conversations-title">
+        <div className="flex items-center justify-between px-1">
+          <h3 id="conversations-title" className="text-lg font-semibold text-gray-900">{t('conversations.recent')}</h3>
+          <button
+            onClick={() => navigate('/conversations')}
+            className="text-base text-[#0057B8] font-medium flex items-center gap-1 hover:text-[#003D82] transition-colors"
+          >
+            {t('common.viewAll')} <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+        <button
+          onClick={() => void talkToReachy()}
+          className="w-full flex items-center justify-center gap-2 py-4 rounded-xl border border-[#0057B8] text-[#0057B8] text-base font-medium hover:bg-blue-50 transition-colors touch-target-large"
+        >
+          <Bot className="w-5 h-5" />{t('conversations.talkNow')}
+        </button>
+        {checkinNotice && <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">{checkinNotice}</p>}
+        {conversations.length === 0 ? (
+          <p className="px-1 text-base text-gray-500">{t('conversations.empty')}</p>
+        ) : conversations.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => navigate('/conversations')}
+            className={`w-full text-left flex items-start gap-3 p-4 bg-white rounded-xl border shadow-sm hover:shadow-md transition-all ${
+              item.risk_flag ? 'border-red-200' : 'border-gray-100'}`}
+          >
+            <div className="w-10 h-10 bg-blue-50 rounded-full flex items-center justify-center shrink-0">
+              <Bot className="w-5 h-5 text-[#0057B8]" />
+            </div>
+            <div className="flex-1 min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm text-gray-500">{new Date(item.started_at).toLocaleString()}</span>
+                <MoodBadge mood={item.mood} />
+                {item.risk_flag && <AlertTriangle className="w-4 h-4 text-red-600" aria-label={t('conversations.safetyAlert')} />}
+              </div>
+              <p className="text-base text-gray-800 truncate">
+                {item.summary || item.first_words || t('conversations.noAnswer')}
+              </p>
+            </div>
+          </button>
+        ))}
       </section>
 
       {/* Recent Emotions */}

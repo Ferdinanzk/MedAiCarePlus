@@ -8,6 +8,7 @@ import {
   User,
   LogOut,
   Settings,
+  MessageCircle,
 } from 'lucide-react';
 import LanguageSwitcher from './LanguageSwitcher';
 import { type FaceAuthUser } from '../lib/face-auth';
@@ -26,6 +27,7 @@ export default function Sidebar({ faceUser }: SidebarProps) {
     { to: '/medications', icon: Pill, label: t('medications.title') },
     { to: '/scan', icon: Camera, label: t('scan.title') },
     { to: '/history', icon: History, label: t('history.title') },
+    { to: '/conversations', icon: MessageCircle, label: t('conversations.title') },
     { to: '/family', icon: User, label: t('family.title') },
     { to: '/settings', icon: Settings, label: t('settings.title') },
   ];

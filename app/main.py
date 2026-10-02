@@ -12,9 +12,10 @@ from app.services.emotion_service import EmotionService
 from app.services.ocr_service import OCRService
 from app.services.line_service import LineService
 from app.services.intake_detection import IntakeDetectionService
+from app.services.landmark_service import LandmarkService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
-from app.routers import api_legal, api_consent, api_account, api_reachy, api_device
+from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
     EmotionService.get_instance()
     LineService.get_instance()
     IntakeDetectionService.get_instance()
+    LandmarkService.get_instance()
     start_scheduler()
     await start_dispatcher()
     yield
@@ -104,6 +106,7 @@ app.include_router(api_consent.router,       tags=["consent"])
 app.include_router(api_account.router,       tags=["account"])
 app.include_router(api_reachy.router,        tags=["reachy"])
 app.include_router(api_device.router,        tags=["device"])
+app.include_router(api_conversations.router, tags=["conversations"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────
@@ -117,6 +120,7 @@ async def health():
         "ocr": OCRService._available,
         "line": LineService._available,
         "intake_detection": IntakeDetectionService._available,
+        "landmarks": LandmarkService._available,
     }
 
 
@@ -130,7 +134,9 @@ async def root():
 
 @app.get("/{full_path:path}")
 async def serve_spa(full_path: str):
-    # Don't intercept API routes — they are handled by included routers above.
+    # Unknown API endpoints must not look like a successful SPA response.
+    if full_path == "api" or full_path.startswith("api/"):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     # Serve actual files (assets, favicon, etc.) if they exist.
     file_path = os.path.join(WEB_DIR, full_path)
     if os.path.isfile(file_path):

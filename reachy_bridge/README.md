@@ -8,12 +8,36 @@ and makes no recording decisions; the server's policy is authoritative. **No mic
 
 ## Run
 
-Docker (opt-in profile, no published ports):
+Docker (opt-in profile, no published bridge ports):
 
 ```powershell
-# .env: REACHY_DEVICE_TOKEN=rdv1.…  REACHY_ROBOT_HOST=192.168.x.x  (give the robot a DHCP reservation)
-docker compose --profile reachy up -d --build reachy-bridge
-docker compose logs -f reachy-bridge
+# From any working directory, run this repository helper:
+& "C:\medcareai\MedAiCarePlus\scripts\reachy-start.ps1"
+
+# Check configuration and Docker readiness without building or starting anything:
+& "C:\medcareai\MedAiCarePlus\scripts\reachy-start.ps1" -CheckOnly
+```
+
+The helper locates `docker-compose.yml` and `.env` relative to its own file, checks that Docker is
+running, reads the resolved Compose configuration in memory, validates bridge settings without
+displaying them, and checks the configuration before it builds or starts `reachy-bridge`. It never
+creates or overwrites `.env`.
+
+The Docker bridge is an optional runner. If the installed `medcare_reachy` app on the robot is already
+handling MedAiCare integration, use that runner and leave this Docker bridge stopped. Run only one
+runner for the same Reachy device at a time. Reachy Mini Control is the desktop app for managing the
+robot and its installed app; the outdated robot web interface is not part of setup.
+
+If choosing the Docker bridge, launch/connect the robot with the **Reachy Mini Control desktop app**
+and set `REACHY_ROBOT_HOST` to the robot's LAN address. Pair the bridge from the **MedAiCare app UI**
+and set `REACHY_DEVICE_TOKEN` to the resulting `rdv1.` device token. Set these values in the
+repository `.env` or in the current PowerShell process; the helper reports missing values by name
+and never prints the token.
+
+To follow bridge logs:
+
+```powershell
+docker compose --file "C:\medcareai\MedAiCarePlus\docker-compose.yml" --profile reachy logs --follow reachy-bridge
 ```
 
 > **Unverified:** the Linux GStreamer/WebRTC setup in `Dockerfile.bridge` has not been exercised against
@@ -24,12 +48,19 @@ docker compose logs -f reachy-bridge
 
 ```powershell
 pip install -r reachy_bridge/requirements.txt
-$env:APP_INTERNAL_URL="http://localhost:8001"; $env:REACHY_DEVICE_TOKEN="rdv1.…"; $env:REACHY_ROBOT_HOST="192.168.x.x"
+$env:APP_INTERNAL_URL="http://localhost:8001"; $env:REACHY_DEVICE_TOKEN="<rdv1 device token>"; $env:REACHY_ROBOT_HOST="<robot LAN address>"
 python -m reachy_bridge
 ```
 
-Port 8001 must then be reachable from the host (it is not published by compose; publish it on
-`127.0.0.1` only if you choose this fallback).
+The app publishes device API port 8001 using `DEVICE_BIND` from `.env`. If it is set to the laptop's
+LAN address `192.168.49.32`, point this native bridge at `http://192.168.49.32:8001`:
+
+```powershell
+$env:APP_INTERNAL_URL="http://192.168.49.32:8001"
+```
+
+If `DEVICE_BIND` is unset, Compose binds port 8001 to `127.0.0.1` by default, so keep
+`APP_INTERNAL_URL="http://localhost:8001"` for a bridge running on that same laptop.
 
 Hardware-free: `ROBOT_BACKEND=video VIDEO_PATH=clip.mp4 python -m reachy_bridge` replays a file as the
 camera and logs motion/audio.

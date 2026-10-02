@@ -150,6 +150,12 @@ class MonitorSession:
     landmark_fps: float = 0.0
     extra_events: list = field(default_factory=list)
     last_activity_at: float = field(default_factory=time.monotonic)
+    # Reachy frame stream (api_device.monitor_frame): this session's landmark trackers, the lock that keeps
+    # its frames in order, and the background identity/emotion call on a streamed frame.
+    vision_engine: object | None = None
+    frame_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    vision_task: asyncio.Task | None = None
+    last_vision_started: float = float("-inf")
 
     def verified(self, now: float | None = None) -> bool:
         return self.identity_hits >= 2 and (now or time.monotonic()) - self.verified_at <= 1.5

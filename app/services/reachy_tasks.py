@@ -42,6 +42,13 @@ def is_supported(dose_form: str | None, units_per_dose) -> bool:
         return False
 
 
+CHECKIN_SCOPES = ("robot_microphone", "cloud_voice", "conversation_analysis", "safety_alerts")
+
+
+def checkin_allowed(consent_state: dict) -> bool:
+    return all(consent_service.is_current(consent_state, scope) for scope in CHECKIN_SCOPES)
+
+
 def slot_label(slot_time: datetime) -> str:
     if slot_time.tzinfo is None:
         slot_time = slot_time.replace(tzinfo=timezone.utc)
@@ -63,11 +70,16 @@ async def task_payload(conn, task) -> dict:
         'SELECT u.name, d.auto_record FROM "user" u '
         "LEFT JOIN reachy_device d ON d.u_id = u.u_id AND d.revoked_at IS NULL WHERE u.u_id = $1",
         task["u_id"])
+    consent = await consent_service.fetch_state(conn, task["u_id"])
     return {
         "task_id": str(task["task_id"]), "slot_time": _iso(task["slot_time"]), "reason": task["reason"],
         "attempt": task["attempt"], "status": task["status"], "expires_at": _iso(task["expires_at"]),
         "patient_name": head["name"] if head else None,
         "auto_record": bool(head and head["auto_record"]),
+        # The robot may listen (speech-to-text on the robot) only while this consent is current.
+        "microphone": consent_service.is_current(consent, "robot_microphone"),
+        # A check-in conversation needs every check-in scope (notice: check-ins only with safety alerts on).
+        "checkin": checkin_allowed(consent),
         "doses": [{
             "intk_id": d["intk_id"], "med_id": d["med_id"], "med_name": d["med_name"],
             "pill_description": d["pill_description"], "dose_form": d["dose_form"],
@@ -84,7 +96,7 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
     no current robot camera consent. A task already leased/searching/in_progress
     is never re-armed or reset.
     """
-    if reason not in ("upcoming", "missed_retry", "manual") or not intk_ids:
+    if reason not in ("upcoming", "missed_retry", "manual", "checkin") or (not intk_ids and reason != "checkin"):
         raise ValueError("Invalid task request")
     device = await conn.fetchval(
         "SELECT device_id FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from app.config import MEDCARE_TIMEZONE, SECRET_KEY
 from app.database import get_pool
 from app.services import outbox
+from app.services.intake_repository import take_stock
 
 SOURCES = ("uncertain_detection", "unsupported_dose", "degraded", "auto_record_off", "patient_claim")
 ANSWERS = ("taken", "not_taken")
@@ -217,17 +218,15 @@ async def resolve(conn, confirmation_id: str, contact_id: int, answer: str) -> d
                     "ORDER BY intk_id FOR UPDATE", list(row["intk_ids"]), row["u_id"]):
                 if intake["intake_stats"] != "pending_confirmation":
                     continue
-                stock = await conn.fetchval(
-                    "UPDATE medication SET pills_remaining=pills_remaining-1 "
-                    "WHERE med_id=$1 AND u_id=$2 AND pills_remaining>0 RETURNING pills_remaining",
-                    intake["med_id"], row["u_id"])
-                if stock is None:
-                    # The caregiver saw the dose taken; record it even though stock was already 0.
+                used = await take_stock(conn, intake["med_id"], row["u_id"])
+                if used is None:
+                    # The caregiver saw the dose taken; record it even though stock had run out.
                     stock_empty.append(intake["intk_id"])
                 await conn.execute(
                     "UPDATE intake SET intake_stats='taken', actual_intake_time=NOW(), "
-                    "detection_method='caregiver_confirmed', detection_confidence=NULL WHERE intk_id=$1",
-                    intake["intk_id"])
+                    "detection_method='caregiver_confirmed', detection_confidence=NULL, units_taken=$2 "
+                    "WHERE intk_id=$1",
+                    intake["intk_id"], used[1] if used else 0)
                 changed.append(intake["intk_id"])
         else:
             resolution = "denied"

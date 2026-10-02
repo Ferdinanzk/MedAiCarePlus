@@ -19,8 +19,9 @@ from app.services import deletion_ledger
 router = APIRouter(prefix="/api/account", tags=["account"])
 logger = logging.getLogger(__name__)
 EXPORT_TABLES = (
-    "user", "detail", "medication", "intake", "emotion", "family_contacts",
+    "user", "detail", "medication", "medication_supply", "intake", "emotion", "family_contacts",
     "notification_settings", "notification", "login_log", "monitor_event", "consent",
+    "conversation", "conversation_turn",
 )
 
 

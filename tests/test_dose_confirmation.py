@@ -123,6 +123,14 @@ class FakeDB:
         raise AssertionError(f"unexpected fetch: {query}")
 
     async def fetchrow(self, query, *args):
+        if "UPDATE medication SET pills_remaining=pills_remaining-units_per_dose" in query:
+            med_id, u_id = args
+            med = self.meds[med_id]
+            units = med.get("units_per_dose", 1)
+            if med["u_id"] != u_id or med["pills_remaining"] < units:
+                return None
+            med["pills_remaining"] -= units
+            return {"pills_remaining": med["pills_remaining"], "units_per_dose": units}
         if "FROM dose_confirmation WHERE confirmation_id" in query and "FOR UPDATE" in query:
             row = self.confirmations.get(str(args[0]))
             if row is None:
@@ -153,13 +161,6 @@ class FakeDB:
         if "SELECT name FROM family_contacts" in query:
             contact = self.contacts.get(args[0])
             return contact["name"] if contact else None
-        if "UPDATE medication SET pills_remaining=pills_remaining-1" in query:
-            med_id, u_id = args
-            med = self.meds[med_id]
-            if med["u_id"] != u_id or med["pills_remaining"] <= 0:
-                return None
-            med["pills_remaining"] -= 1
-            return med["pills_remaining"]
         raise AssertionError(f"unexpected fetchval: {query}")
 
     async def execute(self, query, *args):
