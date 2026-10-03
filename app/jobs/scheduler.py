@@ -18,6 +18,7 @@ def start_scheduler():
     from app.jobs.reachy_task_job import run_reachy_task_maintenance
     from app.jobs.dose_confirmation_job import run_dose_confirmation_maintenance
     from app.jobs.conversation_retention_job import purge_old_transcripts
+    from app.jobs.after_chat_job import run_after_chat_sweep
 
     scheduler.add_job(
         check_missed_doses,
@@ -65,6 +66,12 @@ def start_scheduler():
         purge_old_transcripts,
         CronTrigger(hour=3, minute=30),
         id="conversation_retention",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_after_chat_sweep,
+        IntervalTrigger(minutes=10),
+        id="after_chat_sweep",
         replace_existing=True,
     )
     scheduler.start()

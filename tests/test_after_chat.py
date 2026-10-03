@@ -214,3 +214,50 @@ def test_followup_given_up_after_two_chats(world):
 def test_a_claimed_chat_is_not_processed_twice(world):
     world.chat["after_chat_state"] = "done"
     assert run(world) is None and world.model_calls == []
+
+
+def test_sweep_closes_abandoned_chats_and_reprocesses_pending(monkeypatch):
+    from app.jobs import after_chat_job
+    sql, processed = [], []
+
+    class C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, query, *args):
+            sql.append((query, args))
+
+        async def fetch(self, query, *args):
+            sql.append((query, args))
+            return [{"conversation_id": uuid.UUID(CID), "u_id": 7}]
+
+    class P:
+        def acquire(self):
+            return C()
+
+    async def process(cid, u_id):
+        processed.append((cid, u_id))
+        return "done"
+
+    monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
+    monkeypatch.setattr(after_chat, "process", process)
+    asyncio.run(after_chat_job.run_after_chat_sweep())
+    assert "end_reason = 'abandoned'" in sql[0][0] and sql[0][1] == (after_chat_job.ABANDON_MINUTES,)
+    assert "INTERVAL '2 days'" in sql[1][0] and processed == [(CID, 7)]
+
+
+def test_retention_purges_transcripts_events_and_tombstones():
+    from app.jobs import conversation_retention_job as job
+    sql = []
+
+    class C:
+        async def execute(self, query, *args):
+            sql.append((query, args))
+
+    asyncio.run(job.run_retention(C()))
+    assert "conversation_turn" in sql[0][0]
+    assert "kind = 'event'" in sql[1][0] and sql[1][1] == (config.MEDCARE_TIMEZONE, 30)
+    assert "patient_memory_deleted" in sql[2][0] and sql[2][1] == (7,)
