@@ -207,7 +207,7 @@ async def _own_conversation(conn, device: dict, conversation_id: str):
     except ValueError as exc:
         raise HTTPException(404, "Conversation not found") from exc
     row = await conn.fetchrow(
-        "SELECT conversation_id, language, ended_at FROM conversation "
+        "SELECT conversation_id, language, ended_at, risk_flag FROM conversation "
         "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
     if not row:
         raise HTTPException(404, "Conversation not found")
@@ -296,9 +296,13 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
     return _spoken(reply, language, end=end, risk=bool(risk))
 
 
-async def _summarize(conversation_id: str, history: list[dict], language: str) -> None:
+async def _summarize(conversation_id: str, history: list[dict], language: str, risk: bool) -> None:
     try:
-        summary, mood = await conversation.summarize(history, language)
+        if risk:
+            # The words of a risk chat never go to a model, not even for a summary (module rule, notice §6).
+            summary, mood = None, "unknown"
+        else:
+            summary, mood = await conversation.summarize(history, language)
         async with get_pool().acquire() as conn:
             await conn.execute("UPDATE conversation SET summary = $2, mood = $3 WHERE conversation_id = $1::uuid",
                                conversation_id, summary, mood)
@@ -318,7 +322,8 @@ async def conversation_end(conversation_id: str, payload: ConversationEndPayload
             str(row["conversation_id"]), payload.reason)
         history = await _history(conn, row["conversation_id"])
     if any(turn["role"] == "patient" for turn in history):
-        task = asyncio.create_task(_summarize(str(row["conversation_id"]), history, row["language"]))
+        task = asyncio.create_task(_summarize(str(row["conversation_id"]), history, row["language"],
+                                              bool(row["risk_flag"])))
         _background.add(task)
         task.add_done_callback(_background.discard)
     return {"ended": True}
