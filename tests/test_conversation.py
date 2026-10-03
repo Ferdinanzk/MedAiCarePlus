@@ -35,6 +35,13 @@ ATTEMPT = {"model_requested": "primary/model:free", "model_served": "primary/mod
            "finish_reason": "stop", "tokens": 18, "usable": True}
 
 
+def _fake_http_session(post):
+    class Session:
+        def post(self, *args, **kwargs):
+            return post(*args, **kwargs)
+    return Session()
+
+
 # ── pure rules ──
 
 @pytest.mark.parametrize("text, kind", [
@@ -147,7 +154,7 @@ def test_a_reply_cut_off_by_the_token_limit_is_discarded(monkeypatch, finish_rea
         def json(self):
             return {"choices": [{"finish_reason": finish_reason, "message": {"content": "好的。"}}]}
 
-    monkeypatch.setattr(conversation.requests, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(conversation, "_http_session", lambda: _fake_http_session(lambda *a, **kw: Response()))
     assert conversation._post([{"role": "user", "content": "hi"}], 50) == expected
 
 
@@ -1224,7 +1231,7 @@ def test_post_sends_temperature_and_optional_provider_routing(monkeypatch):
         sent.update(json)
         return Response()
 
-    monkeypatch.setattr(conversation.requests, "post", post)
+    monkeypatch.setattr(conversation, "_http_session", lambda: _fake_http_session(post))
     monkeypatch.setattr(config, "OPENROUTER_PROVIDER_ONLY", "")
     monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "")
     conversation._post([], 10, temperature=0)

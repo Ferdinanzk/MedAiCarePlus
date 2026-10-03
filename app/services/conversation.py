@@ -31,6 +31,7 @@ message: never to the risk check or the summary.
 import asyncio
 import logging
 import re
+import threading
 import time
 
 import requests
@@ -41,6 +42,8 @@ from app.services import context_info, outbox
 log = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_HTTP_LOCAL = threading.local()
+HTTP_IDLE_SECONDS = 60.0   # a worker's keep-alive session idle longer than this is replaced (see _http_session)
 MAX_PATIENT_TURNS = 6
 HISTORY_TURNS = 12
 MAX_TEXT = 500
@@ -287,6 +290,30 @@ def _provider() -> dict | None:
     return routing
 
 
+def _http_session(clock=time.monotonic) -> requests.Session:
+    """A pooled HTTP session for this worker thread.
+
+    The synchronous requests.post convenience function creates and closes a Session for every call. The reply and
+    safety calls run in the executor, so a thread-local Session lets each worker reuse its OpenRouter keep-alive
+    connection (saving the ~0.1 s connection setup) without sharing mutable Session state between concurrent
+    workers. Reuse happens only when the same executor thread takes the next call, so the gain is small.
+
+    A session idle for more than HTTP_IDLE_SECONDS is replaced: turns of one conversation are seconds apart, but
+    check-ins are hours apart, and a connection dropped silently in between (laptop sleep, NAT) would fail the
+    first call after it.
+    """
+    now = clock()
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is not None and now - getattr(_HTTP_LOCAL, "used", now) > HTTP_IDLE_SECONDS:
+        session.close()
+        session = None
+    if session is None:
+        session = requests.Session()
+        _HTTP_LOCAL.session = session
+    _HTTP_LOCAL.used = now
+    return session
+
+
 def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeout: float = CALL_TIMEOUT,
           info: dict | None = None, temperature: float = 0.7) -> str | None:
     """One OpenRouter call. `info`, when given, receives status, model_served, finish_reason and tokens.
@@ -298,7 +325,7 @@ def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeo
     provider = _provider()
     if provider:
         payload["provider"] = provider
-    response = requests.post(
+    response = _http_session().post(
         OPENROUTER_URL, timeout=timeout,
         headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}", "Content-Type": "application/json",
                  "X-Title": "MedAiCarePlus Reachy check-in"},
