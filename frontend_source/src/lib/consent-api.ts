@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { faceLogout, getFaceAuthHeaders } from './face-auth';
 
-export type LegalKind = 'core' | 'robot';
+export type LegalKind = 'core' | 'robot' | 'memory';
 export type LegalLanguage = 'en' | 'zh-TW';
 export type LegalBlock =
   | { type: 'p'; text: string }
