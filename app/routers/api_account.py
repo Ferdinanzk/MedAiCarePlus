@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 EXPORT_TABLES = (
     "user", "detail", "medication", "medication_supply", "intake", "emotion", "family_contacts",
     "notification_settings", "notification", "login_log", "monitor_event", "consent",
-    "conversation", "conversation_turn",
+    "conversation", "conversation_turn", "patient_memory", "patient_memory_deleted",
+    "dose_confirmation", "monitor_extra_event", "reachy_device", "reachy_task", "notification_outbox",
 )
 
 

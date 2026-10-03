@@ -15,7 +15,7 @@ from app.services.intake_detection import IntakeDetectionService
 from app.services.landmark_service import LandmarkService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
-from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations
+from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations, api_memory
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
@@ -107,6 +107,7 @@ app.include_router(api_account.router,       tags=["account"])
 app.include_router(api_reachy.router,        tags=["reachy"])
 app.include_router(api_device.router,        tags=["device"])
 app.include_router(api_conversations.router, tags=["conversations"])
+app.include_router(api_memory.router,        tags=["memory"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────

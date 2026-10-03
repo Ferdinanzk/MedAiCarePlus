@@ -17,7 +17,7 @@ from app import config
 from app.config import DEVICE_PORT
 from app.dependencies import get_current_user
 from app.routers import api_conversations, api_device, api_reachy
-from app.services import after_chat, consent_service, conversation, outbox
+from app.services import after_chat, consent_service, conversation, deletion_ledger, outbox
 from app.services.device_auth import get_device
 
 DEVICE_ID = str(uuid.uuid4())
@@ -321,8 +321,22 @@ def test_patient_can_read_and_delete_only_own_conversations(monkeypatch):
     from app.main import app
 
     cid = str(uuid.uuid4())
+    executed, host = [], []
 
     class Conn:
+        def transaction(self):
+            class Tx:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *exc):
+                    return False
+            return Tx()
+
+        async def execute(self, query, *args):
+            executed.append((query, args))
+            return "SELECT 1"
+
         async def fetchrow(self, query, *args):
             assert args[1] == 7
             return {"id": uuid.UUID(cid), "started_at": None, "ended_at": None, "end_reason": "finished",
@@ -352,6 +366,7 @@ def test_patient_can_read_and_delete_only_own_conversations(monkeypatch):
 
     monkeypatch.setattr(consent_service, "get_state", get_state)
     monkeypatch.setattr(api_conversations, "get_pool", lambda: P())
+    monkeypatch.setattr(deletion_ledger, "append_host_file", lambda *entry: host.append(entry))
     monkeypatch.setattr(app, "dependency_overrides", {get_current_user: lambda: {"u_id": 7, "name": "Pearl"}})
     client = TestClient(app)
     detail = client.get(f"/api/conversations/{cid}").json()
@@ -359,7 +374,11 @@ def test_patient_can_read_and_delete_only_own_conversations(monkeypatch):
     assert client.get(f"/api/conversations/{uuid.uuid4()}").status_code == 404
     assert client.get("/api/conversations/nope").status_code == 404
     assert client.delete(f"/api/conversations/{cid}").json() == {"deleted": cid}
+    assert 'FOR UPDATE' in executed[0][0] and executed[0][1] == (7,)
+    assert [args for query, args in executed if "INSERT INTO deletion_ledger" in query] == [("conversation", 7, cid)]
+    assert host == [("conversation", 7, cid)]
     assert client.delete(f"/api/conversations/{uuid.uuid4()}").status_code == 404
+    assert len(host) == 1
 
 
 def test_end_after_a_risk_turn_makes_no_model_call(robot, monkeypatch):
