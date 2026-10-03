@@ -221,3 +221,122 @@ def date_table(today: date, language: str) -> str:
             else f"Today {today.isoformat()} {names[today.weekday()]}")
     days = [today + timedelta(days=offset) for offset in range(-7, 15)]
     return "\n".join([head] + [f"{day.isoformat()} {names[day.weekday()]}" for day in days if day != today])
+
+
+# ── database helpers ─────────────────────────────────────────────────────────
+
+CURRENT_FACTS_SQL = (
+    "SELECT DISTINCT ON (kind, subject) memory_id, kind, subject, text, event_date, source, followed_up_at, "
+    "created_at FROM patient_memory WHERE u_id = $1 "
+    "ORDER BY kind, subject, (source = 'patient') DESC, created_at DESC")
+_FIXED_REPLIES = {text for table in (conversation.FALLBACK, conversation.CLOSING, conversation.HELPLINE)
+                  for text in table.values()}
+
+
+async def lock_user(conn, u_id: int) -> None:
+    """The one per-patient lock: post-chat writes, deletes, patient edits and consent withdrawal."""
+    await conn.execute('SELECT 1 FROM "user" WHERE u_id = $1 FOR UPDATE', u_id)
+
+
+async def current_facts(conn, u_id: int) -> list[dict]:
+    return [dict(row) for row in await conn.fetch(CURRENT_FACTS_SQL, u_id)]
+
+
+async def store_facts(conn, u_id: int, conversation_id: str, facts: list[dict]) -> int:
+    """Store validated, grounded facts from one chat. The caller holds a transaction."""
+    await lock_user(conn, u_id)
+    if not consent_current(await consent_service.fetch_state(conn, u_id)):
+        return 0
+    chat = await conn.fetchrow(
+        "SELECT ended_at FROM conversation WHERE conversation_id = $1::uuid AND u_id = $2", conversation_id, u_id)
+    if chat is None:
+        return 0
+    current = {(f["kind"], f["subject"]): f for f in await current_facts(conn, u_id)}
+    deleted = {(r["kind"], r["subject"]) for r in await conn.fetch(
+        "SELECT kind, subject FROM patient_memory_deleted WHERE u_id = $1 AND deleted_at > $2",
+        u_id, chat["ended_at"])}
+    stored = 0
+    for fact in facts:
+        key = (fact["kind"], fact["subject"])
+        existing = current.get(key)
+        if key in deleted or (existing and existing["text"] == fact["text"]
+                              and existing["event_date"] == fact["event_date"]):
+            continue
+        followed = None
+        if fact["kind"] == "event":   # talking about an already-asked event again must not re-arm the follow-up
+            followed = await conn.fetchval(
+                "SELECT max(followed_up_at) FROM patient_memory "
+                "WHERE u_id = $1 AND kind = 'event' AND subject = $2 AND event_date = $3",
+                u_id, fact["subject"], fact["event_date"])
+        status = await conn.execute(
+            "INSERT INTO patient_memory (u_id, conversation_id, kind, subject, text, event_date, followed_up_at) "
+            "VALUES ($1, $2::uuid, $3, $4, $5, $6, $7) "
+            "ON CONFLICT (conversation_id, kind, subject) WHERE conversation_id IS NOT NULL DO NOTHING",
+            u_id, conversation_id, fact["kind"], fact["subject"], fact["text"], fact["event_date"], followed)
+        stored += status.endswith(" 1")
+    return stored
+
+
+async def finish_followup(conn, u_id: int, followup_memory_id, reachy_texts: list[str]) -> None:
+    """Mark the follow-up asked once a real model reply happened, or after two chats tried."""
+    if followup_memory_id is None:
+        return
+    row = await conn.fetchrow("SELECT subject FROM patient_memory WHERE memory_id = $1::uuid AND u_id = $2",
+                              str(followup_memory_id), u_id)
+    if row is None:
+        return
+    answered = any(text not in _FIXED_REPLIES for text in reachy_texts[1:])   # [0] is the opening line
+    tries = await conn.fetchval("SELECT count(*) FROM conversation WHERE u_id = $1 AND followup_memory_id = $2::uuid",
+                                u_id, str(followup_memory_id))
+    if answered or tries >= 2:
+        await conn.execute(
+            "UPDATE patient_memory SET followed_up_at = NOW() "
+            "WHERE u_id = $1 AND kind = 'event' AND subject = $2 AND followed_up_at IS NULL", u_id, row["subject"])
+
+
+AFTER_CHAT_PROMPT = {
+    "zh-TW": (
+        "以下是陪伴機器人 Reachy 和長者的對話。請做兩件事。\n"
+        "第一，用一句繁體中文總結長者談到的主題和心情（不要引用原話），並判斷整體心情，輸出兩行：\n"
+        "MOOD: happy|calm|sad|worried|angry|unknown\nSUMMARY: <一句話>\n"
+        "第二，只根據「長者」自己說的話（不要用 Reachy 說的話，不要猜測），記下新的或有改變的事實，最多 5 條。"
+        "不要記任何健康、藥物、看醫生、住院或醫院的事（長者或任何人都一樣），也不要記長者的名字或稱呼。"
+        "kind 只能是 person（人名與關係）、like（喜好）、routine（習慣）、event（有日期的事）。"
+        "event 的 event_date 請在日期表中查出，格式 YYYY-MM-DD。subject 用簡短小寫英文或拼音，以底線連接；"
+        "已知事實裡有的 subject 請沿用。最後輸出一個 JSON 物件，沒有新事實就輸出 {\"facts\": []}。"),
+    "en": (
+        "Below is a conversation between the companion robot Reachy and an older adult. Do two things.\n"
+        "First, summarise the topics and mood in one sentence (no direct quotes) and classify the overall mood, "
+        "as exactly two lines:\nMOOD: happy|calm|sad|worried|angry|unknown\nSUMMARY: <one sentence>\n"
+        "Second, from the older adult's own lines only (never Reachy's, never guesses), note up to 5 new or "
+        "changed facts. Never note health, medicine, doctor or hospital matters, for them or anyone else, and "
+        "never their own name. kind is one of person (a name and relation), like, routine, event (dated). "
+        "Look event_date up in the date table, as YYYY-MM-DD. subject is short lowercase English joined with "
+        "underscores; reuse a known subject when it fits. End with one JSON object; with nothing new, output "
+        "{\"facts\": []}."),
+}
+
+
+async def after_chat_call(history: list[dict], language: str, known: list[dict],
+                          today: date) -> tuple[str | None, str, list | None, str]:
+    """One model call for the summary and the facts: (summary, mood, raw facts or None, reason)."""
+    language = conversation.language_of(language)
+    speaker = "長者" if language == "zh-TW" else "Older adult"
+    transcript = "\n".join(f"{speaker if t['role'] == 'patient' else 'Reachy'}: {t['text']}" for t in history)
+    newest = sorted((f for f in known if f["kind"] != "name"), key=lambda f: f["created_at"], reverse=True)
+    known_lines = "\n".join(f"{f['subject']}: {f['text']}" for f in newest[:KNOWN_LIMIT]) or "-"
+    heading = ("對話：", "日期表：", "已知事實（subject: 內容）：") if language == "zh-TW" else (
+        "Conversation:", "Date table:", "Known facts (subject: text):")
+    content = (f"{heading[0]}\n{transcript}\n\n{heading[1]}\n{date_table(today, language)}\n\n"
+               f"{heading[2]}\n{known_lines}")
+    messages = [{"role": "system", "content": AFTER_CHAT_PROMPT[language]}, {"role": "user", "content": content}]
+    reason = "empty"
+    for _ in range(2):
+        answer, reason = await conversation.complete_with_reason(messages, max_tokens=1000, temperature=0)
+        if reason in ("no_key", "rate_limited"):
+            break
+        summary, mood = conversation.parse_summary(answer)
+        facts = parse_facts(answer)
+        if summary or facts is not None:
+            return summary, mood, facts, "ok"
+    return None, "unknown", None, reason
