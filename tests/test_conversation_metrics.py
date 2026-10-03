@@ -26,6 +26,79 @@ PRIMARY, FALLBACK_MODEL = "primary/model:free", "openrouter/free"
 HISTORY = [{"role": "reachy", "text": "今天感覺怎麼樣？"}, {"role": "patient", "text": "我去散步了"}]
 
 
+def _fake_http_session(post):
+    class Session:
+        def post(self, *args, **kwargs):
+            return post(*args, **kwargs)
+    return Session()
+
+
+# ── the keep-alive session (one per executor thread) ──
+
+class _RecordedSession:
+    def __init__(self, created):
+        self.closed = False
+        created.append(self)
+
+    def close(self):
+        self.closed = True
+
+
+def _record_sessions(monkeypatch):
+    created = []
+    monkeypatch.setattr(conversation.requests, "Session", lambda: _RecordedSession(created))
+    return created
+
+
+def test_http_session_is_reused_by_each_executor_worker(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    created = _record_sessions(monkeypatch)
+    # A fresh worker thread each time, so no thread-local session leaks into other tests.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        sessions = list(pool.map(lambda _: conversation._http_session(), range(3)))
+    assert len(created) == 1 and sessions == [created[0]] * 3
+
+
+def test_concurrent_workers_never_share_a_session(monkeypatch):
+    """The reply and the risk check run at the same time on two executor threads."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    created = _record_sessions(monkeypatch)
+    both_running = threading.Barrier(2, timeout=5)
+
+    def worker(_):
+        session = conversation._http_session()
+        both_running.wait()   # neither thread can finish before the other has its session
+        return session
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sessions = list(pool.map(worker, range(2)))
+    assert len(created) == 2 and sessions[0] is not sessions[1]
+
+
+def test_an_idle_session_is_replaced_and_closed(monkeypatch):
+    """Check-ins are hours apart: a connection dropped silently meanwhile must not fail the next call."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    created = _record_sessions(monkeypatch)
+    now = [1000.0]
+    clock = lambda: now[0]   # noqa: E731
+
+    def calls():
+        first = conversation._http_session(clock)
+        now[0] += conversation.HTTP_IDLE_SECONDS - 1          # the next turn of the same conversation
+        second = conversation._http_session(clock)
+        now[0] += conversation.HTTP_IDLE_SECONDS + 1          # the next check-in
+        third = conversation._http_session(clock)
+        return first, second, third
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first, second, third = pool.submit(calls).result()
+    assert first is second and third is not first
+    assert first.closed and not third.closed and len(created) == 2
+
+
 # ── the model chain ──
 
 class Response:
@@ -55,7 +128,7 @@ def openrouter(monkeypatch):
     monkeypatch.setattr(config, "LLM_MODEL", PRIMARY)
     monkeypatch.setattr(config, "LLM_FALLBACK_MODEL", FALLBACK_MODEL)
     monkeypatch.setattr(config, "LLM_DEADLINE_SECONDS", 8.0)
-    monkeypatch.setattr(conversation.requests, "post", post)
+    monkeypatch.setattr(conversation, "_http_session", lambda: _fake_http_session(post))
     return types.SimpleNamespace(answers=answers, sent=sent)
 
 
