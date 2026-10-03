@@ -340,3 +340,33 @@ async def after_chat_call(history: list[dict], language: str, known: list[dict],
         if summary or facts is not None:
             return summary, mood, facts, "ok"
     return None, "unknown", None, reason
+
+
+PICK_FOLLOWUP_SQL = """
+WITH current AS (
+    SELECT DISTINCT ON (subject) memory_id, subject, text, event_date
+    FROM patient_memory WHERE u_id = $1 AND kind = 'event'
+    ORDER BY subject, (source = 'patient') DESC, created_at DESC)
+SELECT memory_id, text, event_date FROM current c
+WHERE c.event_date BETWEEN $2::date - 7 AND $2::date - 1
+  AND NOT EXISTS (SELECT 1 FROM patient_memory r
+                  WHERE r.u_id = $1 AND r.kind = 'event' AND r.subject = c.subject
+                    AND r.followed_up_at IS NOT NULL)
+ORDER BY c.event_date DESC
+LIMIT 1
+"""
+
+
+async def pick_followup(conn, u_id: int, today: date) -> dict | None:
+    row = await conn.fetchrow(PICK_FOLLOWUP_SQL, u_id, today)
+    return dict(row) if row else None
+
+
+async def build_block(conn, u_id: int, language: str, followup_memory_id, today: date) -> str:
+    facts = await current_facts(conn, u_id)
+    followup = None
+    if followup_memory_id is not None:
+        row = await conn.fetchrow("SELECT text, event_date FROM patient_memory WHERE memory_id = $1::uuid AND u_id = $2",
+                                  str(followup_memory_id), u_id)
+        followup = dict(row) if row else None
+    return render_block(facts, language, followup=followup, today=today)

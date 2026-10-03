@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import after_chat, consent_service, conversation, outbox, reachy_tasks
+from app.services import after_chat, consent_service, conversation, memory, outbox, reachy_tasks
 from app.services.device_auth import get_device, get_device_for_heartbeat
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
@@ -207,7 +207,7 @@ async def _own_conversation(conn, device: dict, conversation_id: str):
     except ValueError as exc:
         raise HTTPException(404, "Conversation not found") from exc
     row = await conn.fetchrow(
-        "SELECT conversation_id, language, ended_at, risk_flag FROM conversation "
+        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id FROM conversation "
         "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
     if not row:
         raise HTTPException(404, "Conversation not found")
@@ -241,13 +241,19 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
     await _checkin_consent(device)
     language = conversation.language_of(payload.language)
     conversation_id = str(uuid.uuid4())
-    opening = conversation.OPENING[language]
+    memory_on = memory.consent_current(await consent_service.get_state(device["u_id"]))
     async with get_pool().acquire() as conn, conn.transaction():
         task = await _leased_task(conn, device, payload.task_id)
+        name, followup = None, None
+        if memory_on:
+            name = memory.preferred_name(await memory.current_facts(conn, device["u_id"]))
+            followup = await memory.pick_followup(conn, device["u_id"], memory.local_today())
+        opening = memory.opening_line(language, name)
         await conn.execute(
-            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model) "
-            "VALUES ($1::uuid, $2, $3::uuid, $4, $5)",
-            conversation_id, device["u_id"], str(task["task_id"]), language, config.LLM_MODEL or "openrouter/free")
+            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
+            "VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid)",
+            conversation_id, device["u_id"], str(task["task_id"]), language, config.LLM_MODEL or "openrouter/free",
+            str(followup["memory_id"]) if followup else None)
         await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
     return _spoken(opening, language, end=False, conversation_id=conversation_id)
 
@@ -267,6 +273,10 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         language = row["language"]
         turn_id = await _add_turn(conn, row["conversation_id"], device["u_id"], "patient", text, bool(risk))
         history = await _history(conn, row["conversation_id"])
+        block = ""
+        if not risk and memory.consent_current(await consent_service.get_state(device["u_id"])):
+            block = await memory.build_block(conn, device["u_id"], language, row["followup_memory_id"],
+                                             memory.local_today())
         if risk:
             # Fixed help-line reply; the words never go to the model. Every verified contact is told,
             # whatever their other alert settings (robot notice §6).
@@ -290,7 +300,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         reply, end = conversation.CLOSING[language], True
     else:
         # No connection is held while the (possibly slow, free-tier) model answers.
-        reply, end = await conversation.reply(history, language), False
+        reply, end = await conversation.reply(history, language, block), False
     async with get_pool().acquire() as conn:
         await _add_turn(conn, row["conversation_id"], device["u_id"], "reachy", reply)
     return _spoken(reply, language, end=end, risk=bool(risk))
