@@ -348,3 +348,21 @@ def test_patient_can_read_and_delete_only_own_conversations(monkeypatch):
     assert client.get("/api/conversations/nope").status_code == 404
     assert client.delete(f"/api/conversations/{cid}").json() == {"deleted": cid}
     assert client.delete(f"/api/conversations/{uuid.uuid4()}").status_code == 404
+
+
+def test_end_after_a_risk_turn_makes_no_model_call(robot, monkeypatch):
+    calls = []
+
+    async def summarize(history, language):
+        calls.append(history)
+        return "should not happen", "sad"
+
+    monkeypatch.setattr(conversation, "summarize", summarize)
+    cid = _start(robot)["conversation_id"]
+    assert _turn(robot, cid, "我覺得活不下去了").json()["risk"] is True
+    assert robot.client.post(f"/api/device/conversations/{cid}/end", json={"reason": "risk"}).json() == {"ended": True}
+    deadline = time.time() + 1
+    while time.time() < deadline and robot.db.conversations[cid]["mood"] is None:
+        time.sleep(0.02)
+    assert calls == []
+    assert robot.db.conversations[cid]["summary"] is None and robot.db.conversations[cid]["mood"] == "unknown"
