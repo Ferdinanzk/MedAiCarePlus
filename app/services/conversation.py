@@ -118,13 +118,32 @@ def speech_text(text: str, language: str) -> str:
     return text
 
 
-def _post(messages: list[dict], max_tokens: int) -> str | None:
+REPLY_BUDGET_SECONDS = 45   # stay inside the robot's 60 s turn timeout (reachy_app app_client.py)
+
+
+def _provider() -> dict | None:
+    only = [slug.strip() for slug in config.OPENROUTER_PROVIDER_ONLY.split(",") if slug.strip()]
+    if not only and not config.OPENROUTER_DATA_COLLECTION:
+        return None
+    routing: dict = {"allow_fallbacks": not only}
+    if only:
+        routing["only"] = only
+    if config.OPENROUTER_DATA_COLLECTION:
+        routing["data_collection"] = config.OPENROUTER_DATA_COLLECTION
+    return routing
+
+
+def _post(messages: list[dict], max_tokens: int, temperature: float = 0.7) -> str | None:
+    body = {"model": config.LLM_MODEL or "openrouter/free", "messages": messages,
+            "max_tokens": max_tokens, "temperature": temperature}
+    provider = _provider()
+    if provider:
+        body["provider"] = provider
     response = requests.post(
         OPENROUTER_URL, timeout=REQUEST_TIMEOUT,
         headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}", "Content-Type": "application/json",
                  "X-Title": "MedAiCarePlus Reachy check-in"},
-        json={"model": config.LLM_MODEL or "openrouter/free", "messages": messages,
-              "max_tokens": max_tokens, "temperature": 0.7})
+        json=body)
     if response.status_code in (429, 500, 502, 503):
         raise RuntimeError(f"retryable {response.status_code}")
     response.raise_for_status()
@@ -135,19 +154,28 @@ def _post(messages: list[dict], max_tokens: int) -> str | None:
     return content.strip() if isinstance(content, str) and content.strip() else None
 
 
-async def complete(messages: list[dict], max_tokens: int = 200) -> str | None:
-    """One chat completion, retried once; None when unavailable (no key, rate limit, empty answer)."""
+async def complete_with_reason(messages: list[dict], max_tokens: int = 200,
+                               temperature: float = 0.7) -> tuple[str | None, str]:
+    """One chat completion, retried once, and why it failed: ok, no_key, rate_limited, unavailable, empty."""
     if not config.OPENROUTER_API_KEY:
-        return None
+        return None, "no_key"
     loop = asyncio.get_running_loop()
+    reason = "unavailable"
     for attempt in range(2):
         try:
-            return await loop.run_in_executor(None, _post, messages, max_tokens)
+            text = await loop.run_in_executor(None, _post, messages, max_tokens, temperature)
+            return (text, "ok") if text else (None, "empty")
         except Exception as exc:
+            reason = "rate_limited" if "429" in str(exc) else "unavailable"
             log.warning("OpenRouter call failed (attempt %d): %s", attempt + 1, exc)
             if attempt == 0:
                 await asyncio.sleep(2)
-    return None
+    return None, reason
+
+
+async def complete(messages: list[dict], max_tokens: int = 200) -> str | None:
+    """One chat completion, retried once; None when unavailable (no key, rate limit, empty answer)."""
+    return (await complete_with_reason(messages, max_tokens))[0]
 
 
 # openrouter/free sometimes routes to a reasoning model that writes its plan into the answer ("The user wants
@@ -162,11 +190,7 @@ def usable_reply(text: str | None, language: str) -> bool:
     return bool(_CJK.search(text)) if language == "zh-TW" else True
 
 
-async def reply(history: list[dict], language: str) -> str:
-    """history: [{"role": "patient"|"reachy", "text": ...}] oldest first, ending with the patient's turn."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT[language]}]
-    for turn in history[-HISTORY_TURNS:]:
-        messages.append({"role": "user" if turn["role"] == "patient" else "assistant", "content": turn["text"]})
+async def _reply(messages: list[dict], language: str) -> str:
     for _ in range(2):
         answer = await complete(messages)
         if usable_reply(answer, language):
@@ -174,6 +198,20 @@ async def reply(history: list[dict], language: str) -> str:
             if cleaned:
                 return cleaned
     return FALLBACK[language]
+
+
+async def reply(history: list[dict], language: str, memory: str = "") -> str:
+    """history: [{"role": "patient"|"reachy", "text": ...}] oldest first, ending with the patient's turn.
+    memory: the memory block (memory.render_block), sent as its own system message, or ""."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT[language]}]
+    if memory:
+        messages.append({"role": "system", "content": memory})
+    for turn in history[-HISTORY_TURNS:]:
+        messages.append({"role": "user" if turn["role"] == "patient" else "assistant", "content": turn["text"]})
+    try:
+        return await asyncio.wait_for(_reply(messages, language), REPLY_BUDGET_SECONDS)
+    except asyncio.TimeoutError:
+        return FALLBACK[language]
 
 
 def parse_summary(answer: str | None) -> tuple[str | None, str]:
