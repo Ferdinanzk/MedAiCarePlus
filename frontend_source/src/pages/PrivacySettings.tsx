@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Download, Loader2, LogOut, Trash2 } from 'lucide-react';
 import ConsentGate from '../components/ConsentGate';
 import { ConsentApiError, deleteAccount, exportAccount, logoutAccount } from '../lib/consent-api';
+import { deleteAllMemory } from '../lib/memory-api';
 
 export default function PrivacySettings({ limited = false }: { limited?: boolean }) {
   const { t } = useTranslation();
@@ -13,6 +14,7 @@ export default function PrivacySettings({ limited = false }: { limited?: boolean
   const [busy, setBusy] = useState<'export' | 'delete' | null>(null);
   const [error, setError] = useState('');
   const [reauthRequired, setReauthRequired] = useState(false);
+  const [memoryCleared, setMemoryCleared] = useState<number | null>(null);
 
   const download = async () => {
     setBusy('export');
@@ -70,6 +72,12 @@ export default function PrivacySettings({ limited = false }: { limited?: boolean
         <button onClick={download} disabled={busy !== null} className="w-full min-h-12 px-4 py-3 rounded-xl bg-[#0057B8] text-white font-semibold flex items-center justify-center gap-2 disabled:opacity-50">
           {busy === 'export' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}{t('legal.export')}
         </button>
+      </div>
+      <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm space-y-4">
+        <p className="text-sm text-gray-600">{t('memory.privacyHelp')}</p>
+        <button onClick={() => { if (confirm(t('memory.deleteAllConfirm'))) void deleteAllMemory().then(r => setMemoryCleared(r.deleted), () => setError('memory.saveFailed')); }}
+          disabled={busy !== null} className="min-h-12 w-full px-5 py-3 rounded-xl bg-red-50 text-red-700 font-semibold disabled:opacity-50">{t('memory.deleteAll')}</button>
+        {memoryCleared !== null && <p role="status" className="text-sm text-gray-600">{t('memory.deleteAllDone', { count: memoryCleared })}</p>}
       </div>
       <div className="bg-white rounded-2xl border border-red-100 p-5 shadow-sm space-y-4">
         {!confirmDelete ? (

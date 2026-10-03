@@ -5,6 +5,7 @@ import {
   deleteConversation, fetchConversation, fetchConversations,
   type ConversationDetail, type ConversationSummary, type Mood,
 } from '../lib/reachy-api';
+import MemoryPanel from '../components/MemoryPanel';
 
 const PAGE_SIZE = 20;
 
@@ -72,6 +73,8 @@ export default function Conversations() {
         <h2 className="text-2xl font-bold text-gray-900">{t('conversations.title')}</h2>
         <p className="text-base text-gray-500 mt-1">{t('conversations.subtitle')}</p>
       </div>
+
+      <MemoryPanel />
 
       {error && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{error}</p>}
 

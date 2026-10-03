@@ -13,7 +13,7 @@ export interface ReachyStatus {
   last_task?: { task_id: string; status: string; slot_time: string; finished_at: string | null } | null;
 }
 
-async function call<T>(url: string, init: RequestInit = {}): Promise<T> {
+export async function call<T>(url: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(url, {
     ...init,
     headers: { ...getFaceAuthHeaders(), ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
