@@ -103,6 +103,7 @@ Settings that matter:
 | `DEVICE_BIND` | This laptop's Wi-Fi IPv4 address from step 4. Never `0.0.0.0`. |
 | `WEB_PORT` | `8080`, so port 8000 stays free for the Reachy daemon |
 | `MEDCARE_FRONTEND_URL` | `http://localhost:8080` |
+| `GEMINI_API_KEY` | Your own Gemini API key (https://aistudio.google.com/apikey). This is the **only** thing prescription scanning (the Scan page) needs; it then works for every account. A secret: `.env` only, never commit it. Leave `OCR_MODEL` and `OCR_GEMINI_FALLBACK_MODEL` as in `.env.example` (or delete them); if an old `.env` says `OCR_MODEL=gemini-3.8-flash`, change it. See [OCR.md](OCR.md). |
 | `OPENROUTER_API_KEY`, `LLM_MODEL` | Optional; only for future conversation features |
 | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | Leave empty until LINE is set up |
 | `BACKUP_PASSPHRASE` | A strong passphrase for the weekly encrypted backup. Store it somewhere else too. |
@@ -135,7 +136,9 @@ docker compose ps
 Invoke-RestMethod http://localhost:8080/health
 ```
 
-Expected: `face_recognition`, `emotion`, `intake_detection` and `landmarks` are `true`; `ocr` and `line` are `false`.
+Expected: `face_recognition`, `emotion`, `intake_detection` and `landmarks` are `true`. `ocr` is `true` once `GEMINI_API_KEY` is in `.env` (if it is `false`, add the key and run `docker compose up -d --force-recreate app`). `line` is `false` until LINE is set up (step 10b).
+
+To check OCR, sign in, open **Scan**, photograph a prescription or medicine bag, and press **Confirm**: the medicine name and schedule should appear within a few seconds.
 
 Open **http://localhost:8080** and sign in:
 - **Moving:** your existing account and face work as before.
@@ -228,7 +231,8 @@ The tunnel address changes whenever its container restarts, for example after a 
 
 | Check | Where | Expected |
 | --- | --- | --- |
-| Server health | `http://localhost:8080/health` | all `true` except `ocr`, `line` |
+| Server health | `http://localhost:8080/health` | all `true` (`ocr` needs `GEMINI_API_KEY`, `line` needs step 10b) |
+| Prescription scan | Web app → Scan, any account | the medicine name and schedule appear |
 | Robot connection | Web app → Settings → Reachy card | **Online** |
 | Robot app | `http://reachy-mini.local:8042/api/status` | `"state":"running"`, `"missing_clips":0` |
 | Camera rate during a reminder | Reachy card → *Camera rate* | about 15 fps (the server needs ≥12 to record by itself) |

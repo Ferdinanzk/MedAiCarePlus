@@ -60,6 +60,23 @@ interface Medication {
   /** Overdose protection limits; null = the default from the schedule. */
   min_interval_minutes?: number | null;
   max_daily_doses?: number | null;
+  /** What the scan read (pharmacy, dates…). course_end equal to use_before: that date ends the course, not an expiry. */
+  prescription_meta?: Record<string, unknown> | null;
+}
+
+/** prescription_meta as an object: asyncpg returns JSONB as text. */
+function parseMeta(value: unknown): Record<string, unknown> | null {
+  let candidate = value;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+  return candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : null;
 }
 
 type DoseForm = 'solid_oral' | 'liquid' | 'inhaler' | 'injection' | 'topical' | 'other';
@@ -238,10 +255,12 @@ export default function Medications() {
     const headers = getAuthHeaders();
     const resp = await fetch('/api/medications', { headers }).catch(() => null);
     if (resp?.ok) {
-      const rows = await resp.json() as Array<Omit<Medication, 'schedule_time'> & { schedule_time?: unknown }>;
+      const rows = await resp.json() as Array<Omit<Medication, 'schedule_time' | 'prescription_meta'>
+        & { schedule_time?: unknown; prescription_meta?: unknown }>;
       setMedications(rows.map((row) => ({
         ...row,
         schedule_time: normalizeScheduleTime(row.schedule_time),
+        prescription_meta: parseMeta(row.prescription_meta),
       })));
     }
     setLoading(false);
@@ -377,6 +396,8 @@ export default function Medications() {
       // Always sent, so clearing a field on edit returns that limit to the default.
       min_interval_minutes: gapMinutes(form.min_gap_hours),
       max_daily_doses: dailyMax(form.max_daily),
+      // The update stores what it is sent: an edit keeps what the scan read (pharmacy, dates, course end).
+      prescription_meta: editingId ? medications.find((m) => m.id === editingId)?.prescription_meta ?? null : null,
     };
 
     const url = editingId ? `/api/medications/${editingId}` : '/api/medications';
@@ -459,7 +480,19 @@ export default function Medications() {
               {t('medications.daysLeft', { days: med.days_left, date: med.run_out_date })}
             </p>
           )}
-          {med.use_before && (() => {
+          {med.use_before && med.prescription_meta?.course_end === med.use_before && (() => {
+            // A scanned course: the date ends its reminders. Reaching it is not the medicine expiring.
+            const exp = getExpiryStatus(med.use_before);
+            return (
+              <p className="text-sm mt-1 flex items-center gap-1 text-gray-500">
+                <CalendarClock className="w-3 h-3 shrink-0" />
+                {exp.status === 'expired'
+                  ? t('medications.courseEndedOn', { date: exp.iso ?? med.use_before })
+                  : t('medications.courseEnds', { date: exp.iso ?? med.use_before })}
+              </p>
+            );
+          })()}
+          {med.use_before && med.prescription_meta?.course_end !== med.use_before && (() => {
             const exp = getExpiryStatus(med.use_before);
             const alert = exp.status === 'expired' || exp.status === 'soon';
             return (

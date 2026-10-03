@@ -134,6 +134,35 @@ def test_create_stores_given_fields(monkeypatch):
     assert args[-4:-2] == ("liquid", Decimal("2.5"))
 
 
+def test_create_with_a_last_day_that_passed_makes_no_doses(monkeypatch):
+    """A scanned course that already ended (use_before = its last day) creates the medicine but no reminders."""
+    conn = _Conn(fetchval_result=13)
+    monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
+    today = datetime.datetime.now(api_medications._MEDCARE_TZ).date()
+    three = {"morning": True, "noon": True, "night": True}
+    asyncio.run(api_medications.create_medication(
+        _payload(schedule_time=three, use_before=(today - datetime.timedelta(days=2)).isoformat()), {"u_id": 7}))
+    assert not any(call[0] == "executemany" for call in conn.calls)
+    asyncio.run(api_medications.create_medication(
+        _payload(schedule_time=three, use_before=(today + datetime.timedelta(days=2)).isoformat()), {"u_id": 7}))
+    assert any(call[0] == "executemany" for call in conn.calls)
+
+
+def test_today_calls_a_scanned_course_end_no_expiry(monkeypatch):
+    stamp = datetime.datetime(2026, 10, 3, 0, 0, tzinfo=datetime.timezone.utc)
+    base = {"intake_id": 9, "id": 9, "med_id": 4, "name": "Metformin", "status": "pending",
+            "scheduled_time": stamp, "previous_time": None, "schedule_time": None}
+    rows = [{**base, "use_before": "2026-10-04", "course_end": "2026-10-04"},
+            {**base, "id": 10, "intake_id": 10, "use_before": "2026-10-04", "course_end": None},
+            {**base, "id": 11, "intake_id": 11, "use_before": "2026-10-01"}]
+    conn = _Conn(rows=rows)
+    monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
+    today = asyncio.run(api_medications.today_medications({"u_id": 7}, "2026-10-03"))
+    assert [row["use_before_warning"] for row in today] == [None, "Expires in 1 days", "Expired"]
+    assert all("course_end" not in row for row in today)
+    assert "prescription_meta->>'course_end' AS course_end" in conn.calls[0][1]
+
+
 @pytest.mark.parametrize("fields, expected", [
     ({}, (None, None)),
     ({"dose_form": "inhaler", "units_per_dose": 2}, ("inhaler", Decimal("2"))),

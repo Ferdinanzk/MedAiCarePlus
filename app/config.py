@@ -32,8 +32,22 @@ YOLO_MODEL_PATH = Path(os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://medai:medai@localhost:5432/medaicare")
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434/api/generate")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-OCR_MODEL = os.getenv("OCR_MODEL", "gemini-3.8-flash")
+# Prescription OCR needs only GEMINI_API_KEY (a secret: .env only, never committed); it serves every account.
+# The default models are the pair that worked on 3-4 Oct 2026, when the earlier default gemini-3.8-flash answered
+# every scan with 503 "high demand" (every account saw an all-N/A result). gemini-3.5-flash goes first because it
+# read a real pharmacy receipt more accurately (4 Oct: 2 of 3 names exact, against 1 of 3 for flash-lite, which
+# copied one row's name onto another), at 7-12 s a scan; flash-lite (2-3 s) is the fallback. docs/OCR.md has the
+# measurements. The fallback is tried once when the primary is busy, times out or no longer exists; set
+# OCR_GEMINI_FALLBACK_MODEL empty to turn it off.
+OCR_DEFAULT_MODEL = "gemini-3.5-flash"
+OCR_DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OCR_MODEL = os.getenv("OCR_MODEL", "").strip() or OCR_DEFAULT_MODEL
+OCR_GEMINI_FALLBACK_MODEL = os.getenv("OCR_GEMINI_FALLBACK_MODEL", OCR_DEFAULT_FALLBACK_MODEL).strip()
+# Seconds per Gemini request: gemini-3.5-flash took up to 11.8 s on a three-medicine receipt, so 25 s leaves the
+# fallback 20 s of the 45 s scan budget.
+OCR_GEMINI_TIMEOUT = max(1, int(os.getenv("OCR_GEMINI_TIMEOUT", "") or "25"))
+OCR_GEMINI_IMAGE_BUDGET = max(OCR_GEMINI_TIMEOUT, int(os.getenv("OCR_GEMINI_IMAGE_BUDGET", "") or "45"))   # per scan
 SECRET_KEY   = os.getenv("SECRET_KEY",   "change-me-in-production-32chars!!")
 DEVICE       = "CPU"
 MEDCARE_TIMEZONE = os.getenv("MEDCARE_TIMEZONE", "Asia/Taipei")

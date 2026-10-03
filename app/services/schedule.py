@@ -98,14 +98,18 @@ def parse_date(text: str | None) -> datetime.date | None:
 
 def occurrences(schedule_time, start: datetime.datetime, *, until: datetime.date | None = None,
                 horizon_days: int = HORIZON_DAYS) -> list[datetime.datetime]:
-    """Dose times after `start` (aware, local) for the next `horizon_days`, ending on `until` if earlier."""
+    """Dose times after `start` (aware, local) for the next `horizon_days`, ending on `until` if earlier.
+
+    An `until` before `start`'s day gives none: a course that already ended (a scanned receipt's last day, or a
+    use-before date that passed) gets no reminders for the rest of today.
+    """
     times = [tuple(map(int, t.split(":"))) for t in dose_times(schedule_time)]
     days = set(weekdays(schedule_time))
-    if not times:
+    if not times or (until is not None and until < start.date()):
         return []
     last = start.date() + datetime.timedelta(days=horizon_days - 1)
     if until is not None:
-        last = min(last, max(until, start.date()))
+        last = min(last, until)
     result = []
     day = start.date()
     while day <= last:

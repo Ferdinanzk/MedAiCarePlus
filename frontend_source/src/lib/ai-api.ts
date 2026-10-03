@@ -1,4 +1,5 @@
 import { getFaceToken } from './face-auth';
+import type { ScanResult } from './scan';
 
 interface Landmark {
   x: number;
@@ -90,27 +91,37 @@ export const aiApi = {
     return resp.json();
   },
 
-  async parsePrescription(imageFile: File): Promise<{
-    med_name?: string;
-    quantity?: string;
-    amount_each_intake?: string;
-    total_intake?: string;
-    schedule_time?: Record<string, boolean>;
-    warning?: string;
-    intake_time_label?: string;
+  /** Every medicine on the paper in `medications`; the top-level fields are the first one (see lib/scan.ts). */
+  async parsePrescription(imageFile: File): Promise<Partial<ScanResult> & {
     error?: string;
+    /** The server's machine-readable reason (e.g. 'ocr_provider_busy'), for a message in the page's language. */
+    code?: string;
   }> {
     const form = new FormData();
     form.append('file', imageFile);
-    const resp = await aiFetch('/api/ocr/parse', {
-      method: 'POST',
-      body: form,
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      return { error: err.detail || `HTTP ${resp.status}` };
+    const controller = new AbortController();
+    // Longer than the server's own limit (45 s with Gemini; OLLAMA_TIMEOUT, 180 s by default, without it),
+    // so the server's answer, which says why, normally arrives first.
+    const timeout = setTimeout(() => controller.abort(), 200_000);
+    try {
+      const resp = await aiFetch('/api/ocr/parse', {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        const message = typeof err.error === 'string' ? err.error
+          : typeof err.detail === 'string' ? err.detail : `HTTP ${resp.status}`;
+        // OCR failures carry `code`; consent and auth refusals carry a code-like `detail` ('consent_required').
+        const code = typeof err.code === 'string' ? err.code
+          : typeof err.detail === 'string' && /^[a-z_]+$/.test(err.detail) ? err.detail : undefined;
+        return { error: message, code };
+      }
+      return await resp.json();
+    } finally {
+      clearTimeout(timeout);
     }
-    return resp.json();
   },
 
   async analyzeEmotion(imageFile: File): Promise<{

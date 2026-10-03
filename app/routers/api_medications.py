@@ -179,6 +179,7 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
                 m.pill_description,
                 m.warning,
                 m.use_before,
+                m.prescription_meta->>'course_end' AS course_end,
                 m.schedule_time,
                 i.intake_time_stamp AS scheduled_time,
                 {schedule.previous_sql('i')} AS previous_time,
@@ -201,7 +202,11 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
     result = []
     for r in rows:
         row = dict(r)
-        row["use_before_warning"] = _expiry_warning(row.get("use_before"), today)
+        # A scanned course's last day is stored in use_before to end its reminders (Scan page, course_end in
+        # prescription_meta); reaching it is not the medicine expiring.
+        course_end = row.pop("course_end", None)
+        row["use_before_warning"] = (None if course_end and course_end == row.get("use_before")
+                                     else _expiry_warning(row.get("use_before"), today))
         ts = row.get("scheduled_time")
         row["slot_label"] = schedule.slot_label(row.get("schedule_time"), ts.astimezone(_MEDCARE_TZ)) if ts else ""
         # From when the dose may be started or recorded (DOSE_EARLY_MINUTES before its time, or halfway from the
