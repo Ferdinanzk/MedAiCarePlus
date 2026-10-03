@@ -149,3 +149,8 @@ def test_date_table_covers_21_days_with_weekdays():
     table = memory.date_table(TODAY, "zh-TW").split("\n")
     assert len(table) == 22 and table[0].startswith("今天 2026-10-03")
     assert "2026-09-26 週六" in table and "2026-10-17 週六" in table
+
+
+def test_pick_followup_query_uses_the_current_version_and_skips_asked_subjects():
+    sql = memory.PICK_FOLLOWUP_SQL
+    assert "DISTINCT ON (subject)" in sql and "followed_up_at IS NOT NULL" in sql and "LIMIT 1" in sql

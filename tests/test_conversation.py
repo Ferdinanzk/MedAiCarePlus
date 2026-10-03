@@ -167,7 +167,7 @@ class FakeDB:
 
     async def execute(self, query, *args):
         if "INSERT INTO conversation " in query:
-            cid, u_id, task_id, language, model = args
+            cid, u_id, task_id, language, model, followup = args
             self.conversations[cid] = {"conversation_id": cid, "u_id": u_id, "language": language,
                                        "ended_at": None, "risk_flag": False, "summary": None, "mood": None,
                                        "after_chat_state": "done", "after_chat_attempts": 0,
@@ -208,7 +208,7 @@ def robot(monkeypatch):
         alerts.append({"u_id": u_id, **kwargs})
         return state["family_contacts"]
 
-    async def reply(history, language):
+    async def reply(history, language, memory=""):
         prompts.append(list(history))
         return "真好，您走了多久呢？"
 
@@ -447,3 +447,45 @@ def test_post_sends_temperature_and_optional_provider_routing(monkeypatch):
     monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "deny")
     conversation._post([], 10)
     assert sent["provider"] == {"only": ["deepinfra", "together"], "allow_fallbacks": False, "data_collection": "deny"}
+
+
+def test_block_empty_without_memory_consent(robot, monkeypatch):
+    seen = []
+
+    async def reply(history, language, memory=""):
+        seen.append(memory)
+        return "好。"
+
+    monkeypatch.setattr(conversation, "reply", reply)
+    cid = _start(robot)["conversation_id"]
+    _turn(robot, cid, "我去散步了")
+    assert seen == [""]
+
+
+def test_memory_on_names_the_patient_and_sends_the_block(robot, monkeypatch):
+    from app.services import memory
+    seen = []
+    robot.state["consent"] = {**CHECKIN, "conversation_memory": {"granted": True, "terms_version": config.TERMS_VERSION}}
+
+    async def current_facts(conn, u_id):
+        return [{"kind": "name", "subject": "preferred_name", "text": "王奶奶", "event_date": None, "source": "patient",
+                 "created_at": None, "memory_id": "m", "followed_up_at": None}]
+
+    async def pick_followup(conn, u_id, today):
+        return None
+
+    async def build_block(conn, u_id, language, followup_memory_id, today):
+        return "<memory>\n稱呼：王奶奶\n</memory>"
+
+    async def reply(history, language, memory=""):
+        seen.append(memory)
+        return "好。"
+
+    monkeypatch.setattr(memory, "current_facts", current_facts)
+    monkeypatch.setattr(memory, "pick_followup", pick_followup)
+    monkeypatch.setattr(memory, "build_block", build_block)
+    monkeypatch.setattr(conversation, "reply", reply)
+    opened = _start(robot)
+    assert opened["reply"] == "王奶奶，" + conversation.OPENING["zh-TW"]
+    _turn(robot, opened["conversation_id"], "我去散步了")
+    assert seen == ["<memory>\n稱呼：王奶奶\n</memory>"]
