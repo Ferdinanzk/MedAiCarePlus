@@ -6,6 +6,7 @@ A local medication-care web app (FastAPI + React) with face-recognition sign-in,
 - [HANDOFF.md](HANDOFF.md): what exists, what works, what is still open.
 - [docs/NEW_LAPTOP_SETUP.md](docs/NEW_LAPTOP_SETUP.md): install everything on another computer, step by step.
 - [CLAUDE.md](CLAUDE.md): developer ground rules and design decisions.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/MODELS.md](docs/MODELS.md), [docs/DATA_FLOW.md](docs/DATA_FLOW.md): system architecture, every model and algorithm, and every data flow.
 
 ## Run in Docker
 
@@ -59,7 +60,7 @@ The server, not the robot, decides what is recorded.
 
 The expression model predicts Angry, Disgust, Fear, Happy, Sad, Surprise, and Neutral. The face gallery is bind-mounted from `models/face_recognition/face_gallery`, so enrollments survive container rebuilds. PostgreSQL data is in the `medcareai2_pgdata` volume.
 
-`/health` reports each model service. In the default local setup, `ocr: false` (OCR is not installed) and `line: false` (LINE is not configured yet); everything else should be `true`.
+`/health` reports each model service. `ocr` is `true` once your own `GEMINI_API_KEY` is in `.env` (never commit it); prescription scanning then works for every account ([docs/OCR.md](docs/OCR.md)). `line` is `false` until LINE is configured. Everything else should be `true`.
 
 ## Checks and maintenance
 
