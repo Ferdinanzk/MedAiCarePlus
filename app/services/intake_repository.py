@@ -3,6 +3,7 @@
 import json
 
 from app.database import get_pool
+from app.services import dose_emotion, dose_safety, dose_video, schedule
 from app.services.emotion_service import LABELS
 
 
@@ -24,10 +25,27 @@ async def return_stock(conn, med_id: int, units_taken) -> None:
 
 
 async def commit_monitored(state, candidate: dict, method: str) -> dict:
+    try:
+        result = await _commit_monitored(state, candidate, method)
+    except schedule.DoseRefused as refused:
+        # The camera saw a hand-to-mouth event for a dose overdose protection refuses: when that is a second dose
+        # (too soon, or over the daily maximum), family is alerted. The refusal itself rolled back.
+        await dose_safety.alert_after(refused)
+        raise
+    if not result["already_recorded"] and getattr(state, "clip_enabled", False):
+        dose_video.capture(state.u_id, [state.intk_id], event_started_at=state.event_started_at)
+    if not result["already_recorded"]:
+        # The session's facial-expression result for this dose, written after its after-window (in memory now).
+        dose_emotion.note_resolution(state)
+    return result
+
+
+async def _commit_monitored(state, candidate: dict, method: str) -> dict:
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
-            "SELECT intk_id, med_id, intake_stats FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
+            "SELECT intk_id, med_id, intake_stats, intake_time_stamp FROM intake WHERE intk_id=$1 AND u_id=$2 "
+            "FOR UPDATE",
             state.intk_id, state.u_id)
         if not row or row["intake_stats"] not in ("pending", "missed"):
             # A retried request can arrive after its first transaction has
@@ -45,6 +63,11 @@ async def commit_monitored(state, candidate: dict, method: str) -> dict:
             candidate["event_id"], state.u_id)
         if existing:
             return {"event_id": str(existing["event_id"]), "status": existing["outcome"], "already_recorded": True}
+        # Session start already checked overdose protection; checked again here, under the row lock: due and not
+        # expired as of when the session started (it was allowed then, and the pill is down now), the gap and the
+        # daily maximum now. A refusal here follows a hand-to-mouth event, so its sentence says it was not recorded.
+        await dose_safety.check(conn, state.u_id, [state.intk_id], lock=True,
+                                started_at=getattr(state, "started_at", None), after_intake=True)
         used = await take_stock(conn, row["med_id"], state.u_id)
         if used is None:
             raise ValueError("No pills remain for this medication")
@@ -57,8 +80,9 @@ async def commit_monitored(state, candidate: dict, method: str) -> dict:
                 "INSERT INTO emotion (u_id, emotion_type, emotion_score, context) "
                 "VALUES ($1,$2,$3,'during_ingestion') RETURNING emot_id",
                 state.u_id, label.capitalize(), float(probabilities[label]))
+        # taken_notified: a dose recorded (again) is reported to family again (taken_confirmation_job).
         await conn.execute(
-            "UPDATE intake SET intake_stats='taken', actual_intake_time=NOW(), "
+            "UPDATE intake SET intake_stats='taken', actual_intake_time=NOW(), taken_notified=FALSE, "
             "detection_confidence=$1, detection_method=$2, emot_id=$3, units_taken=$5 WHERE intk_id=$4",
             candidate["confidence"], method, emot_id, state.intk_id, units)
         await conn.execute(
@@ -106,7 +130,8 @@ async def transition_intake(u_id: int, intk_id: int, new_status: str, *, method:
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
-            "SELECT intk_id, med_id, intake_stats, units_taken FROM intake WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
+            "SELECT intk_id, med_id, intake_stats, units_taken, intake_time_stamp FROM intake "
+            "WHERE intk_id=$1 AND u_id=$2 FOR UPDATE",
             intk_id, u_id)
         if not row:
             raise ValueError("Intake record not found")
@@ -119,17 +144,22 @@ async def transition_intake(u_id: int, intk_id: int, new_status: str, *, method:
             return {"intk_id": intk_id, "status": new_status, "changed": False}
         units = None
         if new_status == "taken":
+            # Only 'taken' records a pill, so only it is checked. Skipping (or resetting) a later dose stays allowed.
+            # A refused tap only shows its sentence: a button press is no evidence of a second pill.
+            await dose_safety.check(conn, u_id, [intk_id], lock=True)
             used = await take_stock(conn, row["med_id"], u_id)
             if used is None:
                 raise ValueError("No pills remain for this medication")
             units = used[1]
         elif previous == "taken":
             await return_stock(conn, row["med_id"], row["units_taken"])
+        # taken_notified is cleared on every change, as undo_monitored does: a dose that left 'taken' and is taken
+        # again must be reported to family again (taken_confirmation_job only reports rows not yet notified).
         await conn.execute(
             "UPDATE intake SET intake_stats=$1::varchar, "
             "actual_intake_time=CASE WHEN $1::varchar='taken' THEN NOW() ELSE NULL END, "
             "detection_method=CASE WHEN $1::varchar='taken' THEN $2::varchar ELSE NULL END, "
-            "detection_confidence=NULL, units_taken=$4 WHERE intk_id=$3::int",
+            "detection_confidence=NULL, units_taken=$4, taken_notified=FALSE WHERE intk_id=$3::int",
             new_status, method, intk_id, units)
         if previous == "taken" and new_status != "taken":
             # A later manual correction must retire the evidence row. Without

@@ -1,0 +1,5 @@
+# What Reachy knows about the day (app/services/context_info.py): Taiwan's official holidays with their make-up days,
+# and the lunar calendar for the traditional festivals. A separate layer, so changing it does not re-download
+# everything in requirements.txt. Both are pure Python; holidays needs python-dateutil, already installed.
+holidays==0.105
+lunar_python==1.4.8

@@ -1,0 +1,96 @@
+{
+  "kind": "video",
+  "version": "2026-10",
+  "language": "en",
+  "title": "Dose Videos for Family Notice",
+  "what_changed": [
+    "First version of the notice for optional dose videos sent to family on LINE."
+  ],
+  "sections": [
+    {
+      "id": "video-service",
+      "heading": "1. What this does",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "When a dose is recorded while a camera is watching (Reachy, or this app's camera), we make a **short video of the moments before it was recorded** (usually 10 to 20 seconds) and send it on LINE to the verified family contacts who receive \"dose taken\" messages. The message also says how the dose was recorded and the AI's estimate that it was taken."
+        },
+        {
+          "type": "p",
+          "text": "The video shows **your face, your hands and the room around you**, so anyone near you at that moment can appear in it."
+        },
+        {
+          "type": "p",
+          "text": "The AI's estimate is based on hand-to-mouth movement. **It cannot see the pill itself**, so the video and the estimate help your family; they do not prove which medicine you took."
+        }
+      ]
+    },
+    {
+      "id": "video-exception",
+      "heading": "2. An exception to \"camera images are never saved\"",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "Our other notices say camera images are analysed in memory and never saved. With dose videos on, **the last 20 seconds of camera images are held in memory during medication time, and a clip is saved on the home server only when a dose is recorded.** With dose videos off, nothing changes from our other notices."
+        }
+      ]
+    },
+    {
+      "id": "video-processing",
+      "heading": "3. Where the video goes, and for how long",
+      "blocks": [
+        {
+          "type": "table",
+          "header": [
+            "Data",
+            "Processed by",
+            "Location",
+            "Kept"
+          ],
+          "rows": [
+            [
+              "The clip on our server",
+              "The home server run by {OPERATOR_NAME}",
+              "Your home, Taiwan",
+              "Until every family member's LINE app has downloaded it or played it to the end, and **24 hours at most**"
+            ],
+            [
+              "The download of the clip",
+              "{TUNNEL_PROVIDER} carries it from the home server to LINE",
+              "Its network",
+              "Not kept by us"
+            ],
+            [
+              "The video in your family's LINE chats",
+              "LINE (LY Corporation) and your family members",
+              "Their phones and LINE's service",
+              "**We cannot delete it once delivered**: a sent LINE message cannot be recalled by us"
+            ]
+          ]
+        },
+        {
+          "type": "p",
+          "text": "Each family member gets their own private link. Nobody else can open the clip from our server, and the link stops working once the clip is deleted."
+        }
+      ]
+    },
+    {
+      "id": "video-choice",
+      "heading": "4. Your choice",
+      "blocks": [
+        {
+          "type": "p",
+          "text": "A video of you taking medicine is **sensitive health information**. Dose videos are optional and separate from everything else, and we only make them with your consent here."
+        },
+        {
+          "type": "p",
+          "text": "You can switch dose videos off at any time on the Family page. Videos not yet downloaded are deleted from our server at once, and no new video is made. Videos your family already received stay on their devices."
+        },
+        {
+          "type": "p",
+          "text": "Questions: {OPERATOR_CONTACT}."
+        }
+      ]
+    }
+  ]
+}

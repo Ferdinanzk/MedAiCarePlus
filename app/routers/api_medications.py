@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.config import MEDCARE_TIMEZONE
-from app.services import schedule
+from app.services import dose_emotion, dose_safety, schedule
 
 router = APIRouter(prefix="/api/medications", tags=["medications-api"])
 _MEDCARE_TZ = ZoneInfo(MEDCARE_TIMEZONE)
@@ -85,6 +85,11 @@ class MedicationPayload(BaseModel):
     # None = keep the stored value on update, schema default on create.
     dose_form: Optional[str] = None
     units_per_dose: Optional[Decimal] = None
+    # Overdose protection's limits for this medicine (services/dose_safety.py). null = the default from its schedule
+    # (half the shortest gap between its dose times, or 4 h; as many doses a day as it has times, or no limit). On
+    # update a field left out keeps the stored value, and an explicit null returns to the default.
+    min_interval_minutes: Optional[int] = Field(default=None, ge=30, le=2880)
+    max_daily_doses: Optional[int] = Field(default=None, ge=1, le=24)
 
     @field_validator("dose_form")
     @classmethod
@@ -162,7 +167,7 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT
                 i.intk_id        AS intake_id,
                 m.med_id         AS med_id,
@@ -176,11 +181,15 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
                 m.use_before,
                 m.schedule_time,
                 i.intake_time_stamp AS scheduled_time,
+                {schedule.previous_sql('i')} AS previous_time,
+                {dose_safety.next_sql('i')} AS next_time,
                 i.actual_intake_time AS taken_at,
                 i.intake_stats   AS status,
-                i.intk_id        AS id
+                i.intk_id        AS id,
+                dose_emotion_best.dose_emotion
             FROM medication m
             JOIN intake i ON i.med_id = m.med_id
+            {dose_emotion.chip_join('i.intk_id', 'i.u_id', 'i.intake_stats')}
             WHERE m.u_id = $1
               AND m.is_active = TRUE
               AND i.intake_time_stamp >= $2
@@ -195,8 +204,17 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
         row["use_before_warning"] = _expiry_warning(row.get("use_before"), today)
         ts = row.get("scheduled_time")
         row["slot_label"] = schedule.slot_label(row.get("schedule_time"), ts.astimezone(_MEDCARE_TZ)) if ts else ""
+        # From when the dose may be started or recorded (DOSE_EARLY_MINUTES before its time, or halfway from the
+        # same medicine's previous dose if that is later); the server enforces it.
+        row["due_from"] = schedule.due_from(ts, row.pop("previous_time"))
+        # Until when a missed dose may still be taken (halfway to the next one); while overdose protection is on,
+        # the server refuses it afterwards (dose_expired). None: it never expires.
+        row["expires_at"] = dose_safety.expires_at(ts, row.pop("next_time", None))
         row["pills_remaining"] = _number(row.get("pills_remaining"))
         row["units_per_dose"] = _number(row.get("units_per_dose"))
+        if "dose_emotion" in row:
+            # Facial expression while this dose was taken (a camera session's result), or None.
+            row["emotion"] = dose_emotion.chip(row.pop("dose_emotion"))
         result.append(row)
     return result
 
@@ -205,12 +223,22 @@ async def today_medications(user: dict = Depends(get_consented_user), date: Opti
 async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
     """Resolve a medication card's Take Now action to a pending intake row.
 
-    Scheduled rows whose time has arrived (including missed rows) are reused.
-    If the next scheduled slot is still in the future, or the medication is
-    unscheduled, create one ad-hoc row at the current time.  The medication
-    row lock makes repeated/concurrent clicks return the same pending row
-    instead of creating duplicate doses.  Nothing is marked taken here;
-    monitor/commit_monitored owns that transition after camera evidence.
+    Today's scheduled rows a pill taken now may count for (dose_safety.open_sql:
+    their time has arrived, or is at most DOSE_EARLY_MINUTES away and past
+    halfway from the previous dose, and while overdose protection is on they
+    have not expired; missed rows included) are reused, nearest to now first,
+    the earlier one on a tie. A pill taken at 10:01 with 08:00 open and 12:00
+    due counts as 12:00: crediting 08:00 would leave the 12:00 reminder to
+    prompt a second pill two hours later. If the next scheduled slot is further
+    away, or the medication is unscheduled, create one ad-hoc row at the current
+    time: a later scheduled dose is never consumed early. Under protection, a
+    missed dose that has expired is not made up that way (409 dose_expired:
+    wait for the next one), and the dose returned must pass every rule (409
+    dose_too_soon / daily_max_reached otherwise, ad-hoc rows included; nothing
+    is created then). The medication row lock makes repeated/concurrent clicks
+    return the same pending row instead of creating duplicate doses. Nothing
+    is marked taken here; monitor/commit_monitored owns that transition after
+    camera evidence.
     """
     u_id = await _get_u_id(user)
     if not u_id:
@@ -240,13 +268,14 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
             if (medication["pills_remaining"] or 0) < (medication.get("units_per_dose") or 1):
                 return JSONResponse({"detail": "No pills remain for this medication"}, status_code=409)
 
-            # A due row is the medication's existing scheduled dose. Future
-            # rows are intentionally not selected: Take Now means the dose
-            # starts now even when the next scheduled slot is later today.
+            # A due row is the medication's existing scheduled dose. Rows that
+            # are not due yet are intentionally not selected: Take Now means the
+            # dose starts now even when the next scheduled slot is later today.
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT i.intk_id AS id, i.med_id, m.med_name AS name, m.dosage,
                        i.intake_time_stamp AS scheduled_time, i.intake_stats AS status,
+                       {schedule.previous_sql('i')} AS previous_time,
                        m.pills_remaining, m.warning
                 FROM intake i
                 JOIN medication m ON m.med_id=i.med_id
@@ -256,8 +285,9 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                     WHERE med_id=$1 AND u_id=$2
                       AND intake_stats IN ('pending', 'missed')
                       AND intake_time_stamp >= $3
-                      AND intake_time_stamp <= $4
-                    ORDER BY intake_time_stamp DESC
+                      AND {dose_safety.open_sql('intake', '$4::timestamptz')}
+                    ORDER BY ABS(EXTRACT(EPOCH FROM (intake_time_stamp - $4::timestamptz))),
+                             intake_time_stamp
                     LIMIT 1
                 )
                 FOR UPDATE
@@ -268,6 +298,25 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                 now,
             )
             if not row:
+                # The latest scheduled dose of today that has come is still open: it expired (or it would have been
+                # picked). Under protection the pill is not taken as an ad-hoc dose instead (409 dose_expired); with
+                # protection off check() lets it through and an ad-hoc dose is made as before. An earlier ad-hoc dose
+                # left pending is no missed dose: it never expires, and it does not stand in for the schedule here.
+                latest = await conn.fetchrow(
+                    f"""
+                    SELECT intk_id, intake_stats FROM intake
+                    WHERE med_id=$1 AND u_id=$2 AND intake_time_stamp >= $3 AND intake_time_stamp <= $4
+                      AND NOT {dose_safety.ad_hoc_sql('intake')}
+                    ORDER BY intake_time_stamp DESC, intk_id DESC
+                    LIMIT 1
+                    """,
+                    med_id,
+                    u_id,
+                    local_start,
+                    now,
+                )
+                if latest is not None and latest["intake_stats"] in ("pending", "missed"):
+                    await dose_safety.check(conn, u_id, [latest["intk_id"]], at=now)
                 # Prevent an immediate second click after a monitored dose
                 # has committed from manufacturing another dose. A later
                 # intentional dose still has its scheduled pending row (or
@@ -285,6 +334,10 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                 )
                 if recent_taken:
                     return JSONResponse({"detail": "This medication was just recorded"}, status_code=409)
+                # An ad-hoc row keeps the moment it was made, never a whole minute: that is how it is told from a
+                # scheduled one (dose_safety.is_ad_hoc).
+                if (now.second, now.microsecond) == (0, 0):
+                    now += datetime.timedelta(microseconds=1)
                 row = await conn.fetchrow(
                     """
                     INSERT INTO intake (u_id, med_id, intake_time_stamp, intake_stats, notify_stats)
@@ -305,7 +358,11 @@ async def intake_now(med_id: int, user: dict = Depends(get_consented_user)):
                 })
             else:
                 row = dict(row)
+            # Every rule, on the dose the pill would count for. A refusal rolls back an ad-hoc row made just now.
+            await dose_safety.check(conn, u_id, [row["id"]], at=now)
             row["pills_remaining"] = _number(row.get("pills_remaining"))
+            # An ad-hoc row is made now, so it is due whatever came before it.
+            row["due_from"] = schedule.due_from(row.get("scheduled_time"), row.pop("previous_time", None))
             return row
 
 
@@ -328,7 +385,9 @@ async def update_intake_status(
         return JSONResponse({"detail": "Invalid status"}, status_code=400)
 
     # transition_intake refuses doses awaiting caregiver confirmation under the row
-    # lock (409 "awaiting_caregiver_confirmation").
+    # lock (409 "awaiting_caregiver_confirmation"), and 'taken' for a dose overdose
+    # protection refuses (schedule.DoseRefused: 409 "dose_not_due_yet",
+    # "dose_too_soon", "daily_max_reached" or "dose_expired", from main.py).
     from app.services.intake_repository import transition_intake
     try:
         return await transition_intake(u_id, intk_id, new_status)
@@ -348,7 +407,7 @@ async def list_medications(user: dict = Depends(get_consented_user)):
             SELECT med_id AS id, med_name AS name, dosage, pill_prescribed AS total_pills,
                    pills_remaining, instructions, warning, pill_description, use_before,
                    is_active, archived_at, schedule_time, prescription_meta, created_at,
-                   dose_form, units_per_dose
+                   dose_form, units_per_dose, min_interval_minutes, max_daily_doses
             FROM medication
             WHERE u_id = $1
             ORDER BY is_active DESC, created_at DESC
@@ -366,6 +425,9 @@ async def list_medications(user: dict = Depends(get_consented_user)):
         row["daily_units"] = supply.get("daily_units")
         row["days_left"] = supply.get("days_left")
         row["run_out_date"] = supply.get("run_out_date")
+        # What null means for this medicine's overdose protection limits (from its schedule), for the edit form.
+        row["default_min_interval_minutes"] = int(dose_safety.min_gap(row.get("schedule_time")).total_seconds() // 60)
+        row["default_max_daily_doses"] = dose_safety.daily_max(row.get("schedule_time"))
         result.append(row)
     return result
 
@@ -392,8 +454,9 @@ async def create_medication(
                 INSERT INTO medication
                     (u_id, med_name, dosage, pill_prescribed, pills_remaining,
                      instructions, warning, pill_description, use_before,
-                     is_active, schedule_time, prescription_meta, dose_form, units_per_dose)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                     is_active, schedule_time, prescription_meta, dose_form, units_per_dose,
+                     min_interval_minutes, max_daily_doses)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                 RETURNING med_id
                 """,
                 u_id,
@@ -410,6 +473,8 @@ async def create_medication(
                 json.dumps(payload.prescription_meta) if payload.prescription_meta else None,
                 dose_form,
                 units_per_dose,
+                payload.min_interval_minutes,
+                payload.max_daily_doses,
             )
             # Auto-generate intake schedule rows
             if payload.is_active:
@@ -419,7 +484,8 @@ async def create_medication(
         except Exception as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
     return {"id": med_id, "name": payload.name.strip(), "dose_form": dose_form,
-            "units_per_dose": _number(units_per_dose)}
+            "units_per_dose": _number(units_per_dose), "min_interval_minutes": payload.min_interval_minutes,
+            "max_daily_doses": payload.max_daily_doses}
 
 
 @router.patch("/{med_id}")
@@ -457,16 +523,18 @@ async def update_medication(
                     (payload.use_before or "").strip(),
                     payload.is_active,
                 )
-                updated = await conn.fetchval(
+                updated = await conn.fetchrow(
                     """
                     UPDATE medication
                     SET med_name=$1, dosage=$2, pill_prescribed=$3, pills_remaining=$4,
                         instructions=$5, warning=$6, pill_description=$7, use_before=$8,
                         is_active=$9, schedule_time=$10, prescription_meta=$11,
                         dose_form=COALESCE($14, dose_form), units_per_dose=COALESCE($15, units_per_dose),
+                        min_interval_minutes=CASE WHEN $16 THEN $17::int ELSE min_interval_minutes END,
+                        max_daily_doses=CASE WHEN $18 THEN $19::int ELSE max_daily_doses END,
                         archived_at=CASE WHEN $9 THEN NULL ELSE COALESCE(archived_at, NOW()) END
                     WHERE med_id=$12 AND u_id=$13
-                    RETURNING med_id
+                    RETURNING med_id, min_interval_minutes, max_daily_doses
                     """,
                     payload.name.strip(),
                     payload.dosage,
@@ -483,6 +551,11 @@ async def update_medication(
                     u_id,
                     payload.dose_form,
                     payload.units_per_dose,
+                    # Left out: keep; given (null included): set. null returns to the schedule's default.
+                    "min_interval_minutes" in payload.model_fields_set,
+                    payload.min_interval_minutes,
+                    "max_daily_doses" in payload.model_fields_set,
+                    payload.max_daily_doses,
                 )
                 if old_signature != new_signature:
                     await _clear_future_doses(conn, med_id, u_id)
@@ -496,7 +569,8 @@ async def update_medication(
                         )
     if not updated:
         return JSONResponse({"detail": "Medication not found"}, status_code=404)
-    return {"id": updated}
+    return {"id": updated["med_id"], "min_interval_minutes": updated["min_interval_minutes"],
+            "max_daily_doses": updated["max_daily_doses"]}
 
 
 @router.post("/{med_id}/archive")

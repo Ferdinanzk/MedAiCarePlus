@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.jobs.missed_dose_job import _slot_key
-from app.services import consent_service, reachy_tasks
+from app.services import consent_service, dose_safety, reachy_tasks, schedule
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
@@ -119,14 +119,18 @@ async def checkin_task(user: dict = Depends(get_consented_user)):
 
 @router.post("/tasks")
 async def manual_task(payload: TaskPayload, user: dict = Depends(get_consented_user)):
-    """'Use Reachy': a manual task for that dose's 5-minute slot (its pending/missed doses)."""
+    """'Use Reachy' (and the Reachy card's test alert): a manual task for that dose's 5-minute slot (its
+    pending/missed doses that overdose protection lets start now). A dose it refuses gets 409 with the reason
+    (dose_not_due_yet with its time, dose_too_soon, daily_max_reached, dose_expired) and the patient's sentence."""
     u_id = user["u_id"]
     async with get_pool().acquire() as conn, conn.transaction():
         dose = await conn.fetchrow(
-            "SELECT intake_time_stamp FROM intake WHERE intk_id = $1 AND u_id = $2 "
-            "AND intake_stats IN ('pending','missed')", payload.intk_id, u_id)
+            "SELECT intake_time_stamp FROM intake "
+            "WHERE intk_id = $1 AND u_id = $2 AND intake_stats IN ('pending','missed')", payload.intk_id, u_id)
         if not dose:
             raise HTTPException(404, "dose_not_found")
+        now = schedule.current_time()
+        await dose_safety.check(conn, u_id, [payload.intk_id], at=now)
         device = await conn.fetchval(
             "SELECT device_id FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
         if device is None:
@@ -137,15 +141,20 @@ async def manual_task(payload: TaskPayload, user: dict = Depends(get_consented_u
             "SELECT i.intk_id FROM intake i JOIN medication m ON m.med_id = i.med_id "
             "WHERE i.u_id = $1 AND i.intake_stats IN ('pending','missed') "
             "AND i.intake_time_stamp >= $2 AND i.intake_time_stamp < $3 "
-            "ORDER BY m.med_name, m.med_id, i.intk_id", u_id, slot_time, slot_end)
-        intk_ids = [row["intk_id"] for row in rows] or [payload.intk_id]
+            f"AND {dose_safety.startable_sql('i', '$4::timestamptz')} "
+            "ORDER BY m.med_name, m.med_id, i.intk_id", u_id, slot_time, slot_end, now)
+        # The slot's other doses come along only when nothing refuses them (a gap or a daily maximum of their own).
+        allowed = set(await dose_safety.allowed(conn, u_id, [row["intk_id"] for row in rows], at=now))
+        intk_ids = [row["intk_id"] for row in rows if row["intk_id"] in allowed or row["intk_id"] == payload.intk_id]
+        intk_ids = intk_ids or [payload.intk_id]
         settings_row = await conn.fetchrow(
             "SELECT COALESCE(remind_after_minutes, 10) AS after, COALESCE(remind_after_retries, 3) AS retries "
             "FROM notification_settings WHERE u_id = $1", u_id)
         after, retries = (settings_row["after"], settings_row["retries"]) if settings_row else (10, 3)
         expires_at = max(slot_time + timedelta(minutes=after * (retries + 1)),
                          datetime.now(timezone.utc) + timedelta(minutes=MANUAL_TASK_MIN_MINUTES))
-        task_id = await reachy_tasks.enqueue_reachy_task(conn, u_id, slot_time, intk_ids, "manual", expires_at)
+        task_id = await reachy_tasks.enqueue_reachy_task(conn, u_id, slot_time, intk_ids, "manual", expires_at,
+                                                         at=now)
         if task_id is None:
             raise HTTPException(403, "robot_consent_required")
         task = await conn.fetchrow(

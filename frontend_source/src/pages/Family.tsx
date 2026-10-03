@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
+import DoseVideoCard from '../components/DoseVideoCard';
 import {
   Users,
   Plus,
@@ -277,6 +278,8 @@ export default function Family() {
           <p className="flex-1 text-sm text-gray-600">{t('family.familyReceivesHint')}</p>
         </div>
       )}
+
+      <DoseVideoCard />
 
       {/* Add Member Form Modal */}
       {showForm && (

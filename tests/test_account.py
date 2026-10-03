@@ -243,6 +243,14 @@ def test_refresh_removes_identity_even_when_files_remain(monkeypatch):
 
 def test_export_strips_the_device_token_hash():
     from app.routers import api_account
-    rows = {"reachy_device": [{"device_id": "d", "u_id": 7, "token_hash": "abc"}], "user": [{"password_hash": "x"}]}
+    rows = {"reachy_device": [{"device_id": "d", "u_id": 7, "token_hash": "abc"}], "user": [{"password_hash": "x"}],
+            "dose_video_link": [{"link_id": "l", "token_sha256": "def"}]}
     api_account._strip_secrets(rows)
     assert "token_hash" not in rows["reachy_device"][0] and "password_hash" not in rows["user"][0]
+    assert rows["dose_video_link"] == [{"link_id": "l"}]
+
+
+def test_export_reads_dose_video_links_through_their_video():
+    query = api_account.EXPORT_QUERIES["dose_video_link"]
+    assert "JOIN dose_video v" in query and query.endswith("WHERE v.u_id=$1")
+    assert set(api_account.EXPORT_QUERIES) <= set(api_account.EXPORT_TABLES)

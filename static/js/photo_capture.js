@@ -290,6 +290,7 @@ export async function uploadPhotos(faceLabel) {
   );
   const resp = await fetch("/auth/register-photos", { method: "POST", body: fd });
   const data = await resp.json();
-  if (data.error) { alert("Photo save error: " + data.error); return false; }
+  // A refused face (409) carries a sentence in `detail`, e.g. face_already_registered: use face login instead.
+  if (data.error) { alert("Photo save error: " + (data.detail || data.error)); return false; }
   return true;
 }

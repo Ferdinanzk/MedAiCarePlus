@@ -18,26 +18,36 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import ServiceCard from '../components/ui/ServiceCard';
+import DoseEmotionChip from '../components/DoseEmotionChip';
+import type { DoseEmotion } from '../lib/dose-emotion';
 import { MoodBadge } from './Conversations';
 import { fetchConversations, startCheckin, type ConversationSummary } from '../lib/reachy-api';
+import { blockLabel, blockOf, type DoseBlock } from '../lib/doses';
+import { useNow } from '../hooks/useNow';
+import { useOverdoseProtection } from '../hooks/useOverdoseProtection';
 
 interface TodayMedication {
   id: number;
-  medication_id?: number;
+  med_id?: number;
   name: string;
   dosage: string | null;
   status: 'pending' | 'taken' | 'skipped' | 'missed' | 'pending_confirmation';
   scheduled_time: string | null;
+  due_from: string | null;
+  expires_at?: string | null;
   taken_at: string | null;
   pills_remaining: number;
   units_per_dose: number;
+  /** Facial expression while it was taken (a camera session's result), when there was one. */
+  emotion?: DoseEmotion | null;
 }
 
 type TodayGroup = 'due' | 'later' | 'awaiting' | 'done';
 const GROUP_ORDER: TodayGroup[] = ['due', 'later', 'awaiting', 'done'];
 
-function groupOf(dose: TodayMedication, now: number): TodayGroup {
-  if (dose.status === 'taken' || dose.status === 'skipped') return 'done';
+/** A dose missed past halfway to the next one is closed: it is not made up (overdose protection). */
+function groupOf(dose: TodayMedication, now: number, block: DoseBlock | null): TodayGroup {
+  if (dose.status === 'taken' || dose.status === 'skipped' || block?.reason === 'expired') return 'done';
   if (dose.status === 'pending_confirmation') return 'awaiting';
   if (dose.status === 'missed') return 'due';
   return dose.scheduled_time && new Date(dose.scheduled_time).getTime() > now ? 'later' : 'due';
@@ -63,12 +73,19 @@ interface RawMedItem {
   units_per_dose?: number | null;
   status?: string;
   scheduled_time?: string | null;
+  due_from?: string | null;
+  expires_at?: string | null;
   taken_at?: string | null;
+  emotion?: DoseEmotion | null;
 }
 
 export default function Dashboard() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  // Ticks, so a dose that becomes due while the page is open is enabled without a reload.
+  const now = useNow();
+  const protection = useOverdoseProtection();
+  const blockFor = (dose: TodayMedication) => blockOf(dose, medications, now, protection !== false);
   const [medications, setMedications] = useState<TodayMedication[]>([]);
   const [emotions, setEmotions] = useState<EmotionRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,14 +122,18 @@ export default function Dashboard() {
         const medsData = await resp.json() as RawMedItem[];
         const formatted = medsData.map((item: RawMedItem) => ({
           id: item.id ?? item.med_id ?? 0,
-          medication_id: item.med_id,
+          med_id: item.med_id,
           name: item.name || '',
           dosage: item.dosage ?? null,
           pills_remaining: item.pills_remaining ?? 0,
           units_per_dose: item.units_per_dose ?? 1,
           status: (item.status || 'pending') as TodayMedication['status'],
           scheduled_time: item.scheduled_time ?? null,
+          due_from: item.due_from ?? null,
+          // Undefined from an older server: doses.ts then works expiry out from the day's list.
+          expires_at: item.expires_at,
           taken_at: item.taken_at ?? null,
+          emotion: item.emotion ?? null,
         }));
         setMedications(formatted);
 
@@ -321,6 +342,13 @@ export default function Dashboard() {
 
         {actionError && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{actionError}</p>}
 
+        {protection === false && (
+          <p role="status" className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-sm text-amber-900">
+            {t('overdose.offNotice')}{' '}
+            <button onClick={() => navigate('/settings')} className="font-medium underline">{t('family.goToSettings')}</button>
+          </p>
+        )}
+
         {medications.length === 0 ? (
           <div className="bg-white rounded-xl border border-gray-100 p-8 text-center shadow-sm">
             <Pill className="w-12 h-12 text-gray-300 mx-auto mb-3" />
@@ -334,9 +362,8 @@ export default function Dashboard() {
           </div>
         ) : (
           (() => {
-            const now = Date.now();
             const groups: Record<TodayGroup, TodayMedication[]> = { due: [], later: [], awaiting: [], done: [] };
-            medications.forEach((dose) => groups[groupOf(dose, now)].push(dose));
+            medications.forEach((dose) => groups[groupOf(dose, now, blockFor(dose))].push(dose));
             return GROUP_ORDER.filter((group) => groups[group].length > 0).map((group) => (
               <div key={group} className="space-y-2">
                 <h4 className={`px-1 text-sm font-semibold uppercase tracking-wide ${
@@ -345,6 +372,11 @@ export default function Dashboard() {
                 </h4>
                 {groups[group].map((dose) => {
                   const canTake = dose.pills_remaining >= dose.units_per_dose;
+                  // A later dose can be started from due_from on; the server refuses it before then, and (with
+                  // overdose protection on) a dose missed past halfway to the next or one it just refused.
+                  const block = blockFor(dose);
+                  // An expired dose shows as missed even before the missed-dose job has marked it.
+                  const shown = block?.reason === 'expired' ? 'missed' : dose.status;
                   return (
                     <div
                       key={dose.id}
@@ -352,12 +384,12 @@ export default function Dashboard() {
                         group === 'due' ? 'bg-white border-blue-200' : 'bg-white border-gray-100'}`}
                     >
                       <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
-                        dose.status === 'taken' ? 'bg-green-50' :
-                        dose.status === 'missed' ? 'bg-red-50' :
-                        dose.status === 'skipped' ? 'bg-orange-50' :
+                        shown === 'taken' ? 'bg-green-50' :
+                        shown === 'missed' ? 'bg-red-50' :
+                        shown === 'skipped' ? 'bg-orange-50' :
                         'bg-blue-50'
                       }`}>
-                        {getStatusIcon(dose.status)}
+                        {getStatusIcon(shown)}
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="font-medium text-gray-900 text-base truncate">
@@ -367,15 +399,21 @@ export default function Dashboard() {
                           {dose.dosage ? `${dose.dosage} · ` : ''}{t('dashboard.unitsPerDose', { count: dose.units_per_dose })}
                           {dose.status === 'taken' && dose.taken_at ? ` · ${t('history.takenAt', { time: clock(dose.taken_at) })}` : ''}
                         </p>
+                        {dose.emotion?.dominant && (
+                          <div className="mt-1">
+                            <DoseEmotionChip dominant={dose.emotion.dominant} score={dose.emotion.score}
+                              occluded={dose.emotion.mostly_occluded} uncertain={dose.emotion.uncertain} />
+                          </div>
+                        )}
                       </div>
                       {group === 'due' || group === 'later' ? (
                         <div className="flex gap-2 shrink-0">
                           <button
                             onClick={() => navigate(`/intake?intake=${dose.id}&start=1`)}
-                            disabled={!canTake}
-                            className="px-4 py-2 bg-[#0057B8] text-white text-base font-medium rounded-lg hover:bg-[#003D82] active:scale-95 transition-all touch-target-large disabled:bg-gray-200 disabled:text-gray-400"
+                            disabled={!canTake || !!block}
+                            className="px-4 py-2 bg-[#0057B8] text-white text-base font-medium rounded-lg hover:bg-[#003D82] active:scale-95 transition-all touch-target-large disabled:bg-gray-200 disabled:text-gray-600"
                           >
-                            {canTake ? t('intake.take') : t('intake.cannotTake')}
+                            {!canTake ? t('intake.cannotTake') : block ? blockLabel(block, t) : t('intake.take')}
                           </button>
                           {group === 'due' && (
                             <button
@@ -387,6 +425,8 @@ export default function Dashboard() {
                             </button>
                           )}
                         </div>
+                      ) : block?.reason === 'expired' ? (
+                        <span className="text-sm font-medium px-2 py-1 rounded-full bg-red-50 text-red-600">{blockLabel(block, t)}</span>
                       ) : (
                         getStatusBadge(dose.status)
                       )}

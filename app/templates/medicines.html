@@ -88,7 +88,12 @@
 {% block scripts %}
 <script>
 async function markDose(medId, status) {
-  await fetch(`/medicines/${medId}/${status}`, {method:'PATCH'});
+  const res = await fetch(`/medicines/${medId}/${status}`, {method:'PATCH'});
+  // A refused dose (overdose protection: 409 with `reply`, one sentence for the patient) says why.
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    alert(body.reply || body.error || (typeof body.detail === 'string' ? body.detail : 'This dose could not be recorded.'));
+  }
   location.reload();
 }
 async function deleteMed(medId) {

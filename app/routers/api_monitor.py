@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.database import get_pool
 from app.dependencies import get_consented_user
-from app.services import reachy_tasks
+from app.services import dose_safety, dose_video, reachy_tasks
 from app.services.emotion_service import EmotionService
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored, undo_monitored
@@ -80,12 +80,16 @@ async def start(payload: StartPayload, account: dict = Depends(current_account))
         raise HTTPException(503, "Identity or seed 43 emotion model is not ready")
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT i.intk_id, m.dose_form, m.units_per_dose FROM intake i JOIN medication m ON m.med_id=i.med_id "
+            "SELECT i.intk_id, m.dose_form, m.units_per_dose, i.intake_time_stamp FROM intake i "
+            "JOIN medication m ON m.med_id=i.med_id "
             "WHERE i.intk_id=$1 AND i.u_id=$2 AND i.intake_stats IN ('pending','missed') "
             "AND m.pills_remaining>=m.units_per_dose AND m.is_active=TRUE",
             payload.intk_id, account["u_id"])
-    if not row:
-        raise HTTPException(409, "Dose is unavailable or does not belong to this account")
+        if not row:
+            raise HTTPException(409, "Dose is unavailable or does not belong to this account")
+        # Overdose protection: a later dose is taken with Take Now (an ad-hoc dose at this time), never by starting
+        # its scheduled row early; nor a second dose, nor a missed one (409 with the reason and the patient's sentence).
+        await dose_safety.check(conn, account["u_id"], [payload.intk_id])
     # Same rule as the robot: a hand-to-mouth gesture can stand for one solid tablet, nothing else,
     # so other doses always ask the person to confirm.
     auto_commit = reachy_tasks.is_supported(row.get("dose_form", "solid_oral"), row.get("units_per_dose", 1))
@@ -94,6 +98,7 @@ async def start(payload: StartPayload, account: dict = Depends(current_account))
                                        mode="dose", client_type="browser", auto_commit=auto_commit)
     except BusyOtherClient as exc:
         raise HTTPException(409, "busy_other_client") from exc
+    state.clip_enabled = await dose_video.enabled(account["u_id"])
     return state.public()
 
 
@@ -114,6 +119,8 @@ async def vision(session_id: str = Form(...), generation: str = Form(...),
     data = await file.read(1_000_001)
     if len(data) > 1_000_000:
         raise HTTPException(413, "Camera frame is too large")
+    if state.clip_enabled:
+        dose_video.buffer_frame(state.u_id, data, "browser")
     try:
         return await registry.vision(state, frame_seq, data, commit_monitored)
     except (ValueError, TypeError) as exc:

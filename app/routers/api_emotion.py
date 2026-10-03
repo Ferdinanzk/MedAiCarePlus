@@ -3,11 +3,12 @@ import cv2
 import numpy as np
 from typing import Optional
 from collections import defaultdict
-from fastapi import APIRouter, UploadFile, File, Depends
+from fastapi import APIRouter, UploadFile, File, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from app.dependencies import get_consented_user
 from app.database import get_pool
+from app.services import dose_emotion
 from app.services.emotion_service import EmotionService
 
 router = APIRouter(prefix="/api/emotion", tags=["emotion-api"])
@@ -75,6 +76,62 @@ async def emotion_history(user: dict = Depends(get_consented_user)):
             u_id,
         )
     return [dict(r) for r in rows]
+
+
+_DOSE_EMOTION_COLUMNS = (
+    "de.dose_emotion_id AS id, de.intk_id, m.med_name, i.intake_time_stamp AS scheduled_time, "
+    "i.intake_stats AS status, de.outcome, de.client_type, de.session_started_at, de.resolved_at, de.created_at, "
+    "de.dominant, de.dominant_score AS score, de.probabilities, de.occluded_share, de.basis, de.basis_samples, "
+    "de.samples, de.unoccluded_samples, de.phases")
+
+
+def _dose_emotion_row(row, timeline: bool = False) -> dict:
+    item = dict(row)
+    for key in ("probabilities", "phases", "timeline"):
+        if key in item:
+            item[key] = dose_emotion.parse_json(item[key])
+    item["mostly_occluded"] = dose_emotion.mostly_occluded(item.get("basis"), item.get("occluded_share"))
+    item["uncertain"] = dose_emotion.uncertain(item.get("basis_samples"), item.get("score"), item["mostly_occluded"])
+    item["phases"] = dose_emotion.phase_flags(item.get("phases"))
+    if not timeline:
+        item.pop("timeline", None)
+    return item
+
+
+@router.get("/medication")
+async def medication_emotions(user: dict = Depends(get_consented_user), limit: int = Query(20, ge=1, le=100)):
+    """Facial expression while medicine was taken: each dose's best camera-session result (one the session
+    resolved over one it left pending, one with data over none, then the newest), newest first. `outcome` is how
+    the session left the dose; `status` is the dose's status now (an undo or family's answer may have changed it)."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return []
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT * FROM (SELECT DISTINCT ON (de.intk_id) {_DOSE_EMOTION_COLUMNS} "
+            "FROM dose_emotion de JOIN intake i ON i.intk_id = de.intk_id JOIN medication m ON m.med_id = i.med_id "
+            "WHERE de.u_id = $1 "
+            "ORDER BY de.intk_id, (de.outcome = 'unresolved'), (de.basis = 'none'), de.created_at DESC) best "
+            "ORDER BY created_at DESC LIMIT $2",
+            u_id, limit)
+    return [_dose_emotion_row(row) for row in rows]
+
+
+@router.get("/medication/{intk_id}")
+async def medication_emotion_detail(intk_id: int, user: dict = Depends(get_consented_user)):
+    """Every camera session's result for one of the patient's doses, newest first, with its timeline."""
+    u_id = await _get_u_id(user)
+    if not u_id:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT {_DOSE_EMOTION_COLUMNS}, de.scored_by, de.timeline "
+            "FROM dose_emotion de JOIN intake i ON i.intk_id = de.intk_id JOIN medication m ON m.med_id = i.med_id "
+            "WHERE de.u_id = $1 AND de.intk_id = $2 ORDER BY de.created_at DESC LIMIT 20",
+            u_id, intk_id)
+    if not rows:
+        return JSONResponse({"detail": "not_found"}, status_code=404)
+    return {"intk_id": intk_id, "sessions": [_dose_emotion_row(row, timeline=True) for row in rows]}
 
 
 @router.post("/analyze")

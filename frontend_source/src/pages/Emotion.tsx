@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getFaceToken } from '../lib/face-auth';
 import { aiApi } from '../lib/ai-api';
+import MedicationEmotions from '../components/MedicationEmotions';
 import { Smile, Frown, Meh, Angry, TrendingUp, Camera, ScanFace, Loader2, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 
 interface EmotionRecord {
@@ -286,6 +287,9 @@ export default function Emotion() {
           {t('emotion.alertFailed')}
         </div>
       )}
+
+      {/* Facial expression while medicine was taken (camera dose sessions) */}
+      <MedicationEmotions />
 
       {/* History Chart */}
       {history.length > 0 && (

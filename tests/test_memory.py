@@ -62,6 +62,15 @@ def test_validate_drops_bad_facts(raw):
     assert memory.validate_fact(raw, today=TODAY, source="chat") is None
 
 
+@pytest.mark.parametrize("subject", ["I want to die", "kill myself", "doctor visit", "from now on", "我想自残"])
+def test_a_subject_is_checked_with_its_words_apart(subject):
+    # normalise_subject joins words with "_", which the screen's English phrases and \b words don't match
+    # (review probe P4: "I want to die" was stored as i_want_to_die).
+    for source in ("chat", "patient"):
+        assert memory.validate_fact({"kind": "like", "subject": subject, "text": "喜歡散步"},
+                                    today=TODAY, source=source) is None
+
+
 def test_pillow_is_not_a_pill():
     assert memory.validate_fact({"kind": "like", "subject": "pillow", "text": "likes a soft pillow"},
                                 today=TODAY, source="chat") is not None
@@ -164,3 +173,24 @@ def test_after_chat_prompt_spells_out_every_fact_field_with_an_example(language)
         assert field in prompt
     example = memory.parse_facts(prompt.splitlines()[-2])     # the example line, before the empty-case line
     assert example and all(memory.validate_fact(item, today=date(2026, 10, 3), source="chat") for item in example)
+
+
+@pytest.mark.parametrize("language", ["zh-TW", "en"])
+def test_after_chat_prompt_asks_for_the_risk_line_about_this_conversation_only(language):
+    # The combined call is the summary's risk backstop (layer 3) whenever memory is on.
+    prompt = memory.AFTER_CHAT_PROMPT[language]
+    assert "MOOD: happy|calm|sad|worried|angry|unknown\nSUMMARY: " in prompt and "\nRISK: none|self_harm|overdose\n" in prompt
+    for words in (("self_harm", "overdose", "語音辨識", "這次的對話") if language == "zh-TW"
+                  else ("self_harm", "overdose", "speech-to-text", "this conversation only")):
+        assert words in prompt
+
+
+@pytest.mark.parametrize("answer, expected", [
+    ("MOOD: calm\nSUMMARY: s\nRISK: none", "none"), ("**RISK:** self_harm", "self_harm"), ("RISK：overdose", "overdose"),
+    ("MOOD: calm\nSUMMARY: s", None), (None, None),
+    # the template echoed back is no judgement: facts need an explicit none
+    ("MOOD: calm\nSUMMARY: s\nRISK: none|self_harm|overdose", None),
+    ("RISK: none|self_harm|overdose\nMOOD: calm\nSUMMARY: s\nRISK: none", "none"),
+])
+def test_risk_line_tells_an_explicit_none_from_a_missing_line(answer, expected):
+    assert conversation.risk_line(answer) == expected

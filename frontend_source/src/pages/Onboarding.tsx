@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { aiApi } from '../lib/ai-api';
 import { getFaceToken, faceLogout } from '../lib/face-auth';
@@ -62,7 +63,7 @@ const STAGE_ORDER = ['front', 'left', 'right'] as const;
 type PoseDir = 'front' | 'left' | 'right';
 
 export default function Onboarding() {
-  useTranslation();
+  const { t } = useTranslation();
   const videoRef = useRef<HTMLVideoElement>(null);
   const sampleCanvasRef = useRef<HTMLCanvasElement>(null);
   const [step, setStep] = useState<Step>(getSavedStep());
@@ -79,6 +80,10 @@ export default function Onboarding() {
   const [countdown, setCountdown] = useState<number | null>(null);  // 3,2,1 or null
   const [enrolling, setEnrolling] = useState(false);
   const [faceError, setFaceError] = useState('');
+  // The server refused the photos (409, nothing saved): this face is already another account's
+  // ('face_already_registered'), or it is in the face gallery with no account behind it
+  // ('face_registered_without_account': face login cannot sign it in either).
+  const [faceTaken, setFaceTaken] = useState<'' | 'face_already_registered' | 'face_registered_without_account'>('');
   const stagePhotosRef = useRef<string[]>([]);
   const captureInFlightRef = useRef(false);
   const holdStartRef = useRef<number | null>(null);
@@ -372,6 +377,7 @@ export default function Onboarding() {
   const startCamera = async () => {
     try {
       setFaceError('');
+      setFaceTaken('');
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
       if (videoRef.current) videoRef.current.srcObject = stream;
       setCameraOn(true);
@@ -416,6 +422,15 @@ export default function Onboarding() {
     const files = photos.map((p, i) => dataUrlToFile(p, `face-${i}.jpg`));
     try {
       const result = await aiApi.enrollFace(faceLabel, files);
+      if (result.code === 'face_already_registered' || result.code === 'face_registered_without_account') {
+        // Capturing again would be refused again: explain what to do instead.
+        stopCamera();
+        stagePhotosRef.current = [];
+        setCapturedPhotos([]);
+        setPoseStageIdx(0);
+        setFaceTaken(result.code);
+        return;
+      }
       if (result.error || !result.saved || result.saved.length !== 3) {
         throw new Error(result.error || 'Face enrollment did not save all three photos. Please try again.');
       }
@@ -532,6 +547,31 @@ export default function Onboarding() {
           <div className="space-y-4">
             <h2 className="text-xl font-semibold text-[#0b1c30]">Face Enrollment</h2>
             <p className="text-sm text-[#3d4a3e]">We'll capture 3 photos to recognize you at login.</p>
+
+            {faceTaken === 'face_registered_without_account' && (
+              <div role="alert" className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-3">
+                <p className="text-base font-semibold text-amber-900">{t('faceEnroll.noAccountTitle')}</p>
+                <p className="text-sm text-amber-900">{t('faceEnroll.noAccountBody')}</p>
+              </div>
+            )}
+
+            {faceTaken === 'face_already_registered' && (
+              <div role="alert" className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-3">
+                <p className="text-base font-semibold text-amber-900">{t('faceEnroll.takenTitle')}</p>
+                <p className="text-sm text-amber-900">{t('faceEnroll.takenBody')}</p>
+                <button
+                  type="button"
+                  onClick={handleLogoutAndLogin}
+                  className="w-full py-3 bg-[#006d36] text-white text-base font-semibold rounded-xl hover:bg-[#005229] transition-colors"
+                >
+                  {t('faceEnroll.goToFaceLogin')}
+                </button>
+                <p className="text-sm text-amber-800">{t('faceEnroll.takenThisAccount')}</p>
+                <Link to="/privacy-settings" className="inline-block py-2 text-sm text-[#0057B8] font-medium underline">
+                  {t('faceEnroll.privacy')}
+                </Link>
+              </div>
+            )}
 
             {/* Camera view */}
             <div className="relative aspect-square bg-[#213145] rounded-2xl overflow-hidden">

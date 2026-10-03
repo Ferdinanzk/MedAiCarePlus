@@ -6,8 +6,9 @@ from fastapi import APIRouter, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature
-from app.config import SECRET_KEY, FACE_GALLERY_DIR
+from app.config import SECRET_KEY
 from app.database import get_pool
+from app.routers.api_face import save_enrollment
 from app.services.face_recognition_service import FaceRecognitionService
 
 router = APIRouter()
@@ -134,7 +135,11 @@ async def register_photos(
     """
     Save 3 enrollment photos into face_gallery as:
       {face_label}-0.jpg, {face_label}-1.jpg, {face_label}-2.jpg
-    Mirrors the save logic from photo_capture.py.
+    The legacy register page (static/js/photo_capture.js) posts them before /auth/register creates the
+    account. They go through the same checks as POST /api/face/enroll (api_face.save_enrollment): a face
+    login already takes for another account is refused with 409, nothing saved. This route has no login,
+    so it only takes a label with no gallery photos and no account yet (409 face_label_taken): it can never
+    replace anyone's photos.
     """
     label = face_label.strip().lower()
     if not label or "/" in label or "\\" in label:
@@ -142,16 +147,7 @@ async def register_photos(
     if len(photos) != 3:
         return JSONResponse({"error": "Exactly 3 photos required"}, status_code=400)
 
-    FACE_GALLERY_DIR.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for i, upload in enumerate(photos):
-        data = await upload.read()
-        nparr = np.frombuffer(data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return JSONResponse({"error": f"Cannot decode photo {i}"}, status_code=400)
-        path = FACE_GALLERY_DIR / f"{label}-{i}.jpg"
-        cv2.imwrite(str(path), img)
-        saved.append(str(path))
-
-    return {"saved": saved, "face_label": label}
+    saved = await save_enrollment(photos, label, caller="legacy /auth/register-photos", new_label_only=True)
+    if isinstance(saved, JSONResponse):
+        return saved
+    return {"saved": [str(path) for path in saved], "face_label": label}

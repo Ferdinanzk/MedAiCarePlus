@@ -51,6 +51,8 @@ async def record_intake(payload: RecordPayload, user: dict = Depends(get_consent
 
     if payload.detection_method != "manual":
         return JSONResponse({"detail": "Automatic intake requires a monitored event"}, status_code=400)
+    # A dose overdose protection refuses raises a schedule.DoseRefused in transition_intake: 409 with its reason
+    # (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired) and the patient's sentence (main.py).
     try:
         result = await transition_intake(u_id, payload.intk_id, "taken")
     except ValueError as exc:

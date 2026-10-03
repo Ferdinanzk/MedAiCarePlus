@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.config import MEDCARE_TIMEZONE
 from app.dependencies import get_consented_user
 from app.database import get_pool
-from app.services import adherence
+from app.services import adherence, dose_emotion
 
 router = APIRouter(prefix="/api/history", tags=["history-api"])
 _TZ = ZoneInfo(MEDCARE_TIMEZONE)
@@ -55,29 +55,40 @@ async def get_intake_history(
     range_start, range_end = _range(start, end, now.date(), None)
     pool = get_pool()
     async with pool.acquire() as conn:
+        # The page is cut first, then each of its doses gets its emotion summary: the lateral probe runs for the
+        # rows returned, not for the whole history the total counts.
         rows = await conn.fetch(
-            """
-            SELECT i.intk_id AS id,
-                   m.med_name AS medication_name,
-                   m.dosage,
-                   i.intake_time_stamp AS scheduled_time,
-                   i.actual_intake_time AS taken_at,
-                   i.intake_stats AS status,
-                   i.detection_confidence,
-                   i.detection_method,
-                   COUNT(*) OVER () AS total
-            FROM intake i
-            JOIN medication m ON m.med_id = i.med_id
-            WHERE m.u_id = $1
-              AND i.intake_time_stamp <= $2
-              AND ($3::timestamptz IS NULL OR i.intake_time_stamp >= $3)
-              AND i.intake_time_stamp < $4
-            ORDER BY i.intake_time_stamp DESC, i.intk_id DESC
-            LIMIT $5 OFFSET $6
+            f"""
+            SELECT page.*, dose_emotion_best.dose_emotion
+            FROM (
+                SELECT i.intk_id AS id,
+                       m.med_name AS medication_name,
+                       m.dosage,
+                       i.intake_time_stamp AS scheduled_time,
+                       i.actual_intake_time AS taken_at,
+                       i.intake_stats AS status,
+                       i.detection_confidence,
+                       i.detection_method,
+                       COUNT(*) OVER () AS total
+                FROM intake i
+                JOIN medication m ON m.med_id = i.med_id
+                WHERE m.u_id = $1
+                  AND i.intake_time_stamp <= $2
+                  AND ($3::timestamptz IS NULL OR i.intake_time_stamp >= $3)
+                  AND i.intake_time_stamp < $4
+                ORDER BY i.intake_time_stamp DESC, i.intk_id DESC
+                LIMIT $5 OFFSET $6
+            ) page
+            {dose_emotion.chip_join('page.id', '$1', 'page.status')}
+            ORDER BY page.scheduled_time DESC, page.id DESC
             """,
             u_id, now, range_start, range_end, limit, offset,
         )
     items = [{key: value for key, value in dict(r).items() if key != "total"} for r in rows]
+    for item in items:
+        if "dose_emotion" in item:
+            # Facial expression while this dose was taken (a camera session's result), or None.
+            item["emotion"] = dose_emotion.chip(item.pop("dose_emotion"))
     total = int(rows[0]["total"]) if rows else 0
     if not rows and offset:
         # Past the last page: report the real total so the client can step back.

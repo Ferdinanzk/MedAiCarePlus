@@ -59,6 +59,10 @@ class _Conn:
 
     async def fetchrow(self, query, *args):
         self.calls.append(("fetchrow", query, args))
+        if query.lstrip().startswith("UPDATE medication") and self.fetchval_result is not None:
+            # RETURNING the stored limits: set when given ($16/$18), else as stored (none here).
+            return {"med_id": self.fetchval_result, "min_interval_minutes": args[16] if args[15] else None,
+                    "max_daily_doses": args[18] if args[17] else None}
         return self.previous
 
     async def fetchval(self, query, *args):
@@ -111,10 +115,12 @@ def test_create_stores_defaults_when_fields_missing(monkeypatch):
     conn = _Conn(fetchval_result=11)
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
     result = asyncio.run(api_medications.create_medication(_payload(), {"u_id": 7}))
-    assert result == {"id": 11, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": 1.0}
+    assert result == {"id": 11, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": 1.0,
+                      "min_interval_minutes": None, "max_daily_doses": None}
     query, args = next((c[1], c[2]) for c in conn.calls if "INSERT INTO medication" in c[1])
     assert "dose_form" in query and "units_per_dose" in query
-    assert args[-2:] == ("solid_oral", Decimal("1"))
+    assert "min_interval_minutes, max_daily_doses" in query
+    assert args[-4:] == ("solid_oral", Decimal("1"), None, None)   # overdose limits: the schedule's defaults
 
 
 def test_create_stores_given_fields(monkeypatch):
@@ -125,7 +131,7 @@ def test_create_stores_given_fields(monkeypatch):
     assert result["dose_form"] == "liquid"
     assert result["units_per_dose"] == 2.5
     args = next(c[2] for c in conn.calls if "INSERT INTO medication" in c[1])
-    assert args[-2:] == ("liquid", Decimal("2.5"))
+    assert args[-4:-2] == ("liquid", Decimal("2.5"))
 
 
 @pytest.mark.parametrize("fields, expected", [
@@ -135,19 +141,61 @@ def test_create_stores_given_fields(monkeypatch):
 def test_update_keeps_existing_fields_unless_given(monkeypatch, fields, expected):
     conn = _Conn(fetchval_result=5, previous={"schedule_time": None, "use_before": None})
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
-    assert asyncio.run(api_medications.update_medication(5, _payload(**fields), {"u_id": 7})) == {"id": 5}
+    assert asyncio.run(api_medications.update_medication(5, _payload(**fields), {"u_id": 7})) == {
+        "id": 5, "min_interval_minutes": None, "max_daily_doses": None}
     query, args = next((c[1], c[2]) for c in conn.calls if "UPDATE medication" in c[1])
     assert "COALESCE($14" in query and "COALESCE($15" in query
     assert args[13:15] == expected
+
+
+@pytest.mark.parametrize("fields, expected", [
+    ({}, (False, None, False, None)),                                          # left out: kept
+    ({"min_interval_minutes": 90, "max_daily_doses": 3}, (True, 90, True, 3)),
+    ({"min_interval_minutes": None}, (True, None, False, None)),               # null: back to the default
+])
+def test_update_sets_overdose_limits_only_when_given(monkeypatch, fields, expected):
+    conn = _Conn(fetchval_result=5, previous={"schedule_time": None, "use_before": None})
+    monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
+    result = asyncio.run(api_medications.update_medication(5, _payload(**fields), {"u_id": 7}))
+    assert result == {"id": 5, "min_interval_minutes": expected[1], "max_daily_doses": expected[3]}   # as stored
+    query, args = next((c[1], c[2]) for c in conn.calls if "UPDATE medication" in c[1])
+    assert "RETURNING med_id, min_interval_minutes, max_daily_doses" in query
+    assert "min_interval_minutes=CASE WHEN $16 THEN $17::int ELSE min_interval_minutes END" in query
+    assert "max_daily_doses=CASE WHEN $18 THEN $19::int ELSE max_daily_doses END" in query
+    assert args[15:19] == expected
+
+
+@pytest.mark.parametrize("fields", [
+    {"min_interval_minutes": 29}, {"min_interval_minutes": 2881}, {"max_daily_doses": 0}, {"max_daily_doses": 25},
+])
+def test_payload_rejects_overdose_limits_outside_the_database_checks(fields):
+    with pytest.raises(ValidationError):
+        _payload(**fields)
+
+
+def test_list_gives_the_overdose_defaults_of_each_schedule(monkeypatch):
+    rows = [{"id": 1, "name": "allegra", "schedule_time": {"morning": True, "noon": True, "night": True,
+                                                            "bedtime": True}},
+            {"id": 2, "name": "daily", "schedule_time": {"morning": True}, "min_interval_minutes": 600,
+             "max_daily_doses": 2}]
+    conn = _Conn(rows=rows)
+    monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
+    allegra, daily = asyncio.run(api_medications.list_medications({"u_id": 7}))
+    assert (allegra["default_min_interval_minutes"], allegra["default_max_daily_doses"]) == (60, 4)
+    assert (daily["default_min_interval_minutes"], daily["default_max_daily_doses"]) == (720, 1)
+    assert (daily["min_interval_minutes"], daily["max_daily_doses"]) == (600, 2)   # its own, as stored
 
 
 def test_list_returns_dose_fields(monkeypatch):
     conn = _Conn(rows=[{"id": 1, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": Decimal("1.00")}])
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
     result = asyncio.run(api_medications.list_medications({"u_id": 7}))
+    # Unscheduled: overdose protection keeps 4 h between doses and sets no daily maximum unless the medicine does.
     assert result == [{"id": 1, "name": "Metformin", "dose_form": "solid_oral", "units_per_dose": 1.0,
-                       "pills_remaining": None, "daily_units": None, "days_left": None, "run_out_date": None}]
+                       "pills_remaining": None, "daily_units": None, "days_left": None, "run_out_date": None,
+                       "default_min_interval_minutes": 240, "default_max_daily_doses": None}]
     assert "dose_form" in conn.calls[0][1] and "units_per_dose" in conn.calls[0][1]
+    assert "min_interval_minutes, max_daily_doses" in conn.calls[0][1]
 
 
 def test_list_reports_days_of_supply_for_active_scheduled_medication(monkeypatch):
@@ -232,7 +280,7 @@ def test_manual_patch_of_other_status_still_transitions(monkeypatch):
 def test_today_and_history_return_pending_confirmation_as_is(monkeypatch):
     stamp = datetime.datetime(2026, 9, 30, 0, 0, tzinfo=datetime.timezone.utc)
     row = {"intake_id": 9, "id": 9, "med_id": 4, "name": "Metformin", "status": "pending_confirmation",
-           "scheduled_time": stamp, "schedule_time": None, "use_before": None, "total": 1}
+           "scheduled_time": stamp, "previous_time": None, "schedule_time": None, "use_before": None, "total": 1}
     conn = _Conn(rows=[row])
     monkeypatch.setattr(api_medications, "get_pool", lambda: _Pool(conn))
     monkeypatch.setattr(api_history, "get_pool", lambda: _Pool(conn))

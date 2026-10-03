@@ -19,6 +19,8 @@ def start_scheduler():
     from app.jobs.dose_confirmation_job import run_dose_confirmation_maintenance
     from app.jobs.conversation_retention_job import purge_old_transcripts
     from app.jobs.after_chat_job import run_after_chat_sweep
+    from app.services.dose_video import cleanup as delete_finished_dose_videos
+    from app.services.context_info import refresh as refresh_checkin_background
 
     scheduler.add_job(
         check_missed_doses,
@@ -69,10 +71,32 @@ def start_scheduler():
         replace_existing=True,
     )
     scheduler.add_job(
+        delete_finished_dose_videos,
+        IntervalTrigger(minutes=2),
+        id="dose_videos",
+        replace_existing=True,
+        max_instances=1,
+    )
+    # Closes abandoned check-ins and runs post-chat work (summary, risk backstop, memory) that /end missed.
+    scheduler.add_job(
         run_after_chat_sweep,
-        IntervalTrigger(minutes=10),
+        IntervalTrigger(minutes=5),
         id="after_chat_sweep",
         replace_existing=True,
+        max_instances=1,
+    )
+    # A plain function, so it runs in a worker thread; next_run_time also runs it once right after startup. No misfire
+    # limit: with APScheduler's default of 1 s, a startup that keeps the event loop busy longer skipped that first
+    # run, leaving no weather for 30 minutes.
+    scheduler.add_job(
+        refresh_checkin_background,
+        IntervalTrigger(minutes=30),
+        id="checkin_background",
+        replace_existing=True,
+        max_instances=1,
+        next_run_time=datetime.now(TZ_TAIPEI),
+        misfire_grace_time=None,
+        coalesce=True,
     )
     scheduler.start()
     print(f"[Scheduler] Started at {datetime.now(TZ_TAIPEI)}")

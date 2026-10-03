@@ -69,7 +69,7 @@ async def dispatch_once(now: datetime.datetime | None = None) -> int:
             rows = await conn.fetch(
                 "SELECT outbox_id, recipient_line_id, priority, payload, attempts FROM notification_outbox "
                 "WHERE status IN ('queued','failed') AND next_attempt_at <= $1 "
-                "ORDER BY priority, next_attempt_at LIMIT $2 FOR UPDATE SKIP LOCKED",
+                "ORDER BY priority, next_attempt_at, outbox_id LIMIT $2 FOR UPDATE SKIP LOCKED",   # same time: queue order
                 now, BATCH_SIZE)
             if not rows:
                 return 0

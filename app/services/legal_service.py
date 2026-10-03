@@ -16,6 +16,7 @@ KIND_SCOPES: dict[str, tuple[str, ...]] = {
     "core": ("core",),
     "robot": ("robot_camera", "robot_microphone", "cloud_voice", "conversation_analysis", "safety_alerts"),
     "memory": ("conversation_memory",),
+    "video": ("dose_video",),
 }
 SCOPE_KIND: dict[str, str] = {scope: kind for kind, scopes in KIND_SCOPES.items() for scope in scopes}
 LANGUAGES = ("en", "zh-TW")

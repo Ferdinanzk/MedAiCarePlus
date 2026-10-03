@@ -80,6 +80,40 @@ Network on 2 Oct 2026 (a phone hotspot, so these addresses can change): laptop `
    - **To watch:** keep an eye on free space. Downloads (~37 GB) and the Conda package cache (~9 GB) are the big remaining items.
 10. **OpenRouter key added** to `.env` (`OPENROUTER_API_KEY`, `LLM_MODEL=openrouter/free`), with a $0.001 spend cap. Nothing calls an LLM yet.
 
+11. **Faster check-ins, with timings (2 Oct, evening).**
+    - **Model:** reasoning is switched off, and the model is pinned (`LLM_MODEL=inclusionai/ling-3.0-flash-sante:free`) with `openrouter/free` as fallback and an 8 s deadline. Replies went from 2.7–17.6 s, often empty, to about 1.5 s.
+    - **Robot app 0.5.0:** hands over speech sooner (0.5 s of silence instead of 0.6 s + a 0.7 s gap) and mutes itself for less time after speaking. It is deployed.
+    - **Timings:** each turn stores how long hearing, the model and speaking took. The Conversations page shows them per turn, adds a "Response times (last 7 days)" panel and a CSV download. The data comes from `/api/conversations/metrics/summary`.
+    - **Stale chats:** a chat left open (the robot switched off mid-conversation) is closed after 15 minutes as `abandoned`.
+12. **Dose videos for family on LINE (opt-in).**
+    - **The message:** the "dose taken" LINE message now says how each dose was recorded and the AI's estimate that it was taken (for example `82%（高）`, or "not determined" when the camera saw nothing), and that the AI can't see the pill itself.
+    - **The video:** with the patient's consent (Family page → "Dose videos for family", notice `app/legal/video/`), each recorded dose's 10–20 s clip goes along as a LINE video.
+    - **Deletion:** the clip is deleted from the laptop once each family member's LINE app has downloaded it or played it to the end, after 24 h in any case, and at once if the switch is turned off.
+    - **Needs:** the LINE tunnel (`scripts/line-tunnel.ps1`), because LINE apps download the clip from the laptop.
+
+13. **Self-harm alerts fixed (2 Oct, 23:00).**
+    - **The miss:** 「我想自残」 raised no LINE alert. The speech-to-text writes Simplified Chinese, and the keyword list had no 自殘/自傷 at all.
+    - **Layer 1, the keyword list:** now checks in Traditional and ignores spaces and punctuation. It was red-teamed against about 180 sentences.
+    - **Layer 2, the AI:** a check runs alongside every reply and catches indirect wording such as 一了百了 or 不想拖累孩子. It was verified live on the pinned model.
+    - **Layer 3, the backstop:** the end-of-chat summary raises the alert if both earlier layers missed.
+    - **Alerts:** one per conversation, and the patient hears the help-line reply.
+14. **Robot camera is capped at 10 fps by Pollen's daemon** (`IPC_FPS = 10` in its media_server.py). The server needs 12, so every robot dose goes to family confirmation as "degraded".
+    - **Robot app 0.5.1 (deployed):**
+      - faster encoding;
+      - stall logging on both the robot and the server;
+      - the confirmation clip now says 「我沒辦法確定您吃了沒，會請家人幫忙看看。請先別再吃一次喔。」 instead of starting with 「謝謝您」.
+    - **To lift the cap:** run `python tools/deploy_to_robot.py --camera-ipc-fps 15`, then restart the daemon in a quiet window. This is not done yet, and the CPU cost at 15 fps hasn't been measured.
+    - **The confirmation request** shows the AI's estimate (e.g. `48%（不確定）`) and the measured frame rate.
+    - **Dose videos:** with the patient's consent, the clip goes out with the request, whatever the frame rate.
+    - **Note:** deploying the robot app stops it. Start it again with `curl -X POST localhost:8000/api/apps/start-app/medcare_reachy` on the robot, then rerun the deploy.
+
+15. **3 Oct, morning: robot app 0.5.2 and day knowledge (deployed).**
+    - **The 「嗯」:** Reachy says 「嗯」 about 1 s after the patient stops talking.
+    - **Gestures:** the antennas and body move while Reachy thinks, and the antennas while it speaks. Both can be switched off on the robot settings page.
+    - **Day knowledge:** replies know the date, time, lunar date, weather (Open-Meteo, 台北 by default, `WEATHER_*` in `.env`) and Taiwan holidays and festivals.
+    - **Backup model:** pinned to `apodex/apodex-1.1-mini:free`.
+    - **Still to check on the real robot:** how loudly the 「嗯」 leaks back into the microphone (`echo_dropped`, `handover_ms` on turns with `ack_ms`); the gesture log lines `gesture from the pose measured ...`.
+
 The decision table the robot and server now follow:
 
 | Camera | Patient said "finished" | Result |
