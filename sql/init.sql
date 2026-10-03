@@ -173,16 +173,18 @@ ALTER TABLE family_contacts ADD COLUMN IF NOT EXISTS notify_taken BOOLEAN DEFAUL
 -- the hash without changing the version, and consent must reference what
 -- the person actually saw.
 CREATE TABLE IF NOT EXISTS legal_document (
-    kind          VARCHAR(10) NOT NULL CHECK (kind IN ('core','robot','memory')),
+    kind          VARCHAR(10) NOT NULL CHECK (kind IN ('core','robot','memory','video')),
     terms_version VARCHAR(20) NOT NULL,
     language      VARCHAR(10) NOT NULL,
     sha256        CHAR(64) NOT NULL,
     published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (kind, terms_version, language, sha256)
 );
--- Existing databases keep the old check; replace it (same name) so the memory notice can register.
+-- Existing databases keep the old check; replace it (same name) so the newer notices can register:
+-- 'memory', the check-in memory notice, and 'video', the opt-in dose-video notice (dose videos sent to family on
+-- LINE). Every version of this check must list all four kinds, or startup fails on rows already registered.
 ALTER TABLE legal_document DROP CONSTRAINT IF EXISTS legal_document_kind_check;
-ALTER TABLE legal_document ADD CONSTRAINT legal_document_kind_check CHECK (kind IN ('core','robot','memory'));
+ALTER TABLE legal_document ADD CONSTRAINT legal_document_kind_check CHECK (kind IN ('core','robot','memory','video'));
 
 -- Append-only; current state is the highest consent_id per (u_id, scope).
 CREATE TABLE IF NOT EXISTS consent (
@@ -253,6 +255,25 @@ CREATE TABLE IF NOT EXISTS medication_supply (
 );
 CREATE INDEX IF NOT EXISTS idx_medication_supply_med ON medication_supply(med_id, created_at DESC);
 
+-- ─────────────────────────────────────────────
+-- Overdose protection (「防止重複服藥」, app/services/dose_safety.py)
+-- ─────────────────────────────────────────────
+-- Per patient, on by default. Off: no dose is refused for being early, too close to the last one, over the
+-- daily maximum or missed, and no double-dose alert goes to family (turning it off tells family on LINE).
+ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS overdose_protection BOOLEAN NOT NULL DEFAULT TRUE;
+-- A medicine's own limits; NULL = the default from its schedule (half the shortest gap between its dose times, or
+-- 4 h without times; as many doses a day as it has times, or no limit without times).
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS min_interval_minutes INTEGER;
+ALTER TABLE medication ADD COLUMN IF NOT EXISTS max_daily_doses INTEGER;
+ALTER TABLE medication DROP CONSTRAINT IF EXISTS medication_min_interval_minutes_check;
+ALTER TABLE medication ADD CONSTRAINT medication_min_interval_minutes_check
+    CHECK (min_interval_minutes IS NULL OR min_interval_minutes BETWEEN 30 AND 2880);
+ALTER TABLE medication DROP CONSTRAINT IF EXISTS medication_max_daily_doses_check;
+ALTER TABLE medication ADD CONSTRAINT medication_max_daily_doses_check
+    CHECK (max_daily_doses IS NULL OR max_daily_doses BETWEEN 1 AND 24);
+-- The rules look up the same medicine's previous, next and taken doses of a patient.
+CREATE INDEX IF NOT EXISTS idx_intake_user_med_time ON intake(u_id, med_id, intake_time_stamp);
+
 -- auto_record defaults to FALSE while decision D2 (recording without pill
 -- identification) is open: every observed event goes to caregiver confirmation.
 CREATE TABLE IF NOT EXISTS reachy_device (
@@ -321,6 +342,9 @@ CREATE TABLE IF NOT EXISTS conversation_turn (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_turn_conv ON conversation_turn(conversation_id, turn_id);
+-- Where a turn's time went, in ms (no wall-clock times). Patient turn: {"robot": {how the robot heard it}};
+-- Reachy turn: {"server": {how the reply was made}, "robot": {how the robot played it}}.
+ALTER TABLE conversation_turn ADD COLUMN IF NOT EXISTS metrics JSONB;
 
 -- Long-term check-in memory (memory notice). One row per fact per conversation; the newest row per
 -- (u_id, kind, subject) wins, and a patient-entered row beats any chat row. UUID ids are never
@@ -409,3 +433,72 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON notification_outbox(priority, next_attempt_at)
     WHERE status IN ('queued','failed');
+
+-- Dose videos for family (opt-in, consent scope 'dose_video'). A short clip around a recorded dose, sent with the
+-- "dose taken" LINE message. LINE has no upload API: each recipient's LINE app downloads the clip from this server
+-- through its own link. The files are deleted once every recipient's app has the whole clip or has played it to
+-- the end, after 24 h at most, or at once when consent is withdrawn; the rows stay as a record, without media.
+CREATE TABLE IF NOT EXISTS dose_video (
+    video_id      UUID PRIMARY KEY,
+    u_id          INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    intk_ids      INTEGER[] NOT NULL,
+    source        VARCHAR(10) NOT NULL CHECK (source IN ('browser','reachy')),
+    frames        INTEGER NOT NULL,
+    duration_ms   INTEGER NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at       TIMESTAMPTZ,
+    expires_at    TIMESTAMPTZ,
+    deleted_at    TIMESTAMPTZ,
+    delete_reason VARCHAR(30)
+);
+CREATE INDEX IF NOT EXISTS idx_dose_video_live ON dose_video(u_id, created_at DESC) WHERE deleted_at IS NULL;
+
+-- One link per recipient, so the server knows when that person's LINE app has the clip.
+CREATE TABLE IF NOT EXISTS dose_video_link (
+    link_id       UUID PRIMARY KEY,
+    video_id      UUID NOT NULL REFERENCES dose_video(video_id) ON DELETE CASCADE,
+    contact_id    INTEGER REFERENCES family_contacts(id) ON DELETE CASCADE,
+    line_id       VARCHAR(100) NOT NULL,
+    token_sha256  CHAR(64) NOT NULL UNIQUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fetched_at    TIMESTAMPTZ,   -- the last byte of the clip was served on this link
+    viewed_at     TIMESTAMPTZ    -- LINE sent videoPlayComplete for this link
+);
+CREATE INDEX IF NOT EXISTS idx_dose_video_link_video ON dose_video_link(video_id);
+
+-- Facial expression during each camera dose session (Oct 2026, services/dose_emotion.py): the seed-43 model's
+-- results around the intake, one row per (monitor session, dose), whatever the dose's outcome. Analysis results only
+-- (core notice section 4 "Mood: facial-expression analysis results at medication time"); no image is stored.
+-- `occluded` samples were scored with a hand over the mouth (biased; the result prefers uncovered ones).
+CREATE TABLE IF NOT EXISTS dose_emotion (
+    dose_emotion_id     BIGSERIAL PRIMARY KEY,
+    u_id                INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    intk_id             INTEGER NOT NULL REFERENCES intake(intk_id) ON DELETE CASCADE,
+    session_id          UUID NOT NULL,
+    client_type         VARCHAR(10) NOT NULL CHECK (client_type IN ('browser','reachy')),
+    scored_by           VARCHAR(10) NOT NULL CHECK (scored_by IN ('server','robot','mixed','none')),
+    outcome             VARCHAR(20) NOT NULL
+        CHECK (outcome IN ('recorded','taken_other','sent_to_family','patient_claim','skipped','unresolved')),
+    intake_status       VARCHAR(20),
+    detection_method    VARCHAR(50),
+    confirmation_source VARCHAR(20),
+    session_started_at  TIMESTAMPTZ NOT NULL,
+    resolved_at         TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    samples             INTEGER NOT NULL,
+    unoccluded_samples  INTEGER NOT NULL,
+    occluded_share      REAL,
+    basis               VARCHAR(14) NOT NULL
+        CHECK (basis IN ('event','event_during','session','occluded_only','none')),
+    basis_samples       INTEGER NOT NULL DEFAULT 0,
+    probabilities       JSONB,
+    dominant            VARCHAR(10)
+        CHECK (dominant IN ('angry','disgust','fear','happy','sad','surprise','neutral')),
+    dominant_score      REAL,
+    phases              JSONB,      -- before / during / after the intake event
+    timeline            JSONB,      -- at most 60 points [seconds, class index, score, occluded]
+    UNIQUE (session_id, intk_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dose_emotion_intake ON dose_emotion(intk_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dose_emotion_user ON dose_emotion(u_id, created_at DESC);

@@ -16,6 +16,7 @@ from app.services.landmark_service import LandmarkService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
 from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations, api_memory
+from app.routers import api_dose_video
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
@@ -23,6 +24,7 @@ from app.services.legal_service import register_documents
 from app.startup_checks import run_startup_checks, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
+from app.services.schedule import DoseRefused
 
 
 @asynccontextmanager
@@ -34,9 +36,9 @@ async def lifespan(app: FastAPI):
         await register_documents(conn)
     FaceRecognitionService.get_instance()
     EmotionService.get_instance()
+    OCRService.get_instance()
     LineService.get_instance()
     IntakeDetectionService.get_instance()
-    OCRService.get_instance()
     LandmarkService.get_instance()
     start_scheduler()
     await start_dispatcher()
@@ -47,6 +49,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MedAiCarePlus", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(DoseRefused)
+async def dose_refused(request, exc: DoseRefused):
+    """Every route (both ports) refuses a dose overdose protection stops the same way: 409 with the reason
+    (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired), its times and the patient's sentence."""
+    return JSONResponse(exc.body(), status_code=409)
 
 
 @app.middleware("http")
@@ -109,6 +118,8 @@ app.include_router(api_reachy.router,        tags=["reachy"])
 app.include_router(api_device.router,        tags=["device"])
 app.include_router(api_conversations.router, tags=["conversations"])
 app.include_router(api_memory.router,        tags=["memory"])
+app.include_router(api_dose_video.router,    tags=["dose-video"])
+app.include_router(api_dose_video.media_router, tags=["dose-video"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────

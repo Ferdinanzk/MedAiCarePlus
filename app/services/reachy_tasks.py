@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import consent_service, outbox
+from app.services import consent_service, dose_safety, outbox
 
 LEASE_SECONDS = 60
 OFFLINE_AFTER_SECONDS = 60
@@ -89,12 +89,16 @@ async def task_payload(conn, task) -> dict:
     }
 
 
-async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at) -> str | None:
+async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at,
+                              at=None) -> str | None:
     """Open (or re-arm a queued) task for this slot inside the caller's transaction.
 
     Returns the open task id, or None when the patient has no active device or
     no current robot camera consent. A task already leased/searching/in_progress
-    is never re-armed or reset.
+    is never re-armed or reset. Raises a schedule.DoseRefused when overdose
+    protection refuses a listed dose (dose_safety.check, judged at `at`, default
+    now): the robot must never start a dose hours early, a second dose, or a
+    missed one. Callers that picked the doses at a moment of their own pass it.
     """
     if reason not in ("upcoming", "missed_retry", "manual", "checkin") or (not intk_ids and reason != "checkin"):
         raise ValueError("Invalid task request")
@@ -105,6 +109,8 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
     state = await consent_service.fetch_state(conn, u_id)
     if not (consent_service.is_current(state, "core") and consent_service.is_current(state, "robot_camera")):
         return None
+    if intk_ids:
+        await dose_safety.check(conn, u_id, list(intk_ids), at=at)
     task_id = await conn.fetchval(
         "INSERT INTO reachy_task (task_id, u_id, slot_time, intk_ids, reason, expires_at) "
         "VALUES ($1::uuid, $2, $3, $4::int[], $5, $6) ON CONFLICT DO NOTHING RETURNING task_id",
@@ -124,12 +130,19 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
+    # A task holding an open dose that is not due yet stays queued until it is, and one holding an open dose that has
+    # expired is not handed out (enqueue refuses such tasks; this also covers any queued before the rules, or that
+    # lapsed while queued). Doses already taken, skipped or waiting for family don't count: expiry is a matter of
+    # time alone, and a taken dose past its halfway point must not keep the slot's other doses from the robot.
+    # Overdose protection's switch decides, as in dose_safety.startable_sql; monitor/start checks the rest.
     async with get_pool().acquire() as conn, conn.transaction():
         task = await conn.fetchrow(
             "UPDATE reachy_task SET status = 'leased', lease_owner = $2::uuid, "
             f"lease_until = NOW() + INTERVAL '{LEASE_SECONDS} seconds' "
-            "WHERE task_id = (SELECT task_id FROM reachy_task WHERE u_id = $1 AND status = 'queued' "
-            "AND expires_at > NOW() ORDER BY slot_time, created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
+            "WHERE task_id = (SELECT t.task_id FROM reachy_task t WHERE t.u_id = $1 AND t.status = 'queued' "
+            "AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i WHERE i.intk_id = ANY(t.intk_ids) "
+            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')})) "
+            "ORDER BY t.slot_time, t.created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
             "RETURNING *",
             u_id, device_id)
         return await task_payload(conn, task) if task else None

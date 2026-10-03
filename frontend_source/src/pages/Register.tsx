@@ -214,10 +214,13 @@ export default function Register() {
           </div>
 
           {step === 1 && (
-            <p className="text-center text-base text-gray-500 mt-6">
-              {t('register.haveAccount')}{' '}
-              <Link to="/login" className="text-[#0057B8] hover:text-[#003D82] font-medium transition-colors">{t('register.loginLink')}</Link>
-            </p>
+            <>
+              <p className="text-center text-base text-gray-500 mt-6">
+                {t('register.haveAccount')}{' '}
+                <Link to="/login" className="text-[#0057B8] hover:text-[#003D82] font-medium transition-colors">{t('register.loginLink')}</Link>
+              </p>
+              <p className="text-center text-sm text-gray-500 mt-2">{t('register.faceOnce')}</p>
+            </>
           )}
         </div>
       </div>

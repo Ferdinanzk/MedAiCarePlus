@@ -7,7 +7,7 @@ from pydantic import BaseModel, StrictBool
 
 from app.database import get_pool
 from app.dependencies import get_current_user
-from app.services import consent_service, deletion_ledger, reachy_tasks
+from app.services import consent_service, deletion_ledger, dose_video, reachy_tasks
 
 router = APIRouter(prefix="/api/consent", tags=["consent"])
 
@@ -51,4 +51,7 @@ async def record_consent(payload: ConsentPayload, request: Request,
     for scope in withdrawn:
         deletion_ledger.append_host_file("consent", u_id, scope)
     consent_service.invalidate(u_id)
+    if payload.scopes.get("dose_video") is False:
+        # Clips not yet downloaded are deleted at once (the video notice, section 4).
+        await dose_video.delete_all(u_id, "consent_withdrawn")
     return consent_service.status_payload(await consent_service.get_state(u_id))

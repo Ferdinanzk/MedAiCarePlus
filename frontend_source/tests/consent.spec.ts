@@ -103,9 +103,10 @@ async function mockApi(page: Page, options: {
       await route.fulfill({ json: { success: true, u_id: 7, token: 'test-face-token' } });
     } else {
       state.dataRequests.push(url.pathname);
+      // The dashboard reads the conversations page's items, so that list answers in its real (paged) shape.
       await route.fulfill(options.denyData
         ? { status: 403, json: { detail: 'consent_required' } }
-        : { json: [] });
+        : { json: url.pathname === '/api/conversations' ? { items: [], total: 0, has_more: false } : [] });
     }
   });
   return state;

@@ -1,6 +1,7 @@
 """Leased robot tasks: enqueue rules, leasing, transitions, lease expiry and the reminder hook."""
 
 import asyncio
+import os
 import sys
 import types
 import uuid
@@ -13,9 +14,12 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app import config
-from app.jobs import missed_dose_job, reachy_task_job
-from app.services import consent_service, outbox, reachy_tasks
+sys.path.insert(0, os.path.dirname(__file__))
+import dose_facts  # noqa: E402
+
+from app import config  # noqa: E402
+from app.jobs import missed_dose_job, reachy_task_job  # noqa: E402
+from app.services import consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
 
 T0 = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)          # 08:00 in Taipei
 OPEN = ("queued", "leased", "searching", "in_progress")
@@ -49,14 +53,19 @@ class FakeDB:
         self.users = {7: "Pearl"}
         self.doses = {
             101: {"intk_id": 101, "med_id": 2, "med_name": "Metformin", "pill_description": "white round",
-                  "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending"},
+                  "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
+                  "intake_time_stamp": T0},
             102: {"intk_id": 102, "med_id": 1, "med_name": "Aspirin", "pill_description": None,
-                  "dose_form": "liquid", "units_per_dose": Decimal("1.00"), "intake_stats": "pending"},
+                  "dose_form": "liquid", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
+                  "intake_time_stamp": T0},
             103: {"intk_id": 103, "med_id": 3, "med_name": "Zinc", "pill_description": None,
-                  "dose_form": "solid_oral", "units_per_dose": Decimal("2.00"), "intake_stats": "taken"},
+                  "dose_form": "solid_oral", "units_per_dose": Decimal("2.00"), "intake_stats": "taken",
+                  "intake_time_stamp": T0},
         }
         self.executed = []
         self.outbox_now = None
+        self.due_checks = []
+        self.protection = True
 
     # helpers
     def transaction(self):
@@ -79,6 +88,18 @@ class FakeDB:
 
     def by_id(self, task_id):
         return next((t for t in self.tasks if str(t["task_id"]) == str(task_id)), None)
+
+    def facts(self, args):
+        """dose_safety.FACTS_SQL over the doses (all patient 7's)."""
+        meds = {d["med_id"]: {"med_name": d["med_name"]} for d in self.doses.values()}
+        return dose_facts.rows(args, self.doses, meds, protection=self.protection)
+
+    def startable(self, intk_id):
+        """dose_safety.startable_sql: due and not expired, under the patient's switch."""
+        (row,) = self.facts((7, [intk_id], self.now, "Asia/Taipei"))
+        expiry = dose_safety.expires_at(row["intake_time_stamp"], row["next_time"])
+        return not row["protection"] or (schedule.is_due(row["intake_time_stamp"], self.now, row["previous_time"])
+                                         and (expiry is None or self.now < expiry))
 
     # asyncpg surface
     async def fetchval(self, query, *args):
@@ -114,8 +135,18 @@ class FakeDB:
     async def fetchrow(self, query, *args):
         if "SET status = 'leased'" in query:
             assert "FOR UPDATE SKIP LOCKED" in query
+            assert "AND NOT EXISTS (SELECT 1 FROM intake i" in query
+            assert (f"AND i.intake_stats IN ('pending','missed') "
+                    f"AND NOT ({dose_safety.startable_sql('i', 'NOW()')})") in query and len(args) == 2
+
+            def due(task):
+                # Only open doses hold a task back: a taken one past its halfway point does not.
+                return all(self.startable(i) for i in task["intk_ids"]
+                           if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed"))
+
             queued = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["status"] == "queued"
-                             and t["expires_at"] > self.now), key=lambda t: (t["slot_time"], t["created_at"]))
+                             and t["expires_at"] > self.now and due(t)),
+                            key=lambda t: (t["slot_time"], t["created_at"]))
             if not queued:
                 return None
             task = queued[0]
@@ -146,6 +177,10 @@ class FakeDB:
         raise AssertionError(query)
 
     async def fetch(self, query, *args):
+        if dose_facts.is_facts(query):
+            assert args[0] == 7
+            self.due_checks.append(list(args[1]))
+            return self.facts(args)
         if "FROM intake i JOIN medication m" in query:
             assert "ORDER BY m.med_name, m.med_id" in query
             rows = [self.doses[i] for i in args[1] if i in self.doses]
@@ -203,6 +238,7 @@ def db(monkeypatch):
     monkeypatch.setattr(consent_service, "fetch_state", fetch_state)
     monkeypatch.setattr(outbox, "enqueue_to_contacts", enqueue_to_contacts)
     monkeypatch.setattr(reachy_tasks, "get_pool", lambda: db)
+    monkeypatch.setattr(schedule, "_now", lambda: db.now)   # the due rule runs on the fake database's clock
     return db
 
 
@@ -258,6 +294,20 @@ def test_enqueue_refused_without_current_robot_consent(db, state):
     assert enqueue(db) is None and db.tasks == []
 
 
+@pytest.mark.parametrize("reason", ["upcoming", "missed_retry", "manual"])
+def test_enqueue_refuses_a_dose_not_due_yet_for_every_caller(db, reason):
+    db.doses[102]["intake_time_stamp"] = T0 + schedule.DOSE_EARLY + timedelta(minutes=1)
+    with pytest.raises(schedule.DoseNotDueYet) as refused:
+        enqueue(db, reason=reason, slot=T0 + timedelta(hours=2))
+    assert refused.value.intk_id == 102 and db.tasks == []
+    db.doses[102]["intake_time_stamp"] = T0 + schedule.DOSE_EARLY   # exactly DOSE_EARLY ahead: due
+    assert enqueue(db, reason=reason, slot=T0 + timedelta(hours=2)) and len(db.tasks) == 1
+
+
+def test_checkin_task_has_no_dose_to_check(db):
+    assert enqueue(db, reason="checkin", intk_ids=()) and db.due_checks == []
+
+
 # ── Lease, payload, restart recovery ─────────────────────────────────────────
 
 def test_lease_next_leases_oldest_queued_and_returns_payload(db):
@@ -282,6 +332,45 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
 def test_lease_next_skips_expired_tasks(db):
     enqueue(db, expires=T0 - timedelta(seconds=1))
     assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+
+
+def test_a_queued_task_for_a_later_dose_waits_until_it_is_due(db):
+    """3 Oct 2026: the 20:00 dose's task, queued at 00:14, was leased at once. Such a task now waits."""
+    db.doses[104] = {"intk_id": 104, "med_id": 2, "med_name": "Metformin", "pill_description": None,
+                     "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
+                     "intake_time_stamp": T0 + timedelta(hours=12)}
+    db.tasks.append({"task_id": "early", "u_id": 7, "slot_time": T0 + timedelta(hours=12), "intk_ids": [104],
+                     "reason": "manual", "attempt": 1, "status": "queued", "lease_owner": None, "lease_until": None,
+                     "created_at": T0, "finished_at": None, "expires_at": T0 + timedelta(hours=13), "detail": None})
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+    db.now = T0 + timedelta(hours=12) - schedule.DOSE_EARLY - timedelta(seconds=1)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+    db.now += timedelta(seconds=1)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == "early"
+
+
+def _next_metformin(db, hours=2):
+    """Metformin again `hours` after dose 101 (T0): 20:00 and 22:00 in the user's schedule."""
+    db.doses[105] = {**db.doses[101], "intk_id": 105, "intake_time_stamp": T0 + timedelta(hours=hours)}
+
+
+def test_enqueue_refuses_the_next_dose_of_a_medicine_until_halfway(db):
+    _next_metformin(db)
+    with pytest.raises(schedule.DoseNotDueYet) as refused:
+        enqueue(db, reason="manual", slot=T0 + timedelta(hours=2), intk_ids=(105,))
+    assert refused.value.due_from == T0 + timedelta(hours=1) and db.tasks == []
+    db.now = T0 + timedelta(hours=1)
+    assert enqueue(db, reason="manual", slot=T0 + timedelta(hours=2), intk_ids=(105,)) and len(db.tasks) == 1
+
+
+def test_a_queued_task_for_the_next_dose_of_a_medicine_waits_until_halfway(db):
+    _next_metformin(db)
+    db.tasks.append({"task_id": "next", "u_id": 7, "slot_time": T0 + timedelta(hours=2), "intk_ids": [105],
+                     "reason": "manual", "attempt": 1, "status": "queued", "lease_owner": None, "lease_until": None,
+                     "created_at": T0, "finished_at": None, "expires_at": T0 + timedelta(hours=3), "detail": None})
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None          # within DOSE_EARLY, before halfway
+    db.now = T0 + timedelta(hours=1)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == "next"
 
 
 def test_lease_next_long_polls_until_a_task_arrives(db, monkeypatch):
@@ -451,12 +540,26 @@ class _ReminderConn:
         self.rows = rows
         self.depth = 0
         self.log = []
+        self.queries = []
+        self.facts_asked = []
 
     def transaction(self):
         return _Transaction(self)
 
     async def fetch(self, query, *args):
+        if dose_facts.is_facts(query):
+            # The job's rows hold the facts a test needs (previous_time, and optionally the others).
+            u_id, ids, at, zone = args
+            self.facts_asked.append((list(ids), at))
+            return [{"intk_id": r["id"], "u_id": r["u_id"], "med_id": r["med_id"], "intake_stats": "pending",
+                     "intake_time_stamp": r["intake_time_stamp"], "previous_time": r.get("previous_time"),
+                     "next_time": r.get("next_time"), "med_name": r["med_name"], "schedule_time": None,
+                     "min_interval_minutes": None, "max_daily_doses": r.get("max_daily_doses"),
+                     "protection": r.get("protection", True),
+                     "language": None, "last_taken_at": r.get("last_taken_at"),
+                     "taken_that_day": r.get("taken_that_day", 0)} for r in self.rows if r["id"] in ids]
         if "FROM intake i" in query:
+            self.queries.append(query)
             return self.rows
         return []
 
@@ -489,7 +592,7 @@ class _Line:
 
 
 def _reminder_rows(slot, reminder_sent=False, retries_sent=0):
-    return [{"id": intk_id, "u_id": 7, "intake_time_stamp": slot, "reminder_sent": reminder_sent,
+    return [{"id": intk_id, "u_id": 7, "intake_time_stamp": slot, "previous_time": None, "reminder_sent": reminder_sent,
              "missed_reminders_sent": retries_sent, "med_id": intk_id, "med_name": f"Med {intk_id}",
              "patient_name": "Pearl", "patient_line_id": "U1", "remind_before_minutes": 5,
              "remind_after_minutes": 10, "remind_after_retries": 3, "notify_family_on_missed": False}
@@ -506,8 +609,8 @@ def test_reminder_flag_and_task_enqueue_share_a_transaction(monkeypatch, offset,
     conn = _ReminderConn(_reminder_rows(slot, reminder_sent=reason != "upcoming"))
     calls = []
 
-    async def fake_enqueue(c, u_id, slot_time, intk_ids, task_reason, expires_at):
-        calls.append((u_id, slot_time, intk_ids, task_reason, expires_at, c.depth))
+    async def fake_enqueue(c, u_id, slot_time, intk_ids, task_reason, expires_at, at=None):
+        calls.append((u_id, slot_time, intk_ids, task_reason, expires_at, c.depth, at))
         c.log.append(("enqueue", task_reason, c.depth))
         return "task"
 
@@ -516,12 +619,201 @@ def test_reminder_flag_and_task_enqueue_share_a_transaction(monkeypatch, offset,
     monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: _Line()))
     run(missed_dose_job.check_missed_doses())
     assert len(calls) == 1
-    u_id, slot_time, intk_ids, task_reason, expires_at, depth = calls[0]
+    u_id, slot_time, intk_ids, task_reason, expires_at, depth, at = calls[0]
     assert (u_id, slot_time, intk_ids, task_reason) == (7, slot, [101, 102], reason)
     assert expires_at == slot + timedelta(minutes=10 * (3 + 1))
-    assert depth == 1
+    # Judged on the job's clock, the moment the doses were picked by (conn.facts_asked).
+    assert at == conn.facts_asked[0][1]
+    # In a savepoint inside the reminder's transaction: a refusal there never rolls the flag back.
+    assert depth == 2
     flag = [entry for entry in conn.log if entry[0] == "execute" and entry[1].startswith(flag_sql)]
     assert flag and flag[0][2] == 1
     # the flag update and the enqueue are adjacent inside the same transaction block
     index = conn.log.index(flag[0])
-    assert conn.log[index + 1] == ("enqueue", reason, 1)
+    assert conn.log[index + 1] == ("enqueue", reason, 2)
+
+
+def test_reminder_further_ahead_than_the_early_window_sends_line_but_no_robot_task(monkeypatch):
+    """remind_before_minutes can exceed DOSE_EARLY_MINUTES through the API: the LINE reminder still goes (and its
+    flag is kept), but the robot is not sent for a dose that is not due."""
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) + schedule.DOSE_EARLY + timedelta(minutes=30)
+    rows = _reminder_rows(slot)
+    for row in rows:
+        row["remind_before_minutes"] = int(schedule.DOSE_EARLY.total_seconds() // 60) + 60
+    conn = _ReminderConn(rows)
+    calls, sent = [], []
+
+    async def fake_enqueue(*args, **kwargs):
+        calls.append(args)
+
+    line = _Line()
+    line.send_text = lambda *args: sent.append(args)
+    monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
+    monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
+    monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
+    run(missed_dose_job.check_missed_doses())
+    assert sent and calls == []
+    assert any(entry[0] == "execute" and entry[1].startswith("UPDATE intake SET reminder_sent = TRUE")
+               for entry in conn.log)
+
+
+@pytest.mark.parametrize("gap,robot", [(timedelta(minutes=8), False), (timedelta(hours=2), True)])
+def test_upcoming_robot_task_waits_for_halfway_from_the_same_medicines_previous_dose(monkeypatch, gap, robot):
+    """Custom times 8 minutes apart: at the 5-minute reminder the second dose is not due yet (from halfway, 4
+    minutes before), so the LINE reminder goes alone and the robot comes with the first overdue retry."""
+    slot = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)                 # 20:00 in Taipei
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return slot - timedelta(minutes=5)                               # the reminder at 19:55
+
+    rows = _reminder_rows(slot)
+    for row in rows:
+        row["previous_time"] = slot - gap
+    conn = _ReminderConn(rows)
+    calls, sent = [], []
+
+    async def fake_enqueue(*args, **kwargs):
+        calls.append(args)
+
+    line = _Line()
+    line.send_text = lambda *args: sent.append(args)
+    monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
+    monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
+    monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
+    monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
+    run(missed_dose_job.check_missed_doses())
+    assert sent and bool(calls) is robot
+    # Overdose protection decides (dose_safety.allowed), on the job's clock, for the slot's doses together.
+    assert conn.facts_asked == [([101, 102], slot - timedelta(minutes=5))]
+
+
+def _run_reminders(monkeypatch, conn, enqueue=None):
+    """check_missed_doses over `conn`; returns (the robot's dose lists, the patient's LINE texts)."""
+    calls, sent = [], []
+
+    async def fake_enqueue(c, u_id, slot_time, intk_ids, reason, expires_at, at=None):
+        calls.append(list(intk_ids))
+        if enqueue is not None:
+            await enqueue(c)
+
+    line = _Line()
+    line.send_text = lambda line_id, text: sent.append(text)
+    monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
+    monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
+    monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
+    run(missed_dose_job.check_missed_doses())
+    return calls, sent
+
+
+@pytest.mark.parametrize("protection", [True, False])
+def test_the_robot_and_the_reminder_leave_out_a_dose_too_soon_after_the_last_one(monkeypatch, protection):
+    """Med 101 taken late at 19:40 (an ad-hoc dose; it keeps 4 h between doses): at the 20:00 reminder the robot
+    comes for Med 102 alone (one medicine does not keep it from the others), and the LINE reminder asks for Med 102
+    and says why not Med 101. With protection off, both as before."""
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) + timedelta(minutes=5)
+    rows = _reminder_rows(slot)
+    rows[0].update(last_taken_at=now - timedelta(minutes=20))
+    for row in rows:
+        row["protection"] = protection
+    calls, sent = _run_reminders(monkeypatch, _ReminderConn(rows))
+    (text,) = sent
+    # On the patient's clock (the database's UTC once said "14:00" for the 22:00 dose).
+    assert f"您預定於 {slot.astimezone(missed_dose_job._TZ):%H:%M} 服用" in text
+    if protection:
+        assert calls == [[102]]
+        asked, held = text.split("請準時服用。")
+        assert "Med 102" in asked and "Med 101" not in asked
+        assert held.startswith("\n⚠️ Med 101：這個藥您") and held.endswith("已經吃過了，請先不要再吃。")
+    else:
+        assert calls == [[101, 102]] and "⚠️" not in text
+
+
+def test_an_overdue_reminder_never_asks_for_a_dose_missed_past_halfway(monkeypatch):
+    """Doses 15 minutes apart (custom times): at the first overdue retry Med 101's dose has expired. The patient is
+    told not to make it up, not "please take it as soon as possible", and the robot comes for Med 102 only."""
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) - timedelta(minutes=10)
+    rows = _reminder_rows(slot, reminder_sent=True)
+    rows[0]["next_time"] = slot + timedelta(minutes=15)          # expired 7.5 minutes after its time
+    calls, sent = _run_reminders(monkeypatch, _ReminderConn(rows))
+    (text,) = sent
+    asked, held = text.split("請盡快服用。")
+    assert "Med 102" in asked and "Med 101" not in asked
+    assert "⚠️ Med 101：" in held and "已經錯過了，請不要補吃，等下一次就好。" in held
+    assert calls == [[102]]
+
+
+def test_a_reminder_where_every_dose_is_held_back_still_says_why_and_sends_no_robot(monkeypatch):
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) + timedelta(minutes=5)
+    rows = _reminder_rows(slot)
+    for row in rows:
+        row.update(taken_that_day=3, max_daily_doses=3)
+    calls, sent = _run_reminders(monkeypatch, _ReminderConn(rows))
+    (text,) = sent
+    assert "請準時服用" not in text and text.count("⚠️") == 2 and "已經吃滿 3 次了，請不要再吃。" in text
+    assert calls == []
+
+
+def test_a_dose_refused_while_the_robot_is_sent_never_undoes_the_reminder(monkeypatch):
+    """Something changed between the verdicts and the robot (e.g. the patient tapped a dose taken meanwhile): the
+    refusal stays in the robot's savepoint, the reminder flag commits and the run goes on."""
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) + timedelta(minutes=5)
+    conn = _ReminderConn(_reminder_rows(slot))
+
+    async def refuse(c):
+        raise dose_safety.DoseTooSoon(last_taken_at=now, gap=timedelta(hours=4), intk_id=101)
+
+    calls, sent = _run_reminders(monkeypatch, conn, enqueue=refuse)
+    assert calls == [[101, 102]] and sent
+    assert any(entry[0] == "execute" and entry[1].startswith("UPDATE intake SET reminder_sent = TRUE")
+               for entry in conn.log)
+
+
+# ── Overdose protection on enqueue and lease ─────────────────────────────────
+
+def test_enqueue_refuses_a_second_dose_too_soon_after_the_last(db):
+    """Metformin (no times: 4 h between doses) taken ad hoc 30 minutes ago."""
+    earlier = T0 - timedelta(minutes=30)
+    db.doses[106] = {**db.doses[101], "intk_id": 106, "intake_stats": "taken", "intake_time_stamp": earlier,
+                     "actual_intake_time": earlier}
+    with pytest.raises(dose_safety.DoseTooSoon) as refused:
+        enqueue(db, intk_ids=(101,))
+    assert refused.value.intk_id == 101 and db.tasks == []
+    db.protection = False
+    assert enqueue(db, intk_ids=(101,)) and len(db.tasks) == 1
+
+
+def test_a_queued_task_whose_dose_expired_is_not_leased(db):
+    """101 (08:00) with the next Metformin at 10:00 expires at 09:00: the robot must not ask for it any more."""
+    _next_metformin(db)
+    enqueue(db, intk_ids=(101,), expires=T0 + timedelta(hours=3))
+    db.now = T0 + timedelta(hours=1)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+    db.protection = False
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["doses"][0]["intk_id"] == 101
+
+
+def test_a_taken_dose_past_its_halfway_point_does_not_hold_back_the_slots_other_doses(db):
+    """101 (Metformin 08:00) was taken; at 09:00 it is past halfway to the 10:00 one. Expiry is a matter of time
+    alone, so only open doses decide: the slot's Aspirin (102) still gets the robot."""
+    _next_metformin(db)
+    enqueue(db, intk_ids=(101, 102), expires=T0 + timedelta(hours=3))
+    db.doses[101]["intake_stats"] = "taken"
+    db.now = T0 + timedelta(hours=1)
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task is not None and {d["intk_id"] for d in task["doses"]} == {101, 102}
+
+
+def test_with_protection_off_a_task_for_a_later_dose_is_leased_at_once(db):
+    """The behaviour before 3 Oct, when the patient chose it: a test alert at midnight starts the 20:00 dose."""
+    db.protection = False
+    db.doses[104] = {**db.doses[101], "intk_id": 104, "intake_time_stamp": T0 + timedelta(hours=12)}
+    assert enqueue(db, reason="manual", slot=T0 + timedelta(hours=12), intk_ids=(104,),
+                   expires=T0 + timedelta(hours=13))
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["doses"][0]["intk_id"] == 104

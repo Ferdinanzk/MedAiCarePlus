@@ -23,12 +23,18 @@ EXPORT_TABLES = (
     "notification_settings", "notification", "login_log", "monitor_event", "consent",
     "conversation", "conversation_turn", "patient_memory", "patient_memory_deleted",
     "dose_confirmation", "monitor_extra_event", "reachy_device", "reachy_task", "notification_outbox",
+    "dose_video", "dose_video_link", "dose_emotion",
 )
+# Tables without a u_id column, read through the row that owns them.
+EXPORT_QUERIES = {
+    "dose_video_link": "SELECT l.* FROM dose_video_link l JOIN dose_video v USING (video_id) WHERE v.u_id=$1",
+}
 
 
 def _strip_secrets(account: dict) -> None:
-    """Credential-derived values stay out of the export, even hashed."""
-    for table, column in (("user", "password_hash"), ("reachy_device", "token_hash")):
+    """Credential-derived values stay out of the export, even hashed (a dose-video link token opens the clip)."""
+    for table, column in (("user", "password_hash"), ("reachy_device", "token_hash"),
+                          ("dose_video_link", "token_sha256")):
         for row in account.get(table, []):
             row.pop(column, None)
 
@@ -43,7 +49,8 @@ async def export_account(user: dict = Depends(get_current_user)):
     async with get_pool().acquire() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             for table in EXPORT_TABLES:
-                rows = await conn.fetch(f'SELECT * FROM "{table}" WHERE u_id=$1', user["u_id"])
+                query = EXPORT_QUERIES.get(table, f'SELECT * FROM "{table}" WHERE u_id=$1')
+                rows = await conn.fetch(query, user["u_id"])
                 account[table] = [dict(row) for row in rows]
     if not account["user"]:
         raise HTTPException(404, "account_not_found")

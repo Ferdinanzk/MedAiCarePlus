@@ -40,7 +40,7 @@ def test_robot_emotion_is_accepted_for_the_verified_face(monkeypatch):
     _run(monkeypatch, scenario)
 
 
-def test_robot_emotion_is_refused_unverified_wrong_face_or_covered_mouth(monkeypatch):
+def test_robot_emotion_is_refused_unverified_or_wrong_face_and_kept_occluded_for_a_covered_mouth(monkeypatch):
     async def scenario():
         registry = MonitorRegistry()
         unverified = _robot_session(registry, verified=False)
@@ -50,12 +50,16 @@ def test_robot_emotion_is_refused_unverified_wrong_face_or_covered_mouth(monkeyp
 
         state = _robot_session(registry)
         await registry.landmarks(state, _with_emotion(1, face_index=1))      # not the owned face
-        assert state.emotion is None
-        # A hand over the mouth (owned through a visible wrist next to it).
+        assert state.emotion is None and not state.emotion_samples
+        # A hand over the mouth (owned through a visible wrist next to it): never the live emotion, but kept as an
+        # occluded sample for the dose's result (services/dose_emotion.py).
         packet = _with_emotion(2, hands=[_hand(0.3, 0.3)])
         packet["poses"][0]["wrists"] = [[0.3, 0.32, 0.9]]
-        await registry.landmarks(state, packet)
-        assert state.emotion is None and not state.emotion_samples
+        result = await registry.landmarks(state, packet)
+        assert state.emotion is None and result["emotion"] is None and result["emotion_occluded"] is True
+        assert len(state.emotion_samples) == 1
+        assert state.emotion_samples[0][2] is True and state.emotion_samples[0][3] == "robot"
+        assert state.emotion_totals["n"] == 1 and state.emotion_totals["occluded"] == 1
 
     _run(monkeypatch, scenario)
 

@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import MEDCARE_TIMEZONE, SECRET_KEY
 from app.database import get_pool
-from app.services import outbox
+from app.services import dose_emotion, dose_report, dose_safety, outbox, schedule
 from app.services.intake_repository import take_stock
 
 SOURCES = ("uncertain_detection", "unsupported_dose", "degraded", "auto_record_off", "patient_claim")
@@ -33,12 +33,22 @@ _TZ = ZoneInfo(MEDCARE_TIMEZONE)
 _REASONS = {
     "uncertain_detection": ("Reachy 無法確認服藥動作", "Reachy could not verify the intake"),
     "unsupported_dose": ("此劑型無法自動確認", "this dose type cannot be verified automatically"),
-    "degraded": ("影像品質不足", "the camera feed was too poor to verify"),
+    # 'degraded' is about the frame rate, not the picture: the detector is calibrated at ~15 frames per second.
+    "degraded": ("鏡頭畫面不夠流暢，無法確認", "the camera stream was not smooth enough to verify"),
     "auto_record_off": ("自動記錄未開啟", "automatic recording is off"),
     "patient_claim": ("病人表示已服用", "the patient says the dose was already taken"),
 }
+# The frame rate a monitored dose needs to be recorded (monitor_service.FPS_MIN), quoted to caregivers.
+FPS_NEEDED = 12
 _ANSWER_TEXT = {"taken": ("已服用", "taken"), "not_taken": ("未服用", "not taken")}
 _RESOLUTION_ANSWER = {"confirmed": "taken", "denied": "not_taken"}
+# Why a dose family answered 'taken' was not recorded (overdose protection, judged when the patient was asked).
+_REFUSED_TEXT = {
+    "dose_not_due_yet": ("當時還沒到服藥時間", "was not due yet"),
+    "dose_too_soon": ("距離上一次記錄的服藥時間太近", "came too soon after the last recorded dose"),
+    "daily_max_reached": ("當天已經達到每日服用上限", "was over the medicine's daily maximum"),
+    "dose_expired": ("當時已經錯過，不能補吃", "had already been missed and is not made up"),
+}
 
 
 # ── postback signing ──
@@ -109,17 +119,43 @@ async def _details(conn, u_id: int, intk_ids: list[int]) -> dict:
             "slot": _slot_label(rows[0]["intake_time_stamp"]) if rows else ""}
 
 
-def _request_messages(details: dict, source: str, confirmation_id: str, contact_id: int,
-                      reminder: bool = False) -> list[dict]:
+def _reason(source: str, evidence) -> tuple[str, str]:
+    """Why caregivers are asked. A choppy camera stream also says how many frames per second it reached."""
     reason_zh, reason_en = _REASONS[source]
+    fps = evidence.get("landmark_fps") if isinstance(evidence, dict) else None
+    if (source == "degraded" and isinstance(fps, (int, float)) and not isinstance(fps, bool)
+            and 0 <= fps < FPS_NEEDED):
+        reason_zh += f"：每秒 {fps:.1f} 張畫面，需要 {FPS_NEEDED} 張"
+        reason_en += f": {fps:.1f} frames per second, {FPS_NEEDED} needed"
+    return reason_zh, reason_en
+
+
+def _request_messages(details: dict, source: str, confirmation_id: str, contact_id: int,
+                      reminder: bool = False, evidence: dict | None = None) -> list[dict]:
+    reason_zh, reason_en = _reason(source, evidence)
     patient, meds, slot = details["patient"], details["meds"], details["slot"]
+    # When the medicine was last recorded and how early this dose is (dose_safety.request_notes), so family can tell
+    # a second dose from a late one before answering.
+    notes_zh = "".join(f"{line}\n" for line in details.get("notes_zh", ()))
+    notes_en = "".join(f"{line}\n" for line in details.get("notes_en", ()))
     prefix_zh = "⏰ 提醒：尚未回覆\n" if reminder else ""
     prefix_en = "Reminder, still unanswered: " if reminder else ""
+    # What the camera made of it, even when it was too unsure (or the stream too choppy) to record the dose.
+    # The frame rate is already in the reason, so only the patient's own words are added as a note.
+    evidence = evidence if isinstance(evidence, dict) else {}
+    found = dose_report.ai_estimate(dose_report.number(evidence.get("confidence")), {**evidence, "degraded": False})
+    ai_zh = "".join([f"AI 判斷已服藥的可能性：{found['zh']}\n", *(f"{note}\n" for note in found["notes_zh"]),
+                     dose_report.FOOTNOTE_ZH + "\n" if found["scored"] else ""])
+    ai_en = "".join([f"AI estimate that it was taken: {found['en']}\n",
+                     *(f"Note: {note}\n" for note in found["notes_en"]),
+                     dose_report.FOOTNOTE_EN + "\n" if found["scored"] else ""])
     detail = (f"{prefix_zh}💊 用藥確認\n{patient} {slot} 的用藥需要您確認（{reason_zh}）。\n"
-              f"藥物：{meds}\n請查看藥盒後回覆。\n\n"
+              f"藥物：{meds}\n{notes_zh}{ai_zh}請查看藥盒後回覆。\n\n"
               f"{prefix_en}Please confirm {patient}'s {slot} dose ({reason_en}).\n"
-              f"Medication: {meds}\nCheck the pill box, then answer below.")
-    short = f"{patient} {slot}\n{meds}\n{reason_zh}\n{reason_en}"
+              f"Medication: {meds}\n{notes_en}{ai_en}Check the pill box, then answer below.")
+    # The buttons card holds 160 characters: it gives the plain reason, and the text above it the frame rate.
+    short_zh, short_en = _REASONS[source]
+    short = f"{patient} {slot}\n{meds}\n{short_zh}\n{short_en}"
     actions = []
     for answer, label in (("taken", "已服用 Taken"), ("not_taken", "未服用 Not taken")):
         actions.append({"type": "postback", "label": label, "displayText": label,
@@ -138,19 +174,30 @@ def _text(text: str) -> list[dict]:
 # ── state changes ──
 
 async def create(conn, *, u_id: int, task_id: str | None, intk_ids: list[int], source: str,
-                 evidence: dict | None) -> str:
-    """Ask caregivers to confirm doses. Raises ValueError when no listed dose is pending or missed."""
+                 evidence: dict | None, started_at: datetime.datetime | None = None) -> str:
+    """Ask caregivers to confirm doses. Raises ValueError when no listed dose is pending or missed, and a
+    schedule.DoseRefused (nothing changed) when overdose protection refuses one: family must never be asked to
+    confirm a dose hours before its time, a second dose, or a missed one. Every source comes from the robot seeing a
+    hand-to-mouth event or the patient saying it is done, so the caller alerts family when the refusal is a suspected
+    double dose (dose_safety.alert_after, after this transaction rolled back), and the patient's sentence says the
+    dose was not recorded. `started_at` is when the robot's camera session for the dose began: due and not expired
+    are judged then (dose_safety.evaluate). A dose waiting here counts against the medicine's next one (R2/R3), so
+    the medication row is locked as on every recording path."""
     if source not in SOURCES:
         raise ValueError(f"Unknown confirmation source {source}")
     async with conn.transaction():
         rows = await conn.fetch(
-            "SELECT i.intk_id, i.intake_stats, i.intake_time_stamp, m.med_name "
-            "FROM intake i JOIN medication m ON m.med_id = i.med_id "
+            "SELECT i.intk_id, i.intake_stats, i.intake_time_stamp, "
+            "m.med_name FROM intake i JOIN medication m ON m.med_id = i.med_id "
             "WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) AND i.intake_stats IN ('pending','missed') "
             "ORDER BY i.intake_time_stamp, i.intk_id FOR UPDATE OF i",
             u_id, [int(i) for i in intk_ids])
         if not rows:
             raise ValueError("No pending or missed dose to confirm")
+        now = schedule.current_time()
+        notes_zh, notes_en = dose_safety.request_notes(
+            await dose_safety.check(conn, u_id, [row["intk_id"] for row in rows], at=now, lock=True,
+                                    started_at=started_at, after_intake=True), now)
         ids = [row["intk_id"] for row in rows]
         previous = {str(row["intk_id"]): row["intake_stats"] for row in rows}
         await conn.execute(
@@ -164,18 +211,22 @@ async def create(conn, *, u_id: int, task_id: str | None, intk_ids: list[int], s
         patient = await conn.fetchval('SELECT name FROM "user" WHERE u_id = $1', u_id) or "Patient"
         details = {"patient": patient,
                    "meds": "、".join(row["med_name"] for row in rows),
-                   "slot": _slot_label(rows[0]["intake_time_stamp"])}
+                   "slot": _slot_label(rows[0]["intake_time_stamp"]),
+                   "notes_zh": notes_zh, "notes_en": notes_en}
         for contact in await _eligible_contacts(conn, u_id):
             await outbox.enqueue(
                 conn, u_id=u_id, recipient_line_id=contact["line_id"], kind="dose_confirm", priority=1,
-                messages=_request_messages(details, source, confirmation_id, contact["id"]),
+                messages=_request_messages(details, source, confirmation_id, contact["id"], evidence=evidence),
                 dedupe_key=f"dose_confirm:{confirmation_id}:{contact['id']}", recipient_contact_id=contact["id"])
+    # The robot's camera session for the dose resolved it here: its facial-expression result is written shortly
+    # after (dose_emotion, in the background). In memory only, never raises: the request can't fail because of it.
+    dose_emotion.note_resolution_for(u_id, ids)
     return confirmation_id
 
 
 async def _lock(conn, confirmation_id: str):
     return await conn.fetchrow(
-        "SELECT confirmation_id, u_id, intk_ids, previous_status, source, created_at, reminded_at, "
+        "SELECT confirmation_id, u_id, intk_ids, previous_status, source, evidence, created_at, reminded_at, "
         "resolution, resolved_by FROM dose_confirmation WHERE confirmation_id = $1::uuid FOR UPDATE",
         str(confirmation_id))
 
@@ -183,6 +234,15 @@ async def _lock(conn, confirmation_id: str):
 def _previous(row) -> dict:
     previous = row["previous_status"]
     return json.loads(previous) if isinstance(previous, str) else dict(previous or {})
+
+
+def _evidence(row) -> dict | None:
+    evidence = row["evidence"]
+    try:
+        evidence = json.loads(evidence) if isinstance(evidence, str) else evidence
+    except ValueError:
+        return None
+    return evidence if isinstance(evidence, dict) else None
 
 
 async def _restore(conn, row) -> list[int]:
@@ -201,7 +261,17 @@ async def _restore(conn, row) -> list[int]:
 
 async def resolve(conn, confirmation_id: str, contact_id: int, answer: str) -> dict:
     """Apply a caregiver's answer once. 'taken' records the dose with a stock decrement;
-    'not_taken' restores each dose's exact previous status."""
+    'not_taken' restores each dose's exact previous status.
+
+    'taken' is judged as of when the patient was asked (created_at), which is also stored as the time the dose was
+    taken: family may answer up to 2 h later, and the next dose's minimum gap counts from when the pill went down.
+    Judged as of then means with the doses there were then: an ad-hoc Take Now made since does not move this dose's
+    halfway points (dose_safety.FACTS_SQL), but a pill recorded since close to this one counts for the gap. A dose
+    overdose protection refuses at that moment (create() refuses most already; requests from before a rule or from
+    before a dose taken meanwhile remain) is never recorded: it goes back to its previous status and is listed in
+    `refused` (and in `not_due` when it was not due yet). A second dose (too soon, or over the daily maximum) that
+    family saw taken alerts family. When nothing was recorded the request is closed as 'expired', not 'confirmed':
+    later answerers are told it expired, and taken_confirmation_job never credits this contact with a confirmation."""
     if answer not in ANSWERS:
         raise ValueError(f"Unknown answer {answer}")
     async with conn.transaction():
@@ -210,24 +280,41 @@ async def resolve(conn, confirmation_id: str, contact_id: int, answer: str) -> d
             return {"status": "not_found"}
         if row["resolution"] is not None:
             return {"status": "already_resolved", "resolution": row["resolution"], "resolved_by": row["resolved_by"]}
-        changed, stock_empty = [], []
+        changed, stock_empty, not_due, refused = [], [], [], []
         if answer == "taken":
             resolution = "confirmed"
+            previous = _previous(row)
+            asked = row["created_at"]
             for intake in await conn.fetch(
                     "SELECT intk_id, med_id, intake_stats FROM intake WHERE intk_id = ANY($1::int[]) AND u_id = $2 "
-                    "ORDER BY intk_id FOR UPDATE", list(row["intk_ids"]), row["u_id"]):
+                    "ORDER BY intk_id FOR UPDATE",
+                    list(row["intk_ids"]), row["u_id"]):
                 if intake["intake_stats"] != "pending_confirmation":
+                    continue
+                # One dose at a time: a dose recorded just before counts for the next one's gap and daily maximum.
+                facts = await dose_safety.facts(conn, row["u_id"], [intake["intk_id"]], asked, lock=True)
+                refusal = dose_safety.evaluate(facts[0], asked) if facts else None
+                if refusal is not None:
+                    refusal.after_intake = True
+                    await conn.execute("UPDATE intake SET intake_stats=$1 WHERE intk_id=$2",
+                                       previous.get(str(intake["intk_id"]), "pending"), intake["intk_id"])
+                    refused.append({"intk_id": intake["intk_id"], "detail": refusal.detail})
+                    if isinstance(refusal, schedule.DoseNotDueYet):
+                        not_due.append(intake["intk_id"])
+                    await dose_safety.alert_family(conn, refusal)
                     continue
                 used = await take_stock(conn, intake["med_id"], row["u_id"])
                 if used is None:
                     # The caregiver saw the dose taken; record it even though stock had run out.
                     stock_empty.append(intake["intk_id"])
                 await conn.execute(
-                    "UPDATE intake SET intake_stats='taken', actual_intake_time=NOW(), "
+                    "UPDATE intake SET intake_stats='taken', actual_intake_time=$3, taken_notified=FALSE, "
                     "detection_method='caregiver_confirmed', detection_confidence=NULL, units_taken=$2 "
                     "WHERE intk_id=$1",
-                    intake["intk_id"], used[1] if used else 0)
+                    intake["intk_id"], used[1] if used else 0, asked)
                 changed.append(intake["intk_id"])
+            if refused and not changed:
+                resolution = "expired"
         else:
             resolution = "denied"
             changed = await _restore(conn, row)
@@ -236,7 +323,7 @@ async def resolve(conn, confirmation_id: str, contact_id: int, answer: str) -> d
             "WHERE confirmation_id=$1::uuid",
             str(confirmation_id), resolution, contact_id, datetime.datetime.now(datetime.timezone.utc))
     return {"status": "resolved", "resolution": resolution, "u_id": row["u_id"], "intk_ids": changed,
-            "stock_empty": stock_empty}
+            "stock_empty": stock_empty, "not_due": not_due, "refused": refused}
 
 
 async def handle_postback(conn, data: str, sender_line_id: str) -> dict | None:
@@ -260,6 +347,16 @@ async def handle_postback(conn, data: str, sender_line_id: str) -> dict | None:
         await _enqueue_replies(conn, parsed, contact, result)
     outbox.wake()
     return result
+
+
+def _refused_reasons(result: dict) -> tuple[str, str] | None:
+    """(中文, English) for the doses a 'taken' answer did not record, or None."""
+    details = [item["detail"] for item in result.get("refused") or []] or \
+        ["dose_not_due_yet" for _ in result.get("not_due") or []]
+    if not details:
+        return None
+    texts = [_REFUSED_TEXT.get(detail, _REFUSED_TEXT["dose_not_due_yet"]) for detail in dict.fromkeys(details)]
+    return "、".join(zh for zh, _ in texts), "; ".join(en for _, en in texts)
 
 
 async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
@@ -288,6 +385,14 @@ async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
     zh, en = _ANSWER_TEXT[parsed["answer"]]
     ack = (f"已記錄：{patient} {slot} 的用藥（{details['meds']}）— {zh}。\n"
            f"Recorded: {patient}'s {slot} dose ({details['meds']}) — {en}.")
+    refused = _refused_reasons(result)
+    if refused and not result.get("intk_ids"):
+        ack = (f"未記錄：{patient} {slot} 的用藥（{details['meds']}）{refused[0]}，所以沒有記錄為已服用。\n"
+               f"Not recorded: {patient}'s {slot} dose ({details['meds']}) {refused[1]}, "
+               f"so it was not recorded as taken.")
+    elif refused:
+        ack += (f"\n注意：其中有藥{refused[0]}，沒有記錄為已服用。 / "
+                f"Note: a dose that {refused[1]} was not recorded as taken.")
     if result.get("stock_empty"):
         ack += "\n注意：藥量已為 0，請補充藥物。 / Note: stock was already 0, please refill."
     await outbox.enqueue(conn, u_id=u_id, recipient_line_id=contact["line_id"], kind="dose_confirm_reply",
@@ -295,6 +400,14 @@ async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
                          dedupe_key=f"dose_confirm_ack:{confirmation_id}:{contact['id']}")
     notice = (f"{contact['name']} 已回覆：{zh}（{patient} {slot}）。\n"
               f"{contact['name']} answered: {en} ({patient}'s {slot} dose).")
+    # The other contacts must not read "answered: taken" for a dose that was not recorded.
+    if refused and not result.get("intk_ids"):
+        notice = (f"{contact['name']} 回覆已服用，但 {patient} {slot} 的用藥{refused[0]}，所以沒有記錄為已服用。\n"
+                  f"{contact['name']} answered taken, but {patient}'s {slot} dose {refused[1]}, "
+                  f"so it was not recorded as taken.")
+    elif refused:
+        notice += (f"\n注意：其中有藥{refused[0]}，沒有記錄為已服用。 / "
+                   f"Note: a dose that {refused[1]} was not recorded as taken.")
     for other in await _eligible_contacts(conn, u_id):
         if other["id"] == contact["id"]:
             continue
@@ -345,10 +458,14 @@ async def _remind(conn, confirmation_id: str, now: datetime.datetime) -> None:
         if row is None or row["resolution"] is not None or row["reminded_at"] is not None:
             return
         details = await _details(conn, row["u_id"], list(row["intk_ids"]))
+        # The same notes as the request, as of when the patient was asked.
+        details["notes_zh"], details["notes_en"] = dose_safety.request_notes(
+            await dose_safety.facts(conn, row["u_id"], list(row["intk_ids"]), row["created_at"]), row["created_at"])
         for contact in await _eligible_contacts(conn, row["u_id"]):
             await outbox.enqueue(
                 conn, u_id=row["u_id"], recipient_line_id=contact["line_id"], kind="dose_confirm", priority=1,
-                messages=_request_messages(details, row["source"], confirmation_id, contact["id"], reminder=True),
+                messages=_request_messages(details, row["source"], confirmation_id, contact["id"], reminder=True,
+                                           evidence=_evidence(row)),
                 dedupe_key=f"dose_confirm_reminder:{confirmation_id}:{contact['id']}",
                 recipient_contact_id=contact["id"])
         await conn.execute("UPDATE dose_confirmation SET reminded_at=$2 WHERE confirmation_id=$1::uuid",

@@ -2,7 +2,10 @@
 
 Transcript turns are kept 30 days; turns quoted in a safety alert, 180 days. Conversation rows (summary and
 mood) and memory notes stay until the patient deletes them or the account; event notes go 30 days after the
-event; deletion tombstones go after 7 days. Also run by replay_ledger after a restore."""
+event; deletion tombstones go after 7 days. Also run by replay_ledger after a restore.
+
+Closing check-ins the robot never closed, and retrying post-chat work that was missed (the summary and its
+safety backstop), now live in jobs/after_chat_job.py."""
 
 from app import config
 from app.database import get_pool

@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_consented_user
 from app.services.line_service import LineService
-from app.services import dose_confirmation
+from app.services import dose_confirmation, dose_safety, dose_video, outbox
 from app.database import get_pool
 from pydantic import BaseModel
 from typing import Optional
@@ -22,6 +22,9 @@ class NotificationSettingsPayload(BaseModel):
     notify_family_on_missed: bool
     notify_family_on_bad_mood: bool
     notify_family_on_taken: bool = True
+    # Overdose protection (services/dose_safety.py), on by default. Left out (an older client): the stored value is
+    # kept, so a save never turns it back on or off by accident; a new settings row starts on.
+    overdose_protection: Optional[bool] = None
 
 
 router = APIRouter(prefix="/api/notify", tags=["notify-api"])
@@ -95,6 +98,15 @@ async def line_webhook(request: Request):
                     )
             except Exception as exc:
                 print(f"[LINE] postback handling failed: {exc}")
+            continue
+
+        if event.get("type") == "videoPlayComplete":
+            # A family member watched a dose video to the end: their copy no longer needs our server.
+            try:
+                await dose_video.video_viewed((event.get("videoPlayComplete") or {}).get("trackingId", ""),
+                                              (event.get("source") or {}).get("userId", ""))
+            except Exception as exc:
+                print(f"[LINE] videoPlayComplete handling failed: {exc}")
             continue
 
         if event.get("type") != "message":
@@ -226,7 +238,8 @@ async def get_notification_settings(user: dict = Depends(get_consented_user)):
         row = await conn.fetchrow(
             """
             SELECT remind_before_minutes, remind_after_minutes, remind_after_retries,
-                   notify_family_on_missed, notify_family_on_bad_mood, notify_family_on_taken
+                   notify_family_on_missed, notify_family_on_bad_mood, notify_family_on_taken,
+                   overdose_protection
             FROM notification_settings
             WHERE u_id = $1
             """,
@@ -244,34 +257,47 @@ async def get_notification_settings(user: dict = Depends(get_consented_user)):
                 "remind_after_retries": 3,
                 "notify_family_on_missed": True,
                 "notify_family_on_bad_mood": True,
-                "notify_family_on_taken": True
+                "notify_family_on_taken": True,
+                "overdose_protection": True,
             }
         return dict(row)
 
 
 @router.post("/settings")
+@router.put("/settings")
 async def update_notification_settings(payload: NotificationSettingsPayload, user: dict = Depends(get_consented_user)):
+    """Save the settings. Turning overdose protection off is recorded and told to family on LINE
+    (dose_safety.notify_protection_off), in the same transaction; turning it on again sends nothing."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire() as conn, conn.transaction():
+        was_on = await conn.fetchval(
+            "SELECT overdose_protection FROM notification_settings WHERE u_id = $1 FOR UPDATE", user["u_id"])
+        was_on = True if was_on is None else bool(was_on)
+        protection = was_on if payload.overdose_protection is None else payload.overdose_protection
         await conn.execute(
             """
             INSERT INTO notification_settings (u_id, remind_before_minutes, remind_after_minutes,
                                                 remind_after_retries, notify_family_on_missed,
-                                                notify_family_on_bad_mood, notify_family_on_taken)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                                notify_family_on_bad_mood, notify_family_on_taken,
+                                                overdose_protection)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (u_id) DO UPDATE SET
                 remind_before_minutes = EXCLUDED.remind_before_minutes,
                 remind_after_minutes = EXCLUDED.remind_after_minutes,
                 remind_after_retries = EXCLUDED.remind_after_retries,
                 notify_family_on_missed = EXCLUDED.notify_family_on_missed,
                 notify_family_on_bad_mood = EXCLUDED.notify_family_on_bad_mood,
-                notify_family_on_taken = EXCLUDED.notify_family_on_taken
+                notify_family_on_taken = EXCLUDED.notify_family_on_taken,
+                overdose_protection = EXCLUDED.overdose_protection
             """,
             user["u_id"], payload.remind_before_minutes, payload.remind_after_minutes,
             payload.remind_after_retries, payload.notify_family_on_missed, payload.notify_family_on_bad_mood,
-            payload.notify_family_on_taken
+            payload.notify_family_on_taken, protection
         )
-    return {"success": True}
+        notified = await dose_safety.notify_protection_off(conn, user["u_id"]) if was_on and not protection else 0
+    if notified:
+        outbox.wake()
+    return {"success": True, "overdose_protection": protection}
 
 
 @router.get("/list")

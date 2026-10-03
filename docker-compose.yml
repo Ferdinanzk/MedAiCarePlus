@@ -44,7 +44,8 @@ services:
 
   # LINE webhook, the app's only public entry point. Opt-in: scripts/line-tunnel.ps1
   # The tunnel reaches only this proxy, and the proxy forwards only POST /api/notify/webhook/line
-  # (signed by LINE; the app verifies X-Line-Signature). The rest of the app stays on the LAN.
+  # (signed by LINE; the app verifies X-Line-Signature) and GET of dose-video links
+  # (/api/media/line/<43-character token>.mp4|.jpg). The rest of the app stays on the LAN.
   line-webhook-proxy:
     image: nginx:1.27-alpine
     profiles: ["line"]

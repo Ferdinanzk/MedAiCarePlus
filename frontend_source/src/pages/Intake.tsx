@@ -2,8 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { Bot, Camera, CheckCircle2, Clock, Pill, ScanFace, ShieldCheck, TriangleAlert, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { fetchReachyStatus, queueReachyTask } from '../lib/reachy-api';
+import { ApiError, fetchReachyStatus, queueReachyTask } from '../lib/reachy-api';
 import { getFaceAuthHeaders } from '../lib/face-auth';
+import { blockLabel, blockMessage, blockOf, doseRefusal, dueDose, forgetRefusals, isOpen, refusalMessage, rememberRefusal } from '../lib/doses';
+import { useNow } from '../hooks/useNow';
+import { useOverdoseProtection } from '../hooks/useOverdoseProtection';
 
 interface IntakeItem {
   id: number;
@@ -11,6 +14,8 @@ interface IntakeItem {
   name: string;
   dosage: string | null;
   scheduled_time: string | null;
+  due_from?: string | null;
+  expires_at?: string | null;
   status: 'pending' | 'missed' | 'taken' | 'skipped' | 'pending_confirmation';
   pills_remaining: number;
   warning: string | null;
@@ -32,7 +37,9 @@ interface MonitorStatus {
   identity_status: string;
   identity_distance: number | null;
   emotion: { emotion_type: string; emotion_score: number; probabilities: Record<string, number> } | null;
-  detector: { stage: string; decision: string; event_confidence: number } | null;
+  /** The face was last scored with the mouth covered: still analysed for the dose, not shown live. */
+  emotion_occluded?: boolean;
+  detector:{ stage: string; decision: string; event_confidence: number } | null;
   candidate: Candidate | null;
   recorded: { event_id: string; status: string; emotion_id?: number } | null;
 }
@@ -58,7 +65,9 @@ const FRAME_ERROR_MESSAGE = 'Camera frame unavailable. Retrying…';
 async function api<T>(url: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { ...init, headers: { ...getFaceAuthHeaders(), ...init.headers } });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`);
+  if (!response.ok) {
+    throw new ApiError(response.status, typeof body.detail === 'string' ? body.detail : `Request failed (${response.status})`, body);
+  }
   return body as T;
 }
 
@@ -89,7 +98,12 @@ export default function Intake() {
   const [engineReady, setEngineReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  // Ticks, so a row's camera and Reachy buttons appear once its dose becomes due.
+  const clockNow = useNow();
+  // Null while loading; doses are checked as if it were on until then.
+  const protection = useOverdoseProtection();
+  const guarded = protection !== false;
   const [reachyPaired, setReachyPaired] = useState(false);
   const [reachyNotice, setReachyNotice] = useState('');
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -112,6 +126,8 @@ export default function Intake() {
   const autoStartedRef = useRef(false);
   const frameFailureRef = useRef({ count: 0, lastReportedAt: 0 });
   const frameRetryAfterRef = useRef(0);
+  // The medicine of the running session, for a refusal that arrives with a camera frame.
+  const activeMedRef = useRef<number | null>(null);
 
   const reportFrameError = useCallback((cause: unknown) => {
     const failure = frameFailureRef.current;
@@ -183,13 +199,26 @@ export default function Intake() {
     return () => { active = false; };
   }, []);
 
+  /**
+   * An error for the person. A dose the server refused (not due, too soon, daily maximum, missed) gets the server's
+   * sentence, and the refusal is kept so the dose's buttons say it before the next try.
+   */
+  const describe = useCallback((cause: unknown, fallback: string, medId?: number | null) => {
+    const refusal = cause instanceof ApiError ? doseRefusal(cause.body) : null;
+    if (refusal) {
+      rememberRefusal(refusal, medId);
+      return refusalMessage(refusal, t, i18n.language);
+    }
+    return cause instanceof Error ? cause.message : fallback;
+  }, [t, i18n.language]);
+
   const startWithReachy = async (item: IntakeItem) => {
     setError('');
     try {
       await queueReachyTask(item.id);
       setReachyNotice(t('reachy.taskQueued', { name: item.name }));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not start Reachy');
+      setError(describe(cause, 'Could not start Reachy', item.med_id));
     }
   };
 
@@ -211,6 +240,7 @@ export default function Intake() {
   const stop = useCallback(() => {
     const session = sessionRef.current;
     sessionRef.current = null;
+    activeMedRef.current = null;
     releaseResources();
     setActive(null);
     setStatus(null);
@@ -242,6 +272,14 @@ export default function Intake() {
     }
   };
 
+  /** A frame request failed. If the server refused to record the dose (e.g. taken too soon after the last one),
+   * say why and end the session: the camera cannot record this dose. */
+  const frameRefused = (cause: unknown, fallback: string) => {
+    const refused = cause instanceof ApiError && doseRefusal(cause.body) !== null;
+    setError(describe(cause, fallback, activeMedRef.current));
+    if (refused) stop();
+  };
+
   const sendVision = async (session: MonitorStatus, sequence: number, blob: Blob) => {
     if (visionBusyRef.current) return;
     visionBusyRef.current = true;
@@ -254,9 +292,7 @@ export default function Intake() {
       const result = await api<MonitorStatus>('/api/intake/monitor/vision', { method: 'POST', body });
       acceptStatus(result, session);
     } catch (cause) {
-      if (sessionRef.current?.generation === session.generation) {
-        setError(cause instanceof Error ? cause.message : 'Face verification failed');
-      }
+      if (sessionRef.current?.generation === session.generation) frameRefused(cause, 'Face verification failed');
     } finally {
       visionBusyRef.current = false;
     }
@@ -291,9 +327,7 @@ export default function Intake() {
         }
       }
     } catch (cause) {
-      if (sessionRef.current?.generation === session.generation) {
-        setError(cause instanceof Error ? cause.message : 'Intake detector failed');
-      }
+      if (sessionRef.current?.generation === session.generation) frameRefused(cause, 'Intake detector failed');
     } finally {
       landmarkBusyRef.current = false;
     }
@@ -351,6 +385,7 @@ export default function Intake() {
     setLoading(true);
     setError('');
     setActive(item);
+    activeMedRef.current = item.med_id;
     latestStatusFrameRef.current = 0;
     latestStatusRef.current = null;
     lastRecordedEventRef.current = null;
@@ -392,7 +427,7 @@ export default function Intake() {
       };
       worker.postMessage({ type: 'init' });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not start monitoring');
+      setError(describe(cause, 'Could not start monitoring', item.med_id));
       stop();
     } finally {
       setLoading(false);
@@ -400,32 +435,35 @@ export default function Intake() {
   };
 
   // Medication cards can request an immediate camera session. Resolve the
-  // highlighted medication to an existing due row, or ask the backend for a
-  // locked pending row at the current time when today's schedule has passed
-  // or the medication is unscheduled.
+  // highlighted medication to an existing due row (nearest to its time; never
+  // one that is not due yet or missed past halfway to the next), or ask the backend
+  // for a locked pending row at the current time when no scheduled dose is due or
+  // the medication is unscheduled; the backend may refuse that too (too soon, daily maximum).
   // The Today screen opens one exact scheduled dose (?intake=<intk_id>&start=1).
+  // Both wait for the protection switch: with it off, a dose that is not due yet may start.
   useEffect(() => {
-    if (!startNow || !doseParam || autoStartedRef.current || active || loading || items.length === 0) return;
+    if (!startNow || !doseParam || autoStartedRef.current || active || loading || items.length === 0
+        || protection === null) return;
     autoStartedRef.current = true;
     const dose = items.find((item) => String(item.id) === doseParam);
-    if (dose && (dose.status === 'pending' || dose.status === 'missed') && dose.pills_remaining > 0) {
-      void start(dose);
+    if (dose && isOpen(dose) && dose.pills_remaining > 0) {
+      const block = blockOf(dose, items, Date.now(), protection);
+      if (block) setError(blockMessage(block, dose, t, i18n.language));
+      else void start(dose);
     } else {
       setError('This dose is no longer waiting to be taken');
     }
-  }, [active, doseParam, items, loading, start, startNow]);
+  }, [active, doseParam, items, loading, protection, start, startNow, t, i18n.language]);
 
   useEffect(() => {
-    if (!startNow || doseParam || !highlight || autoStartedRef.current || active || loading) return;
+    if (!startNow || doseParam || !highlight || autoStartedRef.current || active || loading || protection === null) return;
     const medId = Number(highlight);
     if (!Number.isInteger(medId) || medId <= 0) {
       autoStartedRef.current = true;
       setError('The selected medication could not be found');
       return;
     }
-    const due = items.find((item) =>
-      item.med_id === medId && (item.status === 'pending' || item.status === 'missed') && item.pills_remaining > 0
-    );
+    const due = dueDose(items.filter((item) => item.med_id === medId && item.pills_remaining > 0), Date.now(), protection);
     autoStartedRef.current = true;
     if (due) {
       void start(due);
@@ -440,9 +478,9 @@ export default function Intake() {
           (a.scheduled_time || '').localeCompare(b.scheduled_time || '')));
       return start(item);
     }).catch((cause) => {
-      setError(cause instanceof Error ? cause.message : 'Could not prepare this dose');
+      setError(describe(cause, 'Could not prepare this dose', medId));
     });
-  }, [active, highlight, items, loading, start, startNow]);
+  }, [active, describe, highlight, items, loading, protection, start, startNow]);
 
   const outcome = async (eventId: string, choice: string) => {
     const session = sessionRef.current;
@@ -454,8 +492,16 @@ export default function Intake() {
                                event_id: eventId, outcome: choice }),
       });
       acceptStatus(result, session);
-      if (choice === 'undo') { stop(); }
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save correction'); }
+      if (choice === 'undo') {
+        forgetRefusals();
+        stop();
+      }
+    } catch (cause) {
+      const refused = cause instanceof ApiError && doseRefusal(cause.body) !== null;
+      setError(describe(cause, 'Could not save correction', activeMedRef.current));
+      // "Yes, taken" was refused (e.g. too soon after the last dose): this session cannot record it.
+      if (refused) stop();
+    }
   };
 
   const undoRecent = async () => {
@@ -465,10 +511,12 @@ export default function Intake() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ event_id: recent.event_id }),
       });
+      // With that dose gone, a gap or daily maximum the server reported may no longer hold.
+      forgetRefusals();
       setRecent(null);
       if (sessionRef.current) stop();
       void refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not undo dose'); }
+    } catch (cause) { setError(describe(cause, 'Could not undo dose')); }
   };
 
   const manual = async (item: IntakeItem) => {
@@ -479,7 +527,7 @@ export default function Intake() {
       });
       if (sessionRef.current) stop();
       void refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save dose'); }
+    } catch (cause) { setError(describe(cause, 'Could not save dose', item.med_id)); }
   };
 
   const skip = async (item: IntakeItem) => {
@@ -489,7 +537,7 @@ export default function Intake() {
         body: JSON.stringify({ status: 'skipped' }),
       });
       void refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not skip dose'); }
+    } catch (cause) { setError(describe(cause, 'Could not skip dose')); }
   };
 
   const candidate = status?.candidate;
@@ -535,7 +583,9 @@ export default function Intake() {
             <span>{name}: {status?.identity_status === 'verified' ? 'Face verified' : status?.identity_status || 'Searching for face'}</span>
           </div>
           <div className="flex items-center gap-2"><ScanFace className="w-5 h-5 text-violet-700" />
-            <span>{status?.emotion ? `${status.emotion.emotion_type} · ${Math.round(status.emotion.emotion_score * 100)}%` : 'Expression unavailable'}</span>
+            <span>{status?.emotion
+              ? `${t(`emotion.${status.emotion.emotion_type.toLowerCase()}`)} · ${Math.round(status.emotion.emotion_score * 100)}%`
+              : status?.emotion_occluded ? t('doseEmotion.liveCovered') : t('doseEmotion.liveUnavailable')}</span>
           </div>
           <div className="flex items-center gap-2"><Pill className="w-5 h-5 text-cyan-700" />
             <span>{recorded ? 'Dose recorded' : candidate?.ready ? 'Intake event detected' :
@@ -557,7 +607,10 @@ export default function Intake() {
       <div className="space-y-3">
         <h2 className="text-xl font-semibold text-slate-900">Today's doses</h2>
         {items.length === 0 && <p className="text-slate-500">No medication is scheduled today.</p>}
-        {items.map((item) => <div key={item.id} className={`rounded-xl border bg-white p-4 flex flex-wrap items-center gap-4 justify-between ${String(item.id) === doseParam || (!doseParam && String(item.med_id) === highlight) ? 'ring-2 ring-blue-600' : ''}`}>
+        {items.map((item) => {
+          // Not due yet, missed past halfway to the next dose, or refused by the server a moment ago.
+          const block = blockOf(item, items, clockNow, guarded);
+          return <div key={item.id} className={`rounded-xl border bg-white p-4 flex flex-wrap items-center gap-4 justify-between ${String(item.id) === doseParam || (!doseParam && String(item.med_id) === highlight) ? 'ring-2 ring-blue-600' : ''}`}>
           <div className="flex items-center gap-3 min-w-0">
             <div className="rounded-full bg-blue-50 p-3 text-blue-700"><Pill className="w-5 h-5" /></div>
             <div><p className="font-semibold text-slate-900">{item.name}</p>
@@ -565,13 +618,17 @@ export default function Intake() {
                 {item.scheduled_time && <> · <Clock className="inline w-3 h-3" /> {new Date(item.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</>}
               </p></div>
           </div>
-          {(item.status === 'pending' || item.status === 'missed') && item.pills_remaining > 0 ?
-            <div className="flex gap-2">
-              <button disabled={loading || !!active} onClick={() => void start(item)}
-                className="rounded-lg bg-blue-700 text-white px-4 py-3 disabled:opacity-50">Start camera</button>
-              {reachyPaired && <button disabled={loading || !!active} onClick={() => void startWithReachy(item)}
-                className="rounded-lg border border-blue-700 text-blue-700 px-4 py-3 flex items-center gap-2 disabled:opacity-50">
-                <Bot className="w-4 h-4" />{t('reachy.useReachy')}</button>}
+          {isOpen(item) && item.pills_remaining > 0 ?
+            <div className="flex flex-wrap items-center gap-2">
+              {!block ? <>
+                <button disabled={loading || !!active} onClick={() => void start(item)}
+                  className="rounded-lg bg-blue-700 text-white px-4 py-3 disabled:opacity-50">Start camera</button>
+                {reachyPaired && <button disabled={loading || !!active} onClick={() => void startWithReachy(item)}
+                  className="rounded-lg border border-blue-700 text-blue-700 px-4 py-3 flex items-center gap-2 disabled:opacity-50">
+                  <Bot className="w-4 h-4" />{t('reachy.useReachy')}</button>}
+              </> : <span className={`flex items-center gap-1 px-2 text-sm ${block.reason === 'not_due' ? 'text-slate-600' : 'text-amber-800 font-medium'}`}>
+                {block.reason === 'not_due' ? <Clock className="w-4 h-4" /> : <TriangleAlert className="w-4 h-4" />}{blockLabel(block, t)}</span>}
+              {/* Skipping a later dose takes no pill, so it stays allowed. */}
               <button disabled={!!active} onClick={() => void skip(item)}
                 className="rounded-lg border px-4 py-3 disabled:opacity-50">Skip</button>
             </div> :
@@ -579,7 +636,8 @@ export default function Intake() {
               <CheckCircle2 className="w-4 h-4 text-green-600" /> : item.status === 'pending_confirmation' ?
               <Clock className="w-4 h-4 text-amber-600" /> : <XCircle className="w-4 h-4" />}
               {item.status === 'pending_confirmation' ? t('intake.pendingConfirmation') : item.status}</span>}
-        </div>)}
+        </div>;
+        })}
       </div>
       <canvas ref={canvasRef} className="hidden" />
     </div>

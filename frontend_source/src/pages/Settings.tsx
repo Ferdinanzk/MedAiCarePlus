@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import ReachyCard from '../components/ReachyCard';
 import { getFaceToken } from '../lib/face-auth';
-import { Bell, ShieldAlert, Users, Save, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
+import { forgetRefusals } from '../lib/doses';
+import { rememberOverdoseProtection } from '../lib/notify-api';
+import { Bell, ShieldAlert, ShieldCheck, Users, Save, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
 
 interface NotificationSettings {
   remind_before_minutes: number;
@@ -12,6 +14,8 @@ interface NotificationSettings {
   notify_family_on_missed: boolean;
   notify_family_on_bad_mood: boolean;
   notify_family_on_taken: boolean;
+  /** Refuse doses too early, too close together, past the daily maximum or missed (server default: on). */
+  overdose_protection: boolean;
 }
 
 const TOGGLE_CLASS =
@@ -31,7 +35,12 @@ export default function Settings() {
     notify_family_on_missed: true,
     notify_family_on_bad_mood: true,
     notify_family_on_taken: true,
+    overdose_protection: true,
   });
+  // What the server has: the protection switch saves at once with these, not with unsaved edits in the form below.
+  const [saved, setSaved] = useState<NotificationSettings | null>(null);
+  const [protectionBusy, setProtectionBusy] = useState(false);
+  const [protectionError, setProtectionError] = useState('');
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -51,8 +60,12 @@ export default function Settings() {
     try {
       const res = await fetch('/api/notify/settings', { headers });
       if (res.ok) {
-        const data = await res.json();
+        const body = await res.json();
+        // An older server does not send the switch; it is on by default.
+        const data: NotificationSettings = { ...body, overdose_protection: body.overdose_protection !== false };
         setSettings(data);
+        setSaved(data);
+        rememberOverdoseProtection(data.overdose_protection);
         setRemindBeforeEnabled(data.remind_before_minutes > 0);
         setRemindAfterEnabled(data.remind_after_retries > 0);
       }
@@ -81,6 +94,7 @@ export default function Settings() {
         body: JSON.stringify(payload),
       });
       if (res.ok) {
+        setSaved(payload);
         setMessage({ type: 'success', text: t('settings.savedSuccess') });
       } else {
         setMessage({ type: 'error', text: t('settings.saveFailed') });
@@ -89,6 +103,29 @@ export default function Settings() {
       setMessage({ type: 'error', text: t('settings.networkError') });
     }
     setSaving(false);
+  };
+
+  // Saved at once, like the robot's switches. Turning it off is confirmed first: the server tells family on LINE.
+  const toggleProtection = async (value: boolean) => {
+    if (!saved || (!value && !confirm(t('overdose.offConfirm')))) return;
+    setProtectionBusy(true);
+    setProtectionError('');
+    try {
+      const next = { ...saved, overdose_protection: value };
+      const res = await fetch('/api/notify/settings', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(next),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSaved(next);
+      setSettings((current) => ({ ...current, overdose_protection: value }));
+      rememberOverdoseProtection(value);
+      forgetRefusals();
+    } catch {
+      setProtectionError(t('overdose.saveFailed'));
+    }
+    setProtectionBusy(false);
   };
 
   if (loading) {
@@ -111,6 +148,35 @@ export default function Settings() {
         <h2 className="text-base font-semibold text-[#0057B8]">{t('legal.privacyCardTitle')}</h2>
         <p className="text-sm text-gray-500 mt-1">{t('legal.privacyCardDesc')}</p>
       </Link>
+
+      <section className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm space-y-3" aria-labelledby="overdose-title">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-green-50 text-green-700 rounded-xl flex items-center justify-center shrink-0">
+            <ShieldCheck className="w-5 h-5" />
+          </div>
+          <div>
+            <h2 id="overdose-title" className="text-base font-semibold text-gray-900">{t('overdose.title')}</h2>
+            <p className="text-xs text-gray-500">{t('overdose.subtitle')}</p>
+          </div>
+          <label className="relative inline-flex items-center cursor-pointer ml-auto shrink-0">
+            <input
+              type="checkbox"
+              className="sr-only peer"
+              aria-labelledby="overdose-title"
+              aria-describedby="overdose-help"
+              checked={settings.overdose_protection}
+              disabled={!saved || protectionBusy}
+              onChange={(e) => void toggleProtection(e.target.checked)}
+            />
+            <div className={`${TOGGLE_CLASS} peer-disabled:opacity-50`}></div>
+          </label>
+        </div>
+        <p id="overdose-help" className="text-sm text-gray-600">{t('overdose.help')}</p>
+        {saved && !settings.overdose_protection && (
+          <p role="alert" className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-sm text-amber-900">{t('overdose.offWarning')}</p>
+        )}
+        {protectionError && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{protectionError}</p>}
+      </section>
 
       <ReachyCard />
 

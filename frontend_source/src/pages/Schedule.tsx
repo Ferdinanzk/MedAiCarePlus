@@ -2,7 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
+import { blockLabel, blockOf } from '../lib/doses';
+import { useNow } from '../hooks/useNow';
+import { useOverdoseProtection } from '../hooks/useOverdoseProtection';
 import { Pill, CalendarDays, CheckCircle2 } from 'lucide-react';
+import DoseEmotionChip from '../components/DoseEmotionChip';
+import type { DoseEmotion } from '../lib/dose-emotion';
 
 interface ScheduleItem {
   id: number;
@@ -10,9 +15,12 @@ interface ScheduleItem {
   name: string;
   dosage: string | null;
   scheduled_time: string;
+  due_from: string | null;
+  expires_at?: string | null;
   status: string;
   slot_label: string;
   use_before_warning: string | null;
+  emotion: DoseEmotion | null;
 }
 
 interface RawScheduleItem {
@@ -23,9 +31,12 @@ interface RawScheduleItem {
   name?: string;
   dosage?: string | null;
   scheduled_time?: string;
+  due_from?: string | null;
+  expires_at?: string | null;
   status?: string;
   slot_label?: string;
   use_before_warning?: string | null;
+  emotion?: DoseEmotion | null;
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -46,6 +57,8 @@ export default function Schedule() {
   const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedDate, setSelectedDate] = useState(() => getLocalDateString(new Date()));
+  const now = useNow();
+  const protection = useOverdoseProtection();
 
   const handleTakeEarly = async (medId: number) => {
     navigate(`/intake?med=${medId}`);
@@ -71,9 +84,12 @@ export default function Schedule() {
         name: item.name || '',
         dosage: item.dosage ?? null,
         scheduled_time: item.scheduled_time || '',
+        due_from: item.due_from ?? null,
+        expires_at: item.expires_at,
         status: item.status || 'pending',
         slot_label: item.slot_label || '',
         use_before_warning: item.use_before_warning ?? null,
+        emotion: item.emotion ?? null,
       }));
       setSchedules(mapped);
     } catch (error) {
@@ -135,7 +151,10 @@ export default function Schedule() {
         </div>
       ) : (
         <div className="space-y-3">
-          {schedules.map((s) => (
+          {schedules.map((s) => {
+            // Not due yet, missed past halfway to the next dose (not made up), or just refused by the server.
+            const block = blockOf(s, schedules, now, protection !== false);
+            return (
             <div
               key={s.id}
               className="flex items-center gap-4 p-5 bg-white rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition-all"
@@ -163,17 +182,29 @@ export default function Schedule() {
                 {s.use_before_warning && (
                   <p className="text-sm text-orange-600 mt-1">{s.use_before_warning}</p>
                 )}
+                {s.emotion?.dominant && (
+                  <div className="mt-1">
+                    <DoseEmotionChip dominant={s.emotion.dominant} score={s.emotion.score}
+                      occluded={s.emotion.mostly_occluded} uncertain={s.emotion.uncertain} />
+                  </div>
+                )}
               </div>
 
-              {/* Status / Take Action */}
-              {s.status === 'pending' ? (
+              {/* Status / Take Action: only a dose the server would start now */}
+              {s.status === 'pending' && !block ? (
                 <button
                   onClick={() => handleTakeEarly(s.med_id)}
                   className="flex items-center justify-center min-w-[48px] min-h-[48px] rounded-full border-2 border-[#0057B8] text-[#0057B8] hover:bg-blue-50 active:scale-95 transition-all"
                   title={t('intake.take')}
+                  aria-label={`${t('intake.take')}: ${s.name}`}
                 >
                   <CheckCircle2 className="w-6 h-6" />
                 </button>
+              ) : block && block.reason !== 'not_due' ? (
+                <div className={`px-3 py-1.5 rounded-full text-base font-medium text-center ${
+                  block.reason === 'expired' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-800'}`}>
+                  {blockLabel(block, t)}
+                </div>
               ) : (
                 <div className={`px-3 py-1.5 rounded-full text-base font-medium ${
                   s.status === 'taken' ? 'bg-green-50 text-green-600' :
@@ -186,7 +217,8 @@ export default function Schedule() {
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

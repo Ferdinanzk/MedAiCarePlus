@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Pill, Smile, TrendingUp, Calendar, Flame, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
+import DoseEmotionChip from '../components/DoseEmotionChip';
+import type { DoseEmotion } from '../lib/dose-emotion';
 
 function getAuthHeaders(): Record<string, string> {
   const token = localStorage.getItem('face_auth_token');
@@ -18,6 +20,8 @@ interface IntakeRecord {
   status: string;
   scheduled_time: string;
   taken_at: string | null;
+  /** Facial expression while it was taken (a camera session's result); absent from an older server. */
+  emotion?: DoseEmotion | null;
 }
 
 interface IntakePage {
@@ -257,9 +261,15 @@ export default function History() {
                             )}
                           </p>
                         </div>
-                        <span className={`px-2.5 py-1 rounded-full text-2xs font-medium ${style.badge}`}>
-                          {statusLabel(item.status)}
-                        </span>
+                        <div className="flex flex-col items-end gap-1 shrink-0">
+                          <span className={`px-2.5 py-1 rounded-full text-2xs font-medium ${style.badge}`}>
+                            {statusLabel(item.status)}
+                          </span>
+                          {item.emotion?.dominant && (
+                            <DoseEmotionChip dominant={item.emotion.dominant} score={item.emotion.score}
+                              occluded={item.emotion.mostly_occluded} uncertain={item.emotion.uncertain} />
+                          )}
+                        </div>
                       </div>
                     );
                   })}

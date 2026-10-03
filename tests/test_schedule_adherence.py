@@ -217,9 +217,10 @@ def test_delete_refuses_a_medication_with_history(monkeypatch):
 def test_deactivating_through_edit_clears_future_doses_without_regenerating(monkeypatch):
     conn = _Conn({"SELECT schedule_time, use_before, is_active": {"schedule_time": {"morning": True},
                                                                   "use_before": None, "is_active": True},
-                  "UPDATE medication": 4})
+                  "UPDATE medication": {"med_id": 4, "min_interval_minutes": None, "max_daily_doses": None}})
     payload = api_medications.MedicationPayload(name="X", is_active=False, schedule_time={"morning": True})
-    assert _run(monkeypatch, conn, api_medications.update_medication, 4, payload, {"u_id": 7}) == {"id": 4}
+    assert _run(monkeypatch, conn, api_medications.update_medication, 4, payload, {"u_id": 7}) == {
+        "id": 4, "min_interval_minutes": None, "max_daily_doses": None}
     assert any("DELETE FROM intake" in q for _, q, _ in conn.calls)
     assert not any(kind == "executemany" for kind, _, _ in conn.calls)
 

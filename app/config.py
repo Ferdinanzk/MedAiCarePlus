@@ -37,6 +37,10 @@ OCR_MODEL = os.getenv("OCR_MODEL", "gemini-3.8-flash")
 SECRET_KEY   = os.getenv("SECRET_KEY",   "change-me-in-production-32chars!!")
 DEVICE       = "CPU"
 MEDCARE_TIMEZONE = os.getenv("MEDCARE_TIMEZONE", "Asia/Taipei")
+# How early a scheduled dose may be started (robot reminder, camera session) or recorded as taken, at most: never
+# before halfway from the same medicine's previous dose. Earlier, the server refuses (409 dose_not_due_yet) while the
+# patient's overdose protection is on (the default); see services/dose_safety.py.
+DOSE_EARLY_MINUTES = max(0, int(os.getenv("DOSE_EARLY_MINUTES", "") or "120"))
 
 FACE_DET_CONFIDENCE  = float(os.getenv("FACE_DET_CONFIDENCE",  "0.6"))
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.3"))
@@ -52,6 +56,12 @@ FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:5173")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"
+LINE_WEBHOOK_ENDPOINT_URL = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+
+# Dose videos for family (opt-in, consent kind 'video'). LINE has no upload API: the family's LINE app downloads
+# each clip from PUBLIC_BASE_URL (https). Empty = the address of the LINE webhook (scripts/line-tunnel.ps1 sets it).
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+DOSE_VIDEO_DIR  = Path(os.getenv("DOSE_VIDEO_DIR", "/tmp/medcare_dose_videos"))
 
 # ── Deployment mode, legal notice, consent (Phase 1) ─────────────────────────
 APP_ENV = os.getenv("APP_ENV", "dev").strip().lower()          # "dev" | "prod"
@@ -69,10 +79,22 @@ LLM_PROVIDER             = os.getenv("LLM_PROVIDER", "")
 LLM_PROVIDER_REGION      = os.getenv("LLM_PROVIDER_REGION", "")
 LLM_RETENTION            = os.getenv("LLM_RETENTION", "")
 OPENROUTER_API_KEY       = os.getenv("OPENROUTER_API_KEY", "")
+# Check-in replies try LLM_MODEL, then LLM_FALLBACK_MODEL, and give up (a fixed line) after LLM_DEADLINE_SECONDS.
 LLM_MODEL                = os.getenv("LLM_MODEL", "")
+LLM_FALLBACK_MODEL       = os.getenv("LLM_FALLBACK_MODEL", "") or "openrouter/free"
+LLM_DEADLINE_SECONDS     = float(os.getenv("LLM_DEADLINE_SECONDS", "") or "8")
 # Optional OpenRouter provider routing: pin providers (comma-separated slugs) and refuse providers that store data.
+# It applies to every call (reply, risk check, summary, memory) and to both models above.
 OPENROUTER_PROVIDER_ONLY   = os.getenv("OPENROUTER_PROVIDER_ONLY", "")
 OPENROUTER_DATA_COLLECTION = os.getenv("OPENROUTER_DATA_COLLECTION", "")   # "" | "allow" | "deny"
+# Check-in replies know today's weather (services/context_info.py) from Open-Meteo, which needs no key. Only these
+# coordinates are sent, so use a town's, not the patient's address. WEATHER_PLACE only names it in the logs; the
+# language model never gets it. WEATHER_ENABLED=false or an empty coordinate turns the weather off; the date, time
+# and holidays stay.
+WEATHER_ENABLED          = os.getenv("WEATHER_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+WEATHER_PLACE            = os.getenv("WEATHER_PLACE", "台北").strip()
+WEATHER_LATITUDE         = os.getenv("WEATHER_LATITUDE", "25.0330").strip()
+WEATHER_LONGITUDE        = os.getenv("WEATHER_LONGITUDE", "121.5654").strip()
 
 REACHY_FEATURE_ENABLED  = os.getenv("REACHY_FEATURE_ENABLED", "").strip().lower() in ("1", "true", "yes")
 RISK_CLASSIFIER_API_KEY = os.getenv("RISK_CLASSIFIER_API_KEY", "")

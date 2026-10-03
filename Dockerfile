@@ -32,6 +32,10 @@ WORKDIR /app
 # Install remaining dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --retries 5 --timeout 120 -r requirements.txt
+COPY requirements-video.txt .
+RUN pip install --no-cache-dir --retries 5 --timeout 120 -r requirements-video.txt
+COPY requirements-context.txt .
+RUN pip install --no-cache-dir --retries 5 --timeout 120 -r requirements-context.txt
 
 # Copy backend code
 COPY app/ ./app/

@@ -3,6 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
 import { getExpiryStatus } from '../lib/expiry';
+import { blockLabel, forgetRefusals, medBlock } from '../lib/doses';
+import { useNow } from '../hooks/useNow';
+import { useOverdoseProtection } from '../hooks/useOverdoseProtection';
 import TimeSection from '../components/ui/TimeSection';
 import {
   Pill,
@@ -24,6 +27,7 @@ import {
   Camera,
   Archive,
   RotateCcw,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface ScheduleTime {
@@ -53,6 +57,9 @@ interface Medication {
   units_per_dose?: number;
   days_left?: number | null;
   run_out_date?: string | null;
+  /** Overdose protection limits; null = the default from the schedule. */
+  min_interval_minutes?: number | null;
+  max_daily_doses?: number | null;
 }
 
 type DoseForm = 'solid_oral' | 'liquid' | 'inhaler' | 'injection' | 'topical' | 'other';
@@ -160,6 +167,32 @@ function amount(value: number | null | undefined): string {
   return String(Math.round(Number(value ?? 0) * 100) / 100);
 }
 
+const hours = (minutes: number) => amount(minutes / 60);
+
+/**
+ * The server's minimum gap when none is set (overdose protection): half the shortest gap between the day's dose
+ * times, counting the one past midnight (once a day: 12 h), or 4 h for a medicine without times.
+ */
+function defaultGapMinutes(times: string[]): number {
+  if (times.length === 0) return 240;
+  const minutes = times.map((time) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3, 5))).sort((a, b) => a - b);
+  return Math.min(...minutes.map((value, i) => (i + 1 < minutes.length ? minutes[i + 1] : minutes[0] + 1440) - value)) / 2;
+}
+
+/** Blank = null, the default; otherwise minutes within the column's 30..2880. */
+function gapMinutes(text: string): number | null {
+  const value = Number(text);
+  if (text.trim() === '' || !Number.isFinite(value) || value <= 0) return null;
+  return Math.min(2880, Math.max(30, Math.round(value * 60)));
+}
+
+/** Blank = null, the default; otherwise 1..24. */
+function dailyMax(text: string): number | null {
+  const value = Number(text);
+  if (text.trim() === '' || !Number.isFinite(value) || value < 1) return null;
+  return Math.min(24, Math.round(value));
+}
+
 const INPUT = 'w-full px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#0057B8]/30 focus:border-[#0057B8] transition-all';
 const LABEL = 'block text-sm font-medium text-gray-500 uppercase tracking-wide mb-1.5';
 
@@ -175,6 +208,10 @@ export default function Medications() {
   const [supplyFor, setSupplyFor] = useState<Medication | null>(null);
   const [supply, setSupply] = useState({ quantity: 30, note: '' });
   const [notice, setNotice] = useState('');
+  const [formError, setFormError] = useState('');
+  // A Take Now the server refused (too soon, daily maximum) stays labelled until it is allowed again.
+  const now = useNow();
+  const protection = useOverdoseProtection();
 
   const [form, setForm] = useState({
     name: '',
@@ -189,6 +226,9 @@ export default function Medications() {
     schedule_time: { ...EMPTY_SCHEDULE },
     dose_form: 'solid_oral' as DoseForm,
     units_per_dose: 1,
+    // Text, so blank means "use the default".
+    min_gap_hours: '',
+    max_daily: '',
   });
 
   useEffect(() => { fetchMedications(); }, []);
@@ -208,9 +248,10 @@ export default function Medications() {
   };
 
   const resetForm = () => {
-    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE }, dose_form: 'solid_oral', units_per_dose: 1 });
+    setForm({ name: '', dosage: '', total_pills: 30, pills_remaining: 30, instructions: '', warning: '', pill_description: '', use_before: '', is_active: true, schedule_time: { ...EMPTY_SCHEDULE }, dose_form: 'solid_oral', units_per_dose: 1, min_gap_hours: '', max_daily: '' });
     setEditingId(null);
     setNewTime('');
+    setFormError('');
     setShowForm(false);
   };
 
@@ -228,8 +269,11 @@ export default function Medications() {
       schedule_time: normalizeScheduleTime(med.schedule_time) || { ...EMPTY_SCHEDULE },
       dose_form: med.dose_form || 'solid_oral',
       units_per_dose: Number(med.units_per_dose ?? 1),
+      min_gap_hours: med.min_interval_minutes ? hours(med.min_interval_minutes) : '',
+      max_daily: med.max_daily_doses ? String(med.max_daily_doses) : '',
     });
     setEditingId(med.id);
+    setFormError('');
     setShowForm(true);
   };
 
@@ -272,7 +316,7 @@ export default function Medications() {
   };
 
   const handleTakeNow = (med: Medication) => {
-    if (med.pills_remaining < Number(med.units_per_dose ?? 1)) return;
+    if (med.pills_remaining < Number(med.units_per_dose ?? 1) || medBlock(med.id, now, protection !== false)) return;
     navigate(`/intake?med=${med.id}&start=1`);
   };
 
@@ -330,13 +374,23 @@ export default function Medications() {
             custom_times: schedule.custom_times,
             ...(schedule.weekdays ? { weekdays: schedule.weekdays } : {}) }
         : null,
+      // Always sent, so clearing a field on edit returns that limit to the default.
+      min_interval_minutes: gapMinutes(form.min_gap_hours),
+      max_daily_doses: dailyMax(form.max_daily),
     };
 
     const url = editingId ? `/api/medications/${editingId}` : '/api/medications';
     const method = editingId ? 'PATCH' : 'POST';
-    await fetch(url, { method, headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const resp = await fetch(url, { method, headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      .catch(() => null);
 
     setSaving(false);
+    if (!resp?.ok) {
+      setFormError(t('medications.saveFailed'));
+      return;
+    }
+    // New limits or times change what the server refuses.
+    forgetRefusals();
     resetForm();
     fetchMedications();
   };
@@ -358,10 +412,17 @@ export default function Medications() {
     return `${times.join(' · ')} — ${dayText}`;
   };
 
+  const limitsSummary = (med: Medication) => [
+    med.min_interval_minutes != null ? t('medications.limitGap', { hours: hours(med.min_interval_minutes) }) : null,
+    med.max_daily_doses != null ? t('medications.limitDaily', { count: med.max_daily_doses }) : null,
+  ].filter(Boolean).join(' · ');
+
   const renderCard = (med: Medication) => {
     const canTake = med.pills_remaining >= Number(med.units_per_dose ?? 1);
+    const block = medBlock(med.id, now, protection !== false);
     const lowSupply = med.days_left != null && med.days_left <= REFILL_SOON_DAYS;
     const summary = scheduleSummary(med);
+    const limits = limitsSummary(med);
     return (
       <div
         key={med.id}
@@ -388,6 +449,11 @@ export default function Medications() {
               </span>
             )}
           </div>
+          {limits && (
+            <p className="text-sm mt-1 text-gray-500 flex items-center gap-1">
+              <ShieldCheck className="w-3 h-3 shrink-0" />{limits}
+            </p>
+          )}
           {med.days_left != null && med.run_out_date && (
             <p className={`text-sm mt-1 ${lowSupply ? 'text-amber-700 font-medium' : 'text-gray-500'}`}>
               {t('medications.daysLeft', { days: med.days_left, date: med.run_out_date })}
@@ -413,12 +479,12 @@ export default function Medications() {
         <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
           <button
             onClick={() => handleTakeNow(med)}
-            disabled={!canTake}
-            aria-label={`${t('intake.take')}: ${med.name}`}
-            className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
+            disabled={!canTake || !!block}
+            aria-label={`${!canTake ? t('intake.cannotTake') : block ? blockLabel(block, t) : t('intake.take')}: ${med.name}`}
+            className="flex items-center gap-1 px-3 py-2 text-sm font-medium text-white bg-[#0057B8] hover:bg-[#003D82] rounded-lg transition-colors disabled:bg-gray-200 disabled:text-gray-600 disabled:cursor-not-allowed"
           >
             <Camera className="w-4 h-4" />
-            {canTake ? t('intake.take') : t('intake.cannotTake')}
+            {!canTake ? t('intake.cannotTake') : block ? blockLabel(block, t) : t('intake.take')}
           </button>
           <button
             onClick={() => { setSupply({ quantity: med.total_pills || 30, note: '' }); setSupplyFor(med); }}
@@ -458,6 +524,20 @@ export default function Medications() {
   }
 
   const formTimes = doseTimes(form.schedule_time);
+  const formGap = hours(defaultGapMinutes(formTimes));
+  // Limits that contradict the medicine's own schedule refuse some of its scheduled doses every day. A pharmacist
+  // may mean that, so it is a warning, not a block.
+  const setGap = gapMinutes(form.min_gap_hours);
+  const setMax = dailyMax(form.max_daily);
+  const closestGap = formTimes.length > 0 ? defaultGapMinutes(formTimes) * 2 : null;
+  const limitWarnings = [
+    setMax !== null && setMax < formTimes.length
+      ? t('medications.limitsMaxBelowTimes', { max: setMax, count: formTimes.length, refused: formTimes.length - setMax })
+      : null,
+    setGap !== null && closestGap !== null && setGap > closestGap
+      ? t('medications.limitsGapOverTimes', { hours: hours(setGap), gap: hours(closestGap) })
+      : null,
+  ].filter((text): text is string => text !== null);
 
   return (
     <div className="space-y-5 relative">
@@ -691,6 +771,58 @@ export default function Medications() {
                 </div>
               </div>
 
+              {/* Safety limits for overdose protection; blank = the server's default from the schedule */}
+              <div className="px-5 py-4 space-y-3">
+                <p className="flex items-center gap-2 text-base font-semibold text-gray-800">
+                  <ShieldCheck className="w-5 h-5 text-[#0057B8]" />{t('medications.safetyLimits')}
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="min-gap-hours" className={LABEL}>{t('medications.minGapHours')}</label>
+                    <input
+                      id="min-gap-hours"
+                      type="number"
+                      inputMode="decimal"
+                      min={0.5}
+                      max={48}
+                      step="any"
+                      value={form.min_gap_hours}
+                      onChange={e => setForm({ ...form, min_gap_hours: e.target.value })}
+                      className={INPUT}
+                      placeholder={formGap}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="max-daily-doses" className={LABEL}>{t('medications.maxDaily')}</label>
+                    <input
+                      id="max-daily-doses"
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={24}
+                      step={1}
+                      value={form.max_daily}
+                      onChange={e => setForm({ ...form, max_daily: e.target.value })}
+                      className={INPUT}
+                      placeholder={formTimes.length > 0 ? String(formTimes.length) : t('medications.noLimit')}
+                    />
+                  </div>
+                </div>
+                <p className="text-sm text-gray-500">
+                  {formTimes.length > 0
+                    ? t('medications.limitsDefault', { hours: formGap, count: formTimes.length })
+                    : t('medications.limitsDefaultUnscheduled', { hours: formGap })}
+                </p>
+                <p className={`text-sm ${formTimes.length > 0 ? 'text-gray-500' : 'text-amber-700 font-medium'}`}>
+                  {t('medications.limitsPharmacist')}
+                </p>
+                {limitWarnings.map((text) => (
+                  <p key={text} role="status" className="flex items-start gap-2 text-sm font-medium text-amber-700">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />{text}
+                  </p>
+                ))}
+              </div>
+
               {/* Instructions + use before */}
               <div className="px-5 py-4 space-y-3">
                 <div>
@@ -755,6 +887,10 @@ export default function Medications() {
                   <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${form.is_active ? 'translate-x-5' : ''}`} />
                 </button>
               </div>
+
+              {formError && (
+                <p role="alert" className="mx-5 my-3 rounded-xl bg-red-50 border border-red-200 p-3 text-sm text-red-700">{formError}</p>
+              )}
 
               {/* Action buttons */}
               <div className="px-5 py-4 flex gap-3">

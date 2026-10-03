@@ -3,10 +3,22 @@ import { useTranslation } from 'react-i18next';
 import { BellRing, Bot, Copy, Loader2, MessageCircle } from 'lucide-react';
 import LegalDocument from './LegalDocument';
 import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalResponse } from '../lib/consent-api';
+import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
 import { deleteAllMemory } from '../lib/memory-api';
-import { fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus } from '../lib/reachy-api';
+import { fetchOverdoseProtection } from '../lib/notify-api';
+import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
+
+/**
+ * `key` and its values, or `text` already worded (the server's reply when it refuses the dose).
+ * `noDose`: no dose could be used, so point to "Talk to Reachy now" for checking the robot alone.
+ */
+interface TestNotice { key?: string; text?: string; name?: string; time?: string; from?: string; noDose?: boolean }
+
+const notDueNotice = (name: string, dose: { scheduled_time?: string | null; due_from?: string | null }): TestNotice =>
+  ({ key: 'reachy.testAlertNotDue', name, time: clockTime(dose.scheduled_time), from: clockTime(dose.due_from),
+     noDose: true });
 
 export default function ReachyCard() {
   const { t, i18n } = useTranslation();
@@ -20,7 +32,7 @@ export default function ReachyCard() {
   const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [testNotice, setTestNotice] = useState<{ key: string; name?: string } | null>(null);
+  const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
 
   const load = useCallback(async () => {
     const [robot, consent] = await Promise.all([fetchReachyStatus(), fetchConsentStatus()]);
@@ -164,16 +176,34 @@ export default function ReachyCard() {
     await refresh();
   });
 
+  // The test uses a real dose, so only one that is due now (nearest to its time first), never a later one, nor (with
+  // overdose protection on) one missed past halfway to the next, and the notice says which dose it is and that
+  // confirming it records it as taken. Even with protection off it never takes a later dose (3 Oct 2026).
   const sendTestAlert = () => run(async () => {
     setTestNotice(null);
-    const doses = await fetchTodayDoses();
-    const dose = doses.find(d => d.status === 'pending' || d.status === 'missed');
+    const [doses, protection] = await Promise.all([fetchTodayDoses(), fetchOverdoseProtection()]);
+    const now = Date.now();
+    const dose = dueDose(doses, now, protection);
     if (!dose) {
-      setTestNotice({ key: 'reachy.testAlertNoDose' });
+      const next = nextDose(doses, now);
+      setTestNotice(next ? notDueNotice(next.name, next)
+        : doses.length > 0 ? { key: 'reachy.testAlertAllDone', noDose: true } : { key: 'reachy.testAlertNoDose' });
       return;
     }
-    await queueReachyTask(dose.id);
-    setTestNotice({ key: 'reachy.testAlertSent', name: dose.name });
+    try {
+      await queueReachyTask(dose.id);
+    } catch (cause) {
+      const refusal = cause instanceof ApiError ? doseRefusal(cause.body) : null;
+      if (!refusal) throw cause;
+      rememberRefusal(refusal, dose.med_id);
+      // Too soon, daily maximum or missed: the server's own sentence (in this card's words when the patient's
+      // language differs from the page's). Not due yet: its times, in this card's words, unless the server worded it.
+      const later = hasReplyFor(refusal, i18n.language) ? null : notDueYet(refusal);
+      setTestNotice(later ? notDueNotice(dose.name, later)
+        : { text: refusalMessage(refusal, t, i18n.language), noDose: true });
+      return;
+    }
+    setTestNotice({ key: 'reachy.testAlertSent', name: dose.name, time: clockTime(dose.scheduled_time) });
     await refresh();
   });
 
@@ -295,7 +325,8 @@ export default function ReachyCard() {
           </div>
           {testNotice && (
             <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">
-              {t(testNotice.key, { name: testNotice.name })}
+              {testNotice.text ?? t(testNotice.key ?? '', { name: testNotice.name, time: testNotice.time, from: testNotice.from })}
+              {testNotice.noDose && checkins && ` ${t('reachy.testAlertTalkInstead', { label: t('conversations.talkNow') })}`}
             </p>
           )}
         </div>

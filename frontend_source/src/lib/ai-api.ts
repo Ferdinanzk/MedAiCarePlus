@@ -70,6 +70,9 @@ export const aiApi = {
     saved?: string[];
     face_label?: string;
     error?: string;
+    /** The server's `error` field, e.g. 409 'face_already_registered' (this face belongs to another account)
+     *  or 'face_registered_without_account' (it is in the gallery with no account behind it). */
+    code?: string;
   }> {
     const form = new FormData();
     form.append('face_label', faceLabel);
@@ -80,7 +83,9 @@ export const aiApi = {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      return { error: err.detail || `HTTP ${resp.status}` };
+      const detail = typeof err.detail === 'string' ? err.detail : undefined;
+      const code = typeof err.error === 'string' ? err.error : undefined;
+      return { error: detail || code || `HTTP ${resp.status}`, code };
     }
     return resp.json();
   },

@@ -1,6 +1,8 @@
 """Bind one live intake detector to the authenticated person's face and hands."""
 
 import asyncio
+import datetime
+import logging
 import time
 import uuid
 from collections import deque
@@ -10,6 +12,7 @@ import cv2
 import numpy as np
 
 from app.intake_v1.policy import apply_policy
+from app.services import dose_emotion, schedule
 from app.services.emotion_service import EmotionService, LABELS, crop_face
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_detection import IntakeDetectionService
@@ -30,6 +33,21 @@ MODES = ("dose", "observe")
 CLIENT_TYPES = ("browser", "reachy")
 LIVE_SESSION_SECONDS = 5.0
 EXTRA_EVENT_CAP = 20
+# A session with no landmark packet for this long is dead (a closed tab that never sent /end): sweep_idle ends it.
+IDLE_SESSION_SECONDS = 600.0
+# The detector stages of one hand-to-mouth event. The event's emotion window starts at the first of the active
+# ones reported: the detector can go READY -> APPROACHING -> AT_MOUTH within one frame (a hand first seen near the
+# face, or a fast approach at 10 fps), and then never reports APPROACHING.
+EVENT_STAGES = ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING", "COMPLETE_CANDIDATE")
+ACTIVE_EVENT_STAGES = ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING")
+# Identity + emotion on a robot's streamed frames (api_device.monitor_frame): every VISION_INTERVAL, and 4 times a
+# second while a verified patient's dose session has no emotion result yet (dose_emotion; measured ~4.5 ms per
+# emotion call on this laptop). Only once verified: vision() runs identity on every call while the patient is not
+# verified, and afterwards at most every 0.5 s (its verified_at gate), so identity never exceeds 2 Hz.
+VISION_INTERVAL = 0.5
+DOSE_VISION_INTERVAL = 0.25
+
+log = logging.getLogger(__name__)
 
 
 class BusyOtherClient(Exception):
@@ -136,8 +154,26 @@ class MonitorSession:
     last_identity_box: list | None = None
     identity_distance: float | None = None
     identity_status: str = "searching"
+    # The live expression shown to the client: only ever an uncovered face.
     emotion: dict | None = None
+    # The latest scored face had its mouth covered (a hand at the mouth): scored, kept as an occluded sample.
+    emotion_occluded: bool = False
+    # (monotonic time of the frame's landmark packet, probabilities, mouth covered, 'server' | 'robot') for the last
+    # dose_emotion.KEEP_SECONDS; emotion_totals counts the whole session (services/dose_emotion.py).
     emotion_samples: list = field(default_factory=list)
+    emotion_totals: dict = field(default_factory=dose_emotion.new_totals)
+    # When each landmark packet arrived (monotonic), so a JPEG scored later is placed at its own frame's moment.
+    packet_times: dict[int, float] = field(default_factory=dict)
+    # Start (first active detector stage) of the hand-to-mouth event under way, reset when the event is abandoned;
+    # and (start, end) of the session's latest candidate event: the window a dose's emotion result is centred on.
+    emotion_event_start: float | None = None
+    last_event: tuple | None = None
+    # The dose's emotion result (dose_emotion): when this session resolved the dose (wall clock), its delayed
+    # write, and whether it was written (once per session).
+    dose_emotion_resolved_at: datetime.datetime | None = None
+    dose_emotion_timer: asyncio.Task | None = None
+    dose_emotion_done: bool = False
+    # Kept for dose_video: set at the first APPROACHING of the session.
     event_started_at: float | None = None
     candidate: dict | None = None
     latest_detector: dict | None = None
@@ -156,6 +192,12 @@ class MonitorSession:
     frame_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     vision_task: asyncio.Task | None = None
     last_vision_started: float = float("-inf")
+    # The patient switched dose videos on (consent 'dose_video', checked at start): its camera frames are also
+    # held in memory for a clip (services/dose_video.py).
+    clip_enabled: bool = False
+    # When the session began (wall clock, the overdose rules' clock): start had allowed the dose then, so a pill seen
+    # later in the session is judged for "due" and "expired" at this moment (dose_safety.evaluate's started_at).
+    started_at: datetime.datetime = field(default_factory=schedule.current_time)
 
     def verified(self, now: float | None = None) -> bool:
         return self.identity_hits >= 2 and (now or time.monotonic()) - self.verified_at <= 1.5
@@ -170,6 +212,8 @@ class MonitorSession:
                 "identity_status": "verified" if self.verified() else self.identity_status,
                 "identity_distance": self.identity_distance,
                 "emotion": self.emotion if self.verified() else None,
+                # The face was last scored with its mouth covered (the live emotion then stays empty).
+                "emotion_occluded": self.emotion_occluded if self.verified() else False,
                 # The verified patient's face box (normalized): a robot scores emotion on this face itself.
                 "target_box": self.target_box if self.verified() else None,
                 "detector": self.latest_detector,
@@ -192,22 +236,26 @@ def _mouth_hidden(selected: dict, hands: list, box: list) -> bool:
 
 def _accept_robot_emotion(state: "MonitorSession", packet: dict, now: float) -> None:
     """A robot scores emotion on its own camera. Accept it under the same gates as the server's own model:
-    identity verified, the scored face is the owned (enrolled) face, and its mouth is not covered."""
+    identity verified and the scored face is the owned (enrolled) face. A covered mouth is kept as an occluded
+    sample for the dose's result (dose_emotion), never shown as the live emotion."""
     report = packet.get("emotion")
     if report is None:
         return
     selected = (select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box)
                 if state.verified(now) and state.target_box is not None else None)
-    if (selected is None or selected["face_index"] != report["face_index"]
-            or _mouth_hidden(selected, packet["hands"], state.target_box)):
+    if selected is None or selected["face_index"] != report["face_index"]:
         state.emotion = None
         return
     probabilities = {name: float(report["probabilities"][name]) for name in LABELS}
+    occluded = _mouth_hidden(selected, packet["hands"], state.target_box)
+    dose_emotion.add_sample(state, now, probabilities, occluded, "robot")
+    state.emotion_occluded = occluded
+    if occluded:
+        state.emotion = None
+        return
     winner = max(LABELS, key=lambda name: probabilities[name])
     state.emotion = {"detected": True, "emotion_type": winner.capitalize(), "emotion_score": probabilities[winner],
                      "probabilities": probabilities, "error": None, "source": "robot"}
-    state.emotion_samples.append((now, probabilities))
-    state.emotion_samples = state.emotion_samples[-50:]
 
 
 def _expire_candidate(state: MonitorSession, now: float) -> None:
@@ -253,6 +301,15 @@ def _hold(candidate: dict, reason: str) -> None:
     candidate["hold_reason"] = reason
 
 
+def vision_interval(state: MonitorSession) -> float:
+    """How often a robot's streamed frames get identity + emotion: 4 times a second while the verified patient's
+    dose has no emotion result yet (so its before/after windows get enough uncovered samples), otherwise every 0.5 s.
+    Never faster while unverified: each call then runs identity, which must stay at most 2 Hz."""
+    if state.intk_id is not None and not state.dose_emotion_done and state.verified():
+        return DOSE_VISION_INTERVAL
+    return VISION_INTERVAL
+
+
 class MonitorRegistry:
     def __init__(self):
         self.sessions: dict[str, MonitorSession] = {}
@@ -278,8 +335,10 @@ class MonitorRegistry:
         self._check_busy(u_id, client_type)
         old_id = self.by_user.get(u_id)
         if old_id in self.sessions:
-            self.sessions[old_id].ended = True
-            self.sessions.pop(old_id, None)
+            old = self.sessions.pop(old_id)
+            old.ended = True
+            # The replaced session's dose gets its emotion result now (dose left pending, or resolved earlier).
+            dose_emotion.finalize_soon(old, "replaced")
         # Sessions ended by the HTTP endpoint should not accumulate forever.
         for session_id, session in tuple(self.sessions.items()):
             if session.ended:
@@ -319,6 +378,19 @@ class MonitorRegistry:
         self.sessions.pop(state.session_id, None)
         if self.by_user.get(state.u_id) == state.session_id:
             self.by_user.pop(state.u_id, None)
+        dose_emotion.finalize_soon(state, "session_end")
+
+    async def sweep_idle(self, max_idle: float = IDLE_SESSION_SECONDS) -> int:
+        """End sessions with no landmark packet for max_idle seconds: a closed tab or a robot that went away without
+        /end. Their detector state is freed and their dose gets its emotion result. Returns how many were ended."""
+        now = time.monotonic()
+        stale = [state for state in tuple(self.sessions.values()) if now - state.last_activity_at > max_idle]
+        for state in stale:
+            try:
+                await self.end(state)
+            except Exception:
+                log.exception("could not end idle monitor session %s", state.session_id)
+        return len(stale)
 
     def get(self, u_id: int, session_id: str, generation: str, client_type: str | None = None) -> MonitorSession:
         state = self.sessions.get(session_id)
@@ -339,10 +411,14 @@ class MonitorRegistry:
             state.last_activity_at = now
             _update_frame_rate(state, float(packet["timestamp"]))
             state.packets[frame_seq] = packet
+            state.packet_times[frame_seq] = now
             cutoff = frame_seq - PACKET_HISTORY
             for old_seq in tuple(state.packets):
                 if old_seq < cutoff:
                     del state.packets[old_seq]
+            for old_seq in tuple(state.packet_times):
+                if old_seq < cutoff:
+                    del state.packet_times[old_seq]
             _expire_candidate(state, now)
             if state.client_type == "reachy":
                 _accept_robot_emotion(state, packet, now)
@@ -356,6 +432,7 @@ class MonitorRegistry:
                     await IntakeDetectionService.get_instance().end_session(state.u_id, state.detector_session_id)
                     state.detector_session_id = str(uuid.uuid4())
                     state.event_started_at = None
+                state.emotion_event_start = None
                 state.latest_detector = {"stage": "WAITING_FOR_PEARL", "decision": "none"}
                 return state.public()
             payload = {"frame_seq": frame_seq, "timestamp": float(packet["timestamp"]),
@@ -366,21 +443,32 @@ class MonitorRegistry:
                 state.u_id, state.detector_session_id, payload, result_transform=apply_policy)
             state.latest_detector = {key: result.get(key) for key in
                                      ("stage", "decision", "event_confidence", "mouth_open", "hand_near_mouth", "frame_seq")}
-            if result.get("stage") == "APPROACHING" and state.event_started_at is None:
+            stage = result.get("stage")
+            if stage == "APPROACHING" and state.event_started_at is None:
                 state.event_started_at = now
+            if stage in ACTIVE_EVENT_STAGES and state.emotion_event_start is None:
+                # The detector set its own event start on this frame, also when it went straight to AT_MOUTH.
+                state.emotion_event_start = now
             event_id = (result.get("policy") or {}).get("event_id")
-            if result.get("decision") in ("confirmed", "uncertain") and event_id and state.mode != "dose":
+            is_event = result.get("decision") in ("confirmed", "uncertain") and bool(event_id)
+            if is_event:
+                event_start = state.emotion_event_start if state.emotion_event_start is not None else now
+                state.emotion_event_start = None     # the next event starts at its own first active stage
+            elif stage not in EVENT_STAGES:
+                state.emotion_event_start = None     # an approach that came to nothing
+            if is_event and state.mode != "dose":
                 # Observe mode: report the event, never turn it into a candidate.
                 if all(event["event_id"] != event_id for event in state.extra_events):
                     state.extra_events.append({"event_id": event_id, "decision": result["decision"],
                                                "confidence": float(result.get("event_confidence") or 0),
                                                "frame_seq": frame_seq})
                     del state.extra_events[:-EXTRA_EVENT_CAP]
-            elif result.get("decision") in ("confirmed", "uncertain") and event_id:
-                samples = [sample for sample in state.emotion_samples if state.event_started_at is not None and sample[0] >= state.event_started_at]
-                average = None
-                if samples:
-                    average = {name: float(sum(sample[1][name] for sample in samples) / len(samples)) for name in LABELS}
+            elif is_event:
+                # The commit's emotion row (and the alert job's input), as before: the faces since this event's
+                # start, now only the uncovered ones (a covered mouth biases the model). The dose's full result,
+                # with the before- and after-windows, is dose_emotion's.
+                state.last_event = (event_start, now)
+                average = dose_emotion.unoccluded_mean(state.emotion_samples, event_start)
                 state.candidate = {"event_id": result["policy"]["event_id"],
                                    "decision": result["decision"],
                                    "confidence": float(result.get("event_confidence") or 0),
@@ -453,18 +541,21 @@ class MonitorRegistry:
                         state.verified_at = now
                         state.identity_status = "verified" if state.identity_hits >= 2 else "verifying"
             if not state.verified(now) or state.target_box is None:
-                state.emotion = None
+                state.emotion, state.emotion_occluded = None, False
                 return state.public()
             box = state.target_box
             h, w = frame.shape[:2]
             pixel_box = (int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h))
             selected = select_owned_observations(faces, packet["poses"], packet["hands"], box)
             if selected is None:
-                state.emotion = None
+                state.emotion, state.emotion_occluded = None, False
                 return state.public()
-            if _mouth_hidden(selected, packet["hands"], box):
+            # A covered mouth (the pill going in) is still scored, as an occluded sample for the dose's result
+            # (dose_emotion prefers uncovered faces around the event); the live emotion shows only uncovered faces.
+            occluded = _mouth_hidden(selected, packet["hands"], box)
+            if occluded:
                 state.emotion = None
-                return state.public()
+            sample_time = state.packet_times.get(frame_seq, now)
         # A robot doing its own vision scores emotion itself and sends it with its landmark packets, so its
         # snapshot is identity-only. A robot streaming frames (vision_engine set) relies on the server for both.
         robot_scores_emotion = state.client_type == "reachy" and state.vision_engine is None
@@ -474,10 +565,16 @@ class MonitorRegistry:
             if not state.verified() or state.ended or state.last_vision_seq != frame_seq:
                 return state.public()
             if emotion is not None:
-                state.emotion = emotion if emotion.get("detected") else None
-                if state.emotion:
-                    state.emotion_samples.append((time.monotonic(), emotion["probabilities"]))
-                    state.emotion_samples = state.emotion_samples[-50:]
+                if emotion.get("detected"):
+                    dose_emotion.add_sample(state, sample_time, emotion["probabilities"], occluded, "server")
+                    state.emotion_occluded = occluded
+                    if not occluded:
+                        state.emotion = emotion
+                elif not occluded:
+                    state.emotion = None
+            if occluded:
+                # Unchanged recording policy: a candidate becomes ready only on a frame with the mouth uncovered.
+                return state.public()
             if state.candidate and not state.candidate["ready"]:
                 if time.monotonic() - state.candidate["created_at"] > CANDIDATE_TIMEOUT_SECONDS:
                     state.candidate = None

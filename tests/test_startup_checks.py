@@ -50,9 +50,11 @@ def test_robot_enabled_requires_voice_and_risk_configuration(enabled):
     env = {**_configured(), "APP_ENV": "dev", "REACHY_FEATURE_ENABLED": enabled}
     problems = startup_checks.run_startup_checks(env)
     assert {problem.split()[0] for problem in problems} == {
-        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL"}
+        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL",
+        "LLM_FALLBACK_MODEL"}
     env.update({key: "configured" for key in (
-        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL")})
+        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL",
+        "LLM_FALLBACK_MODEL")})
     env["APP_ENV"] = "prod"
     assert startup_checks.run_startup_checks(env) == []
 
@@ -85,7 +87,23 @@ def test_reachy_feature_needs_a_pinned_model():
     from app.startup_checks import run_startup_checks
     env = {"SECRET_KEY": "x" * 40, "LINE_CHANNEL_SECRET": "s", "OPERATOR_NAME": "o", "OPERATOR_CONTACT": "c",
            "TUNNEL_PROVIDER": "t", "REACHY_FEATURE_ENABLED": "1", "LLM_PROVIDER": "p", "LLM_PROVIDER_REGION": "r",
-           "LLM_RETENTION": "0", "RISK_CLASSIFIER_API_KEY": "k", "APP_ENV": "dev"}
+           "LLM_RETENTION": "0", "RISK_CLASSIFIER_API_KEY": "k", "APP_ENV": "dev",
+           "LLM_FALLBACK_MODEL": "apodex/apodex-1.1-mini:free"}
     assert "LLM_MODEL must name a pinned model, not openrouter/free" in run_startup_checks({**env, "LLM_MODEL": "openrouter/free"})
     assert "LLM_MODEL must name a pinned model, not openrouter/free" in run_startup_checks(env)
     assert run_startup_checks({**env, "LLM_MODEL": "meta-llama/llama-3.3-70b-instruct"}) == []
+
+
+@pytest.mark.parametrize("fallback", ["openrouter/free", " ", None])
+def test_reachy_feature_needs_a_pinned_fallback_model(fallback):
+    """The fallback model gets the memory notes too whenever the primary fails, so it must be pinned as well."""
+    env = {**_configured(), "APP_ENV": "dev", "REACHY_FEATURE_ENABLED": "1", "LLM_PROVIDER": "p",
+           "LLM_PROVIDER_REGION": "r", "LLM_RETENTION": "0", "RISK_CLASSIFIER_API_KEY": "k",
+           "LLM_MODEL": "inclusionai/ling-3.0-flash-sante:free"}
+    if fallback is not None:
+        env["LLM_FALLBACK_MODEL"] = fallback
+    assert startup_checks.run_startup_checks(env) == [
+        "LLM_FALLBACK_MODEL must name a pinned model, not openrouter/free"]
+    with pytest.raises(SystemExit):
+        startup_checks.run_startup_checks({**env, "APP_ENV": "prod"})
+    assert startup_checks.run_startup_checks({**env, "LLM_FALLBACK_MODEL": "apodex/apodex-1.1-mini:free"}) == []
