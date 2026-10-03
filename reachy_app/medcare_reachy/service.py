@@ -48,7 +48,8 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
     robot = ReachyRobot.attach(reachy_mini)
     clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
-    voice = DoneListener(robot, settings["language"])
+    # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
+    voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
     voice.start()
     speaker = Speaker(robot)
     speaker.preload()
@@ -57,11 +58,13 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
             runner = Runner(app=app, robot=robot, clips=clips, voice=voice, speaker=speaker,
                             language=settings["language"],
                             stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"]),
-                                                 emotion=emotion))
+                                                 emotion=emotion),
+                            ack=settings.get("checkin_ack", True), gestures=settings.get("checkin_gestures", True))
             on_runner(runner)
             await runner.run()
     finally:
         voice.stop()
+        robot.close()   # stops any gesture; the app runtime keeps the connection
         if engine is not None:
             engine.close()
 
@@ -171,6 +174,7 @@ class BridgeService:
             slot = runner.slot
             status.update({
                 "robot_reachable": runner.robot_reachable,
+                "camera_fps": round(runner.stream.camera_fps(), 1),
                 "landmark_fps": round(runner.stream.landmark_fps(), 1),
                 "vision_fps": round(runner.stream.vision_fps(), 1),
                 "missing_clips": runner.clips.missing_count,

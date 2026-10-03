@@ -18,6 +18,13 @@ FRAME_WAIT_STEPS = 100         # up to ~0.5 s (5 ms polls) for a free slot befor
 MAX_FRAMES_IN_FLIGHT = 3
 STREAM_SIZE = (480, 360)
 STREAM_JPEG_QUALITY = 70
+# Server vision follows the camera: a frame may go out this share of the frame interval before it is due. The
+# camera's own timing jitters by a few ms, and a strict 1/15 s gate would drop every frame that came early.
+PACE_EARLY = 0.2
+FRAME_POLL_SECONDS = 0.005     # between reads that found no new frame (the SDK itself waits ~20 ms for one)
+SERVER_FPS_MIN = 12.0          # the server records only at >= 12 fps (app/services/monitor_service.py FPS_MIN)
+STALL_SECONDS = 0.25           # a longer gap between streamed frames makes the server call the stream degraded
+STALL_LOG_SECONDS = 1.0        # at most one stall line per this long (a broken camera would log every frame)
 VISION_INTERVAL = 0.5          # identity-only snapshots, 2 fps (the server re-checks identity every 0.5 s)
 EMOTION_INTERVAL = 0.5         # emotion is scored on the robot, at most 2 fps, only for the verified face
 JPEG_QUALITY = 75
@@ -29,13 +36,24 @@ RESUMABLE = frozenset({"app_unreachable"})   # slot results that leave the task 
 
 
 def encode_stream_jpeg(frame) -> bytes:
-    """BGR 640x480 frame -> a smaller JPEG for the server-side landmark stream (about half the bytes)."""
+    """BGR camera frame -> its 4:3 centre at STREAM_SIZE as a JPEG, for the server-side landmark stream.
+
+    One pass from the camera's own frame: the Wireless's 1280x720 has a 960x720 centre that halves exactly to
+    480x360. On the Pi CM4 that takes ~12 ms, against ~38 ms for crop_4_3 to 640x480 and then a second resize.
+    """
     import io
 
     import numpy as np
     from PIL import Image
 
-    image = Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
+    height, width = frame.shape[:2]
+    crop_width = min(width, int(height * 4 / 3))
+    x = (width - crop_width) // 2
+    crop = np.ascontiguousarray(frame[:, x:x + crop_width])
+    image = Image.frombuffer("RGB", (crop_width, height), crop, "raw", "BGR", 0, 1)
+    factor = crop_width // STREAM_SIZE[0]
+    if factor >= 2 and image.size == (STREAM_SIZE[0] * factor, STREAM_SIZE[1] * factor):
+        image = image.reduce(factor)
     if image.size != STREAM_SIZE:
         image = image.resize(STREAM_SIZE, Image.Resampling.BILINEAR)
     buffer = io.BytesIO()
@@ -60,11 +78,14 @@ class MonitorStream:
 
     With no `engine`, the server computes the landmarks: each frame goes out as a JPEG to
     /monitor/frame, with up to MAX_FRAMES_IN_FLIGHT requests outstanding (the server keeps them in
-    order and ignores a frame older than one it already has).
+    order and ignores a frame older than one it already has). The loop follows the camera rather
+    than a fixed timer, taking every frame up to `fps`: a timer only slightly slower than the camera
+    loses frames, and the server records nothing below 12 fps.
     With an `engine`, the robot computes landmarks itself and posts them plus a 2 fps JPEG; then at
     most one landmark request and one vision request are in flight.
     A frame that finds no free slot is dropped rather than queued. frame_seq restarts at 1 for every
     session; timestamps are capture times.
+    A gap over STALL_SECONDS between streamed frames is logged with what held it up (see _note_stall).
     """
 
     def __init__(self, app, robot, engine, *, clock=time.monotonic, run_blocking=asyncio.to_thread,
@@ -89,7 +110,18 @@ class MonitorStream:
         self._last_vision = float("-inf")
         self._landmark_times: deque = deque()
         self._vision_times: deque = deque()
+        self._camera_times: deque = deque()
+        self._next_due = float("-inf")   # when the server stream's next frame is due
+        self._streaming_since: float | None = None
+        self._slow_camera_logged = False
         self._tasks: set = set()
+        # What held the server stream up, for _note_stall.
+        self._sent_at: dict = {}         # one key per unanswered request -> when it went out
+        self._last_streamed: float | None = None
+        self._last_stall_log = float("-inf")
+        self._stalls = 0
+        self._camera_asked: float | None = None   # since when the stream has waited for a new camera frame
+        self._clear_stall_notes()
 
     # ── the SlotSession-facing interface ─────────────────────────────────
     def attach(self, monitor: dict) -> None:
@@ -98,6 +130,11 @@ class MonitorStream:
         self.frame_seq = 0
         self._latest_seq = 0
         self._error = None
+        self._streaming_since = None
+        self._last_streamed = None
+        self._stalls = 0
+        self._camera_asked = None
+        self._clear_stall_notes()
 
     def detach(self) -> None:
         self.session = None
@@ -120,6 +157,10 @@ class MonitorStream:
     def vision_fps(self) -> float:
         return self._rate(self._vision_times)
 
+    def camera_fps(self) -> float:
+        """New frames the camera handed the server stream: the ceiling for landmark_fps."""
+        return self._rate(self._camera_times)
+
     # ── pipeline ─────────────────────────────────────────────────────────
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -129,7 +170,17 @@ class MonitorStream:
             except Exception:
                 log.exception("capture step failed")
                 await asyncio.sleep(0.5)
-            await asyncio.sleep(max(0.0, self.interval - (self.clock() - started)))
+            pause = self._pause(started)
+            asleep = self.clock()
+            await asyncio.sleep(pause)
+            # Waking late means something else held this process's event loop, or the CPU, meanwhile.
+            self._loop_late = max(self._loop_late, self.clock() - asleep - pause)
+
+    def _pause(self, started: float) -> float:
+        if self.session is not None and self.engine is None:
+            # Sleep until the next frame may go out, then take the first one the camera hands over.
+            return max(FRAME_POLL_SECONDS, self._next_due - self.interval * PACE_EARLY - self.clock())
+        return max(0.0, self.interval - (self.clock() - started))
 
     async def step(self) -> None:
         session = self.session
@@ -156,22 +207,89 @@ class MonitorStream:
         self._spawn(self._send_landmarks(session, {**session, **packet}, seq, jpeg))
 
     async def _stream_frame(self, session) -> None:
-        frame = await self.run_blocking(self.robot.get_frame)
+        # The camera's own frame: encode_stream_jpeg crops and scales it in one pass.
+        asked = self.clock()
+        frame = await self.run_blocking(self.robot.get_camera_frame)
         captured = self.clock()
-        if frame is None or self.session is not session:
+        if self.session is not session:
             return
+        if frame is None:
+            if self._camera_asked is None:
+                self._camera_asked = asked
+            return
+        self._camera_wait = max(self._camera_wait, captured - (asked if self._camera_asked is None
+                                                               else self._camera_asked))
+        self._camera_asked = None
+        self._note_camera_frame(captured)
+        if captured < self._next_due - self.interval * PACE_EARLY:
+            return   # the camera runs faster than the stream: skip this one
         jpeg = await self.run_blocking(self.stream_encode, frame)
         for _ in range(FRAME_WAIT_STEPS):
             if self._frames_in_flight < self.max_in_flight or self.session is not session:
                 break
             await asyncio.sleep(0.005)
-        if self._frames_in_flight >= self.max_in_flight or self.session is not session:
+        if self.session is not session:
+            return
+        if self._frames_in_flight >= self.max_in_flight:
+            self._no_slot += 1
+            if self._sent_at:
+                self._oldest_request = max(self._oldest_request, self.clock() - min(self._sent_at.values()))
             return
         self.frame_seq += 1
         self._frames_in_flight += 1
-        self._spawn(self._send_frame(session, self.frame_seq, captured, jpeg))
+        self._note_stall(captured)
+        # Keep to the schedule (a 15 fps camera streamed at 10 fps sends 2 frames in 3), unless the camera fell
+        # more than a frame behind it: then start again from this frame.
+        on_time = captured - self._next_due <= self.interval
+        self._next_due = (self._next_due if on_time else captured) + self.interval
+        request = object()
+        self._sent_at[request] = self.clock()
+        self._spawn(self._send_frame(session, self.frame_seq, captured, jpeg, request))
 
-    async def _send_frame(self, session, seq: int, captured: float, jpeg: bytes) -> None:
+    def _clear_stall_notes(self) -> None:
+        """Start the notes on what holds up the next streamed frame."""
+        self._camera_wait = 0.0       # longest wait for a new camera frame
+        self._loop_late = 0.0         # latest the event loop woke up
+        self._no_slot = 0             # frames dropped while every request was unanswered
+        self._oldest_request = 0.0    # the oldest unanswered request at such a drop
+
+    def _note_stall(self, captured: float) -> None:
+        """Log a gap the server will see before this frame (it trusts no gap over 0.25 s), with what held it up.
+
+        On 2 Oct 2026 the stream stopped for ~1 s at a time in every slot state, then 4-6 answers came within
+        0.2 s, and nothing said where it had waited. Frames dropped behind old unanswered requests point at Wi-Fi
+        or the server (whose log names its slow frames), a late event loop at this process, and a long camera
+        wait at the camera feed (or a starved CPU).
+        """
+        gap = 0.0 if self._last_streamed is None else captured - self._last_streamed
+        self._last_streamed = captured
+        if gap > STALL_SECONDS:
+            self._stalls += 1
+            if captured - self._last_stall_log >= STALL_LOG_SECONDS:
+                self._last_stall_log = captured
+                log.warning("server stream: %.2f s between frames before frame %d (%d gap(s) over %.2f s since the "
+                            "last report); longest wait for a camera frame %.2f s, event loop up to %.2f s late, "
+                            "frames dropped for want of a free request slot: %d (oldest unanswered request %.2f s)",
+                            gap, self.frame_seq, self._stalls, STALL_SECONDS, self._camera_wait, self._loop_late,
+                            self._no_slot, self._oldest_request)
+                self._stalls = 0
+        self._clear_stall_notes()
+
+    def _note_camera_frame(self, captured: float) -> None:
+        """Count camera frames, and say once in the log when the camera alone keeps the server from recording."""
+        self._camera_times.append(captured)
+        fps = self.camera_fps()   # also forgets frames older than the window
+        if self._streaming_since is None:
+            self._streaming_since = captured
+        if not self._slow_camera_logged and captured - self._streaming_since >= FPS_WINDOW and fps < SERVER_FPS_MIN:
+            self._slow_camera_logged = True
+            # Reachy Mini daemon 1.11 caps the camera feed it shares with apps at 10 fps (IPC_FPS in
+            # reachy_mini/media/media_server.py); tools/deploy_to_robot.py --camera-ipc-fps 15 lifts it.
+            log.warning("the camera hands this app only %.1f fps; the server records doses only at >= %.0f fps, "
+                        "so every dose goes to family confirmation. Check the daemon's IPC_FPS.",
+                        fps, SERVER_FPS_MIN)
+
+    async def _send_frame(self, session, seq: int, captured: float, jpeg: bytes, request: object) -> None:
         try:
             response = await self.app.monitor_frame(session["session_id"], session["generation"], seq, captured, jpeg)
             self._landmark_times.append(self.clock())
@@ -179,6 +297,7 @@ class MonitorStream:
         except BridgeError as exc:
             self._fail(session, exc)
         finally:
+            self._sent_at.pop(request, None)
             self._frames_in_flight -= 1
 
     async def _with_emotion(self, frame, packet: dict, captured: float) -> dict:
@@ -247,9 +366,11 @@ class MonitorStream:
 
 class Runner:
     def __init__(self, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
-                 heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread):
+                 heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread,
+                 ack=True, gestures=True):
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
         self.speaker, self.language = speaker, language
+        self.ack, self.gestures = ack, gestures   # check-in 「嗯」 and body language (SlotSession)
         self.heartbeat_seconds = heartbeat_seconds
         self.tick_seconds = tick_seconds
         self.run_blocking = run_blocking
@@ -317,7 +438,7 @@ class Runner:
         log.info("task %s (%s): %d dose(s)", task.get("task_id"), task.get("reason"), len(task.get("doses", [])))
         slot = SlotSession(task, app=self.app, robot=self.robot, clips=self.clips, stream=self.stream,
                            voice=self.voice, speaker=self.speaker, language=self.language,
-                           run_blocking=self.run_blocking)
+                           run_blocking=self.run_blocking, ack=self.ack, gestures=self.gestures)
         self.slot = slot
         if self.stopping.is_set():
             slot.stop("bridge_shutdown", abort=False)
