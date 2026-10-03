@@ -173,13 +173,16 @@ ALTER TABLE family_contacts ADD COLUMN IF NOT EXISTS notify_taken BOOLEAN DEFAUL
 -- the hash without changing the version, and consent must reference what
 -- the person actually saw.
 CREATE TABLE IF NOT EXISTS legal_document (
-    kind          VARCHAR(10) NOT NULL CHECK (kind IN ('core','robot')),
+    kind          VARCHAR(10) NOT NULL CHECK (kind IN ('core','robot','memory')),
     terms_version VARCHAR(20) NOT NULL,
     language      VARCHAR(10) NOT NULL,
     sha256        CHAR(64) NOT NULL,
     published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (kind, terms_version, language, sha256)
 );
+-- Existing databases keep the old check; replace it (same name) so the memory notice can register.
+ALTER TABLE legal_document DROP CONSTRAINT IF EXISTS legal_document_kind_check;
+ALTER TABLE legal_document ADD CONSTRAINT legal_document_kind_check CHECK (kind IN ('core','robot','memory'));
 
 -- Append-only; current state is the highest consent_id per (u_id, scope).
 CREATE TABLE IF NOT EXISTS consent (
@@ -318,6 +321,46 @@ CREATE TABLE IF NOT EXISTS conversation_turn (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_turn_conv ON conversation_turn(conversation_id, turn_id);
+
+-- Long-term check-in memory (memory notice). One row per fact per conversation; the newest row per
+-- (u_id, kind, subject) wins, and a patient-entered row beats any chat row. UUID ids are never
+-- reissued after a restore, so ledger replay can delete by id safely.
+CREATE TABLE IF NOT EXISTS patient_memory (
+    memory_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    u_id            INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    conversation_id UUID REFERENCES conversation(conversation_id) ON DELETE CASCADE,
+    kind            VARCHAR(10) NOT NULL CHECK (kind IN ('name','person','like','routine','event')),
+    subject         VARCHAR(60) NOT NULL,
+    text            VARCHAR(160) NOT NULL,
+    event_date      DATE,
+    source          VARCHAR(10) NOT NULL DEFAULT 'chat' CHECK (source IN ('chat','patient')),
+    followed_up_at  TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK ((kind = 'event') = (event_date IS NOT NULL)),
+    CHECK ((source = 'chat') = (conversation_id IS NOT NULL)),
+    CHECK (kind <> 'name' OR source = 'patient')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_patient_memory_chat
+    ON patient_memory(conversation_id, kind, subject) WHERE conversation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_patient_memory_patient
+    ON patient_memory(u_id, kind, subject) WHERE source = 'patient';
+CREATE INDEX IF NOT EXISTS idx_patient_memory_recall
+    ON patient_memory(u_id, kind, subject, created_at DESC);
+
+-- Subjects the patient deleted recently, so post-chat work that runs later cannot re-learn them.
+CREATE TABLE IF NOT EXISTS patient_memory_deleted (
+    u_id       INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    kind       VARCHAR(10) NOT NULL,
+    subject    VARCHAR(60) NOT NULL,
+    deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (u_id, kind, subject)
+);
+
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS followup_memory_id UUID
+    REFERENCES patient_memory(memory_id) ON DELETE SET NULL;
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS after_chat_state VARCHAR(10) NOT NULL DEFAULT 'done'
+    CHECK (after_chat_state IN ('pending','done','skipped','failed'));
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS after_chat_attempts SMALLINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS dose_confirmation (
     confirmation_id UUID PRIMARY KEY,
