@@ -154,3 +154,13 @@ def test_date_table_covers_21_days_with_weekdays():
 def test_pick_followup_query_uses_the_current_version_and_skips_asked_subjects():
     sql = memory.PICK_FOLLOWUP_SQL
     assert "DISTINCT ON (subject)" in sql and "followed_up_at IS NOT NULL" in sql and "LIMIT 1" in sql
+
+
+@pytest.mark.parametrize("language", ["zh-TW", "en"])
+def test_after_chat_prompt_spells_out_every_fact_field_with_an_example(language):
+    # Free models guess the JSON shape when it is only described; a live run returned facts with no "text".
+    prompt = memory.AFTER_CHAT_PROMPT[language]
+    for field in ('"kind"', '"subject"', '"text"', '"event_date"'):
+        assert field in prompt
+    example = memory.parse_facts(prompt.splitlines()[-2])     # the example line, before the empty-case line
+    assert example and all(memory.validate_fact(item, today=date(2026, 10, 3), source="chat") for item in example)
