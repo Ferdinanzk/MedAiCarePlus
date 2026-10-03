@@ -10,6 +10,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -75,9 +76,13 @@ def write_wav(path: Path, samples: np.ndarray, rate: int) -> None:
         out.writeframes(pcm.tobytes())
 
 
+def _ms(seconds: float) -> int:
+    return max(0, int(round(seconds * 1000)))
+
+
 class Speaker:
-    def __init__(self, robot, models_dir: Path = TTS_DIR, *, load=_matcha):
-        self.robot, self.models_dir, self._load = robot, Path(models_dir), load
+    def __init__(self, robot, models_dir: Path = TTS_DIR, *, load=_matcha, clock=time.monotonic):
+        self.robot, self.models_dir, self._load, self.clock = robot, Path(models_dir), load, clock
         missing = [name for name in TTS_FILES if not (self.models_dir / name).is_file()]
         self.available = not missing
         if missing:
@@ -102,22 +107,32 @@ class Speaker:
             log.exception("check-in voice failed to load")
             self.available = False
 
-    def say(self, text: str) -> bool:
+    def say(self, text: str, stats: dict | None = None, on_audio=None) -> bool:
         """Speak `text` (blocking until playback ends). False when there's no voice or nothing to say.
 
         Synthesis on the Pi runs at roughly real time, so a whole reply would keep the patient waiting as long
         as it lasts. Instead each chunk is played while the next one is being synthesised.
+
+        `stats`, when given, receives the timings in milliseconds from the start of this call: until the first
+        chunk is handed to the speaker (tts_first_audio_ms) and until playback ends (tts_total_ms), plus the
+        number of chunks played (tts_chunks) and the total synthesis time (tts_synth_ms).
+        `on_audio()` is called once, just before the first chunk is handed to the speaker.
         """
         pieces = chunks(text)
         if not pieces or not self.available:
             return False
+        started = self.clock()
         tts = self._tts()
         ready: queue.Queue = queue.Queue(maxsize=2)
+        synth: list[float] = []
 
         def produce() -> None:
             try:
                 for piece in pieces:
-                    ready.put(tts.generate(piece, sid=0, speed=SPEED))
+                    began = self.clock()
+                    audio = tts.generate(piece, sid=0, speed=SPEED)
+                    synth.append(self.clock() - began)
+                    ready.put(audio)
             except Exception:
                 log.exception("speech synthesis failed")
             finally:
@@ -125,6 +140,8 @@ class Speaker:
 
         threading.Thread(target=produce, name="medcare-tts", daemon=True).start()
         played = False
+        first_audio: float | None = None
+        handed = 0
         while (audio := ready.get()) is not None:
             if len(audio.samples) == 0:
                 continue
@@ -133,7 +150,17 @@ class Speaker:
             path = Path(name)
             try:
                 write_wav(path, audio.samples, audio.sample_rate)
+                if first_audio is None:
+                    first_audio = self.clock() - started
+                    if on_audio is not None:
+                        on_audio()
+                handed += 1
                 played = bool(self.robot.play_clip(path)) or played
             finally:
                 path.unlink(missing_ok=True)
+        if stats is not None:
+            stats.update({"tts_total_ms": _ms(self.clock() - started), "tts_chunks": handed,
+                          "tts_synth_ms": _ms(sum(synth))})   # the producer is done: it sent the final None
+            if first_audio is not None:
+                stats["tts_first_audio_ms"] = _ms(first_audio)
         return played

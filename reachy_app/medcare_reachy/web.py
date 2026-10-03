@@ -11,6 +11,8 @@ class ConfigUpdate(BaseModel):
     language: str | None = None
     capture_fps: float | None = None
     vision_on_server: bool | None = None
+    checkin_ack: bool | None = None
+    checkin_gestures: bool | None = None
 
 
 def register_routes(api, service) -> None:
