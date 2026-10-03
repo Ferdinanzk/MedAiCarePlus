@@ -156,7 +156,7 @@ The decision table the robot and server now follow:
 - **Laptop:** must stay on and awake, with Docker Desktop started at sign-in. If it is off, the robot cannot see and stops within about 10 s.
 - **Robot power:** turn it off with its power switch. "Sleep" in the dashboard keeps the medcare app running, and the app will wake the robot for the next reminder.
 - **Is it working?**
-  - `http://localhost:8080/health`: everything `true` except `ocr` and `line`.
+  - `http://localhost:8080/health`: everything `true`. `ocr` needs `GEMINI_API_KEY` in `.env` (then scanning works for every account, [docs/OCR.md](docs/OCR.md)); `line` needs the LINE keys.
   - Reachy card: *Online*.
   - Robot settings page `http://<robot>:8042`: `state: running`, `missing_clips: 0`.
 - **Test reminder:** Reachy card → *Send test alert*. It uses the first pending or missed dose, and with auto-record on it can change that dose's record.
@@ -167,6 +167,6 @@ These are not written in any file in git:
 
 | Secret | Where it lives |
 | --- | --- |
-| `SECRET_KEY`, `OPENROUTER_API_KEY`, LINE keys, `BACKUP_PASSPHRASE` | `.env` (gitignored). **Keep `SECRET_KEY` when moving laptops**: it signs the robot's pairing key. |
+| `SECRET_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY` (prescription OCR), LINE keys, `BACKUP_PASSPHRASE` | `.env` (gitignored). **Keep `SECRET_KEY` when moving laptops**: it signs the robot's pairing key. |
 | Robot pairing key (`rdv1.…`) | Shown once at pairing; stored only in the robot's `settings.json`. The server keeps only its SHA-256. |
 | Robot SSH password | Ask the owner. |
