@@ -12,7 +12,7 @@ async def parse_prescription(
     file: UploadFile = File(...),
     user: dict = Depends(get_consented_user),
 ):
-    """Upload a prescription image, return structured JSON via YOLO + Ollama."""
+    """Upload a prescription image and return structured OCR results."""
     image_bytes = await file.read()
     svc = OCRService.get_instance()
     loop = asyncio.get_event_loop()

@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     EmotionService.get_instance()
     LineService.get_instance()
     IntakeDetectionService.get_instance()
+    OCRService.get_instance()
     LandmarkService.get_instance()
     start_scheduler()
     await start_dispatcher()

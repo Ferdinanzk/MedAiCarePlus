@@ -32,6 +32,8 @@ YOLO_MODEL_PATH = Path(os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://medai:medai@localhost:5432/medaicare")
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434/api/generate")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OCR_MODEL = os.getenv("OCR_MODEL", "gemini-3.8-flash")
 SECRET_KEY   = os.getenv("SECRET_KEY",   "change-me-in-production-32chars!!")
 DEVICE       = "CPU"
 MEDCARE_TIMEZONE = os.getenv("MEDCARE_TIMEZONE", "Asia/Taipei")
