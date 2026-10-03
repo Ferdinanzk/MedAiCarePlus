@@ -366,3 +366,72 @@ def test_end_after_a_risk_turn_makes_no_model_call(robot, monkeypatch):
         time.sleep(0.02)
     assert calls == []
     assert robot.db.conversations[cid]["summary"] is None and robot.db.conversations[cid]["mood"] == "unknown"
+
+
+def test_reply_sends_memory_as_a_second_system_message(monkeypatch):
+    seen = {}
+
+    async def complete(messages, max_tokens=200):
+        seen["messages"] = messages
+        return "好的。"
+
+    monkeypatch.setattr(conversation, "complete", complete)
+    asyncio.run(conversation.reply([{"role": "patient", "text": "嗨"}], "zh-TW", "<memory>\n稱呼：王奶奶\n</memory>"))
+    assert [m["role"] for m in seen["messages"]] == ["system", "system", "user"]
+    assert seen["messages"][0]["content"] == conversation.SYSTEM_PROMPT["zh-TW"]
+    assert "王奶奶" in seen["messages"][1]["content"]
+
+
+def test_reply_gives_the_fallback_when_the_model_is_too_slow(monkeypatch):
+    async def complete(messages, max_tokens=200):
+        await asyncio.sleep(1)
+        return "太慢了"
+
+    monkeypatch.setattr(conversation, "complete", complete)
+    monkeypatch.setattr(conversation, "REPLY_BUDGET_SECONDS", 0.05)
+    assert asyncio.run(conversation.reply([{"role": "patient", "text": "嗨"}], "zh-TW")) == conversation.FALLBACK["zh-TW"]
+
+
+def test_complete_with_reason(monkeypatch):
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+    assert asyncio.run(conversation.complete_with_reason([])) == (None, "no_key")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "k")
+
+    def limited(*args):
+        raise RuntimeError("retryable 429")
+
+    monkeypatch.setattr(conversation, "_post", limited)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(conversation.asyncio, "sleep", lambda s: real_sleep(0))
+    assert asyncio.run(conversation.complete_with_reason([])) == (None, "rate_limited")
+    monkeypatch.setattr(conversation, "_post", lambda *args: None)
+    assert asyncio.run(conversation.complete_with_reason([])) == (None, "empty")
+    monkeypatch.setattr(conversation, "_post", lambda *args: "hi")
+    assert asyncio.run(conversation.complete_with_reason([])) == ("hi", "ok")
+
+
+def test_post_sends_temperature_and_optional_provider_routing(monkeypatch):
+    sent = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+
+    def post(url, timeout, headers, json):
+        sent.update(json)
+        return Response()
+
+    monkeypatch.setattr(conversation.requests, "post", post)
+    monkeypatch.setattr(config, "OPENROUTER_PROVIDER_ONLY", "")
+    monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "")
+    conversation._post([], 10, 0)
+    assert sent["temperature"] == 0 and "provider" not in sent
+    monkeypatch.setattr(config, "OPENROUTER_PROVIDER_ONLY", "deepinfra, together")
+    monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "deny")
+    conversation._post([], 10)
+    assert sent["provider"] == {"only": ["deepinfra", "together"], "allow_fallbacks": False, "data_collection": "deny"}

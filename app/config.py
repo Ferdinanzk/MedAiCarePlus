@@ -68,6 +68,9 @@ LLM_PROVIDER_REGION      = os.getenv("LLM_PROVIDER_REGION", "")
 LLM_RETENTION            = os.getenv("LLM_RETENTION", "")
 OPENROUTER_API_KEY       = os.getenv("OPENROUTER_API_KEY", "")
 LLM_MODEL                = os.getenv("LLM_MODEL", "")
+# Optional OpenRouter provider routing: pin providers (comma-separated slugs) and refuse providers that store data.
+OPENROUTER_PROVIDER_ONLY   = os.getenv("OPENROUTER_PROVIDER_ONLY", "")
+OPENROUTER_DATA_COLLECTION = os.getenv("OPENROUTER_DATA_COLLECTION", "")   # "" | "allow" | "deny"
 
 REACHY_FEATURE_ENABLED  = os.getenv("REACHY_FEATURE_ENABLED", "").strip().lower() in ("1", "true", "yes")
 RISK_CLASSIFIER_API_KEY = os.getenv("RISK_CLASSIFIER_API_KEY", "")

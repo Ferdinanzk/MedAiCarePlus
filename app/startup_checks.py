@@ -20,6 +20,9 @@ def run_startup_checks(env: Mapping[str, str] | None = None) -> list[str]:
     if str(value("REACHY_FEATURE_ENABLED")).strip().lower() in ("1", "true", "yes"):
         required += ["LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION",
                      "RISK_CLASSIFIER_API_KEY"]
+        model = str(value("LLM_MODEL")).strip()
+        if not model or model == "openrouter/free":
+            problems.append("LLM_MODEL must name a pinned model, not openrouter/free")
     for key in required:
         if not str(value(key)).strip():
             problems.append(f"{key} is required")
