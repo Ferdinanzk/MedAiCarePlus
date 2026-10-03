@@ -16,6 +16,9 @@ async def replay_file(conn, path: Path) -> int:
     lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
              if line.strip()]
     count = await deletion_ledger.replay(conn, lines)
+    # Expired transcripts and event notes come back with an old backup; purge them before the app starts.
+    from app.jobs.conversation_retention_job import run_retention
+    await run_retention(conn)
     await conn.execute("DELETE FROM ops_state WHERE key='restore_in_progress'")
     return count
 

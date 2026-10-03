@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.dependencies import get_current_user
 from app.routers import api_consent
-from app.services import consent_service
+from app.services import consent_service, deletion_ledger
 
 
 class _Conn:
@@ -41,6 +41,7 @@ class _Pool:
 def _client(monkeypatch):
     conn = _Conn()
     monkeypatch.setattr(api_consent, "get_pool", lambda: _Pool(conn))
+    monkeypatch.setattr(deletion_ledger, "append_host_file", lambda *entry: None)   # never the real ledger
 
     async def record(*args, **kwargs):
         return None

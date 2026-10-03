@@ -39,6 +39,8 @@ class _Connection:
             self.users.discard(args[0])
         elif "DELETE FROM ops_state" in query:
             self.marked = False
+        elif query.startswith(("DELETE FROM conversation_turn", "DELETE FROM patient_memory")):
+            assert self.marked   # retention purges run before the restore marker is cleared
         else:
             raise AssertionError(query)
 
@@ -52,7 +54,7 @@ def test_replay_is_idempotent_and_preserves_other_accounts(monkeypatch, tmp_path
     assert asyncio.run(deletion_ledger.replay(conn, entries)) == 1
     assert asyncio.run(deletion_ledger.replay(conn, entries)) == 1
     assert conn.users == {8}
-    assert conn.ledger == {(7, "pearl")}
+    assert conn.ledger == {("account", 7, "pearl")}
     assert not (tmp_path / "pearl-0.jpg").exists()
     assert (tmp_path / "other-0.jpg").exists()
 

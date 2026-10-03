@@ -7,7 +7,7 @@ from pydantic import BaseModel, StrictBool
 
 from app.database import get_pool
 from app.dependencies import get_current_user
-from app.services import consent_service, reachy_tasks
+from app.services import consent_service, deletion_ledger, reachy_tasks
 
 router = APIRouter(prefix="/api/consent", tags=["consent"])
 
@@ -30,6 +30,7 @@ async def status(user: dict = Depends(get_current_user)):
 async def record_consent(payload: ConsentPayload, request: Request,
                          user: dict = Depends(get_current_user)):
     u_id = user["u_id"]
+    withdrawn = []
     try:
         async with get_pool().acquire() as conn:
             async with conn.transaction():
@@ -41,8 +42,13 @@ async def record_consent(payload: ConsentPayload, request: Request,
                     await reachy_tasks.revoke_devices(conn, u_id, "consent_withdrawn")
                 elif payload.scopes.get("core") is False:
                     await reachy_tasks.abort_open_tasks(conn, u_id, "consent_withdrawn")
+                withdrawn = [scope for scope, granted in payload.scopes.items() if granted is False]
+                for scope in withdrawn:
+                    await deletion_ledger.record(conn, "consent", u_id, scope)
     except consent_service.ConsentError as exc:
         status_code = 409 if exc.code in ("stale_terms_version", "document_hash_mismatch") else 422
         raise HTTPException(status_code, exc.code) from exc
+    for scope in withdrawn:
+        deletion_ledger.append_host_file("consent", u_id, scope)
     consent_service.invalidate(u_id)
     return consent_service.status_payload(await consent_service.get_state(u_id))
