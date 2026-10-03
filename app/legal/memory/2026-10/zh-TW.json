@@ -1,0 +1,44 @@
+{
+  "kind": "memory",
+  "version": "2026-10",
+  "language": "zh-TW",
+  "title": "Reachy 記憶功能說明",
+  "what_changed": [],
+  "sections": [
+    {"id": "memory-what", "heading": "一、Reachy 會記得什麼", "blocks": [
+      {"type": "p", "text": "如果您開啟記憶功能，Reachy 會從關心聊天中記下簡短的筆記，讓它能像熟悉您的人一樣和您聊天。"},
+      {"type": "list", "items": [
+        "您提到的人：他們的名字、和您的關係，以及和他們有關的計畫或事情。",
+        "您喜歡的事物，以及您的日常習慣。",
+        "有日期的事情，讓 Reachy 之後可以問您過得如何。",
+        "您希望 Reachy 怎麼稱呼您，**只有在您自己於程式中輸入時**才會記下。"
+      ]},
+      {"type": "p", "text": "Reachy **絕不會記下健康、藥物、劑量、看醫生或住院的事**，不論是您或其他人的。筆記只會根據您自己說的話寫成。"}
+    ]},
+    {"id": "memory-processing", "heading": "二、筆記在哪裡處理", "blocks": [
+      {"type": "table", "header": ["資料", "處理者", "地點", "保存"], "rows": [
+        ["記憶筆記", "{OPERATOR_NAME} 管理的家中伺服器", "您家中（台灣）", "見第四點"],
+        ["聊天文字，每次聊天後讀取一次以寫下筆記", "{LLM_SERVICE}，再傳給 {LLM_PROVIDER}", "{LLM_PROVIDER_REGION}", "{LLM_RETENTION}"],
+        ["您的稱呼和筆記，隨 Reachy 的每次回答一起傳送", "{LLM_SERVICE}，再傳給 {LLM_PROVIDER}", "{LLM_PROVIDER_REGION}", "{LLM_RETENTION}"]
+      ]}
+    ]},
+    {"id": "memory-sharing", "heading": "三、誰能看到或聽到", "blocks": [
+      {"type": "list", "items": [
+        "您可以在程式的「聊天紀錄」中查看、更正和刪除每一則筆記。",
+        "家人聯絡人永遠看不到您的記憶筆記。",
+        "Reachy 可能會說出它記得的事，**旁邊的人都聽得到**。它不會提起您過去的心情，也不會提起別人的私事。"
+      ]}
+    ]},
+    {"id": "memory-retention", "heading": "四、筆記保存多久", "blocks": [
+      {"type": "table", "header": ["資料", "保存"], "rows": [
+        ["記憶筆記", "直到您刪除該筆記、它來自的那次聊天，或您的帳戶"],
+        ["有日期的事情", "事情日期後 30 天"],
+        ["您刪除的筆記", "7 天內不會再被記下；之後如果您再提起，可能會再被記下"]
+      ]},
+      {"type": "p", "text": "刪除筆記不會改變它來自的那次聊天。如果也要刪除那次聊天的紀錄和摘要，請刪除該次聊天。"}
+    ]},
+    {"id": "memory-withdraw", "heading": "五、關閉記憶功能", "blocks": [
+      {"type": "p", "text": "您隨時可以在 Reachy 卡片上關閉記憶功能。Reachy 會立刻停止記下和使用筆記，您也可以同時刪除所有筆記。即使尚未同意更新後的條款，您也可以在「隱私與資料」中刪除所有筆記。"}
+    ]}
+  ]
+}

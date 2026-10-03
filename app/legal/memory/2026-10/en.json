@@ -1,0 +1,44 @@
+{
+  "kind": "memory",
+  "version": "2026-10",
+  "language": "en",
+  "title": "Reachy Memory Notice",
+  "what_changed": [],
+  "sections": [
+    {"id": "memory-what", "heading": "1. What Reachy remembers", "blocks": [
+      {"type": "p", "text": "If you switch memory on, Reachy keeps short notes from your check-in chats, so it can talk with you like someone who knows you."},
+      {"type": "list", "items": [
+        "People you mention: their names, how they are related to you, and plans or events about them.",
+        "Things you like, and your daily routines.",
+        "Dated events, so Reachy can ask how they went.",
+        "The name you want Reachy to call you, **only if you type it yourself** in the app."
+      ]},
+      {"type": "p", "text": "Reachy **never keeps notes about health, medicines, doses, doctors or hospital visits**, yours or anyone else's. Notes are written only from your own words."}
+    ]},
+    {"id": "memory-processing", "heading": "2. Where notes are processed", "blocks": [
+      {"type": "table", "header": ["Data", "Processed by", "Location", "Kept"], "rows": [
+        ["Memory notes", "The home server run by {OPERATOR_NAME}", "Your home, Taiwan", "See section 4"],
+        ["Chat text, read once after each chat to write notes", "{LLM_SERVICE}, which passes it to {LLM_PROVIDER}", "{LLM_PROVIDER_REGION}", "{LLM_RETENTION}"],
+        ["Your name and notes, sent with each Reachy reply", "{LLM_SERVICE}, which passes it to {LLM_PROVIDER}", "{LLM_PROVIDER_REGION}", "{LLM_RETENTION}"]
+      ]}
+    ]},
+    {"id": "memory-sharing", "heading": "3. Who can see or hear them", "blocks": [
+      {"type": "list", "items": [
+        "You can see, correct and delete every note in the app, under Conversations.",
+        "Family contacts never see your memory notes.",
+        "Reachy may mention what it remembers out loud, and **anyone nearby can hear it**. It does not bring up your past moods or other people's private matters."
+      ]}
+    ]},
+    {"id": "memory-retention", "heading": "4. How long notes are kept", "blocks": [
+      {"type": "table", "header": ["Data", "Kept"], "rows": [
+        ["Memory notes", "Until you delete the note, the chat it came from, or your account"],
+        ["Notes about a dated event", "30 days after the event"],
+        ["A note you deleted", "Not learned again for 7 days; after that, mentioning it again can bring it back"]
+      ]},
+      {"type": "p", "text": "Deleting a note does not change the chat it came from. To remove that chat's transcript and summary as well, delete the chat."}
+    ]},
+    {"id": "memory-withdraw", "heading": "5. Switching memory off", "blocks": [
+      {"type": "p", "text": "You can switch memory off at any time on the Reachy card. Reachy stops learning and using notes at once, and you can delete all notes at the same time. You can also delete all notes under Privacy & data, even before accepting updated terms."}
+    ]}
+  ]
+}

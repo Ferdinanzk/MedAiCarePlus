@@ -88,3 +88,13 @@ def test_register_documents_inserts_each_variant():
     asyncio.run(legal_service.register_documents(Conn()))
     assert len(calls) == len(legal_service.KIND_SCOPES) * len(legal_service.LANGUAGES)
     assert all(len(args[3]) == 64 for args in calls)
+
+
+def test_memory_notice_is_its_own_kind_with_one_scope():
+    _clear()
+    assert legal_service.KIND_SCOPES["memory"] == ("conversation_memory",)
+    assert legal_service.SCOPE_KIND["conversation_memory"] == "memory"
+    doc = legal_service.get_document("memory", "zh-TW")
+    assert doc.kind == "memory" and doc.version == config.TERMS_VERSION
+    ids = [s["id"] for s in doc.document["sections"]]
+    assert ids == ["memory-what", "memory-processing", "memory-sharing", "memory-retention", "memory-withdraw"]
