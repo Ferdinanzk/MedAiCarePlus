@@ -4,7 +4,8 @@ import json
 import base64
 import requests
 import numpy as np
-from app.config import YOLO_MODEL_PATH, OLLAMA_URL, OLLAMA_TIMEOUT, OLLAMA_MODELS
+from app.config import (YOLO_MODEL_PATH, OLLAMA_URL, OLLAMA_TIMEOUT, OLLAMA_MODELS,
+                        GEMINI_API_KEY, OCR_MODEL)
 
 _PROMPT_TEXT = """You are reading a Taiwanese hospital prescription (處方箋).
 Extract these fields from the prescription image. Read BOTH Chinese (繁體中文) and English text.
@@ -44,21 +45,33 @@ _CN_NUM = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6,
 
 
 class OCRService:
-    """Singleton wrapping YOLO document detection + Ollama two-pass OCR."""
+    """Singleton wrapping optional YOLO document detection + two-pass vision OCR."""
 
     _instance: "OCRService | None" = None
     _available: bool = False
 
     def __init__(self):
+        self.yolo = None
+        self.gemini_api_key = GEMINI_API_KEY.strip()
+        self.active_model = OCR_MODEL if self.gemini_api_key else None
+        # Boundary detection only improves the crop; OCR itself can work without YOLO.
         try:
             from ultralytics import YOLO
-            self.yolo = YOLO(str(YOLO_MODEL_PATH))
-            self.active_model = self._resolve_model()
-            OCRService._available = True
-            print(f"[OCR] YOLO loaded. Ollama model: {self.active_model}")
+            if YOLO_MODEL_PATH.is_file():
+                self.yolo = YOLO(str(YOLO_MODEL_PATH))
         except Exception as exc:
-            OCRService._available = False
-            print(f"[OCR] Not available: {exc}")
+            print(f"[OCR] YOLO document detection unavailable: {exc}")
+
+        if self.gemini_api_key:
+            OCRService._available = True
+            print(f"[OCR] Gemini vision model: {self.active_model}")
+        else:
+            self.active_model = self._resolve_model()
+            OCRService._available = bool(self.active_model)
+            if self.active_model:
+                print(f"[OCR] Ollama vision model: {self.active_model}")
+            else:
+                print("[OCR] Not available: configure GEMINI_API_KEY or start Ollama with a vision model")
 
     @classmethod
     def get_instance(cls) -> "OCRService":
@@ -101,12 +114,12 @@ class OCRService:
         icon_crop = self._crop_icon_row(enhanced)
 
         if not self.active_model:
-            return {"error": "No Ollama vision model available. Run: ollama pull minicpm-v"}
+            return {"error": "No vision model available. Configure GEMINI_API_KEY or start Ollama with a vision model."}
 
         print("[OCR] Pass 1/2: text extraction…")
-        text_data = self._clean(self._call_ollama(_PROMPT_TEXT, enhanced))
+        text_data = self._clean(self._call_vision_model(_PROMPT_TEXT, enhanced))
         print("[OCR] Pass 2/2: icon row…")
-        icon_data = self._clean(self._call_ollama(_PROMPT_ICONS, icon_crop))
+        icon_data = self._clean(self._call_vision_model(_PROMPT_ICONS, icon_crop))
 
         admin_text = text_data.get("administration_text", "")
         amount_str = text_data.get("amount_each_intake", "")
@@ -152,6 +165,8 @@ class OCRService:
 
     def _warp_with_yolo(self, img):
         try:
+            if self.yolo is None:
+                return None
             results = self.yolo(img, verbose=False, conf=0.80)
             if results and results[0].masks:
                 from ultralytics.utils.ops import scale_image
@@ -200,6 +215,38 @@ class OCRService:
         h, w = img.shape[:2]
         crop = img[int(h * 0.78): int(h * 0.92), :]
         return cv2.resize(crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+    def _call_vision_model(self, prompt: str, img) -> dict:
+        if self.gemini_api_key:
+            return self._call_gemini(prompt, img)
+        return self._call_ollama(prompt, img)
+
+    def _call_gemini(self, prompt: str, img) -> dict:
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        payload = {
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": "image/jpeg",
+                                "data": base64.b64encode(buf).decode("ascii")}},
+            ]}],
+            "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{OCR_MODEL}:generateContent"
+        try:
+            resp = requests.post(
+                url,
+                headers={"x-goog-api-key": self.gemini_api_key},
+                json=payload,
+                timeout=OLLAMA_TIMEOUT,
+            )
+            resp.raise_for_status()
+            candidates = resp.json().get("candidates", [])
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+            raw = "\n".join(part.get("text", "") for part in parts if part.get("text"))
+            return self._parse_json(raw)
+        except Exception as exc:
+            print(f"[OCR] Gemini request failed: {exc}")
+            return {}
 
     def _call_ollama(self, prompt: str, img) -> dict:
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
