@@ -106,6 +106,8 @@ async def _process(conversation_id: str, u_id: int) -> str | None:
     except Exception:
         log.exception("follow-up bookkeeping failed for %s", conversation_id)
     log.info("after-chat %s: reason=%s stored=%d", conversation_id, reason, stored)
-    state = "failed" if reason == "unavailable" and summary is None else "done"
+    # Nothing usable came back (openrouter/free sometimes routes to a model that answers nothing):
+    # the sweep retries, up to MAX_ATTEMPTS.
+    state = "failed" if summary is None and reason in ("unavailable", "empty") else "done"
     await _set_state(conversation_id, state)
     return state

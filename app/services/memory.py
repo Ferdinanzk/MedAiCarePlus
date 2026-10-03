@@ -302,8 +302,14 @@ AFTER_CHAT_PROMPT = {
         "第二，只根據「長者」自己說的話（不要用 Reachy 說的話，不要猜測），記下新的或有改變的事實，最多 5 條。"
         "不要記任何健康、藥物、看醫生、住院或醫院的事（長者或任何人都一樣），也不要記長者的名字或稱呼。"
         "kind 只能是 person（人名與關係）、like（喜好）、routine（習慣）、event（有日期的事）。"
-        "event 的 event_date 請在日期表中查出，格式 YYYY-MM-DD。subject 用簡短小寫英文或拼音，以底線連接；"
-        "已知事實裡有的 subject 請沿用。最後輸出一個 JSON 物件，沒有新事實就輸出 {\"facts\": []}。"),
+        "event 的 event_date 請在日期表中查出，格式 YYYY-MM-DD；其他種類的 event_date 填 null。"
+        "subject 用簡短小寫英文或拼音，以底線連接；已知事實裡有的 subject 請沿用。"
+        "text 是一句簡短的繁體中文筆記。每一條都必須有 \"kind\"、\"subject\"、\"text\"、\"event_date\" 四個欄位。\n"
+        "最後輸出一個 JSON 物件，格式如下：\n"
+        "{\"facts\": [{\"kind\": \"event\", \"subject\": \"amy_visit\", \"text\": \"孫女 Amy 週日來訪\", "
+        "\"event_date\": \"2026-10-11\"}, {\"kind\": \"like\", \"subject\": \"gardening\", "
+        "\"text\": \"喜歡在陽台種花\", \"event_date\": null}]}\n"
+        "沒有新事實就輸出 {\"facts\": []}。"),
     "en": (
         "Below is a conversation between the companion robot Reachy and an older adult. Do two things.\n"
         "First, summarise the topics and mood in one sentence (no direct quotes) and classify the overall mood, "
@@ -311,9 +317,14 @@ AFTER_CHAT_PROMPT = {
         "Second, from the older adult's own lines only (never Reachy's, never guesses), note up to 5 new or "
         "changed facts. Never note health, medicine, doctor or hospital matters, for them or anyone else, and "
         "never their own name. kind is one of person (a name and relation), like, routine, event (dated). "
-        "Look event_date up in the date table, as YYYY-MM-DD. subject is short lowercase English joined with "
-        "underscores; reuse a known subject when it fits. End with one JSON object; with nothing new, output "
-        "{\"facts\": []}."),
+        "Look event_date up in the date table, as YYYY-MM-DD; for other kinds event_date is null. subject is "
+        "short lowercase English joined with underscores; reuse a known subject when it fits. text is one short "
+        "note in English. Every fact must have all four fields \"kind\", \"subject\", \"text\", \"event_date\".\n"
+        "End with one JSON object in this shape:\n"
+        "{\"facts\": [{\"kind\": \"event\", \"subject\": \"amy_visit\", \"text\": \"Granddaughter Amy visits on "
+        "Sunday\", \"event_date\": \"2026-10-11\"}, {\"kind\": \"like\", \"subject\": \"gardening\", "
+        "\"text\": \"Likes growing flowers on the balcony\", \"event_date\": null}]}\n"
+        "With nothing new, output {\"facts\": []}."),
 }
 
 

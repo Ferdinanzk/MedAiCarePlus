@@ -268,3 +268,9 @@ def test_withdrawn_checkin_consent_means_no_model_call(world):
     world.consent = {k: v for k, v in MEMORY_ON.items() if k != "conversation_analysis"}
     assert run(world) == "skipped"
     assert world.model_calls == [] and world.chat["summary"] is None
+
+
+def test_an_empty_answer_is_retried_by_the_sweep(world):
+    # openrouter/free sometimes routes to a model that returns nothing usable; the sweep should try again.
+    world.answer, world.reason = None, "empty"
+    assert run(world) == "failed" and world.chat["after_chat_state"] == "failed"
