@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import consent_service, conversation, outbox, reachy_tasks
+from app.services import after_chat, consent_service, conversation, outbox, reachy_tasks
 from app.services.device_auth import get_device, get_device_for_heartbeat
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
@@ -296,20 +296,6 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
     return _spoken(reply, language, end=end, risk=bool(risk))
 
 
-async def _summarize(conversation_id: str, history: list[dict], language: str, risk: bool) -> None:
-    try:
-        if risk:
-            # The words of a risk chat never go to a model, not even for a summary (module rule, notice §6).
-            summary, mood = None, "unknown"
-        else:
-            summary, mood = await conversation.summarize(history, language)
-        async with get_pool().acquire() as conn:
-            await conn.execute("UPDATE conversation SET summary = $2, mood = $3 WHERE conversation_id = $1::uuid",
-                               conversation_id, summary, mood)
-    except Exception:
-        log.exception("conversation summary failed")
-
-
 @router.post("/conversations/{conversation_id}/end")
 async def conversation_end(conversation_id: str, payload: ConversationEndPayload, device: dict = Depends(get_device)):
     """Close the conversation (idempotent); the summary and mood are written in the background."""
@@ -318,14 +304,11 @@ async def conversation_end(conversation_id: str, payload: ConversationEndPayload
         if row["ended_at"] is not None:
             return {"ended": True}
         await conn.execute(
-            "UPDATE conversation SET ended_at = NOW(), end_reason = $2 WHERE conversation_id = $1::uuid",
-            str(row["conversation_id"]), payload.reason)
-        history = await _history(conn, row["conversation_id"])
-    if any(turn["role"] == "patient" for turn in history):
-        task = asyncio.create_task(_summarize(str(row["conversation_id"]), history, row["language"],
-                                              bool(row["risk_flag"])))
-        _background.add(task)
-        task.add_done_callback(_background.discard)
+            "UPDATE conversation SET ended_at = NOW(), end_reason = $2, after_chat_state = 'pending' "
+            "WHERE conversation_id = $1::uuid", str(row["conversation_id"]), payload.reason)
+    task = asyncio.create_task(after_chat.process(str(row["conversation_id"]), device["u_id"]))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
     return {"ended": True}
 
 

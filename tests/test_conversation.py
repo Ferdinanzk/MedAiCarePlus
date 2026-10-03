@@ -17,7 +17,7 @@ from app import config
 from app.config import DEVICE_PORT
 from app.dependencies import get_current_user
 from app.routers import api_conversations, api_device, api_reachy
-from app.services import consent_service, conversation, outbox
+from app.services import after_chat, consent_service, conversation, outbox
 from app.services.device_auth import get_device
 
 DEVICE_ID = str(uuid.uuid4())
@@ -140,6 +140,13 @@ class FakeDB:
         if "FROM reachy_task WHERE task_id" in query:
             ok = str(self.task["task_id"]) == args[0] and self.task["u_id"] == args[1] and self.task["lease_owner"] == args[2]
             return dict(self.task) if ok else None
+        if "SET after_chat_attempts = after_chat_attempts + 1" in query:
+            row = self.conversations.get(args[0])
+            if (row and row["u_id"] == args[1] and row["after_chat_state"] in ("pending", "failed")
+                    and row["after_chat_attempts"] < args[2]):
+                row["after_chat_attempts"] += 1
+                return {"language": row["language"], "risk_flag": row["risk_flag"], "followup_memory_id": None}
+            return None
         if "FROM conversation WHERE conversation_id" in query:
             row = self.conversations.get(args[0])
             return dict(row) if row and row["u_id"] == args[1] else None
@@ -162,11 +169,15 @@ class FakeDB:
         if "INSERT INTO conversation " in query:
             cid, u_id, task_id, language, model = args
             self.conversations[cid] = {"conversation_id": cid, "u_id": u_id, "language": language,
-                                       "ended_at": None, "risk_flag": False, "summary": None, "mood": None}
+                                       "ended_at": None, "risk_flag": False, "summary": None, "mood": None,
+                                       "after_chat_state": "done", "after_chat_attempts": 0,
+                                       "followup_memory_id": None}
         elif "SET risk_flag = TRUE" in query:
             self.conversations[args[0]]["risk_flag"] = True
         elif "SET ended_at = NOW()" in query:
-            self.conversations[args[0]].update(ended_at="now", end_reason=args[1])
+            self.conversations[args[0]].update(ended_at="now", end_reason=args[1], after_chat_state="pending")
+        elif "SET after_chat_state" in query:
+            self.conversations[args[0]]["after_chat_state"] = args[1]
         elif "SET summary" in query:
             self.conversations[args[0]].update(summary=args[1], mood=args[2])
         elif "INSERT INTO notification" in query:
@@ -207,6 +218,7 @@ def robot(monkeypatch):
     monkeypatch.setattr(app, "dependency_overrides", {get_device: lambda: {
         "device_id": DEVICE_ID, "u_id": 7, "auto_record": True, "face_label": "pearl", "name": "Pearl"}})
     monkeypatch.setattr(api_device, "get_pool", lambda: Pool(db))
+    monkeypatch.setattr(after_chat, "get_pool", lambda: Pool(db))
     monkeypatch.setattr(consent_service, "get_state", get_state)
     monkeypatch.setattr(outbox, "enqueue_to_contacts", enqueue_to_contacts)
     monkeypatch.setattr(conversation, "reply", reply)
