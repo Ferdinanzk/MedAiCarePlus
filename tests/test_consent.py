@@ -61,7 +61,9 @@ class _Connection:
                 consent_id=len(self.rows) + 1, created_at=self.timestamp))
         else:
             # A core withdrawal also aborts open robot tasks in the same transaction.
-            assert "INSERT INTO detail" in query or query.startswith("UPDATE reachy_task SET status = 'aborted'")
+            # A withdrawal is also ledgered in the same transaction.
+            assert ("INSERT INTO detail" in query or query.startswith("UPDATE reachy_task SET status = 'aborted'")
+                    or query.startswith("INSERT INTO deletion_ledger"))
 
     async def fetch(self, query, *args):
         assert "SELECT DISTINCT ON (scope)" in query
@@ -94,8 +96,9 @@ class _Pool:
 
 
 @pytest.fixture(autouse=True)
-def isolated_consent(monkeypatch):
+def isolated_consent(monkeypatch, tmp_path):
     monkeypatch.setattr(service, "_cache", {})
+    monkeypatch.setattr(config, "DELETION_LEDGER_FILE", tmp_path / "ledger.jsonl")
 
     def document(kind, language):
         language = legal_service.normalise_language(language)

@@ -1,8 +1,9 @@
-"""Durable account deletions, including gallery cleanup after a restore."""
+"""Durable deletions (accounts, chats, memory notes, consent withdrawals), replayed after a restore."""
 
 import json
 import logging
 import os
+import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -67,23 +68,63 @@ def refresh_gallery(face_label: str | None) -> None:
                                     if identity.label != face_label.lower()]
 
 
+_DELETE_BY_ID = {
+    "conversation": "DELETE FROM conversation WHERE conversation_id = $1::uuid AND u_id = $2",
+    "memory": "DELETE FROM patient_memory WHERE memory_id = $1::uuid AND u_id = $2",
+}
+
+
+async def _restore_audit_row(conn, kind: str, u_id: int, object_id: str | None) -> None:
+    # Restore the audit row if this deletion postdates the backup. $1 is typed here: otherwise Postgres deduces
+    # text from "kind=$1" and varchar from the insert target, and refuses to prepare the statement.
+    await conn.execute(
+        "INSERT INTO deletion_ledger (kind, u_id, object_id) SELECT $1::text, $2, $3 WHERE NOT EXISTS "
+        "(SELECT 1 FROM deletion_ledger WHERE kind=$1 AND u_id=$2 AND object_id IS NOT DISTINCT FROM $3)",
+        kind, u_id, object_id)
+
+
+def _valid_uuid(value) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
 async def replay(conn, lines: Iterable[dict]) -> int:
+    from app.services import legal_service
+
     count = 0
     for entry in lines:
-        if (not isinstance(entry, dict) or entry.get("kind") != "account" or type(entry.get("u_id")) is not int
-                or entry["u_id"] <= 0
-                or (entry.get("object_id") is not None and not isinstance(entry["object_id"], str))):
+        if not isinstance(entry, dict) or type(entry.get("u_id")) is not int or entry["u_id"] <= 0:
             raise ValueError("Invalid or unsupported deletion ledger entry")
-        u_id, face_label = entry["u_id"], entry.get("object_id")
-        async with conn.transaction():
-            # Restore the audit row if this deletion postdates the backup.
-            await conn.execute(
-                "INSERT INTO deletion_ledger (kind, u_id, object_id) "
-                "SELECT 'account', $1, $2 WHERE NOT EXISTS "
-                "(SELECT 1 FROM deletion_ledger WHERE kind='account' AND u_id=$1 "
-                "AND object_id IS NOT DISTINCT FROM $2)", u_id, face_label)
-            await conn.execute('DELETE FROM "user" WHERE u_id=$1', u_id)
-        # Unlike the request path, replay fails closed on filesystem errors.
-        delete_gallery_files(face_label)
+        kind, u_id, object_id = entry.get("kind"), entry["u_id"], entry.get("object_id")
+        if kind == "account":
+            if object_id is not None and not isinstance(object_id, str):
+                raise ValueError("Invalid or unsupported deletion ledger entry")
+            async with conn.transaction():
+                await _restore_audit_row(conn, "account", u_id, object_id)
+                await conn.execute('DELETE FROM "user" WHERE u_id=$1', u_id)
+            # Unlike the request path, replay fails closed on filesystem errors.
+            delete_gallery_files(object_id)
+        elif kind in _DELETE_BY_ID:
+            if not _valid_uuid(object_id):
+                raise ValueError("Invalid or unsupported deletion ledger entry")
+            async with conn.transaction():
+                await _restore_audit_row(conn, kind, u_id, object_id)
+                await conn.execute(_DELETE_BY_ID[kind], object_id, u_id)
+        elif kind == "consent":
+            if object_id not in legal_service.SCOPE_KIND:
+                raise ValueError("Invalid or unsupported deletion ledger entry")
+            withdrawn_at = datetime.fromisoformat(str(entry.get("deleted_at")))
+            async with conn.transaction():
+                await _restore_audit_row(conn, "consent", u_id, object_id)
+                # Re-apply the withdrawal only if the restored state still grants it from before then.
+                await conn.execute(
+                    "INSERT INTO consent (u_id, kind, terms_version, language, document_sha256, scope, granted, source) "
+                    "SELECT u_id, kind, terms_version, language, document_sha256, scope, FALSE, 'settings' "
+                    "FROM consent WHERE consent_id = (SELECT max(consent_id) FROM consent WHERE u_id = $1 AND scope = $2) "
+                    "AND granted AND created_at < $3", u_id, object_id, withdrawn_at)
+        else:
+            raise ValueError("Invalid or unsupported deletion ledger entry")
         count += 1
     return count
