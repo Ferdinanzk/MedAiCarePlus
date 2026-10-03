@@ -26,6 +26,13 @@ EXPORT_TABLES = (
 )
 
 
+def _strip_secrets(account: dict) -> None:
+    """Credential-derived values stay out of the export, even hashed."""
+    for table, column in (("user", "password_hash"), ("reachy_device", "token_hash")):
+        for row in account.get(table, []):
+            row.pop(column, None)
+
+
 class DeletePayload(BaseModel):
     password: str | None = None
 
@@ -41,8 +48,7 @@ async def export_account(user: dict = Depends(get_current_user)):
     if not account["user"]:
         raise HTTPException(404, "account_not_found")
     face_label = account["user"][0].get("face_label")
-    for row in account["user"]:
-        row.pop("password_hash", None)
+    _strip_secrets(account)
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
         output.writestr("account.json", json.dumps(jsonable_encoder(account), ensure_ascii=False))

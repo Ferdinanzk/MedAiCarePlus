@@ -261,3 +261,10 @@ def test_retention_purges_transcripts_events_and_tombstones():
     assert "conversation_turn" in sql[0][0]
     assert "kind = 'event'" in sql[1][0] and sql[1][1] == (config.MEDCARE_TIMEZONE, 30)
     assert "patient_memory_deleted" in sql[2][0] and sql[2][1] == (7,)
+
+
+def test_withdrawn_checkin_consent_means_no_model_call(world):
+    # e.g. an abandoned chat closed by the sweep after the patient switched check-ins off
+    world.consent = {k: v for k, v in MEMORY_ON.items() if k != "conversation_analysis"}
+    assert run(world) == "skipped"
+    assert world.model_calls == [] and world.chat["summary"] is None

@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 MIN_PATIENT_TURNS, MIN_PATIENT_CHARS = 2, 15
+ANALYSIS_SCOPES = ("core", "cloud_voice", "conversation_analysis")   # needed for any post-chat model call
 _running: set[str] = set()   # one process serves both ports and the scheduler (app.serve)
 
 
@@ -61,10 +62,17 @@ async def _process(conversation_id: str, u_id: int) -> str | None:
         await _set_state(conversation_id, "skipped")
         return "skipped"
 
+    state = await consent_service.get_state(u_id)
+    if not all(consent_service.is_current(state, scope) for scope in ANALYSIS_SCOPES):
+        # Consent withdrawn after the chat (the sweep can reach an abandoned chat much later):
+        # its text no longer goes to a model.
+        await _set_state(conversation_id, "skipped")
+        return "skipped"
+
     today = memory.local_today()
     raw = None
     try:
-        memory_on = memory.consent_current(await consent_service.get_state(u_id))
+        memory_on = memory.consent_current(state)
         if memory_on and len(patient) >= MIN_PATIENT_TURNS and sum(map(len, patient)) >= MIN_PATIENT_CHARS:
             async with get_pool().acquire() as conn:
                 known = await memory.current_facts(conn, u_id)
