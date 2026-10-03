@@ -29,7 +29,7 @@ def append_host_file(kind: str, u_id: int, object_id: str | None) -> None:
             output.flush()
             os.fsync(output.fileno())
     except Exception:
-        logger.exception("Could not append host deletion ledger for account %s", u_id)
+        logger.exception("Could not append host deletion ledger (%s) for account %s", kind, u_id)
 
 
 def gallery_files(face_label: str | None) -> list:

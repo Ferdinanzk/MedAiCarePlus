@@ -75,7 +75,7 @@ export default function PrivacySettings({ limited = false }: { limited?: boolean
       </div>
       <div className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm space-y-4">
         <p className="text-sm text-gray-600">{t('memory.privacyHelp')}</p>
-        <button onClick={() => { if (confirm(t('memory.deleteAllConfirm'))) void deleteAllMemory().then(r => setMemoryCleared(r.deleted), () => setError('memory.saveFailed')); }}
+        <button onClick={() => { if (confirm(t('memory.deleteAllPrivacyConfirm'))) void deleteAllMemory().then(r => setMemoryCleared(r.deleted), () => setError('memory.saveFailed')); }}
           disabled={busy !== null} className="min-h-12 w-full px-5 py-3 rounded-xl bg-red-50 text-red-700 font-semibold disabled:opacity-50">{t('memory.deleteAll')}</button>
         {memoryCleared !== null && <p role="status" className="text-sm text-gray-600">{t('memory.deleteAllDone', { count: memoryCleared })}</p>}
       </div>

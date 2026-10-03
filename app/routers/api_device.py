@@ -271,10 +271,12 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         if row["ended_at"] is not None:
             raise HTTPException(409, "Conversation has ended")
         language = row["language"]
+        # A turn sent after a risk turn (before /end) carries the flagged words in its history.
+        earlier_risk = bool(row["risk_flag"])
         turn_id = await _add_turn(conn, row["conversation_id"], device["u_id"], "patient", text, bool(risk))
         history = await _history(conn, row["conversation_id"])
         block = ""
-        if not risk and memory.consent_current(await consent_service.get_state(device["u_id"])):
+        if not (risk or earlier_risk) and memory.consent_current(await consent_service.get_state(device["u_id"])):
             block = await memory.build_block(conn, device["u_id"], language, row["followup_memory_id"],
                                              memory.local_today())
         if risk:
@@ -294,7 +296,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
                     device["u_id"], "safety_alert_undelivered",
                     "A check-in safety alert could not be sent: no verified family contact on LINE.")
     patient_turns = sum(1 for turn in history if turn["role"] == "patient")
-    if risk:
+    if risk or earlier_risk:
         reply, end = conversation.HELPLINE[language], True
     elif conversation.wants_to_end(text) or patient_turns >= conversation.MAX_PATIENT_TURNS:
         reply, end = conversation.CLOSING[language], True
@@ -303,7 +305,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         reply, end = await conversation.reply(history, language, block), False
     async with get_pool().acquire() as conn:
         await _add_turn(conn, row["conversation_id"], device["u_id"], "reachy", reply)
-    return _spoken(reply, language, end=end, risk=bool(risk))
+    return _spoken(reply, language, end=end, risk=bool(risk or earlier_risk))
 
 
 @router.post("/conversations/{conversation_id}/end")

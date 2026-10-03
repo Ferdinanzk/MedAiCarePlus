@@ -508,3 +508,13 @@ def test_memory_on_names_the_patient_and_sends_the_block(robot, monkeypatch):
     assert opened["reply"] == "王奶奶，" + conversation.OPENING["zh-TW"]
     _turn(robot, opened["conversation_id"], "我去散步了")
     assert seen == ["<memory>\n稱呼：王奶奶\n</memory>"]
+
+
+def test_a_turn_after_a_risk_turn_never_reaches_the_model(robot):
+    # The robot should call /end after a risk reply, but if it sends another turn first, the history
+    # holds the flagged words: no model call, no second alert, the help-line reply again.
+    cid = _start(robot)["conversation_id"]
+    assert _turn(robot, cid, "我覺得活不下去了").json()["risk"] is True
+    body = _turn(robot, cid, "今天天氣很好").json()
+    assert body["end"] is True and body["risk"] is True and body["reply"] == conversation.HELPLINE["zh-TW"]
+    assert robot.prompts == [] and len(robot.alerts) == 1

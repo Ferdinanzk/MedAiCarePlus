@@ -239,3 +239,10 @@ def test_refresh_removes_identity_even_when_files_remain(monkeypatch):
     deletion_ledger.refresh_gallery("pearl")
     assert calls == ["reload"]
     assert [identity.label for identity in database.database] == ["other"]
+
+
+def test_export_strips_the_device_token_hash():
+    from app.routers import api_account
+    rows = {"reachy_device": [{"device_id": "d", "u_id": 7, "token_hash": "abc"}], "user": [{"password_hash": "x"}]}
+    api_account._strip_secrets(rows)
+    assert "token_hash" not in rows["reachy_device"][0] and "password_hash" not in rows["user"][0]
