@@ -55,6 +55,15 @@ def test_occurrences_follow_weekdays_custom_times_and_end_date():
     assert schedule.occurrences({}, start) == []
 
 
+def test_a_course_that_already_ended_gets_no_doses_today():
+    """A scanned receipt dispensed 28 Sep for 5 days ends 2 Oct; saved on 4 Oct it must not remind at 12:00 and 20:00."""
+    now = datetime.datetime(2026, 10, 4, 10, 0, tzinfo=TZ)
+    three = {"morning": True, "noon": True, "night": True}
+    assert schedule.occurrences(three, now, until=datetime.date(2026, 10, 2)) == []
+    today = schedule.occurrences(three, now, until=datetime.date(2026, 10, 4))
+    assert [m.strftime("%d %H:%M") for m in today] == ["04 12:00", "04 20:00"]   # the last day itself still counts
+
+
 @pytest.mark.parametrize("text, expected", [
     ("114年08月22日", datetime.date(2025, 8, 22)), ("2025年8月22日", datetime.date(2025, 8, 22)),
     ("2025-08-22", datetime.date(2025, 8, 22)), ("2025/8/2", datetime.date(2025, 8, 2)),
