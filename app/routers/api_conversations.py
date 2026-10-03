@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.database import get_pool
 from app.dependencies import get_consented_user
+from app.services import deletion_ledger, memory
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -61,10 +62,14 @@ async def get_conversation(conversation_id: str, user: dict = Depends(get_consen
 @router.delete("/{conversation_id}")
 async def delete_conversation(conversation_id: str, user: dict = Depends(get_consented_user)):
     conversation_id = _conversation_id(conversation_id)
-    async with get_pool().acquire() as conn:
+    async with get_pool().acquire() as conn, conn.transaction():
+        await memory.lock_user(conn, user["u_id"])     # facts learned in this chat cascade with it
         deleted = await conn.fetchval(
             "DELETE FROM conversation WHERE conversation_id = $1::uuid AND u_id = $2 RETURNING conversation_id",
             conversation_id, user["u_id"])
+        if deleted:
+            await deletion_ledger.record(conn, "conversation", user["u_id"], str(deleted))
     if not deleted:
         raise HTTPException(404, "Conversation not found")
+    deletion_ledger.append_host_file("conversation", user["u_id"], str(deleted))
     return {"deleted": str(deleted)}

@@ -24,6 +24,8 @@ EXEMPT_PATHS = {
     "/api/face/login", "/api/face/identify", "/api/face/identify-bytes",
     "/api/notify/webhook/line", "/line/webhook",
 }
+# Limited mode for one method only: the same path is consent-gated for the other methods.
+EXEMPT_ROUTES = {("GET", "/api/memory"), ("DELETE", "/api/memory"), ("DELETE", "/api/memory/fact")}
 
 
 def _dependency_calls(dependant):
@@ -49,10 +51,11 @@ def test_all_authenticated_routes_enforce_consent_except_explicit_exemptions(app
         if not isinstance(route, APIRoute):
             continue
         calls = _dependency_calls(route.dependant)
-        if route.path in EXEMPT_PATHS:
-            assert get_consented_user not in calls, route.path
+        exempt = route.path in EXEMPT_PATHS or any((method, route.path) in EXEMPT_ROUTES for method in route.methods)
+        if exempt:
+            assert get_consented_user not in calls, (route.methods, route.path)
         elif get_current_user in calls:
-            assert get_consented_user in calls, route.path
+            assert get_consented_user in calls, (route.methods, route.path)
             protected.add(route.path)
 
     assert {
@@ -63,6 +66,7 @@ def test_all_authenticated_routes_enforce_consent_except_explicit_exemptions(app
         "/api/intake/monitor/start", "/api/intake/monitor/landmarks",
         "/api/intake/monitor/vision", "/api/intake/monitor/outcome",
         "/api/intake/monitor/end", "/api/intake/monitor/recent", "/api/intake/monitor/undo",
+        "/api/memory", "/api/memory/fact",
     } <= protected
 
 

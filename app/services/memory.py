@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from zhconv import convert
 
 from app import config
-from app.services import consent_service, conversation
+from app.services import consent_service, conversation, deletion_ledger
 
 KINDS = ("name", "person", "like", "routine", "event")
 CHAT_KINDS = ("person", "like", "routine", "event")
@@ -370,3 +370,39 @@ async def build_block(conn, u_id: int, language: str, followup_memory_id, today:
                                   str(followup_memory_id), u_id)
         followup = dict(row) if row else None
     return render_block(facts, language, followup=followup, today=today)
+
+
+async def save_patient_fact(conn, u_id: int, fact: dict) -> dict | None:
+    """Upsert the patient's own version of a fact. The caller holds a transaction."""
+    await lock_user(conn, u_id)
+    if not consent_current(await consent_service.fetch_state(conn, u_id)):
+        return None
+    row = await conn.fetchrow(
+        "INSERT INTO patient_memory (u_id, kind, subject, text, event_date, source) "
+        "VALUES ($1, $2, $3, $4, $5, 'patient') "
+        "ON CONFLICT (u_id, kind, subject) WHERE source = 'patient' "
+        "DO UPDATE SET text = EXCLUDED.text, event_date = EXCLUDED.event_date, created_at = NOW() "
+        "RETURNING kind, subject, text, event_date, source, created_at",
+        u_id, fact["kind"], fact["subject"], fact["text"], fact["event_date"])
+    return dict(row)
+
+
+async def delete_facts(conn, u_id: int, kind: str | None = None, subject: str | None = None) -> list[str]:
+    """Delete one fact (every row of kind + subject) or all of them, leave tombstones and ledger rows.
+    The caller holds a transaction and appends the host ledger after commit."""
+    await lock_user(conn, u_id)
+    if kind is None:
+        rows = await conn.fetch(
+            "DELETE FROM patient_memory WHERE u_id = $1 RETURNING memory_id, kind, subject", u_id)
+    else:
+        rows = await conn.fetch(
+            "DELETE FROM patient_memory WHERE u_id = $1 AND kind = $2 AND subject = $3 "
+            "RETURNING memory_id, kind, subject", u_id, kind, subject)
+    for kind_, subject_ in {(row["kind"], row["subject"]) for row in rows}:
+        await conn.execute(
+            "INSERT INTO patient_memory_deleted (u_id, kind, subject) VALUES ($1, $2, $3) "
+            "ON CONFLICT (u_id, kind, subject) DO UPDATE SET deleted_at = NOW()", u_id, kind_, subject_)
+    ids = [str(row["memory_id"]) for row in rows]
+    for memory_id in ids:
+        await deletion_ledger.record(conn, "memory", u_id, memory_id)
+    return ids
