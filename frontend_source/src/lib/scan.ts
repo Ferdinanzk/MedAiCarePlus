@@ -87,6 +87,8 @@ export interface MedicineDraft {
   asNeeded: boolean;
   /** An active medicine with the same name is already saved: unticked until the user ticks it again. */
   duplicate?: boolean;
+  /** The paper's last day, cleared because the user ticked a course that had already ended (shown as a note). */
+  clearedLastDay?: string;
   source: ScannedMedicine;
   status: DraftStatus;
   /** The i18n key of why the last save failed (never the server's raw text). */

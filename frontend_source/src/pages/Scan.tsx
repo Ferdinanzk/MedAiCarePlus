@@ -62,6 +62,7 @@ export default function Scan() {
   const [parsed, setParsed] = useState<ScanResult | null>(null);
   const [drafts, setDrafts] = useState<MedicineDraft[]>([]);
   const [parseError, setParseError] = useState('');
+  const [addError, setAddError] = useState('');
   const [saving, setSaving] = useState(false);
   const [flashOn, setFlashOn] = useState(false);
 
@@ -162,19 +163,24 @@ export default function Scan() {
   const addSelected = async () => {
     if (!parsed) return;
     const headers = getAuthHeaders();
+    // Why nothing was saved is shown next to the button pressed (the page can be long; a message at the top was
+    // out of sight and the button looked dead).
     if (!headers.Authorization) {
-      setParseError(t('scan.notLoggedIn'));
+      setAddError(t('scan.notLoggedIn'));
       return;
     }
     if (selected.length === 0) {
-      setParseError(t('scan.noneSelected'));
+      setAddError(t('scan.noneSelected'));
       return;
     }
     // Problems are shown on their cards; nothing is saved until every kept medicine can be.
-    if (drafts.some((draft) => draft.include && draft.status !== 'saved' && draftProblem(draft, today))) {
-      setParseError(t('scan.fixProblems'));
+    const firstProblem = drafts.findIndex((draft) => draft.include && draft.status !== 'saved' && draftProblem(draft, today));
+    if (firstProblem >= 0) {
+      setAddError(t('scan.fixProblems'));
+      document.getElementById(`scan-card-${firstProblem}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
+    setAddError('');
     setParseError('');
     setSaving(true);
     // Look again just before saving: a save whose answer was lost may have stored the medicine after all.
@@ -183,7 +189,7 @@ export default function Scan() {
     if (existing.length > 0) {
       const checked = markDuplicates(current, existing);
       if (checked.some((draft, index) => draft.duplicate && !current[index].duplicate)) {
-        setParseError(t('scan.duplicatesFound'));
+        setAddError(t('scan.duplicatesFound'));
       }
       current = checked;
       setDrafts(checked);
@@ -244,6 +250,7 @@ export default function Scan() {
     return (
       <div
         key={index}
+        id={`scan-card-${index}`}
         className={`bg-white rounded-2xl border shadow-sm p-4 space-y-3 transition-all ${
           draft.include ? 'border-gray-200' : 'border-gray-100 opacity-70'
         }`}
@@ -255,7 +262,15 @@ export default function Scan() {
               className="w-5 h-5 accent-[#0057B8]"
               checked={draft.include}
               disabled={locked}
-              onChange={(e) => updateDraft(index, (d) => ({ ...d, include: e.target.checked }))}
+              onChange={(e) => {
+                const include = e.target.checked;
+                // Ticking a course that already ended by the paper's dates means "add it anyway": clear the past
+                // last day (the server makes no doses for it) and say so on the card.
+                updateDraft(index, (d) => (include && d.lastDay !== '' && d.lastDay < today
+                  ? { ...d, include, lastDay: '', clearedLastDay: d.lastDay }
+                  : { ...d, include }));
+                setAddError('');
+              }}
             />
             <span className="text-base font-medium text-gray-900">{t('scan.include')}</span>
           </label>
@@ -470,8 +485,10 @@ export default function Scan() {
             disabled={locked}
             onChange={(e) => updateDraft(index, (d) => ({ ...d, lastDay: e.target.value }))}
           />
-          <p className={`text-sm mt-1 ${ended ? 'text-amber-700' : 'text-gray-500'}`}>
-            {draft.lastDay === ''
+          <p className={`text-sm mt-1 ${ended || (draft.lastDay === '' && draft.clearedLastDay) ? 'text-amber-700' : 'text-gray-500'}`}>
+            {draft.lastDay === '' && draft.clearedLastDay
+              ? t('scan.courseEndedCleared', { date: draft.clearedLastDay })
+              : draft.lastDay === ''
               ? t('scan.noLastDay')
               : ended
                 ? t('scan.courseEnded', { date: draft.lastDay })
@@ -745,6 +762,13 @@ export default function Scan() {
               </div>
             </div>
           ) : (
+            <div className="space-y-3">
+            {addError && (
+              <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-xl text-base text-red-600 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                {addError}
+              </div>
+            )}
             <div className="flex gap-3">
               <button
                 onClick={addSelected}
@@ -761,6 +785,7 @@ export default function Scan() {
               >
                 {t('scan.scanAnother')}
               </button>
+            </div>
             </div>
           )}
         </div>
