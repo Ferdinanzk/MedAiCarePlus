@@ -387,6 +387,7 @@ const resources = {
         noLastDay: 'No last day: reminders continue until you stop the medicine.',
         remindersUntil: 'Reminders until {{date}}.',
         courseEnded: 'According to the paper, this course ended on {{date}}. To add it, change or clear the last day.',
+        courseEndedCleared: 'The paper says this course ended on {{date}}, so the last day was cleared: reminders continue until you stop the medicine. Set a new last day if you need one.',
         appearance: 'Appearance',
         clinicalUses: 'Used for',
         problems: {
@@ -999,6 +1000,7 @@ const resources = {
         noLastDay: '沒有最後服藥日：提醒會持續到您停用這個藥物。',
         remindersUntil: '提醒到 {{date}}。',
         courseEnded: '依藥單上的日期，這個療程已在 {{date}} 結束。若要加入，請修改或清除最後服藥日。',
+        courseEndedCleared: '依藥單上的日期，這個療程已在 {{date}} 結束，所以已清除最後服藥日：提醒會持續到您停用這個藥物。如有需要，請重新設定最後服藥日。',
         appearance: '外觀',
         clinicalUses: '用途',
         problems: {
