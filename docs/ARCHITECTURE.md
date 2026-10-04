@@ -51,7 +51,7 @@ flowchart LR
     end
   end
   subgraph Internet["Internet"]
-    OR["OpenRouter LLMs"]
+    OR["OpenRouter<br/>Gemini 2.5 Flash Lite<br/>2.5 Flash fallback"]
     LINE["LINE Messaging API"]
     CF["Cloudflare edge"]
     Gemini["Google Gemini"]
@@ -350,7 +350,7 @@ Version 0.5.4 is in the code (`reachy_app/pyproject.toml:8`): 0.5.3 plus the spe
 | `bridge/runner.py` | Frame streaming (`MonitorStream`), heartbeat every 10 s, long-poll task loop |
 | `bridge/session.py` | Slot state machine (diagram below) |
 | `bridge/app_client.py` | HTTP client for `/api/device/*`; maps errors to exceptions |
-| `bridge/voice.py` | Silero VAD + SenseVoice speech-to-text, "I finished" detection, chat hand-over, echo guards |
+| `bridge/voice.py` | Silero VAD + Whisper Base via faster-whisper, "I finished" detection, chat hand-over, echo guards |
 | `bridge/speech.py` | Matcha-TTS + Vocos live speech |
 | `bridge/clips.py`, `bridge/clips/manifest.json` | 16 prerecorded clips (rendered on the robot by the deploy tool). Optional per-medicine prompts `med_<med_id>.wav` (manifest `per_medication`, `clips.py:97`); without one, `med_prompt_generic` plays |
 | `bridge/media.py`, `bridge/gestures.py`, `bridge/moves.py` | SDK facade, "think"/"speak" gestures, the vendored `inquiring3` move |
@@ -482,7 +482,7 @@ Settings come from `.env` via `env_file`. `docker-compose.yml:29-36` overrides `
 | Dose safety | `DOSE_EARLY_MINUTES` (120) | `app/config.py:43` |
 | Intake policy | `INTAKE_V1_MODE` (assisted), `INTAKE_V1_AUTO_CONFIRM_MIN` (0.75), `INTAKE_V1_PROMPT_MIN` (0.30), `INTAKE_V1_ADAPTIVE_MOUTH` (on), `INTAKE_V1_TONGUE_SUPPORT` (on), `INTAKE_V1_COLLECT` (compose "0") | `app/intake_v1/config.py:40-71` |
 | LINE and videos | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`, `PUBLIC_BASE_URL` (empty → webhook host), `DOSE_VIDEO_DIR` (/tmp/medcare_dose_videos) | `app/config.py:56-64` |
-| LLM | `OPENROUTER_API_KEY`, `LLM_MODEL` (empty), `LLM_FALLBACK_MODEL` (openrouter/free), `LLM_DEADLINE_SECONDS` (8), `OPENROUTER_PROVIDER_ONLY`, `OPENROUTER_DATA_COLLECTION`, `LLM_SERVICE`/`LLM_PROVIDER`/`LLM_PROVIDER_REGION`/`LLM_RETENTION` (notice fill-ins) | `app/config.py:77-89` |
+| LLM | `OPENROUTER_API_KEY`, `LLM_MODEL` (`google/gemini-2.5-flash-lite`), `LLM_FALLBACK_MODEL` (`google/gemini-2.5-flash`), `LLM_DEADLINE_SECONDS` (8), `OPENROUTER_PROVIDER_ONLY`, `OPENROUTER_DATA_COLLECTION`, `LLM_SERVICE`/`LLM_PROVIDER`/`LLM_PROVIDER_REGION`/`LLM_RETENTION` (notice fill-ins) | `app/config.py` |
 | Weather | `WEATHER_ENABLED` (true), `WEATHER_PLACE` (台北, logs only), `WEATHER_LATITUDE` (25.0330), `WEATHER_LONGITUDE` (121.5654) | `app/config.py:94-97` |
 | OCR | `GEMINI_API_KEY` (empty: the only setting an installation must add), `OCR_MODEL` (gemini-3.5-flash), `OCR_GEMINI_FALLBACK_MODEL` (gemini-3.5-flash-lite; empty turns it off), `OCR_GEMINI_TIMEOUT` (25), `OCR_GEMINI_IMAGE_BUDGET` (45), `OLLAMA_URL`, `OLLAMA_TIMEOUT` (180) | `app/config.py` (OCR block); [OCR.md](OCR.md) |
 | Legal and production | `OPERATOR_NAME`, `OPERATOR_CONTACT`, `TUNNEL_PROVIDER`, `REACHY_FEATURE_ENABLED`, `RISK_CLASSIFIER_API_KEY` | `app/config.py:73-75,99-100` |
@@ -490,7 +490,7 @@ Settings come from `.env` via `env_file`. `docker-compose.yml:29-36` overrides `
 
 The laptop's `.env` (secret values not read):
 - **Set:** `SECRET_KEY`, both LINE keys, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`.
-- **Values:** `APP_ENV=dev`, `REACHY_FEATURE_ENABLED=0`, `DEVICE_BIND=192.168.49.32`, `OCR_MODEL=gemini-3.5-flash` and `OCR_GEMINI_FALLBACK_MODEL=gemini-3.5-flash-lite` (the same as the code defaults; swapped on 4 Oct after a receipt comparison, [OCR.md](OCR.md#which-model-and-why)). The LLM models are pinned to `inclusionai/ling-3.0-flash-sante:free` with fallback `apodex/apodex-1.1-mini:free`.
+- **Values:** `APP_ENV=dev`, `REACHY_FEATURE_ENABLED=0`, `DEVICE_BIND=192.168.49.32`, `OCR_MODEL=gemini-3.5-flash` and `OCR_GEMINI_FALLBACK_MODEL=gemini-3.5-flash-lite` (see [OCR.md](OCR.md#which-model-and-why)). Conversation, risk, summary and memory calls use `google/gemini-2.5-flash-lite` with fallback `google/gemini-2.5-flash` through OpenRouter.
 - **Empty:** the operator/tunnel/LLM-provider fill-ins and `BACKUP_PASSPHRASE`.
 - Compose passes `.env` to the app through `env_file` (`docker-compose.yml:28`), read when the container is created. On 4 Oct the running container used the OCR models above: all three accounts got a real scan result through `POST /api/ocr/parse`.
 
@@ -501,7 +501,7 @@ The laptop's `.env` (secret values not read):
 | Rebuild after any backend or frontend change | `docker compose up -d --build app` | Schema migrates on start. A rebuild drops in-memory state and `/tmp` dose videos. Watch disk space: on 2 Oct a full C: drive produced an image with empty files (`HANDOFF.md:73-80`) |
 | Health | `curl http://localhost:8080/health`; `docker compose logs --tail 80 app` | `README.md:17,67` |
 | Backend tests | in a throwaway container from the app image | `README.md:73-77`; `CLAUDE.md:280` |
-| Deploy the robot app | `python reachy_app/tools/deploy_to_robot.py [--host reachy-mini.local] [--user pollen] [--camera-ipc-fps 12-30]`. It backs up the installed package, uploads it, renders changed clips on the robot and checks them with SenseVoice, then sets `capture_fps 15` and `vision_on_server true` | Then restart the app through the daemon: `POST /api/apps/restart-current-app`. Saving settings restarts only the worker thread (`CLAUDE.md:85`). An `IPC_FPS` change needs a manual daemon restart (`reachy_app/tools/deploy_to_robot.py:17-19,280-390`) |
+| Deploy the robot app | `python reachy_app/tools/deploy_to_robot.py [--host reachy-mini.local] [--user pollen] [--camera-ipc-fps 12-30]`. It backs up the installed package, uploads it, installs faster-whisper and Whisper Base, renders changed clips on the robot and checks them with Whisper, then sets `capture_fps 15` and `vision_on_server true` | Then restart the app through the daemon: `POST /api/apps/restart-current-app`. Saving settings restarts only the worker thread (`CLAUDE.md:85`). An `IPC_FPS` change needs a manual daemon restart (`reachy_app/tools/deploy_to_robot.py:17-19,280-390`) |
 | Pair a robot | Web Settings → Reachy robot → Pair. Enter the one-time `rdv1.` key and `http://<laptop LAN IP>:8001` on the robot's `:8042` page | A 404 on the heartbeat means the wrong port was used (`docs/NEW_LAPTOP_SETUP.md:173-185`) |
 | Start LINE | `scripts/line-tunnel.ps1` (about 30 s, idempotent) | Rerun after every tunnel restart |
 | Backup | automatic: daily 02:30 into `backups/nightly/<date>` (14 kept); Sunday `backups/weekly/<date>.tar.gpg` (4 kept) | `scripts/backup/backup.sh:17-61` |

@@ -94,8 +94,8 @@ LLM_PROVIDER_REGION      = os.getenv("LLM_PROVIDER_REGION", "")
 LLM_RETENTION            = os.getenv("LLM_RETENTION", "")
 OPENROUTER_API_KEY       = os.getenv("OPENROUTER_API_KEY", "")
 # Check-in replies try LLM_MODEL, then LLM_FALLBACK_MODEL, and give up (a fixed line) after LLM_DEADLINE_SECONDS.
-LLM_MODEL                = os.getenv("LLM_MODEL", "")
-LLM_FALLBACK_MODEL       = os.getenv("LLM_FALLBACK_MODEL", "") or "openrouter/free"
+LLM_MODEL                = os.getenv("LLM_MODEL", "google/gemini-2.5-flash-lite")
+LLM_FALLBACK_MODEL       = os.getenv("LLM_FALLBACK_MODEL", "google/gemini-2.5-flash") or "google/gemini-2.5-flash"
 LLM_DEADLINE_SECONDS     = float(os.getenv("LLM_DEADLINE_SECONDS", "") or "8")
 # Optional OpenRouter provider routing: pin providers (comma-separated slugs) and refuse providers that store data.
 # It applies to every call (reply, risk check, summary, memory) and to both models above.

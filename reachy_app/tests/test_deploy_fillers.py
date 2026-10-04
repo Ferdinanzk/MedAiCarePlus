@@ -69,7 +69,7 @@ def test_an_unrecognised_phrase_counts_as_not_written():
 # ── the render script itself, on a fake voice and recogniser ─────────────
 
 def run_render(tmp_path, monkeypatch, job_clips, heard):
-    """Runs RENDER as the robot would, with Matcha and SenseVoice replaced: `heard[(text, speed)]` is what the
+    """Runs RENDER as the robot would, with Matcha and Whisper replaced: `heard[(text, speed)]` is what the
     recogniser writes for that render. Returns (printed output, clips folder, speeds tried per text)."""
     tried = []
     fake = types.ModuleType("sherpa_onnx")
@@ -87,21 +87,19 @@ def run_render(tmp_path, monkeypatch, job_clips, heard):
             samples = np.concatenate([np.zeros(1000), np.full(int(2205 * speed), 0.3)]).astype(np.float32)
             return types.SimpleNamespace(samples=samples, sample_rate=22050)
 
-    class Recognizer:
-        @staticmethod
-        def from_sense_voice(**kwargs):
-            return Recognizer()
+    class WhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
 
-        def create_stream(self):
-            return types.SimpleNamespace(accept_waveform=lambda rate, samples: None,
-                                         result=types.SimpleNamespace(text=""))
-
-        def decode_stream(self, stream):
-            stream.result.text = heard[tried[-1]]
+        def transcribe(self, path, **kwargs):
+            return iter([types.SimpleNamespace(text=heard[tried[-1]])]), None
 
     fake.OfflineTtsConfig = fake.OfflineTtsModelConfig = fake.OfflineTtsMatchaModelConfig = Config
-    fake.OfflineTts, fake.OfflineRecognizer = Tts, Recognizer
+    fake.OfflineTts = Tts
     monkeypatch.setitem(sys.modules, "sherpa_onnx", fake)
+    fake_whisper = types.ModuleType("faster_whisper")
+    fake_whisper.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_whisper)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps({"rendered": {"thanks": "謝謝您！"}, "clips": job_clips}, ensure_ascii=False),

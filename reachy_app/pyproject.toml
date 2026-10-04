@@ -17,6 +17,7 @@ dependencies = [
     "pillow>=10",
     "numpy",
     "httpx>=0.27",
+    "faster-whisper>=1.1,<2",
 ]
 keywords = ["reachy-mini-app"]
 
