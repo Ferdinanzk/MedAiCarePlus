@@ -56,7 +56,7 @@ The server, not the robot, decides what is recorded.
 | Expression | Seed 43 ONNX export, `models/emotion_seed43/model_fp32.onnx`, SHA-256 `0caaedf04b60d1c95d89ee2162c8bf207ccd669b88865f155b17987cc15ffbad` |
 | Face, hand, and pose landmarks (browser) | MediaPipe task models in `frontend_source/public/models`, downloaded by `python scripts/fetch_mediapipe_models.py` |
 | Face, hand, and pose landmarks (robot frames) | The same MediaPipe models converted to ONNX, in `models/landmarks/` (six files, pinned by SHA-256 in `app/services/landmark_service.py`) |
-| Robot voice and listening | On the robot: Matcha-TTS `zh-baker` + vocos for prompts; Whisper Base (faster-whisper, CPU int8) + Silero VAD for speech recognition. Whisper weights are fetched from Hugging Face on deploy. |
+| Robot voice and listening | On the robot: ElevenLabs Flash v2.5 for Mandarin prompts and live replies (API key saved in the robot settings); Whisper Base (faster-whisper, CPU int8) + Silero VAD for speech recognition. Whisper weights are fetched from Hugging Face on deploy. |
 
 The expression model predicts Angry, Disgust, Fear, Happy, Sad, Surprise, and Neutral. The face gallery is bind-mounted from `models/face_recognition/face_gallery`, so enrollments survive container rebuilds. PostgreSQL data is in the `medcareai2_pgdata` volume.
 
