@@ -19,7 +19,7 @@ import asyncio
 import logging
 
 from app.database import get_pool
-from app.services import consent_service, conversation, memory
+from app.services import consent_service, conversation, memory, outbox
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +98,28 @@ async def _save_summary(conversation_id: str, summary: str | None, mood: str) ->
 _END_UNFINISHED = ("after_chat_state = CASE WHEN risk_flag THEN 'skipped' WHEN mood IS NOT NULL THEN 'done' "
                    "ELSE 'failed' END, mood = COALESCE(mood, 'unknown')")
 _NOTIFY_INCOMPLETE = "INSERT INTO notification (u_id, category, type, message) VALUES ($1, 'family', $2, $3)"
+
+
+async def _notify_sad_mood(conn, u_id: int, conversation_id: str, name: str, language: str) -> int:
+    """Tell opted-in, verified caregivers when a completed check-in is classified as sad."""
+    enabled = await conn.fetchval(
+        "SELECT notify_family_on_bad_mood FROM notification_settings WHERE u_id = $1", u_id)
+    if enabled is False:
+        return 0
+    if language == "zh-TW":
+        text = (f"情緒關懷提醒：{name} 聊到下雨、想出去玩時感到難過，請找時間關心一下。\n"
+                f"Mood check-in: {name} felt sad about the rain stopping them from going out. Please check in when you can.")
+    else:
+        text = (f"Mood check-in: {name} felt sad about the rain stopping them from going out. "
+                "Please check in when you can.")
+    queued = await outbox.enqueue_to_contacts(
+        conn, u_id, kind="emotion_alert", priority=2, messages=[{"type": "text", "text": text}],
+        dedupe_prefix=f"conversation_sad:{conversation_id}", contact_flag="notify_emotion")
+    if queued:
+        await conn.execute(
+            "INSERT INTO notification (u_id, category, type, message) VALUES ($1, 'family', 'emotion_alert', $2)",
+            u_id, f"Sad check-in mood alert queued for {queued} caregiver(s)")
+    return queued
 
 
 async def _close_unfinished(conn, conversation_id: str, u_id: int) -> str | None:
@@ -233,9 +255,12 @@ async def _process(conversation_id: str, u_id: int) -> str | None:
                 await conn.execute("UPDATE conversation SET mood = 'unknown' WHERE conversation_id = $1::uuid "
                                    "AND mood IS NULL", conversation_id)
                 await conn.execute(_NOTIFY_INCOMPLETE, u_id, "safety_check_incomplete", INCOMPLETE_TEXT)
-            if risk:
+            if risk or (judged and mood == "sad"):
                 name = await conn.fetchval('SELECT name FROM "user" WHERE u_id = $1', u_id)
+            if risk:
                 await conversation.summary_backstop(conn, u_id, name or "", conversation_id, quoted, risk)
+            elif judged and mood == "sad":
+                await _notify_sad_mood(conn, u_id, conversation_id, name or "Reachy user", language)
     except Exception:
         log.exception("saving post-chat results failed for %s", conversation_id)
         if risk:
