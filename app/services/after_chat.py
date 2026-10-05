@@ -107,10 +107,10 @@ async def _notify_sad_mood(conn, u_id: int, conversation_id: str, name: str, lan
     if enabled is False:
         return 0
     if language == "zh-TW":
-        text = (f"情緒關懷提醒：{name} 聊到下雨、想出去玩時感到難過，請找時間關心一下。\n"
-                f"Mood check-in: {name} felt sad about the rain stopping them from going out. Please check in when you can.")
+        text = (f"情緒關懷提醒：{name} 在最近一次與 Reachy 的對話後，情緒被標記為難過。請找時間關心一下。\n"
+                f"Mood check-in: {name} was marked as sad after a recent conversation with Reachy. Please check in when you can.")
     else:
-        text = (f"Mood check-in: {name} felt sad about the rain stopping them from going out. "
+        text = (f"Mood check-in: {name} was marked as sad after a recent conversation with Reachy. "
                 "Please check in when you can.")
     queued = await outbox.enqueue_to_contacts(
         conn, u_id, kind="emotion_alert", priority=2, messages=[{"type": "text", "text": text}],
