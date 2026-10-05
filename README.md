@@ -45,6 +45,7 @@ The server, not the robot, decides what is recorded.
 - **Vision:** the robot streams camera frames (about 15 per second) to `POST /api/device/monitor/frame`. This computer runs the face, hand and pose models plus face recognition and emotion on each frame. Frames are analyzed in memory and never stored.
 - **Recording:** when automatic recording is on and the dose is one solid tablet, a clear hand-to-mouth event is recorded as taken, labelled *observed, pill not verified*. Anything uncertain goes to a family member to confirm through LINE.
 - **"I finished":** this only happens if the patient switches on *Let Reachy listen for "I finished"* in the Reachy card. The robot then turns speech into text on the robot itself and listens for 「我吃完了」. If the camera saw nothing, the family is asked to check the pill box.
+- **Check-in conversation:** Reachy opens with 「今天感覺怎麼樣？想跟我聊聊嗎？」, keeps recent turns in context, and uses today's weather only when it matches the live forecast. When rain disrupts a plan the patient was looking forward to, it acknowledges the disappointment and offers gentle company; the after-chat summary can classify clearly expressed disappointment as sad.
 - **Pairing:** Settings → Reachy robot → review the notice → **Pair**. Enter the one-time `rdv1.` key and the server address `http://<this computer's Wi-Fi IP>:8001` on the robot app's settings page.
 
 ## Model sources

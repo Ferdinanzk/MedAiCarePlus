@@ -134,6 +134,26 @@ SYSTEM_PROMPT = {
         "Never give medical advice or comment on medicines or doses; suggest asking a doctor or pharmacist."
     ),
 }
+# Examples for conversational tone. Weather details in the example are illustrative: the live answer must follow
+# context_info's current forecast above and must never reuse the example's drizzle when today's data differs.
+CONVERSATION_EXAMPLES = {
+    "zh-TW": (
+        "天氣打亂對方期待的計畫時，先接住失望，再溫和陪伴或提供可選的替代方案，不要保證雨會停。\n"
+        "示例（只有今日背景資料確實顯示毛毛雨時，才照此描述天氣）：\n"
+        "Reachy：今天感覺怎麼樣？想跟我聊聊嗎？\n"
+        "長者：今天天氣怎麼樣？\n"
+        "Reachy：外面有毛毛雨，溫度剛好。你出門會帶傘嗎？\n"
+        "長者：為什麼今天要下雨？我想出去玩。\n"
+        "Reachy：本來想出去玩，碰上下雨真的有點掃興。我可以陪你想想，有沒有能避雨又好玩的地方。"
+    ),
+    "en": (
+        "When the weather disrupts a plan the patient was looking forward to, acknowledge the disappointment, then "
+        "offer gentle company or an optional alternative. Do not promise the rain will stop.\n"
+        "Patient: Why does it have to rain today? I wanted to go out and have fun.\n"
+        "Reachy: It is disappointing when rain gets in the way of something you were looking forward to. "
+        "Would you like me to help think of something fun you could do indoors?"
+    ),
+}
 # Introduces the background lines (context_info.background) after SYSTEM_PROMPT, in the reply prompt only.
 # The model can't look anything up: without that line, with no weather given it offered to check. "The rules above"
 # (SYSTEM_PROMPT's no medical advice) without naming medicine again: repeated right before the data, it sent the
@@ -150,6 +170,7 @@ SUMMARY_PROMPT = {
     "zh-TW": ("以下是陪伴機器人和長者的對話。請用一句繁體中文總結長者談到的主題和心情（不要引用原話），"
               "再判斷整體心情，並判斷安全風險：長者若表達任何想傷害自己、自殺或不想活的念頭，RISK 填 self_harm；"
               "若說吃了過量的藥，填 overdose；否則填 none。長者的話來自語音辨識，可能有同音錯字或簡體字。"
+              "若長者因下雨打亂出遊計畫而明確失望或難過，整體心情可判為 sad；不要只因為談到下雨就判 sad。"
               "只輸出三行：\nMOOD: happy|calm|sad|worried|angry|unknown\nSUMMARY: <一句話>\n"
               "RISK: none|self_harm|overdose"),
     "en": ("Below is a conversation between a companion robot and an older adult. Summarise the topics and mood in "
@@ -453,8 +474,9 @@ def reply_prompt(language: str) -> str:
         block = context_info.background(language)
     except Exception:
         log.exception("check-in background failed; replying without it")
-        return SYSTEM_PROMPT[language]
-    return f"{SYSTEM_PROMPT[language]}\n\n{BACKGROUND_RULES[language]}\n{block}"
+        return f"{SYSTEM_PROMPT[language]}\n\n{CONVERSATION_EXAMPLES[language]}"
+    return (f"{SYSTEM_PROMPT[language]}\n\n{BACKGROUND_RULES[language]}\n{block}\n\n"
+            f"{CONVERSATION_EXAMPLES[language]}")
 
 
 async def reply_with_metrics(history: list[dict], language: str, memory: str = "") -> tuple[str, dict]:
