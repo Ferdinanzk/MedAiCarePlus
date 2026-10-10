@@ -21,7 +21,8 @@ from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.startup_checks import run_startup_checks, check_restore_state
+from app.services import ai_settings, ai_store
+from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
 from app.services.schedule import DoseRefused
@@ -33,7 +34,10 @@ async def lifespan(app: FastAPI):
     await init_pool()
     async with get_pool().acquire() as conn:
         await check_restore_state(conn)
-        await register_documents(conn)
+        await ai_store.seed_from_env(conn)
+        ai_settings.set_current(await ai_store.load(conn))
+        check_ai_settings(ai_settings.current())
+        await register_documents(conn)   # after the AI settings: the notices name the services in use
     FaceRecognitionService.get_instance()
     EmotionService.get_instance()
     OCRService.get_instance()

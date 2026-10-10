@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 
 from app import config
+from app.services import ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -18,17 +19,28 @@ def run_startup_checks(env: Mapping[str, str] | None = None) -> list[str]:
         problems.append("SECRET_KEY must be changed from its default")
     required = ["LINE_CHANNEL_SECRET", "OPERATOR_NAME", "OPERATOR_CONTACT", "TUNNEL_PROVIDER"]
     if str(value("REACHY_FEATURE_ENABLED")).strip().lower() in ("1", "true", "yes"):
-        required += ["LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION",
-                     "RISK_CLASSIFIER_API_KEY"]
-        # Both models get the memory notes (reply, post-chat call) whenever the primary fails, so both must be
-        # pinned: the memory notice names the provider, and openrouter/free routes to any of them.
-        for key in ("LLM_MODEL", "LLM_FALLBACK_MODEL"):
-            model = str(value(key)).strip()
-            if not model or model == "openrouter/free":
-                problems.append(f"{key} must name a pinned model, not openrouter/free")
+        # The models and the companies the notices name are checked on the AI connections card's settings
+        # (check_ai_settings), once the database is up.
+        required += ["RISK_CLASSIFIER_API_KEY"]
     for key in required:
         if not str(value(key)).strip():
             problems.append(f"{key} is required")
+    for problem in problems:
+        logger.warning("Startup check: %s", problem)
+    if problems and str(value("APP_ENV", "dev")).strip().lower() == "prod":
+        raise SystemExit(1)
+    return problems
+
+
+def check_ai_settings(snapshot, env: Mapping[str, str] | None = None) -> list[str]:
+    """The robot feature's model rules (LLM_* in .env before the AI connections card) on the settings in use:
+    warn in dev, stop in prod."""
+    def value(key, default=""):
+        return env.get(key, default) if env is not None else getattr(config, key, default)
+
+    if str(value("REACHY_FEATURE_ENABLED")).strip().lower() not in ("1", "true", "yes"):
+        return []
+    problems = ai_settings.problems(snapshot)
     for problem in problems:
         logger.warning("Startup check: %s", problem)
     if problems and str(value("APP_ENV", "dev")).strip().lower() == "prod":
