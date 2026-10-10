@@ -101,6 +101,26 @@ def test_the_first_start_copies_the_env_setup(monkeypatch):
     assert conn.statements("INSERT INTO ai_job") == [(job, 11, 12) for job in ai_settings.JOBS]
     assert conn.statements("INSERT INTO ops_state") == [()]
     assert conn.sql[0] == "BEGIN" and conn.sql[-1] == "COMMIT"
+    # the table is locked first, before the emptiness check, so two starts cannot both copy
+    assert conn.sql[1][0].startswith("LOCK TABLE ai_connection") and "EXISTS" in conn.sql[2][0]
+
+
+def test_an_empty_llm_model_uses_the_fallback_as_main_and_backup(monkeypatch):
+    _env(monkeypatch, model="")
+    conn = Conn(values=[False, 1, 11])
+    asyncio.run(ai_store.seed_from_env(conn))
+    (model,) = conn.statements("INSERT INTO ai_model")
+    assert model[1] == "google/gemini-2.5-flash"
+    assert conn.statements("INSERT INTO ai_job") == [(job, 11, 11) for job in ai_settings.JOBS]
+
+
+def test_an_empty_env_key_seeds_no_key(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+    conn = Conn(values=[False, 1, 11, 12])
+    asyncio.run(ai_store.seed_from_env(conn))
+    (connection,) = conn.statements("INSERT INTO ai_connection")
+    assert connection[3] is None and connection[4] is None
 
 
 def test_equal_env_models_make_one_model_tried_twice(monkeypatch):
@@ -155,6 +175,31 @@ def test_a_failed_change_keeps_the_previous_snapshot(monkeypatch):
     assert ai_settings.loaded() is previous and conn.sql[-1] == "ROLLBACK"
 
 
+def test_a_change_that_fails_after_the_reload_restores_the_previous_snapshot(monkeypatch):
+    previous = ai_settings.Snapshot({}, {}, {"reply": (1, None)}, None)
+    new = ai_settings.Snapshot({}, {}, {"reply": (2, None)}, None)
+    monkeypatch.setattr(ai_settings, "_snapshot", previous)
+
+    async def load(conn):
+        return new
+
+    async def register(conn):
+        raise RuntimeError("registering the notices failed")
+
+    monkeypatch.setattr(ai_store, "load", load)
+    monkeypatch.setattr(legal_service, "register_documents", register)
+    conn = Conn()
+
+    async def run():
+        async with ai_store.change(conn):
+            await conn.execute("UPDATE ai_model SET region = $2 WHERE model_ref = $1", 11, "USA")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run())
+    assert ai_settings.loaded() is previous and conn.sql[-1] == "ROLLBACK"
+    assert legal_service.load_documents.cache_info().currsize == 0
+
+
 def test_what_a_job_uses_cannot_be_deleted():
     with pytest.raises(ai_store.InUse):
         asyncio.run(ai_store.delete_model(Conn(values=[True]), 21))
@@ -202,5 +247,7 @@ def test_a_note_never_raises_without_a_database(monkeypatch):
         raise RuntimeError("Database pool not initialised")
 
     monkeypatch.setattr(ai_store, "get_pool", no_pool)
+    monkeypatch.setattr(ai_settings, "_snapshot",
+                        ai_settings.Snapshot({}, {11: ai_settings.Model(11, 1, "gpt-5.4-mini")}, {}, None))
     asyncio.run(ai_store.note_call(11, "HTTP 503"))
-    assert ai_settings.loaded() is None   # nothing was recorded in memory when the write failed
+    assert ai_settings.current().models[11].last_error is None   # memory not updated when the write failed
