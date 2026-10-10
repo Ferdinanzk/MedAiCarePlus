@@ -22,12 +22,21 @@ interface NoticeDraft { ref: number; company: string; region: string; retention:
 
 const errorCode = (cause: unknown) => (cause instanceof ApiError && KNOWN_ERRORS.includes(cause.message) ? cause.message : 'failed');
 
+/** Brings a refusal into view when it appears. Outside the component, so React calls it once per mount, not on
+ *  every render (it would pull the page back while the person types). */
+const reveal = (node: HTMLElement | null) => { node?.scrollIntoView({ block: 'nearest' }); };
+
+/** A refusal and where it shows: next to what caused it ('connection:<id>', 'newConnection', 'model:<ref>',
+ *  'newModel' or 'jobs'), not at the top of a long card. */
+interface CardError { code: string; at: string }
+
 export default function AiConnectionsCard() {
   const { t } = useTranslation();
   const [settings, setSettings] = useState<AiSettings | null>(null);
   const [jobs, setJobs] = useState<Record<AiJob, AiJobChoice> | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<CardError | null>(null);
+  const [jobsSaved, setJobsSaved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState<number | null>(null);
   const [results, setResults] = useState<Record<number, AiTestResult>>({});
@@ -46,11 +55,12 @@ export default function AiConnectionsCard() {
     return () => { active = false; };
   }, []);
 
-  /** One change; the server answers with the whole card. `done` runs only after a success (e.g. closing a form).
-   *  Unsaved job choices survive every change except saving the jobs themselves. */
-  const run = async (action: () => Promise<AiSettings>, done?: () => void, savesJobs = false) => {
+  /** One change; the server answers with the whole card. A refusal shows at `at`. `done` runs only after a success
+   *  (e.g. closing a form). Unsaved job choices survive every change except saving the jobs themselves. */
+  const run = async (at: string, action: () => Promise<AiSettings>, done?: () => void, savesJobs = false) => {
     setBusy(true);
-    setError('');
+    setError(null);
+    setJobsSaved(false);
     try {
       const next = await action();
       setSettings(next);
@@ -58,7 +68,7 @@ export default function AiConnectionsCard() {
         : mergeJobs(current, next.jobs, next.models.filter(model => model.tested).map(model => model.model_ref))));
       done?.();
     } catch (cause) {
-      setError(errorCode(cause));
+      setError({ code: errorCode(cause), at });
     } finally {
       setBusy(false);
     }
@@ -66,13 +76,13 @@ export default function AiConnectionsCard() {
 
   const runTest = async (ref: number) => {
     setTesting(ref);
-    setError('');
+    setError(null);
     try {
       const { settings: next, ...result } = await testModel(ref);
       setResults(previous => ({ ...previous, [ref]: result }));
       setSettings(next);
     } catch (cause) {
-      setError(errorCode(cause));
+      setError({ code: errorCode(cause), at: `model:${ref}` });
     } finally {
       setTesting(null);
     }
@@ -80,11 +90,11 @@ export default function AiConnectionsCard() {
 
   const loadRemoteModels = async (id: number) => {
     setBusy(true);
-    setError('');
+    setError(null);
     try {
       setRemoteModels((await fetchRemoteModels(id)).models);
     } catch (cause) {
-      setError(errorCode(cause));
+      setError({ code: errorCode(cause), at: 'newModel' });
     } finally {
       setBusy(false);
     }
@@ -114,6 +124,9 @@ export default function AiConnectionsCard() {
   const connectionName = (id: number) => settings.connections.find(c => c.connection_id === id)?.name ?? '';
   const label = (model: AiModel) => `${connectionName(model.connection_id)} · ${model.model_id}`;
   const tested = settings.models.filter(model => model.tested);
+  const errorAt = (at: string) => error?.at === at && (
+    <p role="alert" ref={reveal} className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{t(`aiConnections.errors.${error.code}`)}</p>
+  );
 
   const status = (model: AiModel) => {
     const result = results[model.model_ref];
@@ -136,7 +149,6 @@ export default function AiConnectionsCard() {
       {settings.weak_secret && <p role="alert" className={warning}><TriangleAlert className="inline w-4 h-4" /> {t('aiConnections.weakSecret')}</p>}
       {settings.no_key_in_use && <p role="alert" className={warning}>{t('aiConnections.noKeyInUse')}</p>}
       {settings.seeded_at && <p className="text-xs text-gray-500">{t('aiConnections.seeded', { date: new Date(settings.seeded_at).toLocaleDateString() })}</p>}
-      {error && <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{t(`aiConnections.errors.${error}`)}</p>}
 
       <div className="space-y-2">
         <h3 className="text-sm font-semibold text-gray-900">{t('aiConnections.connections')}</h3>
@@ -154,14 +166,21 @@ export default function AiConnectionsCard() {
                 <button type="button" className={secondary} disabled={busy}
                   onClick={() => setKeyDraft({ id: connection.connection_id, key: '' })}>{t('aiConnections.replaceKey')}</button>
                 <button type="button" className={secondary} disabled={busy} aria-label={t('aiConnections.removeNamed', { name: connection.name })}
-                  onClick={() => void run(() => deleteConnection(connection.connection_id))}><Trash2 className="w-4 h-4" /></button>
+                  onClick={() => {
+                    if (confirm(t('aiConnections.removeConfirm', { name: connection.name }))) {
+                      void run(`connection:${connection.connection_id}`, () => deleteConnection(connection.connection_id));
+                    }
+                  }}><Trash2 className="w-4 h-4" /></button>
               </div>
             </div>
             {keyDraft?.id === connection.connection_id && (
               <form className="flex gap-2" onSubmit={event => {
                 event.preventDefault();
                 const key = keyDraft.key.trim();
-                if (key) void run(() => updateConnection(connection.connection_id, { api_key: key }), () => setKeyDraft(null));
+                if (key) {
+                  void run(`connection:${connection.connection_id}`, () => updateConnection(connection.connection_id, { api_key: key }),
+                    () => setKeyDraft(null));
+                }
               }}>
                 <input type="password" autoComplete="off" className={field} aria-label={t('aiConnections.apiKey')} value={keyDraft.key}
                   onChange={event => setKeyDraft({ id: connection.connection_id, key: event.target.value })} />
@@ -169,13 +188,14 @@ export default function AiConnectionsCard() {
                 <button type="button" className={secondary} onClick={() => setKeyDraft(null)}>{t('aiConnections.cancel')}</button>
               </form>
             )}
+            {errorAt(`connection:${connection.connection_id}`)}
           </div>
         ))}
         {connectionDraft ? (
           <form className="rounded-xl border border-gray-100 p-3 space-y-2" onSubmit={event => {
             event.preventDefault();
             const draft = connectionDraft;
-            void run(() => addConnection({ ...draft, base_url: draft.kind === 'openai_compatible' ? draft.base_url : undefined }),
+            void run('newConnection', () => addConnection({ ...draft, base_url: draft.kind === 'openai_compatible' ? draft.base_url : undefined }),
               () => setConnectionDraft(null));
           }}>
             <label className="block text-xs text-gray-600">{t('aiConnections.kind')}
@@ -208,10 +228,14 @@ export default function AiConnectionsCard() {
               <button type="submit" className={primary} disabled={busy}>{t('aiConnections.save')}</button>
               <button type="button" className={secondary} onClick={() => setConnectionDraft(null)}>{t('aiConnections.cancel')}</button>
             </div>
+            {errorAt('newConnection')}
           </form>
         ) : (
           <button type="button" className={secondary} disabled={busy}
-            onClick={() => setConnectionDraft({ kind: 'openai', name: t('aiConnections.kinds.openai'), base_url: '', api_key: '', service_name: t('aiConnections.kinds.openai') })}>
+            onClick={() => {
+              setError(null);
+              setConnectionDraft({ kind: 'openai', name: t('aiConnections.kinds.openai'), base_url: '', api_key: '', service_name: t('aiConnections.kinds.openai') });
+            }}>
             <Plus className="inline w-4 h-4" /> {t('aiConnections.addConnection')}
           </button>
         )}
@@ -221,13 +245,14 @@ export default function AiConnectionsCard() {
         <h3 className="text-sm font-semibold text-gray-900">{t('aiConnections.models')}</h3>
         {settings.models.map(model => (
           <div key={model.model_ref} role="group" aria-label={label(model)} className="rounded-xl border border-gray-100 p-3 space-y-2">
-            <div className="flex items-start justify-between gap-2">
+            {/* On a phone the buttons go under the text, so the name and the failure reason keep the row's width. */}
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
               <div className="text-sm min-w-0">
-                <div className="font-medium text-gray-900 break-all">{label(model)}</div>
-                <div className="text-xs">{status(model)}</div>
-                <div className="text-xs text-gray-500">{[model.company, model.region, model.retention].map(value => value || '—').join(' · ')}</div>
+                <div className="font-medium text-gray-900 break-words">{label(model)}</div>
+                <div className="text-xs break-words">{status(model)}</div>
+                <div className="text-xs text-gray-500 break-words">{[model.company, model.region, model.retention].map(value => value || '—').join(' · ')}</div>
               </div>
-              <div className="flex flex-wrap gap-2 justify-end shrink-0">
+              <div className="flex flex-wrap gap-2 sm:justify-end sm:shrink-0">
                 <button type="button" className={secondary} disabled={busy || testing !== null} onClick={() => void runTest(model.model_ref)}>
                   {testing === model.model_ref ? <Loader2 className="w-4 h-4 animate-spin" aria-label={t('aiConnections.test')} /> : t('aiConnections.test')}
                 </button>
@@ -236,14 +261,18 @@ export default function AiConnectionsCard() {
                   {t('aiConnections.editNotice')}
                 </button>
                 <button type="button" className={secondary} disabled={busy} aria-label={t('aiConnections.removeNamed', { name: model.model_id })}
-                  onClick={() => void run(() => deleteModel(model.model_ref))}><Trash2 className="w-4 h-4" /></button>
+                  onClick={() => {
+                    if (confirm(t('aiConnections.removeModelConfirm', { name: label(model) }))) {
+                      void run(`model:${model.model_ref}`, () => deleteModel(model.model_ref));
+                    }
+                  }}><Trash2 className="w-4 h-4" /></button>
               </div>
             </div>
             {noticeDraft?.ref === model.model_ref && (
               <form className="space-y-2" onSubmit={event => {
                 event.preventDefault();
                 const { ref, ...details } = noticeDraft;
-                void run(() => updateModel(ref, details), () => setNoticeDraft(null));
+                void run(`model:${ref}`, () => updateModel(ref, details), () => setNoticeDraft(null));
               }}>
                 {(['company', 'region', 'retention'] as const).map(name => (
                   <label key={name} className="block text-xs text-gray-600">{t(`aiConnections.${name}`)}
@@ -256,13 +285,14 @@ export default function AiConnectionsCard() {
                 </div>
               </form>
             )}
+            {errorAt(`model:${model.model_ref}`)}
           </div>
         ))}
         {modelDraft ? (
           <form className="rounded-xl border border-gray-100 p-3 space-y-2" onSubmit={event => {
             event.preventDefault();
             const draft = modelDraft;
-            void run(() => addModel(draft), () => setModelDraft(null));
+            void run('newModel', () => addModel(draft), () => setModelDraft(null));
           }}>
             <label className="block text-xs text-gray-600">{t('aiConnections.connection')}
               <select className={field} aria-label={t('aiConnections.connection')} value={modelDraft.connection_id} onChange={event => {
@@ -289,10 +319,12 @@ export default function AiConnectionsCard() {
               <button type="submit" className={primary} disabled={busy}>{t('aiConnections.add')}</button>
               <button type="button" className={secondary} onClick={() => setModelDraft(null)}>{t('aiConnections.cancel')}</button>
             </div>
+            {errorAt('newModel')}
           </form>
         ) : (
           <button type="button" className={secondary} disabled={busy || !settings.connections.length}
             onClick={() => {
+              setError(null);
               setRemoteModels([]);
               setModelDraft({ connection_id: settings.connections[0].connection_id, model_id: '', company: '', region: '', retention: '' });
             }}>
@@ -305,20 +337,35 @@ export default function AiConnectionsCard() {
         <h3 className="text-sm font-semibold text-gray-900">{t('aiConnections.jobs')}</h3>
         <p className="text-xs text-gray-500">{t('aiConnections.onlyTested')}</p>
         {AI_JOBS.map(job => (
-          <div key={job} className="grid gap-2 sm:grid-cols-3 sm:items-center">
-            <span className="text-sm text-gray-900">{t(`aiConnections.jobNames.${job}`)}</span>
-            <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.main')}`} value={jobs[job].primary_ref}
-              onChange={event => setJobs({ ...jobs, [job]: { ...jobs[job], primary_ref: Number(event.target.value) } })}>
-              {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
-            </select>
-            <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.backup')}`} value={jobs[job].fallback_ref ?? ''}
-              onChange={event => setJobs({ ...jobs, [job]: { ...jobs[job], fallback_ref: event.target.value ? Number(event.target.value) : null } })}>
-              <option value="">{t('aiConnections.noBackup')}</option>
-              {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
-            </select>
+          <div key={job} className="grid gap-2 sm:grid-cols-3 sm:items-end">
+            <span className="text-sm text-gray-900 sm:pb-2">{t(`aiConnections.jobNames.${job}`)}</span>
+            <label className="block text-xs text-gray-600">{t('aiConnections.main')}
+              <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.main')}`} value={jobs[job].primary_ref}
+                onChange={event => {
+                  setJobsSaved(false);
+                  setJobs({ ...jobs, [job]: { ...jobs[job], primary_ref: Number(event.target.value) } });
+                }}>
+                {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
+              </select>
+            </label>
+            <label className="block text-xs text-gray-600">{t('aiConnections.backup')}
+              <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.backup')}`} value={jobs[job].fallback_ref ?? ''}
+                onChange={event => {
+                  setJobsSaved(false);
+                  setJobs({ ...jobs, [job]: { ...jobs[job], fallback_ref: event.target.value ? Number(event.target.value) : null } });
+                }}>
+                <option value="">{t('aiConnections.noBackup')}</option>
+                {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
+              </select>
+            </label>
           </div>
         ))}
-        <button type="button" className={primary} disabled={busy} onClick={() => void run(() => saveJobs(jobs), undefined, true)}>{t('aiConnections.saveJobs')}</button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button type="button" className={primary} disabled={busy}
+            onClick={() => void run('jobs', () => saveJobs(jobs), () => setJobsSaved(true), true)}>{t('aiConnections.saveJobs')}</button>
+          <p role="status" className="text-sm text-green-700">{jobsSaved ? t('aiConnections.jobsSaved') : ''}</p>
+        </div>
+        {errorAt('jobs')}
       </div>
     </section>
   );

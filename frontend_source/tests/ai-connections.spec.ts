@@ -26,7 +26,7 @@ async function seedSession(page: Page) {
   });
 }
 
-async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown } = {}) {
+async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown; jobsRefused?: boolean } = {}) {
   const mock = { settings: startingSettings(), requests: [] as { method: string; path: string; body: any }[] };
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -62,6 +62,7 @@ async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown
       return route.fulfill({ json: { ok: true, ms: 812, sample: '您好！很高興見到您。', profile: model.profile, error: null, settings: mock.settings } });
     }
     if (path === '/api/ai/jobs' && method === 'PUT') {
+      if (options.jobsRefused) return route.fulfill({ status: 400, json: { detail: 'notice_incomplete' } });
       mock.settings.jobs = body;
       return route.fulfill({ json: mock.settings });
     }
@@ -125,19 +126,44 @@ test('a tested model can be given a job, and the card sends the chosen jobs', as
   await expect(main.locator('option', { hasText: 'gpt-5.4-mini' })).toHaveCount(0);
   await row.getByRole('button', { name: 'Test' }).click();
   await expect(row).toContainText('0.8 s');
+  // each job's two lists say which is the main model and which the backup
+  await expect(card(page).locator('label', { hasText: 'Main model' })).toHaveCount(3);
+  await expect(card(page).locator('label', { hasText: 'Backup model' })).toHaveCount(3);
   await main.selectOption({ label: 'OpenAI · gpt-5.4-mini' });
   await card(page).getByRole('button', { name: 'Save jobs' }).click();
   await expect.poll(() => mock.requests.find(r => r.path === '/api/ai/jobs')?.body?.reply)
     .toEqual({ primary_ref: 21, fallback_ref: 12 });
+  await expect(card(page).getByRole('status')).toHaveText('Saved.');
+  await main.selectOption({ label: 'OpenRouter · google/gemini-2.5-flash' });   // a new change clears it
+  await expect(card(page).getByRole('status')).toHaveText('');
 });
 
-test("a refused change shows the card's own words", async ({ page }) => {
+test("a refused change shows the card's own words next to what caused it, after a confirmation", async ({ page }) => {
   await seedSession(page);
-  await mockApi(page);
+  const mock = await mockApi(page);
   await openSettings(page);
-  await card(page).getByRole('button', { name: 'Remove OpenRouter' }).click();
+  const remove = card(page).getByRole('button', { name: 'Remove OpenRouter' });
+  page.once('dialog', dialog => void dialog.dismiss());
+  await remove.click();
+  expect(mock.requests.filter(r => r.method === 'DELETE')).toEqual([]);   // dismissed: nothing is removed
+  let question = '';
+  page.once('dialog', dialog => { question = dialog.message(); void dialog.accept(); });
+  await remove.click();
+  expect(question).toContain('Remove OpenRouter?');
+  const refusal = card(page).getByRole('group', { name: 'OpenRouter', exact: true }).getByRole('alert');
+  await expect(refusal).toContainText('A job still uses this');
+  await expect(refusal).toBeInViewport();
+});
+
+test('a refused Save jobs shows why where it was pressed, and never says saved', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { jobsRefused: true });
+  await openSettings(page);
+  await card(page).getByRole('button', { name: 'Save jobs' }).click();
   // the default-secret warning is an alert too, so pick the refusal by its words
-  await expect(card(page).getByRole('alert').filter({ hasText: 'A job still uses this' })).toBeVisible();
+  const refusal = card(page).getByRole('alert').filter({ hasText: 'Fill in company, region and data retention' });
+  await expect(refusal).toBeInViewport();
+  await expect(card(page).getByRole('status')).toHaveText('');
 });
 
 test('the rest of Settings keeps working when the AI settings cannot load', async ({ page }) => {
