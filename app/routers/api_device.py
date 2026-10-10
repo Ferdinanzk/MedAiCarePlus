@@ -16,7 +16,6 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
 from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_video, memory, outbox,

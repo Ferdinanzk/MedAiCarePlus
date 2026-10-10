@@ -420,14 +420,16 @@ async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: flo
             status = "timeout"
         except Exception as exc:
             status, problem = info.get("status") or (429 if "429" in str(exc) else "error"), exc
+        error = None if result is not None else _call_error(status, problem)
         if result is None:
             log.warning("%s %s gave no usable answer (status %s, finish %s): %s", target.connection.name,
-                        target.model_id, status, info.get("finish_reason"), problem or "unusable text")
+                        target.model_id, status, info.get("finish_reason"),
+                        error if problem is not None else "unusable text")
         attempts.append({"connection": target.connection.name, "model_requested": target.model_id,
                          "model_served": info.get("model_served"), "ms": _ms_since(call_started),
                          "status": status, "finish_reason": info.get("finish_reason"),
                          "tokens": info.get("tokens"), "usable": result is not None})
-        _note_call(target, None if result is not None else _call_error(status, problem))
+        _note_call(target, error)
         if result is not None:
             break
     return result, {"llm_ms": _ms_since(started), "attempts": attempts}
