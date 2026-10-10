@@ -1,0 +1,255 @@
+"""The AI connections card's API: keys never leave the server, refused changes give the card's codes, and the Test
+button saves what the service accepted."""
+
+import dataclasses
+import json
+import sys
+import types
+from contextlib import asynccontextmanager
+
+import pytest
+from fastapi.testclient import TestClient
+
+_asyncpg_stub = types.ModuleType("asyncpg")
+_asyncpg_stub.Pool = object
+sys.modules.setdefault("asyncpg", _asyncpg_stub)
+
+from app import config
+from app.dependencies import get_current_user
+from app.routers import api_ai
+from app.services import ai_profile, ai_settings, ai_store, consent_service
+
+OPENROUTER_KEY = "sk-or-v1-routerSECRET-ab12"
+NEW_KEY = "sk-proj-newSECRET-9876"
+
+
+def _snapshot():
+    openrouter = ai_settings.Connection(1, "OpenRouter", "openrouter", ai_profile.BASE_URLS["openrouter"],
+                                        OPENROUTER_KEY, "ab12", True, "OpenRouter")
+    lite = ai_settings.Model(11, 1, "google/gemini-2.5-flash-lite", "Google", "global", "not kept",
+                             ai_profile.starting_profile("openrouter"))
+    flash = ai_settings.Model(12, 1, "google/gemini-2.5-flash", "Google", "global", "not kept",
+                              ai_profile.starting_profile("openrouter"))
+    spare = ai_settings.Model(13, 1, "meta/llama-4", "Meta", "", "", None)
+    return ai_settings.Snapshot({1: openrouter}, {11: lite, 12: flash, 13: spare},
+                                {"reply": (11, 12), "safety": (11, None), "after_chat": (11, None)})
+
+
+class FakeStore:
+    """ai_store without a database: every write edits the snapshot the way load() would read it back."""
+    InUse = ai_store.InUse
+
+    def __init__(self):
+        self.calls, self.next_id = [], 100
+
+    @asynccontextmanager
+    async def change(self, conn):
+        yield
+
+    def _put(self, **changes):
+        ai_settings.set_current(dataclasses.replace(ai_settings.current(), **changes))
+
+    def _uses(self, refs):
+        return any(ref in refs for pair in ai_settings.current().jobs.values() for ref in pair)
+
+    async def add_connection(self, conn, *, name, kind, base_url, api_key, service_name):
+        self.calls.append(("add_connection", name, kind, base_url, api_key, service_name))
+        self.next_id += 1
+        connection = ai_settings.Connection(self.next_id, name, kind, base_url, api_key,
+                                            api_key[-4:] if api_key else None, True, service_name)
+        self._put(connections={**ai_settings.current().connections, self.next_id: connection})
+        return self.next_id
+
+    async def update_connection(self, conn, connection_id, *, name=None, base_url=None, api_key=None,
+                                service_name=None):
+        self.calls.append(("update_connection", connection_id, name, base_url, api_key, service_name))
+
+    async def delete_connection(self, conn, connection_id):
+        snapshot = ai_settings.current()
+        if self._uses({m.model_ref for m in snapshot.models.values() if m.connection_id == connection_id}):
+            raise ai_store.InUse()
+        self.calls.append(("delete_connection", connection_id))
+
+    async def add_model(self, conn, *, connection_id, model_id, company, region, retention, profile=None):
+        self.calls.append(("add_model", connection_id, model_id, company, region, retention))
+        self.next_id += 1
+        model = ai_settings.Model(self.next_id, connection_id, model_id, company, region, retention, profile)
+        self._put(models={**ai_settings.current().models, self.next_id: model})
+        return self.next_id
+
+    async def update_model(self, conn, model_ref, *, company, region, retention):
+        self.calls.append(("update_model", model_ref, company, region, retention))
+
+    async def delete_model(self, conn, model_ref):
+        if self._uses({model_ref}):
+            raise ai_store.InUse()
+        self.calls.append(("delete_model", model_ref))
+
+    async def save_test(self, conn, model_ref, result):
+        self.calls.append(("save_test", model_ref, result["ok"], result["profile"]))
+
+    async def set_jobs(self, conn, jobs):
+        self.calls.append(("set_jobs", jobs))
+        self._put(jobs=dict(jobs))
+
+
+class Pool:
+    def acquire(self):
+        class Ctx:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *exc):
+                return False
+        return Ctx()
+
+
+class Reply:
+    def __init__(self, status, body):
+        self.status_code, self._body, self.text = status, body, json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture
+def api(monkeypatch):
+    from app.main import app
+
+    async def get_state(u_id):
+        return {"core": {"granted": True, "terms_version": config.TERMS_VERSION}}
+
+    store = FakeStore()
+    monkeypatch.setattr(ai_settings, "_snapshot", _snapshot())
+    monkeypatch.setattr(consent_service, "get_state", get_state)
+    monkeypatch.setattr(api_ai, "ai_store", store)
+    monkeypatch.setattr(api_ai, "get_pool", lambda: Pool())
+    monkeypatch.setattr(config, "OPENROUTER_PROVIDER_ONLY", "")
+    monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "")
+    monkeypatch.setattr(app, "dependency_overrides", {get_current_user: lambda: {"u_id": 1, "name": "A"}})
+    return types.SimpleNamespace(client=TestClient(app), store=store)
+
+
+def test_the_card_never_carries_a_key(api, monkeypatch):
+    monkeypatch.setattr(config, "SECRET_KEY", "change-me-in-production-32chars!!")
+    response = api.client.get("/api/ai/settings")
+    body = response.json()
+    assert "routerSECRET" not in response.text and body["connections"][0]["key_last4"] == "ab12"
+    assert body["weak_secret"] is True and body["no_key_in_use"] is False
+
+
+def test_a_new_openai_connection_keeps_its_key_on_the_server(api):
+    response = api.client.post("/api/ai/connections", json={
+        "name": " OpenAI ", "kind": "openai", "api_key": f"  {NEW_KEY}\n", "service_name": "OpenAI"})
+    assert response.status_code == 200 and "newSECRET" not in response.text
+    # a key pasted with spaces or a newline is stored trimmed (review focus 1)
+    assert api.store.calls[-1] == ("add_connection", "OpenAI", "openai", "https://api.openai.com/v1", NEW_KEY, "OpenAI")
+    assert [c["key_last4"] for c in response.json()["connections"]] == ["ab12", "9876"]
+
+
+@pytest.mark.parametrize("base_url, stored", [
+    ("http://host.docker.internal:11434/v1/", "http://host.docker.internal:11434/v1"),
+    ("https://llm.example.org/v1/chat/completions", "https://llm.example.org/v1"),
+])
+def test_an_other_service_address_is_cleaned(api, base_url, stored):   # review focus 2
+    response = api.client.post("/api/ai/connections", json={
+        "name": "Local", "kind": "openai_compatible", "base_url": base_url, "service_name": "Local"})
+    assert response.status_code == 200 and api.store.calls[-1][3] == stored
+
+
+@pytest.mark.parametrize("body, status, code", [
+    ({"name": "X", "kind": "openai_compatible", "base_url": "ftp://x", "service_name": "X"}, 400, "invalid_base_url"),
+    ({"name": "X", "kind": "openai_compatible", "service_name": "X"}, 400, "invalid_base_url"),
+    ({"name": "X", "kind": "gemini", "service_name": "X"}, 400, "invalid_kind"),
+    ({"name": "   ", "kind": "openai", "service_name": "X"}, 400, "invalid_name"),   # review focus 3
+    ({"name": "X", "kind": "openai", "service_name": "  "}, 400, "invalid_name"),
+    ({"name": "OpenRouter", "kind": "openai", "service_name": "X"}, 409, "already_exists"),
+])
+def test_refused_connections_give_the_cards_codes(api, body, status, code):
+    response = api.client.post("/api/ai/connections", json=body)
+    assert (response.status_code, response.json()["detail"]) == (status, code)
+
+
+def test_a_blank_model_name_is_refused(api):
+    response = api.client.post("/api/ai/models", json={"connection_id": 1, "model_id": "  "})
+    assert response.json() == {"detail": "invalid_name"}
+
+
+def test_a_connection_used_only_as_a_backup_is_still_in_use(api, monkeypatch):   # review focus 4
+    other = ai_settings.Connection(2, "Backup", "openai", ai_profile.BASE_URLS["openai"], "sk-x-1111", "1111", True,
+                                   "OpenAI")
+    backup = ai_settings.Model(21, 2, "gpt-4.1-mini", "OpenAI", "USA", "30 days", ai_profile.starting_profile("openai"))
+    snapshot = _snapshot()
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, connections={**snapshot.connections, 2: other}, models={**snapshot.models, 21: backup},
+        jobs={**snapshot.jobs, "safety": (11, 21)}))
+    assert api.client.delete("/api/ai/connections/2").json() == {"detail": "in_use"}
+    assert api.client.delete("/api/ai/models/21").status_code == 409
+    assert api.client.delete("/api/ai/models/13").status_code == 200
+
+
+def test_only_tested_models_can_be_given_a_job(api):
+    jobs = {"reply": {"primary_ref": 13, "fallback_ref": 12}, "safety": {"primary_ref": 11},
+            "after_chat": {"primary_ref": 11}}
+    assert api.client.put("/api/ai/jobs", json=jobs).json() == {"detail": "untested_model"}
+    jobs["reply"]["primary_ref"] = 99
+    assert api.client.put("/api/ai/jobs", json=jobs).json() == {"detail": "not_found"}
+    jobs["reply"] = {"primary_ref": 12, "fallback_ref": None}
+    response = api.client.put("/api/ai/jobs", json=jobs)
+    assert response.status_code == 200 and response.json()["jobs"]["reply"] == {"primary_ref": 12, "fallback_ref": None}
+    assert api.store.calls[-1] == ("set_jobs", {"reply": (12, None), "safety": (11, None), "after_chat": (11, None)})
+
+
+def test_in_prod_with_the_robot_the_models_in_use_need_full_notice_details(api, monkeypatch):
+    monkeypatch.setattr(config, "REACHY_FEATURE_ENABLED", True)
+    monkeypatch.setattr(config, "APP_ENV", "prod")
+    jobs = {job: {"primary_ref": 11} for job in ai_settings.JOBS}
+    assert api.client.put("/api/ai/jobs", json=jobs).status_code == 200
+    assert api.client.patch("/api/ai/models/11", json={"region": " "}).json() == {"detail": "notice_incomplete"}
+    assert api.client.patch("/api/ai/models/13", json={"region": " "}).status_code == 200   # not in use
+    monkeypatch.setattr(config, "APP_ENV", "dev")
+    assert api.client.patch("/api/ai/models/11", json={"region": " "}).status_code == 200
+
+
+def test_the_test_button_saves_what_the_model_accepted(api, monkeypatch):
+    sent = []
+
+    def post(url, json, timeout, headers):
+        sent.append({"url": url, "json": json, "headers": headers})
+        if "temperature" in json:
+            return Reply(400, {"error": {"message": "Unsupported value: 'temperature' does not support 0.7 with "
+                                                    "this model. Only the default (1) value is supported."}})
+        return Reply(200, {"choices": [{"finish_reason": "stop", "message": {"content": "您好！"}}]})
+
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    response = api.client.post("/api/ai/models/13/test")
+    body = response.json()
+    assert body["ok"] is True and body["profile"]["temperature"] is False and body["sample"] == "您好！"
+    assert "routerSECRET" not in response.text and "connections" in body["settings"]
+    assert sent[0]["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert sent[0]["headers"]["Authorization"] == f"Bearer {OPENROUTER_KEY}"
+    assert api.store.calls[-1] == ("save_test", 13, True, body["profile"])
+
+
+def test_a_key_that_cannot_be_read_is_not_tested(api, monkeypatch):   # review focus 5
+    snapshot = _snapshot()
+    broken = dataclasses.replace(snapshot.connections[1], api_key="", key_readable=False)
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(snapshot, connections={1: broken}))
+    assert api.client.post("/api/ai/models/11/test").json() == {"detail": "key_unreadable"}
+    assert api.client.get("/api/ai/settings").json()["connections"][0]["key_readable"] is False
+
+
+def test_the_services_model_list_is_sorted_ids(api, monkeypatch):
+    def get(url, timeout, headers):
+        assert url == "https://openrouter.ai/api/v1/models"
+        return Reply(200, {"data": [{"id": "z/model"}, {"id": "a/model"}, {"name": "no id"}]})
+
+    monkeypatch.setattr(api_ai.requests, "get", get)
+    assert api.client.get("/api/ai/connections/1/remote-models").json() == {"models": ["a/model", "z/model"]}
+    monkeypatch.setattr(api_ai.requests, "get", lambda url, timeout, headers: Reply(401, {"error": "no"}))
+    assert api.client.get("/api/ai/connections/1/remote-models").json() == {"detail": "remote_models_unavailable"}
+
+
+def test_unknown_ids_are_not_found(api):
+    assert api.client.patch("/api/ai/connections/77", json={"name": "Y"}).status_code == 404
+    assert api.client.post("/api/ai/models/77/test").status_code == 404
