@@ -46,17 +46,33 @@ def test_robot_disabled_does_not_require_voice_configuration():
 
 
 @pytest.mark.parametrize("enabled", ["1", "true", "yes"])
-def test_robot_enabled_requires_voice_and_risk_configuration(enabled):
+def test_robot_enabled_requires_the_risk_key(enabled):
+    """The models and the companies the notices name are checked on the AI settings (check_ai_settings)."""
     env = {**_configured(), "APP_ENV": "dev", "REACHY_FEATURE_ENABLED": enabled}
-    problems = startup_checks.run_startup_checks(env)
-    assert {problem.split()[0] for problem in problems} == {
-        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL",
-        "LLM_FALLBACK_MODEL"}
-    env.update({key: "configured" for key in (
-        "LLM_PROVIDER", "LLM_PROVIDER_REGION", "LLM_RETENTION", "RISK_CLASSIFIER_API_KEY", "LLM_MODEL",
-        "LLM_FALLBACK_MODEL")})
-    env["APP_ENV"] = "prod"
+    assert [problem.split()[0] for problem in startup_checks.run_startup_checks(env)] == ["RISK_CLASSIFIER_API_KEY"]
+    env.update(RISK_CLASSIFIER_API_KEY="configured", APP_ENV="prod")
     assert startup_checks.run_startup_checks(env) == []
+
+
+def _ai_snapshot(model_id="google/gemini-2.5-flash", region="global"):
+    from app.services import ai_profile, ai_settings
+    connection = ai_settings.Connection(1, "OpenRouter", "openrouter", ai_profile.BASE_URLS["openrouter"], "k", "k",
+                                        True, "OpenRouter")
+    model = ai_settings.Model(11, 1, model_id, "Google", region, "not kept", ai_profile.starting_profile("openrouter"))
+    return ai_settings.Snapshot({1: connection}, {11: model}, {job: (11, None) for job in ai_settings.JOBS})
+
+
+def test_ai_settings_are_checked_only_with_the_robot():
+    assert startup_checks.check_ai_settings(_ai_snapshot(region=""), {"REACHY_FEATURE_ENABLED": ""}) == []
+
+
+def test_ai_settings_warn_in_dev_and_stop_prod(caplog):
+    env = {"REACHY_FEATURE_ENABLED": "1", "APP_ENV": "dev"}
+    assert startup_checks.check_ai_settings(_ai_snapshot(), env) == []
+    found = startup_checks.check_ai_settings(_ai_snapshot(model_id="openrouter/free", region=""), env)
+    assert found and "openrouter/free" in caplog.text
+    with pytest.raises(SystemExit):
+        startup_checks.check_ai_settings(_ai_snapshot(region=""), {**env, "APP_ENV": "prod"})
 
 
 def test_explicit_env_is_isolated_from_config(monkeypatch):
@@ -81,29 +97,3 @@ def test_restore_marker_blocks_startup_in_every_mode(monkeypatch, marked):
         assert exc.value.code == 1
     else:
         asyncio.run(startup_checks.check_restore_state(Connection()))
-
-
-def test_reachy_feature_needs_a_pinned_model():
-    from app.startup_checks import run_startup_checks
-    env = {"SECRET_KEY": "x" * 40, "LINE_CHANNEL_SECRET": "s", "OPERATOR_NAME": "o", "OPERATOR_CONTACT": "c",
-           "TUNNEL_PROVIDER": "t", "REACHY_FEATURE_ENABLED": "1", "LLM_PROVIDER": "p", "LLM_PROVIDER_REGION": "r",
-           "LLM_RETENTION": "0", "RISK_CLASSIFIER_API_KEY": "k", "APP_ENV": "dev",
-           "LLM_FALLBACK_MODEL": "apodex/apodex-1.1-mini:free"}
-    assert "LLM_MODEL must name a pinned model, not openrouter/free" in run_startup_checks({**env, "LLM_MODEL": "openrouter/free"})
-    assert "LLM_MODEL must name a pinned model, not openrouter/free" in run_startup_checks(env)
-    assert run_startup_checks({**env, "LLM_MODEL": "meta-llama/llama-3.3-70b-instruct"}) == []
-
-
-@pytest.mark.parametrize("fallback", ["openrouter/free", " ", None])
-def test_reachy_feature_needs_a_pinned_fallback_model(fallback):
-    """The fallback model gets the memory notes too whenever the primary fails, so it must be pinned as well."""
-    env = {**_configured(), "APP_ENV": "dev", "REACHY_FEATURE_ENABLED": "1", "LLM_PROVIDER": "p",
-           "LLM_PROVIDER_REGION": "r", "LLM_RETENTION": "0", "RISK_CLASSIFIER_API_KEY": "k",
-           "LLM_MODEL": "inclusionai/ling-3.0-flash-sante:free"}
-    if fallback is not None:
-        env["LLM_FALLBACK_MODEL"] = fallback
-    assert startup_checks.run_startup_checks(env) == [
-        "LLM_FALLBACK_MODEL must name a pinned model, not openrouter/free"]
-    with pytest.raises(SystemExit):
-        startup_checks.run_startup_checks({**env, "APP_ENV": "prod"})
-    assert startup_checks.run_startup_checks({**env, "LLM_FALLBACK_MODEL": "apodex/apodex-1.1-mini:free"}) == []

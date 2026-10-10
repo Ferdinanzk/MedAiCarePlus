@@ -502,3 +502,37 @@ CREATE TABLE IF NOT EXISTS dose_emotion (
 );
 CREATE INDEX IF NOT EXISTS idx_dose_emotion_intake ON dose_emotion(intk_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dose_emotion_user ON dose_emotion(u_id, created_at DESC);
+
+-- AI connections card (spec 2026-10-10-ai-connections-design.md): services with encrypted keys, their models with
+-- the request profile the Test button found, and the main and backup model of each job. No ON DELETE CASCADE:
+-- what a job uses cannot be deleted (409 in_use).
+CREATE TABLE IF NOT EXISTS ai_connection (
+    connection_id  BIGSERIAL PRIMARY KEY,
+    name           VARCHAR(60)  NOT NULL UNIQUE,
+    kind           VARCHAR(20)  NOT NULL CHECK (kind IN ('openrouter','openai','openai_compatible')),
+    base_url       VARCHAR(300) NOT NULL,
+    api_key_enc    TEXT,                     -- Fernet token; NULL = no key yet
+    api_key_last4  VARCHAR(4),
+    service_name   VARCHAR(80)  NOT NULL,    -- {LLM_SERVICE} in the notices
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS ai_model (
+    model_ref      BIGSERIAL PRIMARY KEY,
+    connection_id  BIGINT NOT NULL REFERENCES ai_connection(connection_id),
+    model_id       VARCHAR(100) NOT NULL,    -- as the service names it, e.g. gpt-5.4-mini
+    company        VARCHAR(80)  NOT NULL DEFAULT '',   -- {LLM_PROVIDER}
+    region         VARCHAR(80)  NOT NULL DEFAULT '',   -- {LLM_PROVIDER_REGION}
+    retention      VARCHAR(200) NOT NULL DEFAULT '',   -- {LLM_RETENTION}
+    profile        JSONB,                    -- request settings (ai_profile); NULL = not tested
+    tested_at      TIMESTAMPTZ,
+    test_ms        INTEGER,
+    last_error     TEXT,                     -- last failed real call or test; NULL after a success
+    UNIQUE (connection_id, model_id)
+);
+CREATE TABLE IF NOT EXISTS ai_job (
+    job            VARCHAR(20) PRIMARY KEY CHECK (job IN ('reply','safety','after_chat')),
+    primary_ref    BIGINT NOT NULL REFERENCES ai_model(model_ref),
+    fallback_ref   BIGINT REFERENCES ai_model(model_ref),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
