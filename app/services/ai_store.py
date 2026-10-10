@@ -7,7 +7,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from app import config
+from app import config, startup_checks
 from app.database import get_pool
 from app.services import ai_crypto, ai_profile, ai_settings, legal_service
 
@@ -44,11 +44,15 @@ async def load(conn) -> ai_settings.Snapshot:
 
 async def seed_from_env(conn) -> bool:
     """Copy the .env setup into empty tables (spec §6), so day one works exactly as before; True when it did. The
-    table is locked in one transaction, so two starts cannot both copy."""
+    table is locked in one transaction, so two starts cannot both copy.
+
+    A setup this start will refuse (startup_checks.check_ai_settings: prod with the robot feature) is refused here,
+    before anything is copied: once copied, .env is no longer read, so fixing it and starting again would not help."""
     async with conn.transaction():
         await conn.execute("LOCK TABLE ai_connection IN EXCLUSIVE MODE")
         if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM ai_connection)"):
             return False
+        startup_checks.check_ai_settings(ai_settings.env_snapshot())
         connection_id = await add_connection(
             conn, name="OpenRouter", kind="openrouter", base_url=ai_profile.BASE_URLS["openrouter"],
             api_key=config.OPENROUTER_API_KEY.strip(), service_name=config.LLM_SERVICE or "OpenRouter")

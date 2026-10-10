@@ -352,6 +352,14 @@ def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeo
     info["status"] = response.status_code
     if response.status_code in (429, 500, 502, 503):
         raise RuntimeError(f"HTTP {response.status_code}")
+    if 400 <= response.status_code < 500:
+        # The service's own words for the card's "last call failed" (e.g. a setting the model no longer accepts),
+        # not requests' "400 Client Error ... for url"; without the key, which a service may echo.
+        try:
+            message = ai_profile._error_message(response.json())
+        except ValueError:
+            message = response.text
+        raise RuntimeError(ai_crypto.redact(f"HTTP {response.status_code}: {message}", target.api_key)[:300])
     response.raise_for_status()
     body = response.json()
     choices = body.get("choices") or []
@@ -370,9 +378,9 @@ def _ms_since(started: float) -> int:
 _NOTE_TASKS: set[asyncio.Task] = set()
 
 
-def _call_error(status, problem) -> str:
+def _call_error(status, problem, api_key: str) -> str:
     if problem is not None:
-        return ai_crypto.redact(str(problem))[:300]
+        return ai_crypto.redact(str(problem), api_key)[:300]
     return "No answer in time" if status == "timeout" else "No usable answer"
 
 
@@ -420,7 +428,7 @@ async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: flo
             status = "timeout"
         except Exception as exc:
             status, problem = info.get("status") or (429 if "429" in str(exc) else "error"), exc
-        error = None if result is not None else _call_error(status, problem)
+        error = None if result is not None else _call_error(status, problem, target.api_key)
         if result is None:
             log.warning("%s %s gave no usable answer (status %s, finish %s): %s", target.connection.name,
                         target.model_id, status, info.get("finish_reason"),

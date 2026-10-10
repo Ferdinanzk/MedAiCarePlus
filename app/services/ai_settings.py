@@ -23,7 +23,7 @@ class Connection:
     name: str
     kind: str
     base_url: str
-    api_key: str            # decrypted; "" when there is none or it cannot be read
+    api_key: str = dataclasses.field(repr=False)   # decrypted; "" when none or unreadable; never in a repr or log
     key_last4: str | None
     key_readable: bool
     service_name: str       # {LLM_SERVICE} in the notices

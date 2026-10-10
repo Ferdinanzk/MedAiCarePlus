@@ -47,5 +47,9 @@ def weak_secret() -> bool:
     return config.SECRET_KEY.strip() in ("", DEFAULT_SECRET)
 
 
-def redact(text: str) -> str:
+def redact(text: str, secret: str = "") -> str:
+    """text without anything shaped like a key, and without `secret` (the exact key, when the caller holds it: a
+    service may echo a key of any shape). Redact before cutting text short, or a cut key escapes the match."""
+    if secret:
+        text = text.replace(secret, "[key removed]")
     return _KEY_SHAPES.sub("[key removed]", text)

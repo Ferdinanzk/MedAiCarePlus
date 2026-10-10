@@ -43,6 +43,10 @@ def check_ai_settings(snapshot, env: Mapping[str, str] | None = None) -> list[st
     problems = ai_settings.problems(snapshot)
     for problem in problems:
         logger.warning("Startup check: %s", problem)
+    if problems and snapshot.seeded_at is not None:
+        logger.warning("Startup check: these AI settings were copied from .env on %s and .env's LLM_* lines are no "
+                       "longer read; change them on the Settings page's AI connections card (to reach it, start once "
+                       "with REACHY_FEATURE_ENABLED=0 or APP_ENV=dev)", snapshot.seeded_at.date().isoformat())
     if problems and str(value("APP_ENV", "dev")).strip().lower() == "prod":
         raise SystemExit(1)
     return problems

@@ -138,6 +138,22 @@ def test_a_second_start_copies_nothing(monkeypatch):
     assert conn.statements("INSERT") == []
 
 
+def test_a_first_start_that_will_be_refused_copies_nothing(monkeypatch):
+    """In prod with the robot, an incomplete .env stops the first start before the copy. Once copied, .env is no
+    longer read, so fixing it would not help and every later start would exit too."""
+    _env(monkeypatch)
+    monkeypatch.setattr(config, "LLM_PROVIDER_REGION", "")
+    monkeypatch.setattr(config, "REACHY_FEATURE_ENABLED", True)
+    monkeypatch.setattr(config, "APP_ENV", "prod")
+    conn = Conn(values=[False])
+    with pytest.raises(SystemExit):
+        asyncio.run(ai_store.seed_from_env(conn))
+    assert conn.statements("INSERT") == [] and conn.sql[-1] == "ROLLBACK"
+    monkeypatch.setattr(config, "LLM_PROVIDER_REGION", "global")   # .env fixed: the next start copies it
+    conn = Conn(values=[False, 1, 11, 12])
+    assert asyncio.run(ai_store.seed_from_env(conn)) is True and conn.sql[-1] == "COMMIT"
+
+
 def test_a_change_reloads_the_snapshot_and_registers_the_notices(monkeypatch):
     new = ai_settings.Snapshot({}, {}, {}, None)
     registered = []

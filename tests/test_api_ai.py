@@ -40,7 +40,7 @@ class FakeStore:
     InUse = ai_store.InUse
 
     def __init__(self):
-        self.calls, self.next_id = [], 100
+        self.calls, self.next_id, self.saved_tests = [], 100, []
 
     @asynccontextmanager
     async def change(self, conn):
@@ -87,6 +87,7 @@ class FakeStore:
 
     async def save_test(self, conn, model_ref, result):
         self.calls.append(("save_test", model_ref, result["ok"], result["profile"]))
+        self.saved_tests.append(result)
 
     async def set_jobs(self, conn, jobs):
         self.calls.append(("set_jobs", jobs))
@@ -110,6 +111,16 @@ class Reply:
 
     def json(self):
         return self._body
+
+
+class TextReply:
+    """An error page that is not JSON."""
+
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+    def json(self):
+        raise ValueError("not JSON")
 
 
 @pytest.fixture
@@ -211,6 +222,28 @@ def test_in_prod_with_the_robot_the_models_in_use_need_full_notice_details(api, 
     assert api.client.patch("/api/ai/models/11", json={"region": " "}).status_code == 200
 
 
+def test_in_prod_an_incomplete_setup_can_be_fixed_one_model_at_a_time(api, monkeypatch):
+    """Only a change that adds a problem is refused: with two incomplete models in use, fixing either one is not
+    refused because of the other (that would leave no way to fix them)."""
+    monkeypatch.setattr(config, "REACHY_FEATURE_ENABLED", True)
+    monkeypatch.setattr(config, "APP_ENV", "prod")
+    snapshot = _snapshot()
+    complete = ai_settings.Model(14, 1, "openai/gpt-4.1-mini", "OpenAI", "USA", "30 days",
+                                 ai_profile.starting_profile("openrouter"))
+    models = {**snapshot.models, 11: dataclasses.replace(snapshot.models[11], region=""),
+              12: dataclasses.replace(snapshot.models[12], region=""), 14: complete}
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, models=models, jobs={"reply": (11, 12), "safety": (14, None), "after_chat": (14, None)}))
+    assert api.client.patch("/api/ai/models/11", json={"region": "global"}).status_code == 200
+    assert api.client.patch("/api/ai/models/12", json={"region": "global"}).status_code == 200
+    jobs = {"reply": {"primary_ref": 11, "fallback_ref": 12}, "safety": {"primary_ref": 14},
+            "after_chat": {"primary_ref": 14}}
+    assert api.client.put("/api/ai/jobs", json=jobs).status_code == 200   # saved as they are: nothing added
+    assert api.client.patch("/api/ai/models/14", json={"region": " "}).json() == {"detail": "notice_incomplete"}
+    jobs["safety"] = {"primary_ref": 11}   # an incomplete model given one more job adds a problem
+    assert api.client.put("/api/ai/jobs", json=jobs).json() == {"detail": "notice_incomplete"}
+
+
 def test_the_test_button_saves_what_the_model_accepted(api, monkeypatch):
     sent = []
 
@@ -294,6 +327,45 @@ def test_a_new_address_needs_a_new_key_when_one_is_stored(api, monkeypatch):
 def test_a_new_address_without_a_stored_key_is_allowed(api, monkeypatch):
     _other_service(monkeypatch, key="")
     assert api.client.patch("/api/ai/connections/2", json={"base_url": "http://other.local/v1"}).status_code == 200
+
+
+@pytest.mark.parametrize("base_url", ["https://user:secret@llm.example.org/v1", "https://token@llm.example.org",
+                                      "http://a@b@llm.example.org/v1"])
+def test_an_address_carrying_a_user_name_or_password_is_refused(api, monkeypatch, base_url):
+    """It would show on the card in clear, outside the key's encryption."""
+    response = api.client.post("/api/ai/connections", json={
+        "name": "X", "kind": "openai_compatible", "base_url": base_url, "service_name": "X"})
+    assert (response.status_code, response.json()) == (400, {"detail": "invalid_base_url"})
+    _other_service(monkeypatch)
+    response = api.client.patch("/api/ai/connections/2", json={"base_url": base_url, "api_key": NEW_KEY})
+    assert (response.status_code, response.json()) == (400, {"detail": "invalid_base_url"})
+    assert api.store.calls == []
+
+
+def test_an_at_sign_in_the_path_is_still_an_address(api):
+    response = api.client.post("/api/ai/connections", json={
+        "name": "X", "kind": "openai_compatible", "base_url": "https://llm.example.org/v1/@team", "service_name": "X"})
+    assert response.status_code == 200 and api.store.calls[-1][3] == "https://llm.example.org/v1/@team"
+
+
+ECHOED_KEY = "AIzaEchoProbe-1234567890"
+
+
+@pytest.mark.parametrize("answer", [
+    Reply(401, {"error": {"message": f"Invalid proxy server token passed. Received API Key = {ECHOED_KEY}"}}),
+    TextReply(401, "x" * 280 + ECHOED_KEY),   # an error page: the key straddles the 300-character cut
+])
+def test_a_key_the_service_echoes_never_reaches_the_card(api, monkeypatch, answer):
+    """A key of any shape, not only sk-…: the Test answer and the saved last_error never carry any of it."""
+    _other_service(monkeypatch, key=ECHOED_KEY)
+    model = ai_settings.Model(31, 2, "local-model", "", "", "", None)
+    monkeypatch.setattr(ai_settings, "_snapshot", ai_settings.with_model(ai_settings.current(), model))
+    monkeypatch.setattr(api_ai.requests, "post", lambda url, json, timeout, headers: answer)
+    response = api.client.post("/api/ai/models/31/test")
+    assert response.status_code == 200 and response.json()["ok"] is False
+    saved = api.store.saved_tests[-1]["error"]
+    assert saved.startswith("HTTP 401: ") and response.json()["error"] == saved
+    assert ECHOED_KEY[:8] not in response.text and ECHOED_KEY[:8] not in saved
 
 
 @pytest.mark.parametrize("get", [
