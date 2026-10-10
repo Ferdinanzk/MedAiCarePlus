@@ -26,7 +26,7 @@ async function seedSession(page: Page) {
   });
 }
 
-async function mockApi(page: Page, options: { aiDown?: boolean } = {}) {
+async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown } = {}) {
   const mock = { settings: startingSettings(), requests: [] as { method: string; path: string; body: any }[] };
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -41,7 +41,7 @@ async function mockApi(page: Page, options: { aiDown?: boolean } = {}) {
     if (path === '/api/reachy/status') return route.fulfill({ json: { paired: false } });
     if (path === '/api/notify/settings') return route.fulfill({ json: {} });
     if (path === '/api/ai/settings') {
-      return options.aiDown ? route.fulfill({ status: 500, json: { detail: 'boom' } }) : route.fulfill({ json: mock.settings });
+      return options.aiDown ? route.fulfill({ status: 500, json: { detail: 'boom' } }) : route.fulfill({ json: options.aiBody ?? mock.settings });
     }
     if (path === '/api/ai/connections' && method === 'POST') {
       mock.settings.connections.push({ connection_id: 2, name: body.name, kind: body.kind, base_url: 'https://api.openai.com/v1',
@@ -146,4 +146,27 @@ test('the rest of Settings keeps working when the AI settings cannot load', asyn
   await openSettings(page);
   await expect(card(page)).toContainText('Could not load the AI settings.');
   await expect(page.locator('section[aria-labelledby="reachy-title"]')).toBeVisible();
+});
+
+test('an incomplete AI settings answer is a load failure, not a crash', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { aiBody: { connections: [], models: [], jobs: {}, seeded_at: null, weak_secret: false, no_key_in_use: false } });
+  await openSettings(page);
+  await expect(card(page)).toContainText('Could not load the AI settings.');
+  await expect(page.locator('section[aria-labelledby="reachy-title"]')).toBeVisible();
+});
+
+test('a job choice not yet saved survives adding another model', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page);
+  await openSettings(page);
+  const main = card(page).getByLabel("Reachy's replies: Main model");
+  await main.selectOption({ label: 'OpenRouter · google/gemini-2.5-flash' });
+  await addOpenAi(page);
+  await card(page).getByRole('button', { name: 'Add model' }).click();
+  await card(page).getByLabel('Connection', { exact: true }).selectOption({ label: 'OpenAI' });
+  await card(page).getByLabel('Model name').fill('gpt-5.4-mini');
+  await card(page).getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(card(page).getByRole('group', { name: 'OpenAI · gpt-5.4-mini' })).toBeVisible();
+  await expect(main).toHaveValue('12');
 });

@@ -26,13 +26,44 @@ export const AI_JOBS: AiJob[] = ['reply', 'safety', 'after_chat'];
 const send = (method: string, body?: unknown): RequestInit =>
   body === undefined ? { method } : { method, body: JSON.stringify(body) };
 
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const isNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value);
+
+/** True only when every part the card reads has the shape it expects. */
+function isAiSettings(value: unknown): value is AiSettings {
+  if (!isObject(value) || !Array.isArray(value.connections) || !Array.isArray(value.models) || !isObject(value.jobs)) return false;
+  const jobs = value.jobs;
+  return value.connections.every(c => isObject(c) && isNumber(c.connection_id) && typeof c.name === 'string' && typeof c.kind === 'string')
+    && value.models.every(m => isObject(m) && isNumber(m.model_ref) && isNumber(m.connection_id) && typeof m.model_id === 'string')
+    && AI_JOBS.every(job => {
+      const choice = jobs[job];
+      return isObject(choice) && isNumber(choice.primary_ref) && (choice.fallback_ref === null || isNumber(choice.fallback_ref));
+    });
+}
+
 /** The card; a malformed answer is a load failure, so one card can never take the Settings page down. */
 export async function fetchAiSettings(): Promise<AiSettings> {
   const settings = await call<AiSettings>('/api/ai/settings', { cache: 'no-store' });
-  if (!Array.isArray(settings?.connections) || !Array.isArray(settings?.models) || !settings?.jobs) {
-    throw new ApiError(500, 'loadFailed', settings);
-  }
+  if (!isAiSettings(settings)) throw new ApiError(500, 'loadFailed', settings);
   return settings;
+}
+
+/**
+ * After a change other than "Save jobs", keep each job choice the person picked but has not saved yet, as long as
+ * it still points at tested models; otherwise take the server's value for that job.
+ */
+export function mergeJobs(
+  current: Record<AiJob, AiJobChoice>, server: Record<AiJob, AiJobChoice>, testedRefs: number[],
+): Record<AiJob, AiJobChoice> {
+  const merged = { ...server };
+  for (const job of AI_JOBS) {
+    const choice = current[job];
+    if (choice && testedRefs.includes(choice.primary_ref) && (choice.fallback_ref === null || testedRefs.includes(choice.fallback_ref))) {
+      merged[job] = choice;
+    }
+  }
+  return merged;
 }
 
 export const addConnection = (body: { name: string; kind: AiKind; base_url?: string; api_key?: string; service_name: string }) =>
