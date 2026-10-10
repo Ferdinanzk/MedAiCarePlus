@@ -34,7 +34,7 @@ def _named_setting(message: str) -> str | None:
     """The request setting a 400 message is about: the one it names first ("Use 'max_completion_tokens' instead"
     comes after the refused max_tokens)."""
     found = [(match.start(), name) for name in _SETTINGS
-             for match in [re.search(rf"\b{name}\b", message)] if match]
+             for match in [re.search(rf"\b{name}\b", message, re.IGNORECASE)] if match]
     return min(found)[1] if found else None
 
 
@@ -53,7 +53,8 @@ def adjust(profile: dict, message: str) -> dict | None:
         value_refused = "does not support" in message.lower() or "unsupported value" in message.lower()
         new["reasoning_off"] = ({"reasoning_effort": "minimal"}
                                 if value_refused and sent_reasoning["reasoning_effort"] == "none" else None)
-    elif setting == "reasoning" and "reasoning" in sent_reasoning:
+    elif setting == "reasoning" and sent_reasoning:
+        # "Reasoning is mandatory for this endpoint": whichever form of reasoning-off we sent, stop sending it.
         new["reasoning_off"] = None
     else:
         return None
@@ -103,10 +104,12 @@ def detect(send, kind: str) -> dict:
         status, body, ms = send(profile)
         if status == 200:
             choices = (body.get("choices") if isinstance(body, dict) else None) or []
-            content = (choices[0].get("message") or {}).get("content") if choices else None
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+            message_part = choice.get("message")
+            content = message_part.get("content") if isinstance(message_part, dict) else None
             if not isinstance(content, str) or not content.strip():
                 return _failed(ms, "The model answered with no text.")
-            if choices[0].get("finish_reason") == "length":
+            if choice.get("finish_reason") == "length":
                 return _failed(ms, "The answer was cut off by the length limit.")
             return {"ok": True, "profile": profile, "ms": ms, "sample": content.strip()[:40], "error": None}
         message = _error_message(body)
