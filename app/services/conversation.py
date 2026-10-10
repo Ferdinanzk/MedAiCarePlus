@@ -1,4 +1,4 @@
-"""Reachy check-in conversations: replies from an LLM through OpenRouter, safety screening, summaries.
+"""Reachy check-in conversations: replies from an LLM (the AI connections card; OpenRouter by default), safety screening, summaries.
 
 Speech is turned into text on the robot; only text reaches this module (robot notice §2-3). Self-harm and overdose
 are looked for in three layers, because each one alone has missed real risk:
@@ -12,13 +12,13 @@ are looked for in three layers, because each one alone has missed real risk:
    after_chat: SUMMARY_PROMPT, or AFTER_CHAT_PROMPT (memory.py) when memory is on; missed ones are retried by the
    after-chat sweep.
 
-Layers 2 and 3 depend on OpenRouter, so during an outage the keyword list is the only check that runs; it has to
+Layers 2 and 3 depend on the model services, so during an outage the keyword list is the only check that runs; it has to
 catch explicit statements on its own. A risk from layer 1 or 2 gets a fixed help-line reply and ends the
 conversation. Every layer alerts all verified family contacts through alert_family(), at most once per
 conversation (notice §6).
 
-If OpenRouter is unconfigured, rate-limited or returns nothing, the robot still answers with a fixed line, so a
-demo never stalls. A reply tries config.LLM_MODEL, then config.LLM_FALLBACK_MODEL, inside one deadline
+If no model has a key, is rate-limited or returns nothing, the robot still answers with a fixed line, so a
+demo never stalls. A reply tries the reply job's main model, then its backup (ai_settings), inside one deadline
 (config.LLM_DEADLINE_SECONDS), and reports how long each attempt took so slow turns can be traced.
 
 The reply prompt also carries a few lines about the day (date, time, weather, holidays; context_info), built from
@@ -37,11 +37,10 @@ import time
 import requests
 
 from app import config
-from app.services import context_info, outbox
+from app.services import ai_crypto, ai_profile, ai_settings, ai_store, context_info, outbox
 
 log = logging.getLogger(__name__)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _HTTP_LOCAL = threading.local()
 HTTP_IDLE_SECONDS = 60.0   # a worker's keep-alive session idle longer than this is replaced (see _http_session)
 MAX_PATIENT_TURNS = 6
@@ -336,21 +335,20 @@ def _http_session(clock=time.monotonic) -> requests.Session:
 
 
 def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeout: float = CALL_TIMEOUT,
-          info: dict | None = None, temperature: float = 0.7) -> str | None:
-    """One OpenRouter call. `info`, when given, receives status, model_served, finish_reason and tokens.
-    temperature: 0 for extraction (memory facts), 0.7 for everything else."""
+          info: dict | None = None, temperature: float = 0.7,
+          target: ai_settings.Target | None = None) -> str | None:
+    """One model call through target's connection, shaped by its model's profile (ai_profile); without a target,
+    OpenRouter with the .env key as before the AI connections card. `info`, when given, receives status,
+    model_served, finish_reason and tokens. temperature: 0 for extraction (memory facts), 0.7 for everything else
+    (left out for a model that accepts only its default)."""
     info = {} if info is None else info
-    # Reasoning off: free reasoning models otherwise spend every token thinking and send back nothing.
-    payload = {"model": model or config.LLM_FALLBACK_MODEL, "messages": messages, "max_tokens": max_tokens,
-               "temperature": temperature, "reasoning": {"enabled": False}}
-    provider = _provider()
-    if provider:
-        payload["provider"] = provider
-    response = _http_session().post(
-        OPENROUTER_URL, timeout=timeout,
-        headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}", "Content-Type": "application/json",
-                 "X-Title": "MedAiCarePlus Reachy check-in"},
-        json=payload)
+    target = target or ai_settings.env_target(model or config.LLM_FALLBACK_MODEL)
+    provider = _provider() if target.kind == "openrouter" else None
+    # The profile turns reasoning off: free reasoning models otherwise spend every token thinking and send nothing.
+    payload = ai_profile.request_body(target.profile, target.model_id, messages, max_tokens, temperature,
+                                      {"provider": provider} if provider else None)
+    response = _http_session().post(target.url, timeout=timeout,
+                                    headers=ai_profile.headers(target.kind, target.api_key), json=payload)
     info["status"] = response.status_code
     if response.status_code in (429, 500, 502, 503):
         raise RuntimeError(f"HTTP {response.status_code}")
@@ -369,49 +367,69 @@ def _ms_since(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+_NOTE_TASKS: set[asyncio.Task] = set()
+
+
+def _call_error(status, problem) -> str:
+    if problem is not None:
+        return ai_crypto.redact(str(problem))[:300]
+    return "No answer in time" if status == "timeout" else "No usable answer"
+
+
+def _note_call(target: ai_settings.Target, error: str | None) -> None:
+    """Keep the card's "last call failed" current: a failure's reason, cleared by the next success. Only for models
+    saved on the card (the .env ones have no row), only when it changes, and never in the reply's way."""
+    if target.model.model_ref <= 0 or target.model.last_error == error:
+        return
+    task = asyncio.get_running_loop().create_task(ai_store.note_call(target.model.model_ref, error))
+    _NOTE_TASKS.add(task)
+    task.add_done_callback(_NOTE_TASKS.discard)
+
+
 async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: float, call_timeout: float,
-                    accept, temperature: float = 0.7) -> tuple[object | None, dict]:
-    """The primary model, then the fallback model, never past `deadline_seconds` in total.
+                    accept, temperature: float = 0.7, *, job: str) -> tuple[object | None, dict]:
+    """The job's main model, then its backup (ai_settings), never past `deadline_seconds` in total.
 
     accept(answer) turns an answer into the result, or returns None when it is unusable (the next model is tried).
-    Returns (result or None, {"llm_ms", "attempts"}). Each attempt records model_requested, model_served, ms,
-    status (the HTTP status, or "timeout" / "error" when none came back), finish_reason, tokens and usable.
-    With LLM_MODEL unset both calls go to the fallback model, i.e. it is retried once.
+    Returns (result or None, {"llm_ms", "attempts"}). Each attempt records connection, model_requested,
+    model_served, ms, status (the HTTP status, or "timeout" / "error" when none came back), finish_reason, tokens
+    and usable. A model whose connection has no readable key is skipped.
     """
     started = time.monotonic()
     deadline = started + deadline_seconds
     attempts: list[dict] = []
     result = None
-    if config.OPENROUTER_API_KEY:
-        loop = asyncio.get_running_loop()
-        for model in (config.LLM_MODEL or config.LLM_FALLBACK_MODEL, config.LLM_FALLBACK_MODEL):
-            left = deadline - time.monotonic()
-            if left < MIN_CALL_SECONDS:
-                break
-            timeout = min(call_timeout, left)
-            info: dict = {}
-            problem = None
-            call_started = time.monotonic()
-            try:
-                # requests' timeout bounds each socket wait, not the whole call; wait_for holds the deadline.
-                answer = await asyncio.wait_for(
-                    loop.run_in_executor(None, _post, messages, max_tokens, model, timeout, info, temperature),
-                    timeout)
-                result = accept(answer)
-                status = info.get("status")
-            except (asyncio.TimeoutError, requests.Timeout):
-                status = "timeout"
-            except Exception as exc:
-                status, problem = info.get("status") or (429 if "429" in str(exc) else "error"), exc
-            if result is None:
-                log.warning("OpenRouter %s gave no usable answer (status %s, finish %s): %s", model, status,
-                            info.get("finish_reason"), problem or "unusable text")
-            attempts.append({"model_requested": model, "model_served": info.get("model_served"),
-                             "ms": _ms_since(call_started), "status": status,
-                             "finish_reason": info.get("finish_reason"), "tokens": info.get("tokens"),
-                             "usable": result is not None})
-            if result is not None:
-                break
+    loop = asyncio.get_running_loop()
+    for target in [target for target in ai_settings.job_targets(job) if target.api_key]:
+        left = deadline - time.monotonic()
+        if left < MIN_CALL_SECONDS:
+            break
+        timeout = min(call_timeout, left)
+        info: dict = {}
+        problem = None
+        call_started = time.monotonic()
+        try:
+            # requests' timeout bounds each socket wait, not the whole call; wait_for holds the deadline.
+            answer = await asyncio.wait_for(
+                loop.run_in_executor(None, _post, messages, max_tokens, target.model_id, timeout, info,
+                                     temperature, target),
+                timeout)
+            result = accept(answer)
+            status = info.get("status")
+        except (asyncio.TimeoutError, requests.Timeout):
+            status = "timeout"
+        except Exception as exc:
+            status, problem = info.get("status") or (429 if "429" in str(exc) else "error"), exc
+        if result is None:
+            log.warning("%s %s gave no usable answer (status %s, finish %s): %s", target.connection.name,
+                        target.model_id, status, info.get("finish_reason"), problem or "unusable text")
+        attempts.append({"connection": target.connection.name, "model_requested": target.model_id,
+                         "model_served": info.get("model_served"), "ms": _ms_since(call_started),
+                         "status": status, "finish_reason": info.get("finish_reason"),
+                         "tokens": info.get("tokens"), "usable": result is not None})
+        _note_call(target, None if result is not None else _call_error(status, problem))
+        if result is not None:
+            break
     return result, {"llm_ms": _ms_since(started), "attempts": attempts}
 
 
@@ -419,12 +437,12 @@ def _failed_call(status) -> bool:
     return status in ("timeout", "error") or (isinstance(status, int) and status >= 400)
 
 
-def _reason(result, metrics: dict) -> str:
-    """Why a model chain (_complete) gave no result: ok (it did), no_key, empty (a model answered, but nothing
+def _reason(result, metrics: dict, job: str) -> str:
+    """Why a job's model chain (_complete) gave no result: ok (it did), no_key, empty (a model answered, but nothing
     usable), rate_limited (no answer, and a 429 among the failures) or unavailable."""
     if result is not None:
         return "ok"
-    if not config.OPENROUTER_API_KEY:
+    if not any(target.api_key for target in ai_settings.job_targets(job)):
         return "no_key"
     statuses = [attempt["status"] for attempt in metrics["attempts"]]
     if any(not _failed_call(status) for status in statuses):
@@ -439,8 +457,8 @@ async def complete_with_reason(messages: list[dict], max_tokens: int = 200, temp
     ok, no_key, rate_limited, unavailable or empty (_reason). accept as in _complete; by default any non-empty
     text. For background work (the defaults are the summary's): nobody waits, so each model gets longer."""
     result, metrics = await _complete(messages, max_tokens, deadline, call_timeout,
-                                      accept or (lambda answer: answer or None), temperature)
-    return result, _reason(result, metrics)
+                                      accept or (lambda answer: answer or None), temperature, job="after_chat")
+    return result, _reason(result, metrics, "after_chat")
 
 
 async def complete(messages: list[dict], max_tokens: int = 200) -> str | None:
@@ -496,7 +514,8 @@ async def reply_with_metrics(history: list[dict], language: str, memory: str = "
     def accept(answer: str | None) -> str | None:
         return (clean_reply(answer) or None) if usable_reply(answer, language) else None
 
-    answer, metrics = await _complete(messages, REPLY_MAX_TOKENS, config.LLM_DEADLINE_SECONDS, CALL_TIMEOUT, accept)
+    answer, metrics = await _complete(messages, REPLY_MAX_TOKENS, config.LLM_DEADLINE_SECONDS, CALL_TIMEOUT, accept,
+                                      job="reply")
     return answer or FALLBACK[language], {"llm_ms": metrics["llm_ms"], "fallback_used": answer is None,
                                           "attempts": metrics["attempts"]}
 
@@ -578,7 +597,7 @@ async def classify_risk(history: list[dict], language: str, late: bool = False) 
 
     try:
         result, metrics = await _complete(_risk_messages(history, language), RISK_MAX_TOKENS, deadline,
-                                          call_timeout, accept)
+                                          call_timeout, accept, job="safety")
     except Exception:
         log.exception("risk check failed")
         result, metrics = None, {"llm_ms": 0, "attempts": []}
@@ -650,9 +669,10 @@ async def summarize(history: list[dict], language: str,
 
     result, metrics = await _complete([{"role": "system", "content": SUMMARY_PROMPT[language]},
                                        {"role": "user", "content": transcript}],
-                                      SUMMARY_MAX_TOKENS, SUMMARY_DEADLINE_SECONDS, SUMMARY_CALL_TIMEOUT, accept)
+                                      SUMMARY_MAX_TOKENS, SUMMARY_DEADLINE_SECONDS, SUMMARY_CALL_TIMEOUT, accept,
+                                      job="after_chat")
     if info is not None:
-        info.update(reason=_reason(result, metrics), attempts=metrics["attempts"])
+        info.update(reason=_reason(result, metrics, "after_chat"), attempts=metrics["attempts"])
     # Otherwise the first answer with a summary, or else the mood the last answer gave.
     summary, mood, risk = (result or next((answer for answer in parsed if answer[0]), None)
                            or (parsed[-1] if parsed else (None, "unknown", None)))

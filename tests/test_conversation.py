@@ -116,7 +116,7 @@ def _model_answers(monkeypatch, *answers):
     """Stands in for OpenRouter (conversation._post): call n gets answers[n], or the last one when they run out."""
     calls = []
 
-    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7):
+    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7, target=None):
         calls.append({"messages": messages, "max_tokens": max_tokens, "model": model, "timeout": timeout,
                       "temperature": temperature})
         if info is not None:
@@ -604,7 +604,7 @@ def _openrouter(monkeypatch, robot, **answers):
                "after_chat": ['MOOD: calm\nSUMMARY: 談到散步。\nRISK: none\n{"facts": []}'], **answers}
     sent = []
 
-    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7):
+    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7, target=None):
         system = messages[0]["content"]
         kind = ("risk" if system == conversation.RISK_PROMPT else
                 "summary" if system in conversation.SUMMARY_PROMPT.values() else
