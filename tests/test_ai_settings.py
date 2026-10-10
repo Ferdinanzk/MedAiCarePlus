@@ -100,3 +100,11 @@ def test_the_public_view_never_carries_a_key():
 def test_no_key_in_use_when_no_model_in_use_has_one():
     snapshot = dataclasses.replace(_card_snapshot(), jobs={job: (21, None) for job in ai_settings.JOBS})
     assert ai_settings.public(snapshot)["no_key_in_use"] is True
+
+
+def test_a_key_is_never_in_a_repr():   # a log line or a traceback showing these must not print the plain key
+    connection = dataclasses.replace(_card_snapshot().connections[1], api_key="AIzaReprProbe-77")
+    snapshot = dataclasses.replace(_card_snapshot(), connections={**_card_snapshot().connections, 1: connection})
+    for value in (connection, ai_settings.job_targets("reply", snapshot)[0], snapshot):
+        assert "AIzaReprProbe-77" not in repr(value)
+    assert connection.api_key == "AIzaReprProbe-77"

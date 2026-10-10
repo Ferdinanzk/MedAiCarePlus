@@ -75,6 +75,15 @@ def test_ai_settings_warn_in_dev_and_stop_prod(caplog):
         startup_checks.check_ai_settings(_ai_snapshot(region=""), {**env, "APP_ENV": "prod"})
 
 
+def test_once_copied_the_exit_says_where_the_settings_are_changed(caplog):
+    import dataclasses
+    from datetime import datetime, timezone
+    snapshot = dataclasses.replace(_ai_snapshot(region=""), seeded_at=datetime(2026, 10, 10, 12, tzinfo=timezone.utc))
+    with pytest.raises(SystemExit):
+        startup_checks.check_ai_settings(snapshot, {"REACHY_FEATURE_ENABLED": "1", "APP_ENV": "prod"})
+    assert "copied from .env on 2026-10-10" in caplog.text and "AI connections card" in caplog.text
+
+
 def test_explicit_env_is_isolated_from_config(monkeypatch):
     for key, value in _configured().items():
         monkeypatch.setattr(config, key, value)

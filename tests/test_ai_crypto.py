@@ -33,3 +33,11 @@ def test_redact_removes_key_shapes_from_error_text():
     cleaned = ai_crypto.redact("Incorrect API key provided: sk-proj-AbCdEf123456. Sent Bearer sk-or-v1-zzzzzzzz")
     assert "AbCdEf123456" not in cleaned and "zzzzzzzz" not in cleaned
     assert cleaned.startswith("Incorrect API key provided: [key removed]")
+
+
+def test_redact_removes_the_exact_key_whatever_its_shape():
+    key = "gsk_abcdef12345ghijkl67890"
+    text = f"Invalid proxy server token passed. Received API Key = {key}"
+    assert ai_crypto.redact(text) == text   # not shaped like a key: only the caller's exact key catches it
+    assert ai_crypto.redact(text, key) == "Invalid proxy server token passed. Received API Key = [key removed]"
+    assert ai_crypto.redact(text, "") == text

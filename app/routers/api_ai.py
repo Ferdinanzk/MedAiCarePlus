@@ -9,6 +9,7 @@ import dataclasses
 import logging
 import re
 import time
+from collections import Counter
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,7 +24,8 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ai", tags=["ai-connections"])
 REMOTE_MODELS_LIMIT = 2000
 REMOTE_MODELS_TIMEOUT = 10
-_BASE_URL = re.compile(r"^https?://[^\s/]+(/\S*)?$", re.IGNORECASE)
+# No "@" before the path: a user:password@ in the address would show on the card in clear and go out with every call.
+_BASE_URL = re.compile(r"^https?://[^\s/@]+(/\S*)?$", re.IGNORECASE)
 
 
 class NewConnection(BaseModel):
@@ -105,9 +107,12 @@ def _model(model_ref: int) -> ai_settings.Model:
 
 
 def _guard(snapshot: ai_settings.Snapshot) -> None:
-    """With the robot feature in prod, refuse a setup the next start would refuse (spec §10)."""
-    if config.REACHY_FEATURE_ENABLED and config.APP_ENV == "prod" and ai_settings.problems(snapshot):
-        raise HTTPException(400, "notice_incomplete")
+    """With the robot feature in prod, refuse a change that adds a problem the next start would refuse (spec §10).
+    Only an added one: with two incomplete models in use, fixing either must not be refused for the other."""
+    if config.REACHY_FEATURE_ENABLED and config.APP_ENV == "prod":
+        added = Counter(ai_settings.problems(snapshot)) - Counter(ai_settings.problems(ai_settings.current()))
+        if added:
+            raise HTTPException(400, "notice_incomplete")
 
 
 @router.get("/settings")
@@ -252,10 +257,11 @@ async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
         try:
             parsed = response.json()
         except ValueError:
-            parsed = response.text[:300]
+            parsed = response.text   # cut by detect, after the key is removed (a cut key would escape the match)
         return response.status_code, parsed, ms
 
-    result = await asyncio.to_thread(ai_profile.detect, send, connection.kind)
+    # The exact key too: a service may echo a key of any shape in its error, which is saved and shown on the card.
+    result = await asyncio.to_thread(ai_profile.detect, send, connection.kind, connection.api_key)
     async with get_pool().acquire() as conn:
         async with ai_store.change(conn):
             await ai_store.save_test(conn, model_ref, result)

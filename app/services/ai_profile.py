@@ -80,22 +80,23 @@ def headers(kind: str, api_key: str) -> dict:
 
 
 def _error_message(body) -> str:
+    """The service's message in an error answer. Not cut: callers redact first, then cut (ai_crypto.redact)."""
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict) and isinstance(error.get("message"), str):
             return error["message"]
         if isinstance(error, str):
             return error
-    return str(body)[:300]
+    return str(body)
 
 
-def _failed(ms, error: str) -> dict:
-    return {"ok": False, "profile": None, "ms": ms, "sample": None, "error": redact(error)[:300]}
+def _failed(ms, error: str, secret: str) -> dict:
+    return {"ok": False, "profile": None, "ms": ms, "sample": None, "error": redact(error, secret)[:300]}
 
 
-def detect(send, kind: str) -> dict:
+def detect(send, kind: str, secret: str = "") -> dict:
     """Find the profile a model accepts. send(profile) -> (HTTP status, parsed body or text, ms) does one request;
-    status 0 means no answer came back.
+    status 0 means no answer came back. secret: the key sent, removed from any error text that echoes it.
 
     Returns {"ok", "profile", "ms", "sample", "error"}: on success the profile to save, the successful request's
     time and the answer's first 40 characters; otherwise the service's own words (cut to 300), and nothing to save."""
@@ -109,13 +110,13 @@ def detect(send, kind: str) -> dict:
             message_part = choice.get("message")
             content = message_part.get("content") if isinstance(message_part, dict) else None
             if not isinstance(content, str) or not content.strip():
-                return _failed(ms, "The model answered with no text.")
+                return _failed(ms, "The model answered with no text.", secret)
             if choice.get("finish_reason") == "length":
-                return _failed(ms, "The answer was cut off by the length limit.")
+                return _failed(ms, "The answer was cut off by the length limit.", secret)
             return {"ok": True, "profile": profile, "ms": ms, "sample": content.strip()[:40], "error": None}
         message = _error_message(body)
         changed = adjust(profile, message) if status == 400 else None
         if changed is None:
-            return _failed(ms, f"HTTP {status}: {message}" if status else message)
+            return _failed(ms, f"HTTP {status}: {message}" if status else message, secret)
         profile = changed
-    return _failed(ms, f"Gave up after {MAX_TRIES} tries: {_error_message(body)}")
+    return _failed(ms, f"Gave up after {MAX_TRIES} tries: {_error_message(body)}", secret)

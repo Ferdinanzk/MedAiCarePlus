@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     await init_pool()
     async with get_pool().acquire() as conn:
         await check_restore_state(conn)
-        await ai_store.seed_from_env(conn)
+        await ai_store.seed_from_env(conn)   # first start only; checks .env (check_ai_settings) before copying it
         ai_settings.set_current(await ai_store.load(conn))
         check_ai_settings(ai_settings.current())
         await register_documents(conn)   # after the AI settings: the notices name the services in use

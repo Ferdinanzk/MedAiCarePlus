@@ -6,6 +6,7 @@ import dataclasses
 import json
 
 import pytest
+import requests
 
 from app import config
 from app.services import ai_profile, ai_settings, ai_store, conversation, legal_service
@@ -147,6 +148,44 @@ def test_a_key_in_an_error_never_reaches_the_log_or_the_note(notes, monkeypatch,
     assert "LEAKED" not in caplog.text and "[key removed]" in caplog.text
     assert notes and all("LEAKED" not in (error or "") for _, error in notes)
     assert any("[key removed]" in (error or "") for _, error in notes)
+
+
+def _http_answer(status, body):
+    """A real requests Response, so the note shows what the card gets from requests itself."""
+    response = requests.models.Response()
+    response.status_code = status
+    response._content = (body if isinstance(body, str) else json.dumps(body)).encode("utf-8")
+    response.url = "https://api.openai.com/v1/chat/completions"
+    return response
+
+
+MAX_TOKENS_REFUSED = ("Unsupported parameter: 'max_tokens' is not supported with this model. "
+                      "Use 'max_completion_tokens' instead.")
+
+
+def test_a_refused_request_notes_the_services_own_words(service, notes, monkeypatch):   # spec §12
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _snapshot())
+    answers["gpt-6-luna"] = _http_answer(400, {"error": {"message": MAX_TOKENS_REFUSED, "type": "invalid_request_error"}})
+    text, metrics = _reply_after_notes()
+    assert text == "您好！" and metrics["attempts"][0]["status"] == 400   # the backup answered
+    assert notes[0] == (11, f"HTTP 400: {MAX_TOKENS_REFUSED}")
+
+
+ECHOED_KEY = "AIzaEchoProbe-1234567890"
+
+
+@pytest.mark.parametrize("body", [{"error": {"message": f"Invalid API key: {ECHOED_KEY}"}},
+                                  "x" * 280 + ECHOED_KEY])   # an error page: the key straddles the 300-character cut
+def test_a_key_the_service_echoes_never_reaches_the_note_or_the_log(service, notes, monkeypatch, caplog, body):
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _snapshot(openai_key=ECHOED_KEY))
+    answers["gpt-6-luna"] = _http_answer(401, body)
+    with caplog.at_level("WARNING"):
+        _reply_after_notes()
+    (ref, note), *_ = notes
+    assert ref == 11 and note.startswith("HTTP 401: ") and "gpt-6-luna" in caplog.text
+    assert ECHOED_KEY[:8] not in note and ECHOED_KEY[:8] not in caplog.text
 
 
 def test_env_models_are_never_noted(service, notes, monkeypatch):
