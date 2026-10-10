@@ -123,3 +123,22 @@ def test_a_starting_profile_is_a_fresh_copy():
     profile = ai_profile.starting_profile("openai")
     profile["reasoning_off"]["reasoning_effort"] = "high"
     assert ai_profile.starting_profile("openai")["reasoning_off"] == {"reasoning_effort": "none"}
+
+
+REASONING_MANDATORY = "Reasoning is mandatory for this endpoint and cannot be disabled."
+
+
+@pytest.mark.parametrize("kind", ["openrouter", "openai_compatible"])
+def test_a_mandatory_reasoning_model_gets_reasoning_off_dropped(kind):
+    send, sent = _service((lambda p: p["reasoning_off"] is not None, _bad(REASONING_MANDATORY)))
+    result = ai_profile.detect(send, kind)
+    assert [p["reasoning_off"] for p in sent][-1] is None and len(sent) == 2
+    assert result["ok"] and result["profile"]["reasoning_off"] is None
+
+
+@pytest.mark.parametrize("body", [{"choices": [{"message": "hi"}]}, {"choices": ["x"]}, {"choices": "x"},
+                                  {"choices": [{"message": ["hi"]}]}])
+def test_a_200_with_an_unexpected_shape_is_a_failure_not_an_exception(body):
+    send, _ = _service((lambda p: True, (200, body, 100)))
+    result = ai_profile.detect(send, "openai")
+    assert result["ok"] is False and result["error"] == "The model answered with no text."
