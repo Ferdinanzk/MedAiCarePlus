@@ -4,7 +4,7 @@ import { Brain, CheckCircle2, Loader2, Lock, Plus, Trash2, TriangleAlert, XCircl
 import { ApiError } from '../lib/reachy-api';
 import {
   AI_JOBS, AI_KINDS, addConnection, addModel, deleteConnection, deleteModel, fetchAiSettings, fetchRemoteModels,
-  saveJobs, testModel, updateConnection, updateModel,
+  mergeJobs, saveJobs, testModel, updateConnection, updateModel,
   type AiJob, type AiJobChoice, type AiKind, type AiModel, type AiSettings, type AiTestResult,
 } from '../lib/ai-connections-api';
 
@@ -46,14 +46,16 @@ export default function AiConnectionsCard() {
     return () => { active = false; };
   }, []);
 
-  /** One change; the server answers with the whole card. `done` runs only after a success (e.g. closing a form). */
-  const run = async (action: () => Promise<AiSettings>, done?: () => void) => {
+  /** One change; the server answers with the whole card. `done` runs only after a success (e.g. closing a form).
+   *  Unsaved job choices survive every change except saving the jobs themselves. */
+  const run = async (action: () => Promise<AiSettings>, done?: () => void, savesJobs = false) => {
     setBusy(true);
     setError('');
     try {
       const next = await action();
       setSettings(next);
-      setJobs(next.jobs);
+      setJobs(current => (savesJobs || !current ? next.jobs
+        : mergeJobs(current, next.jobs, next.models.filter(model => model.tested).map(model => model.model_ref))));
       done?.();
     } catch (cause) {
       setError(errorCode(cause));
@@ -316,7 +318,7 @@ export default function AiConnectionsCard() {
             </select>
           </div>
         ))}
-        <button type="button" className={primary} disabled={busy} onClick={() => void run(() => saveJobs(jobs))}>{t('aiConnections.saveJobs')}</button>
+        <button type="button" className={primary} disabled={busy} onClick={() => void run(() => saveJobs(jobs), undefined, true)}>{t('aiConnections.saveJobs')}</button>
       </div>
     </section>
   );
