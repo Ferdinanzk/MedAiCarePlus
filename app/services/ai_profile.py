@@ -1,7 +1,8 @@
 """How to ask one model: the request settings it accepts (its profile), found by trying, and the request they give.
 
 Models differ even within one service (measured 2026-10-10 with OpenAI): gpt-6-luna and gpt-5.4-mini refuse
-max_tokens and want max_completion_tokens; gpt-6-luna refuses any temperature but the default; gpt-4.1-mini refuses
+max_tokens and want max_completion_tokens; gpt-6-luna refuses a temperature other than the default unless reasoning is turned off
+(reasoning_effort none); gpt-4.1-mini refuses
 reasoning_effort. So no request is fixed in code: the Test button starts from the service's usual request, reads
 each 400 message, changes the one setting it names, and the card saves what worked.
 """
