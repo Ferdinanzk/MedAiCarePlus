@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import (after_chat, consent_service, conversation, dose_safety, dose_video, memory, outbox,
+from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_video, memory, outbox,
                           reachy_tasks, schedule)
 from app.services.device_auth import get_device, get_device_for_heartbeat
 from app.services.face_recognition_service import FaceRecognitionService
@@ -333,7 +333,7 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
             "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
             "VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid)",
             conversation_id, device["u_id"], str(task["task_id"]), language,
-            config.LLM_MODEL or config.LLM_FALLBACK_MODEL, str(followup["memory_id"]) if followup else None)
+            ai_settings.main_model_id("reply"), str(followup["memory_id"]) if followup else None)
         turn_id = await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
     return _spoken(opening, language, end=False, reply_turn_id=turn_id, conversation_id=conversation_id)
 

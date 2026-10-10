@@ -11,6 +11,7 @@ from functools import lru_cache
 from typing import NamedTuple, cast
 
 from app import config
+from app.services import ai_settings
 
 KIND_SCOPES: dict[str, tuple[str, ...]] = {
     "core": ("core",),
@@ -59,7 +60,7 @@ def has_placeholders(doc) -> bool:
 
 
 def fills() -> dict[str, str]:
-    return {
+    values = {
         "OPERATOR_NAME": config.OPERATOR_NAME,
         "OPERATOR_CONTACT": config.OPERATOR_CONTACT,
         "TUNNEL_PROVIDER": config.TUNNEL_PROVIDER,
@@ -68,6 +69,10 @@ def fills() -> dict[str, str]:
         "LLM_PROVIDER_REGION": config.LLM_PROVIDER_REGION,
         "LLM_RETENTION": config.LLM_RETENTION,
     }
+    snapshot = ai_settings.loaded()
+    if snapshot is not None:   # the AI connections card names the services in use (spec 2026-10-10 section 9)
+        values.update(ai_settings.notice_fills(snapshot))
+    return values
 
 
 def normalise_language(lang: str | None) -> str:
