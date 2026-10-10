@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -60,6 +62,15 @@ async def dose_refused(request, exc: DoseRefused):
     """Every route (both ports) refuses a dose overdose protection stops the same way: 409 with the reason
     (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired), its times and the patient's sentence."""
     return JSONResponse(exc.body(), status_code=409)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc: RequestValidationError):
+    """FastAPI's 422 copies the request input back. On the AI card that input holds a plain API key, so the card
+    answers a bare code; every other route keeps the default answer."""
+    if request.url.path.startswith("/api/ai/"):
+        return JSONResponse({"detail": "invalid_request"}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.middleware("http")

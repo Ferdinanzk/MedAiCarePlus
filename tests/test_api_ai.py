@@ -253,3 +253,56 @@ def test_the_services_model_list_is_sorted_ids(api, monkeypatch):
 def test_unknown_ids_are_not_found(api):
     assert api.client.patch("/api/ai/connections/77", json={"name": "Y"}).status_code == 404
     assert api.client.post("/api/ai/models/77/test").status_code == 404
+
+
+def test_a_refused_request_never_echoes_the_key(api):
+    key = "sk-proj-LEAKPROBE-1234"
+    response = api.client.post("/api/ai/connections", json={"name": "X", "api_key": key, "service_name": "X"})
+    assert response.status_code == 422 and response.json() == {"detail": "invalid_request"}
+    assert key not in response.text
+    long_key = "k" * 600
+    response = api.client.patch("/api/ai/connections/1", json={"api_key": long_key})
+    assert response.status_code == 422 and response.json() == {"detail": "invalid_request"}
+    assert long_key not in response.text
+
+
+def test_other_routes_keep_the_default_422(api):
+    response = api.client.post("/api/notify/generate-code", json={"contact_id": "not a number"})
+    assert response.status_code == 422 and isinstance(response.json()["detail"], list)
+
+
+def _other_service(monkeypatch, key="sk-local-5555"):
+    snapshot = _snapshot()
+    other = ai_settings.Connection(2, "Local", "openai_compatible", "https://llm.example.org/v1", key,
+                                   key[-4:] if key else None, True, "Local")
+    monkeypatch.setattr(ai_settings, "_snapshot",
+                        dataclasses.replace(snapshot, connections={**snapshot.connections, 2: other}))
+
+
+def test_a_new_address_needs_a_new_key_when_one_is_stored(api, monkeypatch):
+    _other_service(monkeypatch)
+    response = api.client.patch("/api/ai/connections/2", json={"base_url": "https://attacker.example/v1"})
+    assert (response.status_code, response.json()) == (400, {"detail": "no_key"}) and api.store.calls == []
+    response = api.client.patch("/api/ai/connections/2", json={"base_url": "https://attacker.example/v1",
+                                                               "api_key": NEW_KEY})
+    assert response.status_code == 200
+    assert api.store.calls[-1] == ("update_connection", 2, None, "https://attacker.example/v1", NEW_KEY, None)
+    response = api.client.patch("/api/ai/connections/2", json={"base_url": "https://llm.example.org/v1/"})
+    assert response.status_code == 200 and api.store.calls[-1][3] == "https://llm.example.org/v1"
+
+
+def test_a_new_address_without_a_stored_key_is_allowed(api, monkeypatch):
+    _other_service(monkeypatch, key="")
+    assert api.client.patch("/api/ai/connections/2", json={"base_url": "http://other.local/v1"}).status_code == 200
+
+
+@pytest.mark.parametrize("get", [
+    lambda url, timeout, headers: Reply(200, ["not", "a", "dict"]),
+    lambda url, timeout, headers: (_ for _ in ()).throw(api_ai.requests.ConnectionError("down")),
+])
+def test_a_failed_model_list_is_logged_without_the_key(api, monkeypatch, caplog, get):
+    monkeypatch.setattr(api_ai.requests, "get", get)
+    with caplog.at_level("WARNING", logger=api_ai.log.name):
+        response = api.client.get("/api/ai/connections/1/remote-models")
+    assert (response.status_code, response.json()) == (502, {"detail": "remote_models_unavailable"})
+    assert "AI connection 1 failed" in caplog.text and "routerSECRET" not in caplog.text
