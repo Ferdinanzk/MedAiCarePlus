@@ -115,6 +115,40 @@ def test_a_failed_call_is_noted_for_the_card_and_a_success_clears_it(service, no
     assert notes == [(11, "HTTP 503"), (21, None)]
 
 
+def test_a_keyless_main_model_is_skipped_for_the_backup(service, notes, monkeypatch):
+    sent, _ = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _snapshot(openai_key=""))
+    text, metrics = _reply_after_notes()
+    assert text == "您好！"
+    assert [request["url"] for request in sent] == ["https://openrouter.ai/api/v1/chat/completions"]
+    assert [(a["connection"], a["usable"]) for a in metrics["attempts"]] == [("OpenRouter", True)]
+
+
+def test_an_unchanged_error_is_not_noted_again(service, notes, monkeypatch):
+    sent, answers = service
+    snapshot = _snapshot()
+    snapshot = ai_settings.with_model(snapshot, dataclasses.replace(snapshot.models[11], last_error="HTTP 503"))
+    monkeypatch.setattr(ai_settings, "_snapshot", snapshot)
+    answers["gpt-6-luna"] = Response(status=503)
+    _reply_after_notes()
+    assert len(sent) == 2
+    assert all(ref != 11 for ref, _ in notes)
+
+
+def test_a_key_in_an_error_never_reaches_the_log_or_the_note(notes, monkeypatch, caplog):
+    class Session:
+        def post(self, url, timeout, headers, json):
+            raise ValueError("Invalid header value 'Bearer sk-proj-LEAKED-1234'")
+
+    monkeypatch.setattr(conversation, "_http_session", lambda: Session())
+    monkeypatch.setattr(ai_settings, "_snapshot", _snapshot(fallback=False))
+    with caplog.at_level("WARNING"):
+        _reply_after_notes()
+    assert "LEAKED" not in caplog.text and "[key removed]" in caplog.text
+    assert notes and all("LEAKED" not in (error or "") for _, error in notes)
+    assert any("[key removed]" in (error or "") for _, error in notes)
+
+
 def test_env_models_are_never_noted(service, notes, monkeypatch):
     sent, answers = service
     monkeypatch.setattr(ai_settings, "_snapshot", None)
