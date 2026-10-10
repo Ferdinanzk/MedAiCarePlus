@@ -6,6 +6,7 @@ server: answers carry only their last 4 characters. Every change answers with th
 
 import asyncio
 import dataclasses
+import logging
 import re
 import time
 
@@ -18,6 +19,7 @@ from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.services import ai_crypto, ai_profile, ai_settings, ai_store, conversation
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ai", tags=["ai-connections"])
 REMOTE_MODELS_LIMIT = 2000
 REMOTE_MODELS_TIMEOUT = 10
@@ -138,6 +140,9 @@ async def update_connection(connection_id: int, body: ConnectionChange, user: di
         if connection.kind != "openai_compatible":
             raise HTTPException(400, "invalid_base_url")
         base_url = _base_url(connection.kind, body.base_url)
+        if (base_url != connection.base_url and (connection.key_last4 is not None or connection.api_key)
+                and not (body.api_key or "").strip()):
+            raise HTTPException(400, "no_key")   # the stored key must not follow a new address
     async with get_pool().acquire() as conn:
         async with ai_store.change(conn):
             await ai_store.update_connection(
@@ -168,12 +173,17 @@ async def remote_models(connection_id: int, user: dict = Depends(get_consented_u
                                 if connection.api_key else {})
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code}")
-        data = response.json().get("data") or []
+        body = response.json()
+        if not isinstance(body, dict) or not isinstance(body.get("data") or [], list):
+            raise RuntimeError("unexpected body")
+        data = body.get("data") or []
         return sorted({item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)})
 
     try:
         models = await asyncio.to_thread(fetch)
-    except Exception:
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        log.warning("model list for AI connection %s failed: %s", connection_id,
+                    exc if isinstance(exc, RuntimeError) else type(exc).__name__)
         raise HTTPException(502, "remote_models_unavailable") from None
     return {"models": models[:REMOTE_MODELS_LIMIT]}
 
