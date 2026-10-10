@@ -18,3 +18,4 @@ APScheduler==3.10.4
 pytz==2024.2
 passlib[bcrypt]==1.7.4
 zhconv==1.4.3
+cryptography==50.0.1
