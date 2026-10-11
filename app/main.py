@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from starlette.datastructures import Headers
 
 from app import config
 from app.database import init_pool, close_pool
@@ -92,17 +93,40 @@ async def invalid_request(request, exc: RequestValidationError):
     return await request_validation_exception_handler(request, exc)
 
 
-@app.middleware("http")
-async def device_port_isolation(request, call_next):
-    """Device routes exist only on the private port; device tokens never work on the public one."""
-    server = request.scope.get("server")
-    on_device_port = bool(server) and server[1] == DEVICE_PORT
-    path = request.url.path
-    if path.startswith("/api/device/") != on_device_port:
-        return JSONResponse({"detail": "Not Found"}, status_code=404)
-    if not on_device_port and request.headers.get("authorization", "").lower().startswith("bearer rdv1."):
-        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
-    return await call_next(request)
+class DevicePortIsolation:
+    """Device routes exist only on the private port; device tokens never work on the public one.
+
+    A plain ASGI middleware, so the rule covers WebSockets too: an @app.middleware("http") never sees them (spec
+    2026-10-12-live-voice-2a-design.md A2, flaw F22). HTTP: 404 on the wrong port, then 401 for a device token on the
+    public port, as before. A WebSocket on the wrong port, or with a device token on the public port, is closed with
+    1008 before its handshake completes (uvicorn answers it with HTTP 403). scope["path"] is the path the router
+    matches."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        server = scope.get("server")
+        on_device_port = bool(server) and server[1] == DEVICE_PORT
+        wrong_port = scope["path"].startswith("/api/device/") != on_device_port
+        device_token = (not on_device_port
+                        and Headers(scope=scope).get("authorization", "").lower().startswith("bearer rdv1."))
+        if scope["type"] == "websocket" and (wrong_port or device_token):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        if wrong_port:
+            await JSONResponse({"detail": "Not Found"}, status_code=404)(scope, receive, send)
+            return
+        if device_token:
+            await JSONResponse({"detail": "Invalid or expired token"}, status_code=401)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(DevicePortIsolation)   # where the http-only rule was, so CORS still runs outside it
 
 # CORS for React frontend (local dev + Vercel production)
 _cors_origins = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]

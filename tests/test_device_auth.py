@@ -7,7 +7,7 @@ import types
 import uuid
 
 import pytest
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
@@ -270,3 +270,83 @@ def test_heartbeat_reports_stop_all_for_revoked_device_or_withdrawn_consent(env)
     response = env.device.post("/api/device/heartbeat", json={}, headers=_auth(other))
     assert response.status_code == 200 and response.json()["stop_all"] is True
     assert not any("last_seen_at" in query for query, _ in env.conn.executed)
+
+
+# ── The live chat's WebSocket key check (device_auth.get_device_ws; spec 2026-10-12-live-voice-2a-design.md A2) ──
+
+_ws_probe = APIRouter()
+
+
+@_ws_probe.websocket("/api/device/__ws_auth_probe")
+async def ws_auth_probe(websocket: WebSocket):
+    """As the live chat's route does: get_device_ws gives the device, or None once it has closed the socket."""
+    device = await device_auth.get_device_ws(websocket)
+    if device is None:
+        return
+    await websocket.accept()
+    await websocket.send_json(device)
+    await websocket.close()
+
+
+def _ws_auth(env, headers, query=""):
+    if _ws_probe.routes[0] not in env.app.router.routes:
+        env.app.router.routes.insert(0, _ws_probe.routes[0])
+    # websocket_connect ignores base_url: the device port goes in the URL.
+    return env.device.websocket_connect(f"ws://testserver:{DEVICE_PORT}/api/device/__ws_auth_probe{query}",
+                                        headers=headers)
+
+
+def test_websocket_key_check_gives_the_device(env):
+    device_id = str(uuid.uuid4())
+    token = device_auth.issue_token(device_id, 7)
+    _store(env.conn, device_id, 7, token)
+    with _ws_auth(env, _auth(token)) as websocket:
+        assert websocket.receive_json() == {"device_id": device_id, "u_id": 7, "auto_record": False,
+                                            "face_label": "pearl", "name": "Pearl"}
+
+
+@pytest.mark.parametrize("case", ["missing", "garbage", "face_token", "unstored", "revoked", "claims_mismatch",
+                                  "wrong_salt", "basic_scheme", "query_string"])
+def test_websocket_key_check_closes_4401_for_a_bad_key(env, case):
+    """Accepted, then closed with 4401: the robot sees the code (a close before the accept reaches it as HTTP 403)."""
+    device_id = str(uuid.uuid4())
+    token = device_auth.issue_token(device_id, 7)
+    headers, query = _auth(token), ""
+    if case == "missing":
+        headers = {}
+    elif case == "garbage":
+        headers = _auth("rdv1.not-a-token")
+    elif case == "face_token":
+        from itsdangerous import URLSafeTimedSerializer
+        headers = _auth(URLSafeTimedSerializer(config.SECRET_KEY).dumps({"u_id": 7, "name": "Pearl"}))
+    elif case == "revoked":
+        _store(env.conn, device_id, 7, token, revoked=True)
+    elif case == "claims_mismatch":
+        _store(env.conn, device_id, 8, token)
+    elif case == "wrong_salt":
+        from itsdangerous import URLSafeTimedSerializer
+        forged = "rdv1." + URLSafeTimedSerializer(config.SECRET_KEY).dumps({"d": device_id, "u": 7})
+        _store(env.conn, device_id, 7, forged)
+        headers = _auth(forged)
+    elif case == "basic_scheme":
+        _store(env.conn, device_id, 7, token)
+        headers = {"Authorization": f"Basic {token}"}
+    elif case == "query_string":   # read only from the header, never from the URL (URLs end up in logs)
+        _store(env.conn, device_id, 7, token)
+        headers, query = {}, f"?authorization=Bearer%20{token}"
+    with _ws_auth(env, headers, query) as websocket:
+        assert websocket.receive() == {"type": "websocket.close", "code": 4401, "reason": "invalid_token"}
+
+
+@pytest.mark.parametrize("state", [
+    {}, {"core": CORE},
+    {"core": CORE, "robot_camera": {"granted": False, "terms_version": config.TERMS_VERSION}},
+    {"core": CORE, "robot_camera": {"granted": True, "terms_version": "old"}},
+])
+def test_websocket_key_check_closes_4403_without_robot_camera_consent(env, state):
+    device_id = str(uuid.uuid4())
+    token = device_auth.issue_token(device_id, 7)
+    _store(env.conn, device_id, 7, token)
+    env.consent[7] = state
+    with _ws_auth(env, _auth(token)) as websocket:
+        assert websocket.receive() == {"type": "websocket.close", "code": 4403, "reason": "consent_required"}

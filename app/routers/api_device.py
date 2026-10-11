@@ -1,7 +1,7 @@
 """Robot device API, served only on the private port (main.py enforces the port rule).
 
-Every route authenticates a device token (device_auth.get_device) and acts only
-for that device's own patient.
+Every route authenticates a device token (device_auth.get_device; the live chat's
+WebSocket: device_auth.get_device_ws) and acts only for that device's own patient.
 """
 
 import asyncio
@@ -13,14 +13,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, WebSocket
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_video, memory, outbox,
-                          reachy_tasks, schedule)
-from app.services.device_auth import get_device, get_device_for_heartbeat
+from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_video, live_session,
+                          memory, outbox, reachy_tasks, schedule)
+from app.services.device_auth import get_device, get_device_for_heartbeat, get_device_ws
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
@@ -526,6 +526,37 @@ async def conversation_end(conversation_id: str, payload: ConversationEndPayload
             "WHERE conversation_id = $1::uuid", str(row["conversation_id"]), payload.reason)
     _in_background(after_chat.process(str(row["conversation_id"]), device["u_id"]))
     return {"ended": True}
+
+
+# ── Live voice check-ins (spec 2026-10-12-live-voice-2a-design.md A2) ───────
+
+LIVE_CHAT_OPEN = 4409   # WebSocket close code: this patient already has a live chat running
+_live_chats: dict[int, live_session.LiveRelay] = {}   # u_id -> the patient's running live chat (this process)
+
+
+@router.websocket("/conversations/live")
+async def conversation_live(websocket: WebSocket):
+    """A live voice check-in: live_session.LiveRelay runs the start checks (a fallback to today's text chat at the
+    first failure), GPT-Live and the chat. Device port only (main.py's DevicePortIsolation also covers WebSockets).
+    get_device_ws closes the socket itself on a bad key (4401) or without robot consent (4403). One live chat per
+    patient: a second connection while one runs is accepted and closed with 4409."""
+    device = await get_device_ws(websocket)
+    if device is None:
+        return
+    u_id = device["u_id"]
+    if u_id in _live_chats:
+        log.warning("patient %s: a second live chat was refused while one runs", u_id)
+        await websocket.accept()
+        await websocket.close(code=LIVE_CHAT_OPEN, reason="live_chat_open")
+        return
+    relay = live_session.LiveRelay(live_session.WebSocketRobot(websocket), device)
+    _live_chats[u_id] = relay   # before the accept, with no await since the check: no second chat slips in
+    try:
+        await websocket.accept()
+        await relay.run()
+    finally:
+        if _live_chats.get(u_id) is relay:
+            del _live_chats[u_id]
 
 
 @router.post("/heartbeat")
