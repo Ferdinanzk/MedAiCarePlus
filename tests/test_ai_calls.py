@@ -4,12 +4,13 @@ notices naming the services in use, and failed calls noted for the card."""
 import asyncio
 import dataclasses
 import json
+from datetime import date
 
 import pytest
 import requests
 
 from app import config
-from app.services import ai_profile, ai_settings, ai_store, conversation, legal_service
+from app.services import ai_profile, ai_settings, ai_store, conversation, legal_service, memory
 
 LUNA = {"token_param": "max_completion_tokens", "temperature": False, "reasoning_off": {"reasoning_effort": "none"}}
 
@@ -228,3 +229,153 @@ def test_a_new_service_rewords_the_notice_and_changes_its_hash(monkeypatch):
     after = legal_service.get_document("robot", "en")
     assert after.sha256 != before.sha256
     assert "OpenAI" in json.dumps(after.document, ensure_ascii=False)
+
+
+# ── Thinking levels (spec 2026-10-11 D3-D5) ──
+
+THINKING_PART = {"param": "reasoning_effort", "levels": ["low", "medium", "high"],
+                 "ms": {"low": 1900, "medium": 2700, "high": 4100}, "always": False, "temperature": False}
+MINI_PROFILE = {"token_param": "max_completion_tokens", "temperature": True,
+                "reasoning_off": {"reasoning_effort": "none"}, "thinking": THINKING_PART}
+R1_PROFILE = {"token_param": "max_tokens", "temperature": True, "reasoning_off": {"reasoning": {"enabled": False}},
+              "thinking": {**THINKING_PART, "param": "openrouter_effort", "levels": ["low"], "temperature": True}}
+WALK = [{"role": "patient", "text": "我去散步了"}]
+
+
+class Thought(Response):
+    """An answer whose usage says how many of its completion tokens went on thinking."""
+
+    def __init__(self, tokens=300, reasoning=256, finish_reason="stop", content="您好！"):
+        super().__init__(content=content)
+        self.tokens, self.reasoning, self.finish_reason = tokens, reasoning, finish_reason
+
+    def json(self):
+        return {"model": "served",
+                "usage": {"completion_tokens": self.tokens,
+                          "completion_tokens_details": {"reasoning_tokens": self.reasoning}},
+                "choices": [{"finish_reason": self.finish_reason, "message": {"content": self.content}}]}
+
+
+def _thinking_snapshot(levels, main=MINI_PROFILE, backup=R1_PROFILE):
+    """_snapshot at the given job levels: gpt-5.4-mini on OpenAI (main, every level by default), then
+    deepseek/deepseek-r1 on OpenRouter (backup, low only by default), for every job."""
+    snapshot = _snapshot()
+    models = {11: dataclasses.replace(snapshot.models[11], model_id="gpt-5.4-mini", profile=main),
+              21: dataclasses.replace(snapshot.models[21], model_id="deepseek/deepseek-r1", profile=backup)}
+    return dataclasses.replace(snapshot, models=models, thinking=levels)
+
+
+def _levels(**levels):
+    """Every job off, except the ones named."""
+    return {**{job: "off" for job in ai_settings.JOBS}, **levels}
+
+
+def _body(request):
+    """A request's body without its messages, in the order it was sent."""
+    return {key: value for key, value in request["json"].items() if key != "messages"}
+
+
+@pytest.fixture
+def no_routing(monkeypatch):
+    monkeypatch.setattr(config, "OPENROUTER_PROVIDER_ONLY", "")
+    monkeypatch.setattr(config, "OPENROUTER_DATA_COLLECTION", "")
+
+
+def test_thinking_off_sends_todays_request_and_records_the_level(service, notes, monkeypatch):
+    sent, _ = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels()))
+    text, metrics = _reply_after_notes()
+    assert text == "您好！"
+    assert json.dumps(_body(sent[0])) == json.dumps(
+        {"model": "gpt-5.4-mini", "max_completion_tokens": 200, "temperature": 0.7, "reasoning_effort": "none"})
+    (attempt,) = metrics["attempts"]
+    assert attempt["level"] == "off" and attempt["reasoning_tokens"] is None and "error" not in attempt
+
+
+def test_main_and_backup_each_get_a_level_they_accept_with_its_allowance(service, notes, no_routing, monkeypatch):
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(reply="high")))
+    answers["gpt-5.4-mini"] = Response(status=503)
+    text, metrics = _reply_after_notes()
+    assert text == "您好！"
+    assert _body(sent[0]) == {"model": "gpt-5.4-mini", "max_completion_tokens": 200 + 3000, "reasoning_effort": "high"}
+    assert _body(sent[1]) == {"model": "deepseek/deepseek-r1", "max_tokens": 200 + 800, "temperature": 0.7,
+                              "reasoning": {"effort": "low", "exclude": True}}
+    assert [(a["model_requested"], a["level"]) for a in metrics["attempts"]] == [
+        ("gpt-5.4-mini", "high"), ("deepseek/deepseek-r1", "low")]
+
+
+@pytest.mark.parametrize("job, call, base", [
+    ("reply", lambda: conversation.reply_with_metrics(WALK, "zh-TW"), conversation.REPLY_MAX_TOKENS),
+    ("safety", lambda: conversation.classify_risk(WALK, "zh-TW"), conversation.RISK_MAX_TOKENS),
+    ("after_chat", lambda: conversation.summarize(WALK, "zh-TW"), conversation.SUMMARY_MAX_TOKENS),
+    ("after_chat", lambda: memory.after_chat_call(WALK, "zh-TW", [], date(2026, 10, 11)), 1000),
+])
+def test_every_calls_cap_is_its_base_plus_the_allowance_of_the_level_sent(service, notes, monkeypatch, job, call,
+                                                                          base):
+    sent, _ = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(**{job: "medium"})))
+    asyncio.run(call())
+    assert sent[0]["json"]["max_completion_tokens"] == base + 1600
+    assert sent[0]["json"]["reasoning_effort"] == "medium"
+
+
+def test_memory_extraction_leaves_out_temperature_0_only_while_thinking(service, notes, no_routing, monkeypatch):
+    """Spec D3: extraction's temperature 0 is dropped when thinking is on; a backup that doesn't think keeps it."""
+    sent, answers = service
+    thinker = {**R1_PROFILE, "thinking": {**R1_PROFILE["thinking"], "levels": ["low", "medium", "high"]}}
+    snapshot = _thinking_snapshot(_levels(after_chat="low"), backup=ai_profile.starting_profile("openrouter"))
+    snapshot = ai_settings.with_model(snapshot, dataclasses.replace(
+        snapshot.models[11], connection_id=2, model_id="deepseek/deepseek-v4", profile=thinker))
+    monkeypatch.setattr(ai_settings, "_snapshot", snapshot)
+    answers["deepseek/deepseek-v4"] = Response(status=503)
+    asyncio.run(memory.after_chat_call(WALK, "zh-TW", [], date(2026, 10, 11)))
+    assert _body(sent[0]) == {"model": "deepseek/deepseek-v4", "max_tokens": 1000 + 800,
+                              "reasoning": {"effort": "low", "exclude": True}}
+    assert _body(sent[1]) == {"model": "deepseek/deepseek-r1", "max_tokens": 1000, "temperature": 0,
+                              "reasoning": {"enabled": False}}
+    sent.clear()
+    asyncio.run(conversation.summarize(WALK, "zh-TW"))
+    assert sent[0]["json"]["temperature"] == 0.7   # only extraction's 0 is left out
+
+
+def test_a_model_that_always_thinks_gets_its_lowest_level_and_allowance_when_off(service, notes, monkeypatch):
+    sent, _ = service
+    astra = {"token_param": "max_completion_tokens", "temperature": False,
+             "reasoning_off": {"reasoning_effort": "low"}, "thinking": {**THINKING_PART, "always": True}}
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(), main=astra))
+    _, metrics = _reply_after_notes()
+    assert _body(sent[0]) == {"model": "gpt-5.4-mini", "max_completion_tokens": 200 + 800, "reasoning_effort": "low"}
+    assert metrics["attempts"][0]["level"] == "low"
+
+
+def test_reasoning_tokens_and_the_level_are_recorded_for_each_attempt(service, notes, monkeypatch):
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(reply="low")))
+    answers["gpt-5.4-mini"] = Thought(tokens=300, reasoning=256)
+    text, metrics = _reply_after_notes()
+    (attempt,) = metrics["attempts"]
+    assert text == "您好！" and attempt["reasoning_tokens"] == 256 and attempt["tokens"] == 300
+    assert attempt["level"] == "low" and attempt["usable"] is True and "error" not in attempt
+
+
+def test_thinking_that_uses_the_whole_cap_is_named_thinking_budget(service, notes, monkeypatch, caplog):
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(reply="low")))
+    answers["gpt-5.4-mini"] = Thought(tokens=1000, reasoning=1000, finish_reason="length", content="")
+    with caplog.at_level("WARNING"):
+        text, metrics = _reply_after_notes()
+    first, second = metrics["attempts"]
+    assert first["error"] == conversation.THINKING_BUDGET == "thinking_budget" and first["usable"] is False
+    assert first["finish_reason"] == "length" and first["reasoning_tokens"] == first["tokens"] == 1000
+    assert "error" not in second and text == "您好！"   # the backup answered
+    assert notes == [(11, "thinking_budget")]   # the card's last_error for the main model
+    assert "thinking_budget" in caplog.text
+
+
+def test_an_answer_cut_off_after_some_text_is_not_a_thinking_budget(service, notes, monkeypatch):
+    sent, answers = service
+    monkeypatch.setattr(ai_settings, "_snapshot", _thinking_snapshot(_levels(reply="low")))
+    answers["gpt-5.4-mini"] = Thought(tokens=1000, reasoning=900, finish_reason="length", content="您好，今天")
+    _, metrics = _reply_after_notes()
+    assert "error" not in metrics["attempts"][0] and notes[0] == (11, "No usable answer")
