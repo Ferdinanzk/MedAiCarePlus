@@ -10,6 +10,15 @@ READY_UNCERTAIN = {"event_id": "ev1", "decision": "uncertain", "confidence": 0.3
 RECORDED = {"event_id": "ev1", "status": "taken"}
 
 
+@pytest.mark.parametrize("reason", ["upcoming", "checkin"])
+def test_a_task_asks_for_the_robots_media_back_before_it_wakes_and_greets(reason):
+    # Final review of 11 Oct (R1): a camera recovery the daemon refused leaves the speaker and microphone off; the
+    # greeting needs them.
+    h = Harness(make_task([] if reason == "checkin" else [dose(1)], reason=reason, checkin=reason == "checkin"))
+    h.tick()
+    assert h.robot.calls[:3] == ["is_reachable", "restore_media", "wake"]
+
+
 def test_happy_path_two_doses_recorded_then_post_slot_and_wind_down():
     h = Harness(make_task([dose(1), dose(2)]))
     h.find_patient()

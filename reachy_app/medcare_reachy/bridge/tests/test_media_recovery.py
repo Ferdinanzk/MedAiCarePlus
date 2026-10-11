@@ -1,7 +1,10 @@
 """ReachyRobot.reopen_camera() and media_status(): the camera watchdog's recovery (spec 2026-10-11 A2) through the
 SDK's public release_media() and acquire_media() (reachy_mini 1.11.0, reachy_mini.py:203-240)."""
 
+import asyncio
+import threading
 import time
+import wave
 
 import httpx
 import numpy as np
@@ -9,6 +12,8 @@ import pytest
 
 from medcare_reachy.bridge import media as media_module
 from medcare_reachy.bridge.media import ReachyRobot
+from medcare_reachy.bridge.runner import MonitorStream, Runner
+from medcare_reachy.bridge.tests.fakes import FakeClips
 
 RELEASED = {"available": False, "released": True, "no_media": False}
 AVAILABLE = {"available": True, "released": False, "no_media": False}
@@ -193,3 +198,133 @@ def test_media_status_reads_the_local_daemon_within_2_s(monkeypatch, answer, exp
     monkeypatch.setattr(media_module.httpx, "get", get)
     assert ReachyRobot.attach(MediaMini()).media_status() == expected
     assert seen == [("http://127.0.0.1:8000/api/media/status", 2.0)]
+
+
+# ── restore_media(): media a refused recovery left released (final review of 11 Oct, R1) ──────────────────────
+# release_media() closes the whole media manager: camera, speaker and microphone. When the daemon then refuses to
+# give the media back, only an attached, stalled session's watchdog used to ask again, so after a give-up the app
+# stayed mute and deaf until it restarted.
+
+def _released(mini):
+    """This app's media released by a recovery, as the SDK leaves it; the test's own call is not counted."""
+    mini.release_media()
+    mini.calls.clear()
+
+
+def test_restore_media_is_a_no_op_while_the_app_has_its_media():
+    mini = MediaMini()
+    robot = robot_with(mini)
+    assert robot.restore_media() is True
+    assert mini.calls == [] and mini.media.name == "first"
+
+
+def test_restore_media_only_asks_for_released_media_back_and_never_releases():
+    mini = MediaMini()
+    robot = robot_with(mini)
+    _released(mini)
+    assert robot.get_audio() is None
+    assert robot.restore_media() is True
+    assert mini.calls == ["acquire_media"] and mini.media.name == "fresh 1"
+    assert mini.media.recording                       # the microphone's pipeline runs again
+    assert robot.get_audio() is not None and robot.get_camera_frame() is not None
+    assert robot.restore_media() is True and mini.calls == ["acquire_media"]   # back: nothing more to do
+
+
+def test_a_refused_restore_warns_once_per_streak_and_never_raises(caplog):
+    mini = MediaMini(gives_back=False)
+    robot = robot_with(mini)
+    _released(mini)
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.media"):
+        assert robot.restore_media() is False
+        assert robot.restore_media() is False
+        assert len(caplog.records) == 1
+        assert "the speaker and microphone stay off" in caplog.records[0].getMessage()
+        mini.gives_back = True
+        assert robot.restore_media() is True
+        mini.gives_back = False
+        _released(mini)
+        assert robot.restore_media() is False          # a new streak warns again
+
+        def broken():
+            raise RuntimeError("daemon unreachable")
+
+        mini.acquire_media = broken
+        assert robot.restore_media() is False          # an SDK error is a failure, never an exception
+    assert [r.levelname for r in caplog.records] == ["WARNING", "WARNING"]
+    assert "release_media" not in mini.calls
+
+
+def test_restore_media_holds_the_playback_lock():
+    mini = MediaMini()
+    robot = robot_with(mini)
+    _released(mini)
+    with robot._lock:                                  # a clip being handed to the speaker, or a recovery
+        worker = threading.Thread(target=robot.restore_media)
+        worker.start()
+        worker.join(0.2)
+        assert worker.is_alive() and mini.calls == []
+    worker.join(2.0)
+    assert not worker.is_alive() and mini.calls == ["acquire_media"]
+
+
+def test_no_connection_has_no_media_to_restore():
+    assert ReachyRobot("192.168.1.50").restore_media() is False
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class _App:
+    unreachable_since = None
+
+    async def heartbeat(self, payload, camera=None):
+        return {"stop_all": False}
+
+
+async def _inline(fn, *args):
+    return fn(*args)
+
+
+def test_after_a_refused_recovery_gives_up_the_next_heartbeat_gets_the_speaker_and_microphone_back(tmp_path, caplog):
+    path = tmp_path / "thanks.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.zeros(1600, "<i2").tobytes())
+    mini = MediaMini(gives_back=False)                 # the daemon refuses to give the media back
+    robot = robot_with(mini, RELEASED)
+    mini.managers[0].get_frame = lambda: None          # the camera feed is dead; its audio still works
+    clock = _Clock()
+    stream = MonitorStream(_App(), robot, None, clock=clock, run_blocking=_inline, stream_encode=lambda frame: b"j")
+    clips = FakeClips()
+    clips.missing_count = 0
+    runner = Runner(app=_App(), robot=robot, clips=clips, stream=stream, run_blocking=_inline)
+    assert robot.play_clip(path, wait=False) is True
+
+    async def search_then_heartbeats():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for i in range(1, 80):                         # 20 s of reads that find nothing
+            clock.t = 1000 + i * 0.25
+            await stream.step()
+        assert stream.camera.state == "unavailable"
+        stream.detach()                                # the search ends with camera_unavailable
+        for _ in range(3):                             # heartbeats between tasks: the daemon still refuses
+            clock.t += 10
+            await runner.heartbeat_once()
+        assert robot.play_clip(path, wait=False) is False and robot.get_audio() is None
+        mini.gives_back = True                         # the daemon can give the media back now
+        await runner.heartbeat_once()
+
+    with caplog.at_level("INFO"):
+        asyncio.run(search_then_heartbeats())
+    assert not mini.media_released and robot.play_clip(path, wait=False) is True
+    assert robot.get_audio() is not None and mini.media.recording
+    assert mini.calls.count("release_media") == 1      # the first recovery's; nothing after it releases
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len([m for m in errors if "the speaker and microphone are off" in m]) == 1

@@ -492,6 +492,17 @@ def test_heartbeat_payload_and_stop_all():
     assert runner.slot.stopped == ("stop_all", True)
 
 
+def test_every_heartbeat_asks_for_media_a_refused_recovery_left_released():
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False}))
+    asyncio.run(runner.heartbeat_once())
+    asyncio.run(runner.heartbeat_once())
+    assert runner.robot.calls == ["is_reachable", "restore_media"] * 2
+    offline = heartbeat_runner(HeartbeatApp({"stop_all": False}))
+    offline.robot = FakeRobot(reachable=False)
+    asyncio.run(offline.heartbeat_once())
+    assert offline.robot.calls == ["is_reachable"]     # no robot: nothing to ask
+
+
 def test_heartbeat_not_authorised_stops_and_unreachable_does_not():
     runner = heartbeat_runner(HeartbeatApp(error=NotAuthorised(status=403)))
     runner.slot = StubSlot()

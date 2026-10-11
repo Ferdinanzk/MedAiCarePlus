@@ -50,6 +50,7 @@ class Robot(Protocol):
     def wake(self) -> None: ...
     def sleep(self) -> None: ...
     def is_reachable(self) -> bool: ...
+    def restore_media(self) -> bool: ...   # ask for released media back (speaker, microphone, camera); never raises
     def gesture(self, mode: str | None) -> None: ...   # check-in body language: "think", "speak", None (still)
 
 
@@ -136,6 +137,7 @@ class ReachyRobot:
         self._media_status_url = f"http://{daemon_host}:{DAEMON_PORT}/api/media/status"
         self._lock = threading.Lock()   # audio: the SDK is driven from worker threads
         self._quiet_at = 0.0            # when the last clip handed to the speaker has finished playing
+        self._restore_failing = False   # restore_media(): the daemon refused, already logged for this streak
         # Gestures start only after hold_head() and stop for every other move (wake, sleep, look_around, close).
         self._gestures = Gestures(self._send_gesture, ready=self._motors_on, start_from=self._start_pose,
                                   move=thinking_move())
@@ -296,6 +298,53 @@ class ReachyRobot:
                  "media backend %s)", outcome, status, getattr(mini.media, "backend", None))
         return outcome
 
+    def media_released(self) -> bool:
+        """Whether the SDK has this app's media released: camera, speaker and microphone all off (a camera recovery
+        whose acquire the daemon refused). The camera watchdog reads it when it gives up."""
+        return self._mini is not None and bool(getattr(self._mini, "media_released", False))
+
+    def restore_media(self) -> bool:
+        """Ask for this app's media back when the SDK says it is released; returns whether this app has it now.
+
+        A camera recovery releases the whole media manager, the speaker and the microphone with the camera. When the
+        daemon refused to give it back, only an attached, stalled session's watchdog used to ask again, so after a
+        give-up Reachy stayed mute and deaf (final review of 11 Oct). The runner calls this at every heartbeat and
+        before a task wakes the robot. It only ever calls the SDK's acquire_media(), never release_media(), so media
+        this app has is never touched; it holds the playback lock, as the recovery does, and starts the fresh
+        manager's microphone. Never raises: a refusal or an SDK error logs one WARNING per streak of failures.
+        """
+        mini = self._mini
+        if mini is None:
+            return False
+        if not getattr(mini, "media_released", False):
+            self._restore_failing = False
+            return True
+        failure, restored = None, False
+        try:
+            with self._lock:
+                if getattr(mini, "media_released", False):   # a camera recovery may have got it back meanwhile
+                    mini.acquire_media()
+                    if getattr(mini, "media_released", False):
+                        failure = "the daemon did not give the media back"
+                    else:
+                        restored = True
+                        try:
+                            mini.media.start_recording()
+                        except Exception:   # the speaker works again; only the microphone is missing
+                            log.exception("the microphone did not restart after the media came back")
+        except Exception as exc:   # asked again at the next heartbeat
+            failure = repr(exc)
+        if failure is not None:
+            if not self._restore_failing:
+                log.warning("this app's media is still released (%s): the speaker and microphone stay off; asking "
+                            "again at every heartbeat", failure)
+            self._restore_failing = True
+            return False
+        self._restore_failing = False
+        if restored:
+            log.info("this app's media is back with the SDK's acquire_media(): camera, speaker and microphone")
+        return True
+
     def gesture(self, mode: str | None) -> None:
         """Check-in body language (gestures.py): "think", "speak", or None to come back to the neutral pose.
 
@@ -418,6 +467,9 @@ class VideoFileRobot:
 
     def get_audio(self) -> None:
         return None   # no microphone when replaying a file
+
+    def restore_media(self) -> bool:
+        return True   # a video file has no media to give back
 
     def play_clip(self, path: Path, wait: bool = True) -> bool:
         self.actions.append(("play_clip", Path(path).name))

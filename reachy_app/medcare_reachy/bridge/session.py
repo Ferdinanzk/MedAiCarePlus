@@ -195,6 +195,9 @@ class SlotSession:
         if not await self._robot("is_reachable"):
             await self._shutdown("robot_offline", status="aborted")
             return
+        # A camera recovery the daemon refused may have left the speaker and the microphone off: the greeting needs
+        # them (ReachyRobot.restore_media, which never raises).
+        await self._robot("restore_media")
         await self._robot("wake")
         await self._advance("searching")
         self._go(ANNOUNCE)
