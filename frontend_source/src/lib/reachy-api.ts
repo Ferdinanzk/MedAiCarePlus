@@ -1,6 +1,6 @@
 import { getFaceAuthHeaders } from './face-auth';
 
-/** The robot's camera as its last heartbeat reported it (robot app 0.6.0+; older robots send none). */
+/** The robot's camera as its last heartbeat reported it (robot app 0.7.0+; older robots send none). */
 export type RobotCamera = {
   state: 'idle' | 'ok' | 'stalled' | 'recovering' | 'unavailable';
   fps?: number | null;

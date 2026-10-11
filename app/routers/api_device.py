@@ -73,7 +73,7 @@ class ExtraEventPayload(BaseModel):
 
 
 class CameraReport(BaseModel):
-    """The robot's camera as its watchdog reports it (robot app 0.6.0+). idle: no session, so 0 fps is normal."""
+    """The robot's camera as its watchdog reports it (robot app 0.7.0+). idle: no session, so 0 fps is normal."""
     state: Literal["idle", "ok", "stalled", "recovering", "unavailable"]
     fps: float | None = Field(default=None, ge=0, le=240, allow_inf_nan=False)
     since: float | None = Field(default=None, allow_inf_nan=False)   # unix seconds (robot clock) of the last state change
@@ -86,7 +86,7 @@ class HeartbeatPayload(BaseModel):
     vision_fps: float | None = Field(default=None, ge=0, le=240)
     bridge_version: str | None = Field(default=None, max_length=50)
     missing_clips: int | list[str] | None = None
-    camera: CameraReport | None = None   # robots older than 0.6.0 send none
+    camera: CameraReport | None = None   # robots older than 0.7.0 send none
 
 
 class MonitorStartPayload(BaseModel):

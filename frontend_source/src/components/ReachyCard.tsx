@@ -9,7 +9,7 @@ import { fetchOverdoseProtection } from '../lib/notify-api';
 import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
-/** Camera states the robot's watchdog reports when it gets no frames (robot app 0.6.0+). */
+/** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
 const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
 
 /**

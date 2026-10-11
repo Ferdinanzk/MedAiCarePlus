@@ -1,7 +1,7 @@
 # Robot camera, finding the patient, AI card fixes and thinking levels (Phase 1)
 
 Date: 2026-10-11. Branch: `robot-camera-thinking`, from `ai-connections` (`4808126`, not merged).
-Approved by the user on Telegram and in the terminal ("go", 2026-10-11). Phase 2 (GPT-Live check-ins, with the camera
+Approved by the user on Telegram and in the terminal ("go", 2026-10-11). Renumbered from 0.6.0 to **0.7.0** on 2026-10-11, because the Hugging Face space already published a different "0.6.0" (flaw F23; the user chose no Hugging Face push for now). Phase 2 (GPT-Live check-ins, with the camera
 kept on during the chat) gets its own spec after a measurement spike.
 
 ## 1. Why
@@ -35,7 +35,7 @@ back (`POST /api/media/acquire`) and MedCare Reachy runs.
 ## 2. Scope
 
 In:
-- **A.** Robot app 0.6.0: camera watchdog with recovery, camera state in the heartbeat, early end of a search with a
+- **A.** Robot app 0.7.0: camera watchdog with recovery, camera state in the heartbeat, early end of a search with a
   clear reason, fix of the restart race. Deployed to the robot.
 - **B.** Server: the search before talking verifies with the OpenVINO match alone; identity outcomes are logged; the
   Reachy card shows the robot's camera state.
@@ -51,7 +51,7 @@ Out (later or never):
 
 ## 3. Design
 
-### A. Robot app 0.6.0 (`reachy_app/`)
+### A. Robot app 0.7.0 (`reachy_app/`)
 
 **A1. Restart race** (`medcare_reachy/service.py`, `static/main.js`).
 - `BridgeService.restart()` runs under its own lock, so two restarts never interleave.
@@ -85,7 +85,7 @@ The heartbeat adds `camera`: `{"state": "idle"|"ok"|"stalled"|"recovering"|"unav
 - `idle` when no session is attached (the camera isn't read then, so 0 fps is normal).
 - `unavailable` stays until a later session gets frames again.
 
-**A4. Version and deploy.** `__version__ = "0.6.0"` (both places the repo pins it). Deploy with
+**A4. Version and deploy.** `__version__ = "0.7.0"` (both places the repo pins it). Deploy with
 `reachy_app/tools/deploy_to_robot.py`, then restart the app through the daemon. The deploy also replaces the robot's
 older SenseVoice `voice.py` with the repo's Whisper Base version (F15); the deploy tool installs what Whisper needs.
 
@@ -119,7 +119,7 @@ pixels, the OpenVINO face count and the MediaPipe face count. No images, names o
   `unavailable` and the robot is online, and shows the camera fps while a session runs.
 - The task's `not_found` detail (`camera_unavailable`) is stored with the task like any status detail; no new task
   history screen is added.
-- Robots older than 0.6.0 send no `camera`; the card then shows nothing new.
+- Robots older than 0.7.0 send no `camera`; the card then shows nothing new.
 
 ### C. AI connections card fixes
 
@@ -259,7 +259,7 @@ memory 1000. Per-call timeouts and deadlines don't change.
   - one reply at `low` through the real stack;
   - the OpenRouter key filled from `.env` at start (connection has a key, safety jobs usable).
 - **Robot:**
-  - deploy 0.6.0, then one real check-in. Pass: frames at the camera rate, the patient verified, the chat runs.
+  - deploy 0.7.0, then one real check-in. Pass: frames at the camera rate, the patient verified, the chat runs.
   - A camera-failure check: release the daemon's media during a search (`POST /api/media/release`). Pass: the app
     recovers, or ends with `camera_unavailable` within 15 s, and the card shows the camera warning.
 
@@ -267,7 +267,7 @@ memory 1000. Per-call timeouts and deadlines don't change.
 
 - `CLAUDE.md`: the camera watchdog and the search identity rule; the per-job thinking level and token allowances; the
   OpenRouter key fill; the not-chat-model message.
-- `reachy_app/README.md`: version 0.6.0, the camera watchdog, and the TCU companion clash (it releases the camera).
+- `reachy_app/README.md`: version 0.7.0, the camera watchdog, and the TCU companion clash (it releases the camera).
 - The vault and `C:\Reachy_Mini\repo\flaw.md` (part 2: flaws found after the changes) are updated at the end.
 
 ## 7. Review focus (likely to bite, not covered by the obvious tests)

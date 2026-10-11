@@ -32,7 +32,7 @@ def _iso(value):
 
 
 def _camera(status_detail) -> dict | None:
-    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.6.0 send none).
+    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.7.0 send none).
     asyncpg hands JSONB back as text."""
     if status_detail is None:
         return None
