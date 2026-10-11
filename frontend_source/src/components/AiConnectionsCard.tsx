@@ -3,9 +3,10 @@ import { useTranslation } from 'react-i18next';
 import { Brain, CheckCircle2, Loader2, Lock, Plus, Trash2, TriangleAlert, XCircle } from 'lucide-react';
 import { ApiError } from '../lib/reachy-api';
 import {
-  AI_JOBS, AI_KINDS, addConnection, addModel, deleteConnection, deleteModel, fetchAiSettings, fetchRemoteModels,
-  mergeJobs, saveJobs, testModel, updateConnection, updateModel,
-  type AiJob, type AiJobChoice, type AiKind, type AiModel, type AiSettings, type AiTestResult, type AiThinkingLevel,
+  AI_JOBS, AI_KINDS, LIVE_VOICES, addConnection, addModel, checkLive, deleteConnection, deleteModel, fetchAiSettings,
+  fetchRemoteModels, liveChoice, liveUnsaved, mergeJobs, saveJobs, saveLive, testModel, updateConnection, updateModel,
+  type AiJob, type AiJobChoice, type AiKind, type AiLiveChoice, type AiModel, type AiSettings, type AiTestResult,
+  type AiThinkingLevel,
 } from '../lib/ai-connections-api';
 import { acceptedLevels, nearestLevel, offeredLevels, sentLevel, thinkingMs, tooSlow } from '../lib/ai-thinking';
 
@@ -14,6 +15,8 @@ const KNOWN_ERRORS = ['in_use', 'untested_model', 'not_found', 'invalid_base_url
   'key_unreadable', 'no_key', 'already_exists', 'notice_incomplete', 'remote_models_unavailable', 'invalid_request'];
 /** Codes a model's Test result or last call can carry instead of the service's own words (ai_profile.py). */
 const MODEL_ERRORS = ['not_chat_model', 'thinking_budget'];
+/** Codes a live voice Check can save as its error (live_client.CODES); anything else is shown as it came. */
+const LIVE_ERRORS = ['live_auth', 'live_unavailable', 'rate_limit_exceeded', 'content_filter', 'live_closed'];
 const field = 'w-full px-3 py-2 border border-gray-200 rounded-xl text-sm';
 const primary = 'px-3 py-2 rounded-xl text-sm font-medium bg-[#0057B8] text-white disabled:opacity-50';
 const secondary = 'px-3 py-2 rounded-xl text-sm font-medium border border-gray-200 text-gray-700 disabled:opacity-50';
@@ -48,6 +51,9 @@ export default function AiConnectionsCard() {
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
   const [keyDraft, setKeyDraft] = useState<{ id: number; key: string } | null>(null);
   const [noticeDraft, setNoticeDraft] = useState<NoticeDraft | null>(null);
+  /** The live voice form while it differs from the saved setup; null shows the saved setup (liveChoice). */
+  const [liveDraft, setLiveDraft] = useState<AiLiveChoice | null>(null);
+  const [liveChecking, setLiveChecking] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -89,6 +95,14 @@ export default function AiConnectionsCard() {
     } finally {
       setTesting(null);
     }
+  };
+
+  /** Check tries the saved live setup; the server saves its time or its error code. `run` catches every failure, so
+   *  the spinner always stops. */
+  const runLiveCheck = async () => {
+    setLiveChecking(true);
+    await run('live', checkLive);
+    setLiveChecking(false);
   };
 
   const loadRemoteModels = async (id: number) => {
@@ -195,6 +209,72 @@ export default function AiConnectionsCard() {
           <p role="alert" className={`${warning} sm:col-span-3`}><TriangleAlert className="inline w-4 h-4" /> {t('aiConnections.thinkingTooSlow')}</p>
         )}
       </>
+    );
+  };
+
+  /** A known Check error code in the card's own words; anything else is the server's text, shown as it came. */
+  const liveError = (code: string) => (LIVE_ERRORS.includes(code) ? t(`aiConnections.liveErrors.${code}`) : code);
+
+  /** Spec E2: GPT-Live's OpenAI connection, model and voice, and its Check. Shown only with LIVE_VOICE_TEST=1. The
+   *  form shows the saved setup until the person changes something; Check tries the saved setup, so a change waits
+   *  for Save. The status line is always about the saved setup. */
+  const liveSection = () => {
+    const saved = settings.live ?? null;
+    const choice = liveDraft ?? liveChoice(settings);
+    const openai = settings.connections.filter(connection => connection.kind === 'openai');
+    const liveStatus = () => {
+      if (liveChecking) return <span className="text-gray-500">{t('aiConnections.live.checking')}</span>;
+      if (!saved) return <span className="text-gray-500">{t('aiConnections.live.notSaved')}</span>;
+      if (saved.last_error) {
+        return <span className="text-red-700"><XCircle className="inline w-4 h-4" /> {t('aiConnections.live.checkFailed', { error: liveError(saved.last_error) })}</span>;
+      }
+      if (saved.tested_at && saved.test_ms != null) {
+        return <span className="text-green-700"><CheckCircle2 className="inline w-4 h-4" /> {t('aiConnections.live.checkOk', { seconds: (saved.test_ms / 1000).toFixed(1) })}</span>;
+      }
+      return <span className="text-gray-500">{t('aiConnections.live.notChecked')}</span>;
+    };
+    return (
+      <div role="group" aria-labelledby="ai-live-title" className="space-y-2">
+        <h3 id="ai-live-title" className="text-sm font-semibold text-gray-900">{t('aiConnections.live.title')}</h3>
+        <p className="text-xs text-gray-500">{t('aiConnections.live.intro')}</p>
+        {choice === null ? (
+          <p className="text-sm text-gray-700">{t('aiConnections.live.noOpenAi')}</p>
+        ) : (
+          <form className="space-y-2" onSubmit={event => {
+            event.preventDefault();
+            void run('live', () => saveLive({ ...choice, model_id: choice.model_id.trim() }), () => setLiveDraft(null));
+          }}>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <label className="block text-xs text-gray-600">{t('aiConnections.live.connection')}
+                <select className={field} aria-label={t('aiConnections.live.connection')} value={choice.connection_id}
+                  onChange={event => setLiveDraft({ ...choice, connection_id: Number(event.target.value) })}>
+                  {openai.map(connection => <option key={connection.connection_id} value={connection.connection_id}>{connection.name}</option>)}
+                </select>
+              </label>
+              <label className="block text-xs text-gray-600">{t('aiConnections.live.model')}
+                <input className={field} maxLength={100} value={choice.model_id}
+                  onChange={event => setLiveDraft({ ...choice, model_id: event.target.value })} />
+              </label>
+              <label className="block text-xs text-gray-600">{t('aiConnections.live.voice')}
+                <select className={field} aria-label={t('aiConnections.live.voice')} value={choice.voice}
+                  onChange={event => setLiveDraft({ ...choice, voice: event.target.value })}>
+                  {LIVE_VOICES.map(voice => <option key={voice} value={voice}>{voice}</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="text-xs break-words">{liveStatus()}</div>
+            {saved && liveUnsaved(choice, saved) && <p className="text-xs text-gray-500">{t('aiConnections.live.unsaved')}</p>}
+            <div className="flex flex-wrap gap-2">
+              <button type="submit" className={primary} disabled={busy || !choice.model_id.trim()}>{t('aiConnections.live.save')}</button>
+              <button type="button" className={secondary} disabled={busy || liveUnsaved(choice, saved)} onClick={() => void runLiveCheck()}>
+                {liveChecking ? <Loader2 className="w-4 h-4 animate-spin" aria-label={t('aiConnections.live.check')} /> : t('aiConnections.live.check')}
+              </button>
+            </div>
+          </form>
+        )}
+        {!saved?.usable && <p className={warning}>{t('aiConnections.live.notReady')}</p>}
+        {errorAt('live')}
+      </div>
     );
   };
 
@@ -434,6 +514,9 @@ export default function AiConnectionsCard() {
         </div>
         {errorAt('jobs')}
       </div>
+
+      {/* `=== true`: change answers are not shape-checked like the first load, so a missing field hides the section. */}
+      {settings.live_voice_test === true && liveSection()}
     </section>
   );
 }

@@ -16,6 +16,7 @@ function startingSettings() {
       after_chat: { primary_ref: 11, fallback_ref: 12, thinking: 'off' } },
     jobs_usable: { reply: true, safety: true, after_chat: true },
     seeded_at: '2026-10-10T12:00:00+00:00', weak_secret: true, no_key_in_use: false,
+    live: null as any, live_voice_test: false,
   };
 }
 
@@ -45,7 +46,8 @@ async function seedSession(page: Page) {
   });
 }
 
-async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown; jobsRefused?: boolean; testError?: string } = {}) {
+async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown; jobsRefused?: boolean; testError?: string;
+  liveRefused?: string; liveCheckError?: string; liveCheckRefused?: string } = {}) {
   const mock = { settings: startingSettings(), requests: [] as { method: string; path: string; body: any }[] };
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -88,6 +90,20 @@ async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown
       if (options.jobsRefused) return route.fulfill({ status: 400, json: { detail: 'notice_incomplete' } });
       mock.settings.jobs = body;
       return route.fulfill({ json: mock.settings });
+    }
+    if (path === '/api/ai/live' && method === 'PUT') {
+      if (options.liveRefused) return route.fulfill({ status: 404, json: { detail: options.liveRefused } });
+      // as ai_store.set_live: saving clears the last Check
+      mock.settings.live = { ...body, tested_at: null, test_ms: null, last_error: null, usable: false };
+      return route.fulfill({ json: mock.settings });
+    }
+    if (path === '/api/ai/live/check' && method === 'POST') {
+      if (options.liveCheckRefused) return route.fulfill({ status: 400, json: { detail: options.liveCheckRefused } });
+      const error = options.liveCheckError ?? null;
+      // as ai_store.save_live_check: a pass saves its time; a failure saves its code and keeps the earlier time
+      Object.assign(mock.settings.live, error ? { last_error: error, usable: false }
+        : { tested_at: '2026-10-12T09:00:00+00:00', test_ms: 1220, last_error: null, usable: true });
+      return route.fulfill({ json: { ok: !error, ms: error ? null : 1220, error, settings: mock.settings } });
     }
     return route.fulfill({ json: [] });
   });
@@ -174,7 +190,7 @@ test("a refused change shows the card's own words next to what caused it, after 
   await remove.click();
   expect(question).toContain('Remove OpenRouter?');
   const refusal = card(page).getByRole('group', { name: 'OpenRouter', exact: true }).getByRole('alert');
-  await expect(refusal).toContainText('A job still uses this');
+  await expect(refusal).toContainText('A job or the live voice still uses this');
   await expect(refusal).toBeInViewport();
 });
 
@@ -489,3 +505,197 @@ test('a saved voice-only failure shows the same words as the last call, in both 
   await expect(row).toContainText("Last call failed: Voice-only model (like GPT-Live or a TTS model): it can't write Reachy's text replies.");
   await expect(row).not.toContainText('not_chat_model');
 });
+
+// ── Spec 2026-10-12 E2: the live voice section, shown only with LIVE_VOICE_TEST=1 ──
+
+/** The starting card with live voice tests allowed: OpenRouter plus an OpenAI connection, no live setup saved yet. */
+function liveSettings() {
+  const settings: any = startingSettings();
+  settings.connections.push({ connection_id: 2, name: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1',
+    key_last4: '9876', key_readable: true, has_key: true, service_name: 'OpenAI' });
+  settings.live_voice_test = true;
+  return settings;
+}
+
+/** A saved live setup as ai_settings.public() gives it, with `change` on top. */
+const savedLive = (change: Record<string, unknown> = {}) => ({ connection_id: 2, model_id: 'gpt-live-1', voice: 'marin',
+  tested_at: null, test_ms: null, last_error: null, usable: false, ...change });
+/** A saved setup whose last Check passed in 1.2 s (GPT-Live's measured start). */
+const checkedLive = (change: Record<string, unknown> = {}) =>
+  savedLive({ tested_at: '2026-10-12T09:00:00+00:00', test_ms: 1220, usable: true, ...change });
+
+/** The mock on liveSettings(), changed by `change` first. The mock reads its settings at every request. */
+async function mockLive(page: Page, change?: (settings: any) => void,
+  options: { liveRefused?: string; liveCheckError?: string; liveCheckRefused?: string } = {}) {
+  const mock = await mockApi(page, options);
+  const settings = liveSettings();
+  change?.(settings);
+  mock.settings = settings;
+  return mock;
+}
+
+const live = (page: Page) => card(page).getByRole('group', { name: 'Live voice (test)', exact: true });
+const NOT_READY = 'Live voice is off for now: check-ins use the normal chat until a saved setup passes Check and its connection has a key.';
+
+test('the live voice section is hidden unless the server allows live voice tests', async ({ page }) => {
+  await seedSession(page);
+  // a setup saved while LIVE_VOICE_TEST was on stays hidden once it is off
+  await mockLive(page, settings => { settings.live_voice_test = false; settings.live = checkedLive({ usable: false }); });
+  await openSettings(page);
+  await expect(card(page).getByRole('button', { name: 'Save jobs' })).toBeVisible();
+  await expect(card(page)).not.toContainText('Live voice');
+  await expect(card(page).getByRole('button', { name: 'Check', exact: true })).toHaveCount(0);
+});
+
+test('live voice: pick the OpenAI connection, model and voice, save, then Check shows the time', async ({ page }) => {
+  await seedSession(page);
+  const mock = await mockLive(page);
+  let answer: () => void = () => {};
+  const answered = new Promise<void>(resolve => { answer = resolve; });
+  // Registered after mockApi, so it holds the Check until the test lets it go on to mockApi's handler.
+  await page.route('**/api/ai/live/check', async route => {
+    await answered;
+    await route.fallback();
+  });
+  await openSettings(page);
+  const section = live(page);
+  await expect(section).toContainText('Robots with "Live voice (test)" switched on in the Reachy card talk with GPT-Live');
+  // OpenRouter can't run GPT-Live: only OpenAI connections are offered
+  await expect(section.getByLabel('OpenAI connection').locator('option')).toHaveText(['OpenAI']);
+  await expect(section.getByLabel('Live model name')).toHaveValue('gpt-live-1');
+  const voice = section.getByLabel('Voice', { exact: true });
+  await expect(voice).toHaveValue('marin');
+  await expect(voice.locator('option')).toHaveText(['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse']);
+  await expect(section).toContainText('Not saved yet.');
+  await expect(section).toContainText(NOT_READY);
+  const check = section.getByRole('button', { name: 'Check', exact: true });
+  await expect(check).toBeDisabled();   // nothing saved to check yet
+  await voice.selectOption('cedar');
+  await section.getByRole('button', { name: 'Save live voice' }).click();
+  await expect(section).toContainText('Saved, not checked yet: press Check.');
+  expect(mock.requests.find(r => r.path === '/api/ai/live')?.body).toEqual({ connection_id: 2, model_id: 'gpt-live-1', voice: 'cedar' });
+  await expect(voice).toHaveValue('cedar');
+  await check.click();
+  await expect(section).toContainText('Checking: starting a GPT-Live session…');
+  await expect(section.getByRole('button', { name: 'Save live voice' })).toBeDisabled();
+  answer();
+  await expect(section).toContainText('Check passed: a session started in 1.2 s.');
+  await expect(section).not.toContainText(NOT_READY);
+  expect(mock.requests.filter(r => r.path === '/api/ai/live/check').map(r => r.method)).toEqual(['POST']);
+});
+
+const liveErrors: [string, string, string][] = [
+  ['live_auth', 'OpenAI refused the key. Check the key and that it may use GPT-Live.',
+    'OpenAI 拒絕了這個金鑰。請確認金鑰正確，而且可以使用 GPT-Live。'],
+  ['live_unavailable', 'GPT-Live did not start: it could not be reached, did not answer in time, or does not know this model name. Check the model name, then try again later.',
+    'GPT-Live 沒有啟動：可能連不上、沒有及時回應，或不認得這個模型名稱。請確認模型名稱，稍後再試。'],
+  ['rate_limit_exceeded', 'OpenAI turned it away: too many requests, or no credit left on the account. Try again later, or check the OpenAI account.',
+    'OpenAI 暫時拒絕：請求太多，或帳戶額度已用完。請稍後再試，或檢查 OpenAI 帳戶。'],
+  ['content_filter', "OpenAI's content filter ended the session.", 'OpenAI 的內容過濾機制結束了這次對話。'],
+  ['live_closed', 'GPT-Live closed the session before it started.', 'GPT-Live 在對話開始前就關閉了。'],
+];
+for (const [code, en, zh] of liveErrors) {
+  test(`a Check that ends in ${code} says why in both languages`, async ({ page }) => {
+    await seedSession(page);
+    await mockLive(page, settings => { settings.live = checkedLive(); }, { liveCheckError: code });
+    await page.goto('/settings');   // the app starts in Traditional Chinese
+    const section = card(page).getByRole('group', { name: '即時語音（測試）', exact: true });
+    await expect(section).toContainText('檢查通過：1.2 秒內開始對話。');
+    await section.getByRole('button', { name: '檢查', exact: true }).click();
+    // the server keeps the earlier time, but the new failure is what the card shows
+    await expect(section).toContainText(`檢查失敗：${zh}`);
+    await expect(section).not.toContainText('檢查通過');
+    await expect(section).toContainText('即時語音目前沒有啟用');
+    await page.getByRole('button', { name: '中文' }).first().click();
+    await expect(live(page)).toContainText(`Check failed: ${en}`);
+    await expect(live(page)).not.toContainText(code);
+  });
+}
+
+test('a saved Check shows when the card opens, and an error the card does not know shows as it came', async ({ page }) => {
+  await seedSession(page);
+  const mock = await mockLive(page, settings => { settings.live = checkedLive({ voice: 'verse', test_ms: 1480 }); });
+  await openSettings(page);
+  await expect(live(page).getByLabel('Voice', { exact: true })).toHaveValue('verse');
+  await expect(live(page)).toContainText('Check passed: a session started in 1.5 s.');
+  await expect(live(page)).not.toContainText(NOT_READY);
+  mock.settings.live = savedLive({ tested_at: '2026-10-12T09:05:00+00:00', last_error: 'model_not_found' });
+  await openSettings(page);
+  await expect(live(page)).toContainText('Check failed: model_not_found');
+  await expect(live(page)).toContainText(NOT_READY);
+});
+
+test('a live voice change not yet saved turns Check off, and survives saving the jobs', async ({ page }) => {
+  await seedSession(page);
+  await mockLive(page, settings => { settings.live = checkedLive(); });
+  await openSettings(page);
+  const section = live(page);
+  const check = section.getByRole('button', { name: 'Check', exact: true });
+  const model = section.getByLabel('Live model name');
+  await expect(check).toBeEnabled();
+  await model.fill('gpt-live-2');
+  await expect(check).toBeDisabled();
+  await expect(section).toContainText('Changes not saved yet. Save them, then press Check.');
+  // the status line is still about the saved setup
+  await expect(section).toContainText('Check passed: a session started in 1.2 s.');
+  await card(page).getByRole('button', { name: 'Save jobs' }).click();
+  await expect(card(page).getByRole('status')).toHaveText('Saved.');
+  await expect(model).toHaveValue('gpt-live-2');
+  await model.fill('gpt-live-1');   // back to the saved setup
+  await expect(check).toBeEnabled();
+  await expect(section).not.toContainText('Changes not saved yet');
+});
+
+test('without an OpenAI connection the live voice section asks for one first', async ({ page }) => {
+  await seedSession(page);
+  await mockLive(page, settings => { settings.connections = settings.connections.filter((c: any) => c.kind !== 'openai'); });
+  await openSettings(page);
+  await expect(live(page)).toContainText('Add an OpenAI connection above first: GPT-Live works only with an OpenAI key.');
+  await expect(live(page).getByRole('button', { name: 'Save live voice' })).toHaveCount(0);
+  await addOpenAi(page);
+  await expect(live(page).getByLabel('OpenAI connection')).toHaveValue('2');
+  await expect(live(page).getByRole('button', { name: 'Save live voice' })).toBeEnabled();
+});
+
+test("a refused live save shows the card's own words in the live voice section", async ({ page }) => {
+  await seedSession(page);
+  await mockLive(page, undefined, { liveRefused: 'not_found' });
+  await openSettings(page);
+  await live(page).getByRole('button', { name: 'Save live voice' }).click();
+  const refusal = live(page).getByRole('alert');
+  await expect(refusal).toContainText('It no longer exists. Reload the page.');
+  await expect(refusal).toBeInViewport();
+  await expect(live(page)).toContainText('Not saved yet.');
+});
+
+test('a Check the server refuses shows why in the live voice section, and Check works again', async ({ page }) => {
+  await seedSession(page);
+  // the live setup's OpenAI connection has no key: the server answers 400 no_key without opening a session
+  await mockLive(page, settings => {
+    settings.connections[1] = { ...settings.connections[1], key_last4: null, has_key: false };
+    settings.live = savedLive();
+  }, { liveCheckRefused: 'no_key' });
+  await openSettings(page);
+  const check = live(page).getByRole('button', { name: 'Check', exact: true });
+  await check.click();
+  await expect(live(page).getByRole('alert')).toContainText('Add an API key to this connection first.');
+  await expect(live(page)).toContainText('Saved, not checked yet: press Check.');
+  await expect(check).toBeEnabled();
+});
+
+const brokenLive: [string, (settings: any) => void][] = [
+  ['live_voice_test missing', settings => { delete settings.live_voice_test; }],
+  ['a live setup without its voice', settings => { settings.live = savedLive({ voice: undefined }); }],
+  ['a live setup that is a list', settings => { settings.live = []; }],
+];
+for (const [what, breakIt] of brokenLive) {
+  test(`an AI settings answer with ${what} is a load failure, not a crash`, async ({ page }) => {
+    const settings = liveSettings();
+    breakIt(settings);
+    await seedSession(page);
+    await mockApi(page, { aiBody: settings });
+    await openSettings(page);
+    await expect(card(page)).toContainText('Could not load the AI settings.');
+    await expect(page.locator('section[aria-labelledby="reachy-title"]')).toBeVisible();
+  });
+}

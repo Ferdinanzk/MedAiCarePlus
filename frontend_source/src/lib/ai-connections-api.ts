@@ -30,11 +30,27 @@ export interface AiSettings {
   /** Per job: true when its main or backup model is tested and its connection has a readable key (as saved). */
   jobs_usable: Record<string, boolean>;
   seeded_at: string | null; weak_secret: boolean; no_key_in_use: boolean;
+  /** The saved live voice setup (table ai_live), or null before one is saved. */
+  live: AiLive | null;
+  /** LIVE_VOICE_TEST in the server's .env: only then does the card show the live voice section. */
+  live_voice_test: boolean;
 }
 export interface AiTestResult { ok: boolean; ms: number | null; sample: string | null; profile: AiProfile | null; error: string | null }
+/** GPT-Live's setup as saved (spec E2): its OpenAI connection, model and voice, and the last Check: when it passed,
+ *  how long the session took to start (ms), or its error code. `usable`: the server would use it for check-ins now. */
+export interface AiLive {
+  connection_id: number | null; model_id: string; voice: string;
+  tested_at: string | null; test_ms: number | null; last_error: string | null; usable: boolean;
+}
+/** What the live voice form edits and PUT /api/ai/live takes. */
+export interface AiLiveChoice { connection_id: number; model_id: string; voice: string }
 
 export const AI_KINDS: AiKind[] = ['openrouter', 'openai', 'openai_compatible'];
 export const AI_JOBS: AiJob[] = ['reply', 'safety', 'after_chat'];
+/** GPT-Live's voices, as ai_settings.LIVE_VOICES (the TCU companion's list). */
+export const LIVE_VOICES = ['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'];
+export const LIVE_MODEL_DEFAULT = 'gpt-live-1';
+export const LIVE_VOICE_DEFAULT = 'marin';
 
 const send = (method: string, body?: unknown): RequestInit =>
   body === undefined ? { method } : { method, body: JSON.stringify(body) };
@@ -48,6 +64,12 @@ const isThinking = (value: unknown) => value === undefined || value === null || 
   && value.levels.every(level => typeof level === 'string') && isObject(value.ms) && Object.values(value.ms).every(isNumber)
   && typeof value.always === 'boolean');
 const hasThinking = (choice: unknown) => isObject(choice) && isThinkingChoice(choice.thinking);
+/** null (nothing saved yet) or a saved live setup with every part the card reads. */
+const isLive = (value: unknown) => value === null || (isObject(value)
+  && (value.connection_id === null || isNumber(value.connection_id)) && typeof value.model_id === 'string'
+  && typeof value.voice === 'string' && (value.tested_at === null || typeof value.tested_at === 'string')
+  && (value.test_ms === null || isNumber(value.test_ms)) && (value.last_error === null || typeof value.last_error === 'string')
+  && typeof value.usable === 'boolean');
 
 /** True only when every part the card reads has the shape it expects. */
 function isAiSettings(value: unknown): value is AiSettings {
@@ -63,7 +85,8 @@ function isAiSettings(value: unknown): value is AiSettings {
       const choice = jobs[job];
       return isObject(choice) && isNumber(choice.primary_ref) && (choice.fallback_ref === null || isNumber(choice.fallback_ref))
         && typeof usable[job] === 'boolean';
-    });
+    })
+    && isLive(value.live) && typeof value.live_voice_test === 'boolean';
 }
 
 /** The card; a malformed answer is a load failure, so one card can never take the Settings page down. */
@@ -90,6 +113,22 @@ export function mergeJobs(
   return merged;
 }
 
+/**
+ * The live voice form's starting values: the saved setup, else gpt-live-1 and marin. The connection is the saved one
+ * while it is an OpenAI connection, else the first OpenAI connection; null when there is none (GPT-Live needs one).
+ */
+export function liveChoice(settings: AiSettings): AiLiveChoice | null {
+  const openai = settings.connections.filter(connection => connection.kind === 'openai');
+  const saved = settings.live ?? null;
+  const connection = openai.find(c => c.connection_id === saved?.connection_id) ?? openai[0];
+  if (!connection) return null;
+  return { connection_id: connection.connection_id, model_id: saved?.model_id ?? LIVE_MODEL_DEFAULT, voice: saved?.voice ?? LIVE_VOICE_DEFAULT };
+}
+
+/** True when the form differs from the saved setup, or nothing is saved yet: Check tries only the saved setup. */
+export const liveUnsaved = (choice: AiLiveChoice, saved: AiLive | null) => saved === null
+  || choice.connection_id !== saved.connection_id || choice.model_id.trim() !== saved.model_id || choice.voice !== saved.voice;
+
 export const addConnection = (body: { name: string; kind: AiKind; base_url?: string; api_key?: string; service_name: string }) =>
   call<AiSettings>('/api/ai/connections', send('POST', body));
 
@@ -111,3 +150,12 @@ export const deleteModel = (ref: number) => call<AiSettings>(`/api/ai/models/${r
 export const testModel = (ref: number) => call<AiTestResult & { settings: AiSettings }>(`/api/ai/models/${ref}/test`, send('POST'));
 
 export const saveJobs = (jobs: Record<AiJob, AiJobChoice>) => call<AiSettings>('/api/ai/jobs', send('PUT', jobs));
+
+export const saveLive = (choice: AiLiveChoice) => call<AiSettings>('/api/ai/live', send('PUT', choice));
+
+/** Check opens one GPT-Live session with the saved setup and closes it; the server saves the time or the error code
+ *  in `live`. The whole card is then loaded again (shape-checked), so the card never depends on this answer's body. */
+export async function checkLive(): Promise<AiSettings> {
+  await call<unknown>('/api/ai/live/check', send('POST'));
+  return fetchAiSettings();
+}
