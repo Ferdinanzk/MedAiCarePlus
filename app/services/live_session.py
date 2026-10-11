@@ -40,10 +40,10 @@ BAD_START = 4400        # WebSocket close code: the robot's first message was no
 ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "stopped", "error")   # anything else: stopped
 
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
-                   "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid")   # as api_device._leased_task
+                   "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid")   # api_device uses it too
 LIVE_SWITCH_SQL = "SELECT live_voice FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL"
 INSERT_TURN_SQL = ("INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
-                   "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id")   # as api_device._add_turn
+                   "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id")   # api_device uses it too
 
 # Spec A3: the live rules after Reachy's reply prompt. GPT-Live broke the 30-character rule in half its replies in the
 # spike, so it is stated again, firmly. The help line itself is never GPT-Live's: the robot says it (spec B3).
