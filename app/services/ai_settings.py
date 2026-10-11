@@ -15,6 +15,8 @@ from app.services import ai_profile
 JOBS = ("reply", "safety", "after_chat")
 ENV_CONNECTION_ID = 0           # the .env connection and its models have no database row
 ENV_PRIMARY_REF, ENV_FALLBACK_REF = -1, -2
+# The live voice model's voices (spec 2026-10-12 E2): the TCU companion's list. The card offers only these.
+LIVE_VOICES = ("marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse")
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,26 @@ class Target:
         return self.model.profile or ai_profile.starting_profile(self.kind)
 
 
+@dataclass(frozen=True)
+class LiveSetting:
+    """The card's live voice model (table ai_live, one row; spec 2026-10-12 E2): an OpenAI connection, the model id
+    and the voice, with the last Check: its time (tested_at, test_ms) or its error code (last_error)."""
+    connection_id: int | None
+    model_id: str
+    voice: str
+    tested_at: datetime | None
+    test_ms: int | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class LiveTarget:
+    """What the live relay opens a GPT-Live session with (live_target)."""
+    api_key: str = dataclasses.field(repr=False)   # decrypted; never in a repr or log
+    model_id: str
+    voice: str
+
+
 def _thinking_off() -> dict[str, str]:
     return {job: "off" for job in JOBS}
 
@@ -83,6 +105,7 @@ class Snapshot:
     jobs: dict[str, tuple[int, int | None]]     # job -> (main model_ref, backup model_ref or None)
     seeded_at: datetime | None = None
     thinking: dict[str, str] = dataclasses.field(default_factory=_thinking_off)   # job -> level chosen on the card
+    live: LiveSetting | None = None   # the live voice model (ai_live); None until one is saved
 
 
 _snapshot: Snapshot | None = None
@@ -190,8 +213,33 @@ def job_usable(snapshot: Snapshot, job: str) -> bool:
                for target in job_targets(job, snapshot))
 
 
+def live_target(snapshot: Snapshot | None = None) -> LiveTarget | None:
+    """The live voice model a check-in may use (spec 2026-10-12 E1, E2), or None. Only while .env has
+    LIVE_VOICE_TEST, and only for a saved model on an OpenAI connection whose key this SECRET_KEY can read, after a
+    Check that passed (saving the model again clears its Check: ai_store.set_live)."""
+    if not config.LIVE_VOICE_TEST:
+        return None
+    snapshot = snapshot or current()
+    live = snapshot.live
+    if live is None or live.tested_at is None or live.last_error is not None:
+        return None
+    connection = snapshot.connections.get(live.connection_id)
+    if connection is None or connection.kind != "openai" or not connection.key_readable or not connection.api_key:
+        return None
+    return LiveTarget(connection.api_key, live.model_id, live.voice)
+
+
 def with_model(snapshot: Snapshot, model: Model) -> Snapshot:
     return dataclasses.replace(snapshot, models={**snapshot.models, model.model_ref: model})
+
+
+def _live_public(snapshot: Snapshot) -> dict | None:
+    live = snapshot.live
+    if live is None:
+        return None
+    return {"connection_id": live.connection_id, "model_id": live.model_id, "voice": live.voice,
+            "tested_at": live.tested_at.isoformat() if live.tested_at else None, "test_ms": live.test_ms,
+            "last_error": live.last_error, "usable": live_target(snapshot) is not None}
 
 
 def public(snapshot: Snapshot) -> dict:
@@ -211,4 +259,6 @@ def public(snapshot: Snapshot) -> dict:
         "seeded_at": snapshot.seeded_at.isoformat() if snapshot.seeded_at else None,
         "no_key_in_use": not any(target.api_key for target in in_use),
         "jobs_usable": {job: job_usable(snapshot, job) for job in JOBS},
+        "live": _live_public(snapshot),
+        "live_voice_test": config.LIVE_VOICE_TEST,   # the card shows its live section only then
     }

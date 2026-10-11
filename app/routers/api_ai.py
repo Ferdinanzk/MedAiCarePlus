@@ -2,7 +2,8 @@
 keys, models with the request profile the Test button finds, and the main and backup model of each job.
 
 Every route needs a consented user; any account may change the setup (spec decision 3). Keys never leave the
-server: answers carry only their last 4 characters. Every change answers with the whole card."""
+server: answers carry only their last 4 characters. Every change answers with the whole card. The live voice model
+(spec 2026-10-12 E2) has two routes of its own, which exist only while .env has LIVE_VOICE_TEST."""
 
 import asyncio
 import dataclasses
@@ -19,7 +20,7 @@ from pydantic import BaseModel, Field
 from app import config
 from app.database import get_pool
 from app.dependencies import get_consented_user
-from app.services import ai_crypto, ai_profile, ai_settings, ai_store, conversation
+from app.services import ai_crypto, ai_profile, ai_settings, ai_store, conversation, live_client
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ai", tags=["ai-connections"])
@@ -70,6 +71,12 @@ class Jobs(BaseModel):
     after_chat: JobChoice
 
 
+class LiveChoice(BaseModel):
+    connection_id: int
+    model_id: str = Field(max_length=100)
+    voice: Literal[ai_settings.LIVE_VOICES]   # the card's list; any other voice is a 422
+
+
 def _card() -> dict:
     return {**ai_settings.public(ai_settings.current()), "weak_secret": ai_crypto.weak_secret()}
 
@@ -115,6 +122,21 @@ def _guard(snapshot: ai_settings.Snapshot) -> None:
         added = Counter(ai_settings.problems(snapshot)) - Counter(ai_settings.problems(ai_settings.current()))
         if added:
             raise HTTPException(400, "notice_incomplete")
+
+
+def _live_on() -> None:
+    """The live voice routes exist only while .env has LIVE_VOICE_TEST (spec 2026-10-12 §5). Used as a route
+    dependency, so it answers before the body is checked: with the switch off, any body gets 404."""
+    if not config.LIVE_VOICE_TEST:
+        raise HTTPException(404, "not_found")
+
+
+def _openai_connection(connection_id: int) -> ai_settings.Connection:
+    """GPT-Live answers only on OpenAI's own Live WebSocket, so only an OpenAI connection's key can open it."""
+    connection = _connection(connection_id)
+    if connection.kind != "openai":
+        raise HTTPException(400, "invalid_kind")
+    return connection
 
 
 @router.get("/settings")
@@ -308,3 +330,38 @@ async def set_jobs(body: Jobs, user: dict = Depends(get_consented_user)):
         async with ai_store.change(conn):
             await ai_store.set_jobs(conn, chosen, thinking)
     return _card()
+
+
+@router.put("/live", dependencies=[Depends(_live_on)])
+async def set_live(body: LiveChoice, user: dict = Depends(get_consented_user)):
+    """The live voice model: an OpenAI connection, the model id and the voice. Saving clears the last Check, so the
+    model is usable for check-ins only after the next Check passes."""
+    _openai_connection(body.connection_id)
+    model_id = _name(body.model_id)
+    async with get_pool().acquire() as conn:
+        async with ai_store.change(conn):
+            await ai_store.set_live(conn, body.connection_id, model_id, body.voice)
+    return _card()
+
+
+@router.post("/live/check", dependencies=[Depends(_live_on)])
+async def check_live(user: dict = Depends(get_consented_user)):
+    """Open a GPT-Live session with the saved model and close it (live_client.check), then save its time or its
+    error code. When the model was saved again while the Check ran, the result belongs to the old model and is not
+    saved: the new one stays unchecked."""
+    live = ai_settings.current().live
+    if live is None or live.connection_id is None:
+        raise HTTPException(404, "not_found")
+    connection = _openai_connection(live.connection_id)
+    if not connection.key_readable:
+        raise HTTPException(400, "key_unreadable")
+    if not connection.api_key:
+        raise HTTPException(400, "no_key")
+    ok, ms, error = await live_client.check(connection.api_key, live.model_id, live.voice)
+    now = ai_settings.current().live
+    if now is not None and (now.connection_id, now.model_id, now.voice) == (live.connection_id, live.model_id,
+                                                                             live.voice):
+        async with get_pool().acquire() as conn:
+            async with ai_store.change(conn):
+                await ai_store.save_live_check(conn, ok, ms, error)
+    return {"ok": ok, "ms": ms, "error": error, "settings": _card()}

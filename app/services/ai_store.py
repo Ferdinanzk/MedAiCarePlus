@@ -16,7 +16,8 @@ _IN_USE = "SELECT EXISTS (SELECT 1 FROM ai_job j JOIN ai_model m ON m.model_ref 
 
 
 class InUse(Exception):
-    """A job still uses this connection or model, as its main model or its backup."""
+    """A job still uses this connection or model, as its main model or its backup, or the live voice model uses
+    this connection."""
 
 
 def _json(value):
@@ -40,8 +41,12 @@ async def load(conn) -> ai_settings.Snapshot:
     for row in await conn.fetch("SELECT job, primary_ref, fallback_ref, thinking FROM ai_job"):
         jobs[row["job"]] = (row["primary_ref"], row["fallback_ref"])
         thinking[row["job"]] = row["thinking"]
+    live = None   # ai_live has at most one row
+    for row in await conn.fetch("SELECT connection_id, model_id, voice, tested_at, test_ms, last_error FROM ai_live"):
+        live = ai_settings.LiveSetting(row["connection_id"], row["model_id"], row["voice"], row["tested_at"],
+                                       row["test_ms"], row["last_error"])
     seeded_at = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'ai_seeded_from_env'")
-    return ai_settings.Snapshot(connections, models, jobs, seeded_at, thinking)
+    return ai_settings.Snapshot(connections, models, jobs, seeded_at, thinking, live)
 
 
 async def seed_from_env(conn) -> bool:
@@ -134,7 +139,8 @@ async def update_connection(conn, connection_id: int, *, name: str | None = None
 
 
 async def delete_connection(conn, connection_id: int) -> None:
-    if await conn.fetchval(_IN_USE + "WHERE m.connection_id = $1)", connection_id):
+    if await conn.fetchval(_IN_USE + "WHERE m.connection_id = $1) "
+                           "OR EXISTS (SELECT 1 FROM ai_live WHERE connection_id = $1)", connection_id):
         raise InUse()
     await conn.execute("DELETE FROM ai_model WHERE connection_id = $1", connection_id)
     await conn.execute("DELETE FROM ai_connection WHERE connection_id = $1", connection_id)
@@ -178,6 +184,26 @@ async def set_jobs(conn, jobs: dict[str, tuple[int, int | None]], thinking: dict
             "ON CONFLICT (job) DO UPDATE SET primary_ref = EXCLUDED.primary_ref, "
             "fallback_ref = EXCLUDED.fallback_ref, thinking = EXCLUDED.thinking, updated_at = NOW()",
             job, primary_ref, fallback_ref, thinking.get(job, "off"))
+
+
+async def set_live(conn, connection_id: int, model_id: str, voice: str) -> None:
+    """The live voice model (one row). Saving clears the last Check, so the model is usable only after the next
+    Check passes (ai_settings.live_target)."""
+    await conn.execute(
+        "INSERT INTO ai_live (id, connection_id, model_id, voice) VALUES (TRUE, $1, $2, $3) "
+        "ON CONFLICT (id) DO UPDATE SET connection_id = EXCLUDED.connection_id, model_id = EXCLUDED.model_id, "
+        "voice = EXCLUDED.voice, tested_at = NULL, test_ms = NULL, last_error = NULL, updated_at = NOW()",
+        connection_id, model_id, voice)
+
+
+async def save_live_check(conn, ok: bool, ms: int | None, error: str | None) -> None:
+    """The live Check's outcome: its time, or its error code. A failed Check keeps the earlier time on the card, but
+    its error alone makes the model unusable."""
+    if ok:
+        await conn.execute("UPDATE ai_live SET tested_at = NOW(), test_ms = $1, last_error = NULL, updated_at = NOW() "
+                           "WHERE id", ms)
+    else:
+        await conn.execute("UPDATE ai_live SET last_error = $1, updated_at = NOW() WHERE id", error)
 
 
 async def note_call(model_ref: int, error: str | None) -> None:

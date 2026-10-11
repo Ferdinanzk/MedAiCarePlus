@@ -6,6 +6,7 @@ import json
 import sys
 import types
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,10 +18,11 @@ sys.modules.setdefault("asyncpg", _asyncpg_stub)
 from app import config
 from app.dependencies import get_current_user
 from app.routers import api_ai
-from app.services import ai_profile, ai_settings, ai_store, consent_service
+from app.services import ai_profile, ai_settings, ai_store, consent_service, live_client
 
 OPENROUTER_KEY = "sk-or-v1-routerSECRET-ab12"
 NEW_KEY = "sk-proj-newSECRET-9876"
+LIVE_CHECKED = datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc)
 
 
 def _snapshot():
@@ -93,6 +95,15 @@ class FakeStore:
         self.calls.append(("set_jobs", jobs))
         self.saved_thinking.append(thinking)
         self._put(jobs=dict(jobs), thinking=dict(thinking or {}))
+
+    async def set_live(self, conn, connection_id, model_id, voice):
+        self.calls.append(("set_live", connection_id, model_id, voice))
+        self._put(live=ai_settings.LiveSetting(connection_id, model_id, voice, None, None, None))
+
+    async def save_live_check(self, conn, ok, ms, error):
+        self.calls.append(("save_live_check", ok, ms, error))
+        checked = {"tested_at": LIVE_CHECKED, "test_ms": ms, "last_error": None} if ok else {"last_error": error}
+        self._put(live=dataclasses.replace(ai_settings.current().live, **checked))
 
 
 class Pool:
@@ -542,3 +553,121 @@ def test_a_thinking_level_other_than_off_low_medium_high_is_refused(api, thinkin
     response = api.client.put("/api/ai/jobs", json=jobs)
     assert (response.status_code, response.json()) == (422, {"detail": "invalid_request"})
     assert api.store.calls == []
+
+
+# Live voice model (spec 2026-10-12 E2)
+
+LIVE_KEY = "sk-proj-liveSECRET-4444"
+UNCHECKED = ai_settings.LiveSetting(2, "gpt-live-1", "marin", None, None, None)
+
+
+def _live_card(monkeypatch, live=None, key=LIVE_KEY):
+    """_snapshot plus an OpenAI connection (2) and `live` as the saved live model, with LIVE_VOICE_TEST on."""
+    snapshot = _snapshot()
+    openai = ai_settings.Connection(2, "OpenAI", "openai", ai_profile.BASE_URLS["openai"], key,
+                                    key[-4:] if key else None, True, "OpenAI")
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, connections={**snapshot.connections, 2: openai}, live=live))
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+
+
+def _check_answers(monkeypatch, answer, meanwhile=None):
+    """live_client.check without the network: it answers `answer` (after running `meanwhile`, if given) and
+    returns the list of the calls it got."""
+    seen = []
+
+    async def check(api_key, model, voice, *, connect=None):
+        seen.append((api_key, model, voice))
+        if meanwhile:
+            meanwhile()
+        return answer
+
+    monkeypatch.setattr(live_client, "check", check)
+    return seen
+
+
+def test_without_the_test_switch_the_live_routes_do_not_exist(api, monkeypatch):
+    _live_card(monkeypatch, UNCHECKED)
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
+    seen = _check_answers(monkeypatch, (True, 900, None))
+    assert api.client.get("/api/ai/settings").json()["live_voice_test"] is False
+    for body in ({"connection_id": 2, "model_id": "gpt-live-1", "voice": "marin"}, {"voice": "nova"}):
+        response = api.client.put("/api/ai/live", json=body)
+        assert (response.status_code, response.json()) == (404, {"detail": "not_found"})
+    response = api.client.post("/api/ai/live/check")
+    assert (response.status_code, response.json()) == (404, {"detail": "not_found"})
+    assert api.store.calls == [] and seen == []
+
+
+def test_the_live_model_is_saved_on_an_openai_connection_without_its_key(api, monkeypatch):
+    _live_card(monkeypatch)
+    response = api.client.put("/api/ai/live", json={"connection_id": 2, "model_id": " gpt-live-1 ", "voice": "cedar"})
+    assert response.status_code == 200 and "liveSECRET" not in response.text
+    assert api.store.calls[-1] == ("set_live", 2, "gpt-live-1", "cedar")
+    assert response.json()["live"] == {"connection_id": 2, "model_id": "gpt-live-1", "voice": "cedar",
+                                       "tested_at": None, "test_ms": None, "last_error": None, "usable": False}
+    assert response.json()["live_voice_test"] is True
+
+
+@pytest.mark.parametrize("body, status, code", [
+    ({"connection_id": 1, "model_id": "gpt-live-1", "voice": "marin"}, 400, "invalid_kind"),   # an OpenRouter one
+    ({"connection_id": 77, "model_id": "gpt-live-1", "voice": "marin"}, 404, "not_found"),
+    ({"connection_id": 2, "model_id": "  ", "voice": "marin"}, 400, "invalid_name"),
+    ({"connection_id": 2, "model_id": "gpt-live-1", "voice": "nova"}, 422, "invalid_request"),   # not on the list
+    ({"connection_id": 2, "model_id": "m" * 101, "voice": "marin"}, 422, "invalid_request"),
+    ({"connection_id": 2, "voice": "marin"}, 422, "invalid_request"),
+])
+def test_a_refused_live_model_gives_the_cards_codes(api, monkeypatch, body, status, code):
+    _live_card(monkeypatch)
+    response = api.client.put("/api/ai/live", json=body)
+    assert (response.status_code, response.json()) == (status, {"detail": code})
+    assert api.store.calls == []
+
+
+def test_a_passed_check_makes_the_live_model_usable(api, monkeypatch):
+    _live_card(monkeypatch, UNCHECKED)
+    seen = _check_answers(monkeypatch, (True, 1180, None))
+    response = api.client.post("/api/ai/live/check")
+    body = response.json()
+    assert response.status_code == 200 and (body["ok"], body["ms"], body["error"]) == (True, 1180, None)
+    assert seen == [(LIVE_KEY, "gpt-live-1", "marin")]   # the stored key goes to the check, never into the answer
+    assert "liveSECRET" not in response.text
+    assert api.store.calls[-1] == ("save_live_check", True, 1180, None)
+    assert body["settings"]["live"]["usable"] is True and body["settings"]["live"]["test_ms"] == 1180
+
+
+def test_a_failed_check_saves_its_code_and_the_model_stays_unusable(api, monkeypatch):
+    _live_card(monkeypatch, UNCHECKED)
+    _check_answers(monkeypatch, (False, None, "live_auth"))
+    body = api.client.post("/api/ai/live/check").json()
+    assert (body["ok"], body["ms"], body["error"]) == (False, None, "live_auth")
+    assert api.store.calls[-1] == ("save_live_check", False, None, "live_auth")
+    assert body["settings"]["live"]["last_error"] == "live_auth" and body["settings"]["live"]["usable"] is False
+
+
+def test_a_check_needs_a_saved_model_and_a_key_that_can_be_read(api, monkeypatch):
+    seen = _check_answers(monkeypatch, (True, 900, None))
+    _live_card(monkeypatch)   # nothing saved yet
+    assert api.client.post("/api/ai/live/check").json() == {"detail": "not_found"}
+    _live_card(monkeypatch, UNCHECKED, key="")
+    assert api.client.post("/api/ai/live/check").json() == {"detail": "no_key"}
+    snapshot = ai_settings.current()
+    unreadable = dataclasses.replace(snapshot.connections[2], key_readable=False)
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, connections={**snapshot.connections, 2: unreadable}))
+    assert api.client.post("/api/ai/live/check").json() == {"detail": "key_unreadable"}
+    assert seen == [] and api.store.calls == []
+
+
+def test_a_check_result_is_not_saved_over_a_model_saved_meanwhile(api, monkeypatch):
+    """A Save during the Check makes a new, unchecked model: the old model's result must not mark it usable."""
+    _live_card(monkeypatch, UNCHECKED)
+
+    def saved_meanwhile():
+        ai_settings.set_current(dataclasses.replace(ai_settings.current(),
+                                                    live=dataclasses.replace(UNCHECKED, model_id="gpt-live-2")))
+
+    _check_answers(monkeypatch, (True, 1180, None), meanwhile=saved_meanwhile)
+    body = api.client.post("/api/ai/live/check").json()
+    assert body["ok"] is True and api.store.calls == []
+    assert body["settings"]["live"]["model_id"] == "gpt-live-2" and body["settings"]["live"]["usable"] is False

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -350,3 +351,41 @@ def test_the_schema_adds_the_thinking_level_with_its_check():
     assert "ALTER TABLE ai_job DROP CONSTRAINT IF EXISTS ai_job_thinking_check;" in sql
     assert ("ALTER TABLE ai_job ADD CONSTRAINT ai_job_thinking_check CHECK (thinking IN ('off','low','medium','high'));"
             in sql)
+
+
+# ── Live voice model (spec 2026-10-12 E2) ──
+
+def test_load_reads_the_live_model():
+    checked = datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc)
+    rows = {"ai_live": [{"connection_id": 1, "model_id": "gpt-live-1", "voice": "cedar", "tested_at": checked,
+                         "test_ms": 1180, "last_error": None}]}
+    assert asyncio.run(ai_store.load(Conn(rows))).live == ai_settings.LiveSetting(
+        1, "gpt-live-1", "cedar", checked, 1180, None)
+    assert asyncio.run(ai_store.load(Conn())).live is None   # nothing saved yet
+
+
+def test_saving_the_live_model_clears_its_last_check():
+    conn = Conn()
+    asyncio.run(ai_store.set_live(conn, 2, "gpt-live-1", "marin"))
+    ((query, args),) = conn.sql
+    assert query.startswith("INSERT INTO ai_live (id, connection_id, model_id, voice) VALUES (TRUE, $1, $2, $3) "
+                            "ON CONFLICT (id) DO UPDATE SET ")
+    assert "tested_at = NULL, test_ms = NULL, last_error = NULL" in query and args == (2, "gpt-live-1", "marin")
+
+
+def test_a_live_check_saves_its_time_or_its_error_code():
+    conn = Conn()
+    asyncio.run(ai_store.save_live_check(conn, True, 1180, None))
+    asyncio.run(ai_store.save_live_check(conn, False, None, "live_auth"))
+    (passed, passed_args), (failed, failed_args) = conn.sql
+    assert "SET tested_at = NOW(), test_ms = $1, last_error = NULL" in passed and passed_args == (1180,)
+    assert "SET last_error = $1" in failed and "tested_at" not in failed and failed_args == ("live_auth",)
+
+
+def test_the_live_models_connection_cannot_be_deleted():
+    conn = Conn(values=[True])
+    with pytest.raises(ai_store.InUse):
+        asyncio.run(ai_store.delete_connection(conn, 2))
+    (query, args), = conn.sql
+    assert "fallback_ref" in query and "OR EXISTS (SELECT 1 FROM ai_live WHERE connection_id = $1)" in query
+    assert args == (2,)
