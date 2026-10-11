@@ -134,6 +134,7 @@ class LiveClient:
         self._reader: asyncio.Task | None = None
         self._queue: asyncio.Queue[LiveEvent] = asyncio.Queue()
         self._send_lock = asyncio.Lock()
+        self._mute_lock = asyncio.Lock()  # one mute or unmute at a time: the next decides after the last was answered
         self._acks: dict[str, asyncio.Future] = {}
         self._sequence = 0
         self._ended = asyncio.Event()   # the "closed" event is queued: nothing more is sent
@@ -212,9 +213,13 @@ class LiveClient:
         if self._socket is None or self._ended.is_set() or self._closing:
             raise LiveError("live_closed")
         async with self._send_lock:
+            # The session may have ended while this send waited for the lock: look again, now that it is held.
+            socket = self._socket
+            if socket is None or self._ended.is_set() or self._closing:
+                raise LiveError("live_closed")
             try:
-                await self._socket.send(json.dumps(event, ensure_ascii=False))
-            except (ConnectionClosed, OSError):
+                await socket.send(json.dumps(event, ensure_ascii=False))
+            except (WebSocketException, OSError):
                 raise LiveError("live_closed") from None
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -224,7 +229,8 @@ class LiveClient:
 
     async def mute(self) -> None:
         """Mute GPT-Live's input and wait for session.input_audio.muted. Muting does not stop GPT-Live's speech, and
-        muted time with audio still appended is billed (measured): stop sending audio too."""
+        muted time with audio still appended is billed (measured): stop sending audio too. mute() and unmute() take
+        turns: one asked while the other waits for its acknowledgement waits too, then acts on the state that left."""
         await self._set_muted(True)
 
     async def unmute(self) -> None:
@@ -232,21 +238,26 @@ class LiveClient:
         await self._set_muted(False)
 
     async def _set_muted(self, muted: bool) -> None:
-        if muted == self.muted:
-            return
-        self._sequence += 1
-        action = "mute" if muted else "unmute"
-        event_id = f"{action}-{self._sequence}"
-        future = asyncio.get_running_loop().create_future()
-        self._acks[event_id] = future
-        try:
-            await self._send({"type": "session.input_audio." + action, "event_id": event_id})
-            await asyncio.wait_for(future, ACK_SECONDS)
-        except TimeoutError:
-            raise LiveError("live_unavailable") from None
-        finally:
-            self._acks.pop(event_id, None)
-        self.muted = muted
+        # Held from the state check to the acknowledgement: a call made while another is waiting for its answer waits
+        # too, and then compares with the state that answer left, not with the one before it.
+        async with self._mute_lock:
+            if muted == self.muted:
+                return
+            self._sequence += 1
+            action = "mute" if muted else "unmute"
+            event_id = f"{action}-{self._sequence}"
+            future = asyncio.get_running_loop().create_future()
+            self._acks[event_id] = future
+            try:
+                await self._send({"type": "session.input_audio." + action, "event_id": event_id})
+                await asyncio.wait_for(future, ACK_SECONDS)
+            except TimeoutError:
+                raise LiveError("live_unavailable") from None
+            finally:
+                self._acks.pop(event_id, None)
+                if future.done() and not future.cancelled():
+                    future.exception()   # the session ended before _send looked: its error was set here, unread
+            self.muted = muted
 
     async def commentary(self, text: str) -> None:
         """Ask GPT-Live to say `text` in its own voice. It paraphrases and may drop a sentence (measured), so never

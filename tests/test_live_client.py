@@ -6,6 +6,7 @@ The fake answers with the event names and payloads measured in the Phase 2 spike
 
 import asyncio
 import base64
+import gc
 import json
 import logging
 
@@ -13,7 +14,7 @@ import pytest
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK, InvalidStatus
+from websockets.exceptions import ConcurrencyError, ConnectionClosedError, ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
 
 from app.services import live_client
@@ -65,6 +66,21 @@ class FakeSocket:
 
     async def close(self):
         self.closed = True
+
+
+class BlockingSocket(FakeSocket):
+    """A FakeSocket whose send of microphone audio stops until `release` is set, as a socket with a full buffer does.
+    `entered` is set once such a send is stuck, so a test knows the client's send lock is held."""
+
+    def __init__(self, script=None):
+        super().__init__(script)
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+
+    async def send(self, text):
+        if json.loads(text)["type"] == "session.input_audio.append" and not self.release.is_set():
+            self.entered.set()
+            await self.release.wait()
+        await super().send(text)
 
 
 def gpt_live(event):
@@ -267,6 +283,28 @@ def test_transcripts_become_text_events_and_bad_audio_is_dropped():
                                   LiveEvent("audio", data=b"\x10\x00\x20\x00")]
 
 
+def test_a_bad_audio_delta_is_dropped_with_a_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="app.services.live_client")
+    good = base64.b64encode(b"\x10\x00\x20\x00").decode("ascii")
+
+    async def run():
+        socket = FakeSocket(gpt_live)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        events = client.events()
+        for delta in (base64.b64encode(b"\x01").decode("ascii"), "not base64!", 12345, good):
+            socket.push({"type": "session.output_audio.delta", "delta": delta})
+        got = await take(events, 2)
+        await client.close()
+        return got
+
+    got = asyncio.run(run())
+    assert got[1] == LiveEvent("audio", data=b"\x10\x00\x20\x00")
+    warnings = [record for record in caplog.records
+                if record.name == "app.services.live_client" and record.levelno == logging.WARNING]
+    assert len(warnings) == 3 and all("not PCM16" in record.getMessage() for record in warnings)
+
+
 def test_mute_and_unmute_wait_for_their_acknowledgements():
     async def run():
         socket = FakeSocket(gpt_live)
@@ -284,6 +322,63 @@ def test_mute_and_unmute_wait_for_their_acknowledgements():
                                    "session.close"]
     assert socket.sent[1]["event_id"] != socket.sent[2]["event_id"]
     assert muted is True and after is False
+
+
+def test_an_unmute_asked_while_a_mute_waits_takes_its_turn():
+    """The relay may not wait for mute() before it asks for unmute(). The unmute must then wait until the mute is
+    answered and decide after that, not read the state the mute has not reached yet and return doing nothing."""
+    async def run():
+        socket = FakeSocket(starts_only)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        mute = asyncio.create_task(client.mute())
+        await asyncio.sleep(0.01)
+        unmute = asyncio.create_task(client.unmute())
+        await asyncio.sleep(0.01)
+        waiting = socket.sent_types()
+        socket.push({"type": "session.input_audio.muted", "client_event_id": socket.sent[-1]["event_id"]})
+        await asyncio.wait_for(mute, 1)
+        await asyncio.sleep(0.01)
+        socket.push({"type": "session.input_audio.unmuted", "client_event_id": socket.sent[-1]["event_id"]})
+        await asyncio.wait_for(unmute, 1)
+        muted = client.muted
+        await client.close(wait=0.05)
+        return socket, waiting, muted
+
+    socket, waiting, muted = asyncio.run(run())
+    assert waiting == ["session.start", "session.input_audio.mute"]
+    assert socket.sent_types() == ["session.start", "session.input_audio.mute", "session.input_audio.unmute",
+                                   "session.close"]
+    assert muted is False
+
+
+@pytest.mark.parametrize("where", ["error", "event"])
+def test_an_error_naming_the_mute_request_makes_mute_raise_its_code(where, monkeypatch):
+    """OpenAI puts client_event_id inside `error` or on the event itself (its Live reference allows both)."""
+    monkeypatch.setattr(live_client, "ACK_SECONDS", 0.5)
+
+    def script(event):
+        if event["type"] != "session.input_audio.mute":
+            return starts_only(event)
+        error = {"type": "rate_limit_error", "code": "rate_limit_exceeded", "message": "Rate limit reached"}
+        answer = {"type": "error", "error": error}
+        (error if where == "error" else answer)["client_event_id"] = event["event_id"]
+        return [answer]
+
+    async def run():
+        socket = FakeSocket(script)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        events = client.events()
+        with pytest.raises(LiveError) as error:
+            await client.mute()
+        got = await take(events, 2)
+        await client.close(wait=0.05)
+        return error.value, client.muted, got
+
+    error, muted, got = asyncio.run(run())
+    assert error.code == "rate_limit_exceeded" and muted is False
+    assert got[1] == LiveEvent("error", code="rate_limit_exceeded", text="rate_limit_exceeded")
 
 
 def test_a_mute_never_acknowledged_is_live_unavailable(monkeypatch):
@@ -375,6 +470,103 @@ def test_a_moderation_cut_is_an_error_event_then_the_close_reason():
                        LiveEvent("closed", reason="content", usage_seconds=9.0)]
     assert error.code == "live_closed" and usage == 9.0
     assert socket.sent_types() == ["session.start"]   # no session.close after OpenAI closed it
+
+
+@pytest.mark.parametrize("method", ["send_audio", "commentary", "instructions_append", "mute", "unmute"])
+def test_a_send_after_close_has_begun_is_live_closed(method):
+    async def run():
+        # GPT-Live never answers session.close, so close() keeps waiting for session.closed while the send is tried.
+        socket = FakeSocket(lambda event: [] if event["type"] == "session.close" else gpt_live(event))
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        if method == "unmute":
+            await client.mute()   # unmute() does nothing unless the session is muted
+        closing = asyncio.create_task(client.close(wait=0.1))
+        await asyncio.sleep(0.01)
+        sent_before = len(socket.sent)
+        arguments = {"send_audio": (b"\x00\x00",), "commentary": ("hi",), "instructions_append": ("hi",)}
+        with pytest.raises(LiveError) as error:
+            await getattr(client, method)(*arguments.get(method, ()))
+        await closing
+        return socket, error.value, sent_before
+
+    socket, error, sent_before = asyncio.run(run())
+    assert error.code == "live_closed"
+    assert socket.sent_types()[sent_before - 1:sent_before] == ["session.close"]
+    assert len(socket.sent) == sent_before   # nothing went out after close() began
+
+
+@pytest.mark.parametrize("second_call", ["send_audio", "mute"])
+def test_a_send_waiting_for_the_lock_when_the_session_ends_is_live_closed(second_call, caplog):
+    """Send B passed the first check and waits behind send A, which is stuck. The connection drops, close() runs and
+    the socket is gone before B holds the lock: B must raise live_closed (not AttributeError) and send nothing.
+    A mute as B has an acknowledgement future that the ending session already failed: asyncio must not complain
+    that nobody read it."""
+    async def run():
+        socket = BlockingSocket(gpt_live)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        events = client.events()
+        first = asyncio.create_task(client.send_audio(b"\x01\x00"))
+        await asyncio.wait_for(socket.entered.wait(), 1)
+        second = asyncio.create_task(client.send_audio(b"\x02\x00") if second_call == "send_audio"
+                                     else client.mute())
+        await asyncio.sleep(0.01)
+        socket.hang_up()
+        await take(events, 2)   # started, closed (connection_lost)
+        await client.close()
+        socket.release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 1)
+        return socket.sent_types(), [getattr(result, "code", repr(result)) for result in results]
+
+    sent, codes = asyncio.run(run())
+    gc.collect()   # asyncio reports an unread future exception when the future is freed
+    assert codes == ["live_closed", "live_closed"] and sent == ["session.start"]
+    assert [record.getMessage() for record in caplog.records if record.name == "asyncio"] == []
+
+
+def test_a_websocket_error_from_a_send_is_live_closed():
+    """websockets' send can fail with a WebSocketException other than ConnectionClosed (ConcurrencyError here)."""
+    async def run():
+        socket = FakeSocket(gpt_live)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+
+        async def refuse(text):
+            raise ConcurrencyError("another send is in progress")
+
+        socket.send = refuse
+        with pytest.raises(LiveError) as error:
+            await client.send_audio(b"\x00\x00")
+        await client.close(wait=0.05)   # its session.close is refused the same way: close() still never raises
+        return error.value
+
+    assert asyncio.run(run()).code == "live_closed"
+
+
+def test_a_send_waiting_behind_close_never_goes_out():
+    """Send B was queued for the lock before close() began. close() then holds the line for session.close, so B,
+    which reaches the lock first, must see that the session is closing and raise live_closed instead of sending."""
+    async def run():
+        socket = BlockingSocket(gpt_live)
+        client = LiveClient(KEY, "gpt-live-1", "marin", "x", connect=connector(socket))
+        await client.start()
+        first = asyncio.create_task(client.send_audio(b"\x01\x00"))
+        await asyncio.wait_for(socket.entered.wait(), 1)
+        second = asyncio.create_task(client.send_audio(b"\x02\x00"))
+        await asyncio.sleep(0.01)
+        closing = asyncio.create_task(client.close())
+        await asyncio.sleep(0.01)
+        socket.release.set()
+        usage = await asyncio.wait_for(closing, 3)
+        results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 1)
+        return socket, results, usage
+
+    socket, results, usage = asyncio.run(run())
+    assert results[0] is None and getattr(results[1], "code", repr(results[1])) == "live_closed"
+    assert socket.sent_types() == ["session.start", "session.input_audio.append", "session.close"]
+    assert socket.sent[1]["audio"] == base64.b64encode(b"\x01\x00").decode("ascii")
+    assert usage == 7.0
 
 
 def test_an_error_event_carries_only_the_mapped_code_and_openais_code():
