@@ -44,6 +44,9 @@ interface MockOptions {
   memory?: boolean;
   /** What GET /api/memory lists. */
   memoryFacts?: Record<string, unknown>[];
+  /** The robot's camera from its last heartbeat (robot app 0.6.0+); left out: an older robot, no camera field. */
+  camera?: Record<string, unknown> | null;
+  online?: boolean;
 }
 
 async function mockApi(page: Page, options: MockOptions = {}) {
@@ -59,10 +62,13 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     settingsPatches: [] as Record<string, unknown>[],
     taskPosts: [] as Record<string, unknown>[],
     memoryDeletes: [] as string[],
+    camera: options.camera,
+    online: options.online ?? true,
   };
   const robotStatus = () => state.paired
     ? { paired: true, device_id: 'd-1', label: 'Reachy Mini', auto_record: state.autoRecord, last_seen_at: new Date().toISOString(),
-        online: true, robot_reachable: true, landmark_fps: 15.2, last_task: null, alert_contacts: 1 }
+        online: state.online, robot_reachable: true, landmark_fps: 15.2, last_task: null, alert_contacts: 1,
+        ...(state.camera === undefined ? {} : { camera: state.camera }) }
     : { paired: false };
   const consentStatus = () => ({
     terms_version: '2026-10', core_current: true, robot_current: false,
@@ -354,6 +360,50 @@ test('the conversations page lists what Reachy remembers and deletes one note', 
   await clickCentred(row.getByRole('button', { name: /^(Delete|刪除)$/ }));
   await expect.poll(() => api.memoryDeletes).toEqual(['/api/memory/fact?kind=like&subject=garden']);
   expect(dialogs).toEqual([expect.stringMatching(/Delete this note\?|刪除這則筆記/)]);
+});
+
+// ── The robot's camera (robot app 0.6.0): a warning while it is not working, its rate while a session runs ──
+
+const reachyCard = (page: Page) => page.locator('section[aria-labelledby="reachy-title"]');
+const CAMERA_WARNING = /Robot camera not working|機器人鏡頭無法使用/;
+const robotCamera = (state: string, fps: number) =>
+  ({ state, fps, since: 1791700000.5, media: { available: true, released: false, no_media: false } });
+
+test('the Reachy card warns when the robot camera is stalled, recovering or unavailable', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('stalled', 0) });
+  await page.goto('/settings');
+  for (const state of ['stalled', 'recovering', 'unavailable']) {
+    api.camera = robotCamera(state, 0);
+    await page.reload();
+    await expect(reachyCard(page).getByRole('alert')).toHaveText(CAMERA_WARNING);
+    await expect(reachyCard(page).getByText('0.0 fps')).toBeVisible();     // a session is running
+  }
+});
+
+test('the Reachy card shows no camera warning when the camera works, the robot is offline or older', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('ok', 9.8) });
+  await page.goto('/settings');
+  await expect(reachyCard(page).getByText('9.8 fps')).toBeVisible();        // the camera's rate while a session runs
+  await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
+
+  api.camera = robotCamera('idle', 0);                                       // no session: no rate, no warning
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Robot camera|機器人鏡頭/)).toHaveCount(0);
+
+  api.camera = robotCamera('unavailable', 0);                               // last report of a robot now offline
+  api.online = false;
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Offline|離線/)).toBeVisible();
+  await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
+
+  api.camera = undefined;                                                    // a robot older than 0.6.0
+  api.online = true;
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();
+  await expect(reachyCard(page).getByText(/Robot camera|機器人鏡頭/)).toHaveCount(0);
+  await expect(reachyCard(page).getByRole('alert')).toHaveCount(0);
 });
 
 test('when every dose today is closed the test alert says so', async ({ page }) => {

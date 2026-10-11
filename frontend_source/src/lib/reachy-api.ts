@@ -1,5 +1,13 @@
 import { getFaceAuthHeaders } from './face-auth';
 
+/** The robot's camera as its last heartbeat reported it (robot app 0.6.0+; older robots send none). */
+export type RobotCamera = {
+  state: 'idle' | 'ok' | 'stalled' | 'recovering' | 'unavailable';
+  fps?: number | null;
+  since?: number | null;
+  media?: Record<string, unknown> | null;
+};
+
 export interface ReachyStatus {
   paired: boolean;
   device_id?: string;
@@ -9,6 +17,7 @@ export interface ReachyStatus {
   online?: boolean;
   robot_reachable?: boolean | null;
   landmark_fps?: number | null;
+  camera?: RobotCamera | null;
   alert_contacts?: number;
   last_task?: { task_id: string; status: string; slot_time: string; finished_at: string | null } | null;
 }

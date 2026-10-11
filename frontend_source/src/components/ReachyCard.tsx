@@ -6,9 +6,11 @@ import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalR
 import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
 import { deleteAllMemory } from '../lib/memory-api';
 import { fetchOverdoseProtection } from '../lib/notify-api';
-import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus } from '../lib/reachy-api';
+import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
+/** Camera states the robot's watchdog reports when it gets no frames (robot app 0.6.0+). */
+const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
 
 /**
  * `key` and its values, or `text` already worded (the server's reply when it refuses the dose).
@@ -207,6 +209,10 @@ export default function ReachyCard() {
     await refresh();
   });
 
+  // Only an online robot's report is current. `idle`: no session is attached, so the camera isn't read.
+  const camera = status?.online ? status.camera ?? null : null;
+  const cameraFps = camera && camera.state !== 'idle' && camera.fps != null ? camera.fps : null;
+
   return (
     <section className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm space-y-4" aria-labelledby="reachy-title">
       <div className="flex items-center gap-3">
@@ -261,9 +267,20 @@ export default function ReachyCard() {
             <dd>{status.last_seen_at ? new Date(status.last_seen_at).toLocaleString() : '—'}</dd>
             <dt className="text-gray-500">{t('reachy.cameraRate')}</dt>
             <dd>{status.landmark_fps != null ? `${status.landmark_fps.toFixed(1)} fps` : '—'}</dd>
+            {cameraFps != null && (
+              <>
+                <dt className="text-gray-500">{t('reachy.robotCamera')}</dt>
+                <dd>{`${cameraFps.toFixed(1)} fps`}</dd>
+              </>
+            )}
             <dt className="text-gray-500">{t('reachy.lastTask')}</dt>
             <dd>{status.last_task ? `${new Date(status.last_task.slot_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${status.last_task.status}` : '—'}</dd>
           </dl>
+          {camera && CAMERA_PROBLEMS.includes(camera.state) && (
+            <p role="alert" className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-sm text-amber-900">
+              {t('reachy.cameraNotWorking')}
+            </p>
+          )}
           <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
             <input type="checkbox" className="mt-1 w-5 h-5" checked={!!status.auto_record} disabled={busy}
               onChange={event => void toggleAutoRecord(event.target.checked)} />
