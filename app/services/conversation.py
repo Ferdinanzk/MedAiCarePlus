@@ -60,6 +60,8 @@ RISK_CALL_TIMEOUT = 2.5    # leaves the fallback model about 1.5 s when the prim
 LATE_RISK_DEADLINE_SECONDS = 30   # the background re-check after a failed one: nobody waits
 LATE_RISK_CALL_TIMEOUT = 12
 LATE_RISK_RATE_LIMIT_WAIT = 20    # after a 429 the re-check waits first: asking again at once meets the same limit
+# An attempt's error, and the model's last_error on the card, when thinking used the whole cap (spec D5).
+THINKING_BUDGET = "thinking_budget"
 MOODS = ("happy", "calm", "sad", "worried", "angry", "unknown")
 CHECKIN_SCOPES = ("robot_microphone", "cloud_voice", "conversation_analysis", "safety_alerts")
 
@@ -339,14 +341,21 @@ def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeo
           target: ai_settings.Target | None = None) -> str | None:
     """One model call through target's connection, shaped by its model's profile (ai_profile); without a target,
     OpenRouter with the .env key as before the AI connections card. `info`, when given, receives status,
-    model_served, finish_reason and tokens. temperature: 0 for extraction (memory facts), 0.7 for everything else
-    (left out for a model that accepts only its default)."""
+    model_served, finish_reason, tokens, and reasoning_tokens when the service reports them. temperature: 0 for
+    extraction (memory facts), 0.7 for everything else (left out for a model that accepts only its default).
+
+    The target's thinking level (Target.thinking) goes into the request, and the cap grows by that level's
+    allowance (max_tokens is the job's base cap). With thinking on, extraction's temperature 0 is left out."""
     info = {} if info is None else info
     target = target or ai_settings.env_target(model or config.LLM_FALLBACK_MODEL)
     provider = _provider() if target.kind == "openrouter" else None
-    # The profile turns reasoning off: free reasoning models otherwise spend every token thinking and send nothing.
-    payload = ai_profile.request_body(target.profile, target.model_id, messages, max_tokens, temperature,
-                                      {"provider": provider} if provider else None)
+    if target.thinking != "off" and temperature == 0:
+        temperature = None
+    # Level "off": the profile turns reasoning off, as free reasoning models otherwise spend every token thinking.
+    payload = ai_profile.request_body(target.profile, target.model_id, messages,
+                                      max_tokens + ai_profile.allowance(target.profile, target.thinking),
+                                      temperature, {"provider": provider} if provider else None,
+                                      level=target.thinking)
     response = _http_session().post(target.url, timeout=timeout,
                                     headers=ai_profile.headers(target.kind, target.api_key), json=payload)
     info["status"] = response.status_code
@@ -363,8 +372,12 @@ def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeo
     response.raise_for_status()
     body = response.json()
     choices = body.get("choices") or []
-    info.update(model_served=body.get("model"), tokens=(body.get("usage") or {}).get("completion_tokens"),
+    usage = body.get("usage") or {}
+    info.update(model_served=body.get("model"), tokens=usage.get("completion_tokens"),
                 finish_reason=choices[0].get("finish_reason") if choices else None)
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+        info["reasoning_tokens"] = details["reasoning_tokens"]   # only when the service says (spec D5)
     if not choices or choices[0].get("finish_reason") == "length":
         return None   # cut off mid-sentence (often a reasoning model that ran out of tokens): never speak half a reply
     content = (choices[0].get("message") or {}).get("content")
@@ -384,6 +397,12 @@ def _call_error(status, problem, api_key: str) -> str:
     return "No answer in time" if status == "timeout" else "No usable answer"
 
 
+def _thinking_budget(info: dict) -> bool:
+    """Cut off by the length limit with every completion token spent on thinking: an empty answer (spec D5)."""
+    reasoning = info.get("reasoning_tokens")
+    return info.get("finish_reason") == "length" and bool(reasoning) and reasoning == info.get("tokens")
+
+
 def _note_call(target: ai_settings.Target, error: str | None) -> None:
     """Keep the card's "last call failed" current: a failure's reason, cleared by the next success. Only for models
     saved on the card (the .env ones have no row), only when it changes, and never in the reply's way."""
@@ -400,8 +419,10 @@ async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: flo
 
     accept(answer) turns an answer into the result, or returns None when it is unusable (the next model is tried).
     Returns (result or None, {"llm_ms", "attempts"}). Each attempt records connection, model_requested,
-    model_served, ms, status (the HTTP status, or "timeout" / "error" when none came back), finish_reason, tokens
-    and usable. A model whose connection has no readable key is skipped.
+    model_served, ms, status (the HTTP status, or "timeout" / "error" when none came back), finish_reason, tokens,
+    reasoning_tokens (None when the service doesn't say), level (the thinking level sent) and usable, plus
+    error "thinking_budget" when thinking used the whole cap. A model whose connection has no readable key is
+    skipped. max_tokens is the job's base cap: _post adds the allowance for each model's level.
     """
     started = time.monotonic()
     deadline = started + deadline_seconds
@@ -429,14 +450,20 @@ async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: flo
         except Exception as exc:
             status, problem = info.get("status") or (429 if "429" in str(exc) else "error"), exc
         error = None if result is not None else _call_error(status, problem, target.api_key)
+        if result is None and status == 200 and _thinking_budget(info):
+            error = THINKING_BUDGET
         if result is None:
-            log.warning("%s %s gave no usable answer (status %s, finish %s): %s", target.connection.name,
-                        target.model_id, status, info.get("finish_reason"),
-                        error if problem is not None else "unusable text")
-        attempts.append({"connection": target.connection.name, "model_requested": target.model_id,
-                         "model_served": info.get("model_served"), "ms": _ms_since(call_started),
-                         "status": status, "finish_reason": info.get("finish_reason"),
-                         "tokens": info.get("tokens"), "usable": result is not None})
+            log.warning("%s %s gave no usable answer (status %s, finish %s, level %s): %s", target.connection.name,
+                        target.model_id, status, info.get("finish_reason"), target.thinking,
+                        error if problem is not None or error == THINKING_BUDGET else "unusable text")
+        attempt = {"connection": target.connection.name, "model_requested": target.model_id,
+                   "model_served": info.get("model_served"), "ms": _ms_since(call_started),
+                   "status": status, "finish_reason": info.get("finish_reason"), "tokens": info.get("tokens"),
+                   "reasoning_tokens": info.get("reasoning_tokens"), "level": target.thinking,
+                   "usable": result is not None}
+        if error == THINKING_BUDGET:
+            attempt["error"] = THINKING_BUDGET
+        attempts.append(attempt)
         _note_call(target, error)
         if result is not None:
             break
