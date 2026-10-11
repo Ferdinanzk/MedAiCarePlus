@@ -63,6 +63,7 @@ const resources = {
         levelSeparator: ' · ',
         canThink: 'Can think: {{levels}}',
         cantThink: "Can't think",
+        thinkingNotChecked: 'Not checked yet: press Test',
         testingThinking: 'Testing, including thinking levels…',
         thinkingSent: 'The main model uses {{level}} for this job.',
         thinkingTime: 'Main model took {{seconds}} s in the test.',
@@ -761,6 +762,7 @@ const resources = {
         levelSeparator: '・',
         canThink: '可思考：{{levels}}',
         cantThink: '不可思考',
+        thinkingNotChecked: '尚未檢查：請按「測試」',
         testingThinking: '測試中，也會測試思考等級…',
         thinkingSent: '主要模型在這項工作會使用「{{level}}」。',
         thinkingTime: '主要模型測試時花了 {{seconds}} 秒。',
@@ -769,7 +771,7 @@ const resources = {
         jobUnusableEffect: { safety: 'Reachy 的模型安全檢查已停止。', after_chat: '摘要與摘要安全檢查已停止。' },
         modelErrors: {
           not_chat_model: '語音專用模型（例如 GPT-Live 或 TTS）：無法撰寫 Reachy 的文字回覆。',
-          thinking_budget: '思考用完了全部的額度，所以沒有回答。',
+          thinking_budget: '思考用完了允許的回答長度，所以沒有回答。',
         },
         errors: {
           loadFailed: '無法載入 AI 設定。',

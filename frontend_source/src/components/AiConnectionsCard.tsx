@@ -150,8 +150,10 @@ export default function AiConnectionsCard() {
     return <span className="text-gray-500">{t('aiConnections.notTested')}</span>;
   };
 
-  /** "Can think: low · medium · high" or "Can't think", from what the model's Test found. */
+  /** "Can think: low · medium · high" or "Can't think", from what the model's Test found; "Not checked yet: press
+   *  Test" for a profile saved before Test checked thinking (no `thinking`). Its job offers only off either way. */
   const canThink = (model: AiModel) => {
+    if (model.profile?.thinking == null) return t('aiConnections.thinkingNotChecked');
     const levels = acceptedLevels(model);
     return levels.length
       ? t('aiConnections.canThink', { levels: levels.map(level => t(`aiConnections.levelShort.${level}`)).join(t('aiConnections.levelSeparator')) })

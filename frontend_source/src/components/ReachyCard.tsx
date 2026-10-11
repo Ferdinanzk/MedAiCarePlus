@@ -211,7 +211,10 @@ export default function ReachyCard() {
 
   // Only an online robot's report is current. `idle`: no session is attached, so the camera isn't read.
   const camera = status?.online ? status.camera ?? null : null;
-  const cameraFps = camera && camera.state !== 'idle' && camera.fps != null ? camera.fps : null;
+  const cameraProblem = !!camera && CAMERA_PROBLEMS.includes(camera.state);
+  // The fps is a 10 s average that still counts the frames from before a stall, so a camera not working shows none.
+  const cameraRate = !camera || camera.state === 'idle' ? null
+    : cameraProblem ? '—' : camera.fps != null ? `${camera.fps.toFixed(1)} fps` : null;
 
   return (
     <section className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm space-y-4" aria-labelledby="reachy-title">
@@ -267,16 +270,16 @@ export default function ReachyCard() {
             <dd>{status.last_seen_at ? new Date(status.last_seen_at).toLocaleString() : '—'}</dd>
             <dt className="text-gray-500">{t('reachy.cameraRate')}</dt>
             <dd>{status.landmark_fps != null ? `${status.landmark_fps.toFixed(1)} fps` : '—'}</dd>
-            {cameraFps != null && (
+            {cameraRate != null && (
               <>
                 <dt className="text-gray-500">{t('reachy.robotCamera')}</dt>
-                <dd>{`${cameraFps.toFixed(1)} fps`}</dd>
+                <dd>{cameraRate}</dd>
               </>
             )}
             <dt className="text-gray-500">{t('reachy.lastTask')}</dt>
             <dd>{status.last_task ? `${new Date(status.last_task.slot_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${status.last_task.status}` : '—'}</dd>
           </dl>
-          {camera && CAMERA_PROBLEMS.includes(camera.state) && (
+          {cameraProblem && (
             <p role="alert" className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-sm text-amber-900">
               {t('reachy.cameraNotWorking')}
             </p>
