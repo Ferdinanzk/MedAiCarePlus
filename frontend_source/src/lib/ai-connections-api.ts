@@ -7,13 +7,22 @@ export interface AiConnection {
   connection_id: number; name: string; kind: AiKind; base_url: string;
   key_last4: string | null; key_readable: boolean; has_key: boolean; service_name: string;
 }
-export interface AiProfile { token_param: string; temperature: boolean; reasoning_off: Record<string, unknown> | null }
+/** A job's thinking level (ai_job.thinking). 'off' sends every request as before thinking levels existed. */
+export type AiThinkingLevel = 'off' | 'low' | 'medium' | 'high';
+/** What Test found about thinking (ai_profile.detect_thinking): the setting it sends ('reasoning_effort',
+ *  'openrouter_effort', or null when the model can't think), the levels the model accepts, its time at each in ms,
+ *  whether it always thinks (it refuses to stop), and whether a thinking request may carry a temperature. */
+export interface AiThinking { param: string | null; levels: string[]; ms: Record<string, number>; always: boolean; temperature: boolean }
+/** A profile saved before thinking levels existed has no `thinking`: that model can't think. */
+export interface AiProfile {
+  token_param: string; temperature: boolean; reasoning_off: Record<string, unknown> | null; thinking?: AiThinking;
+}
 export interface AiModel {
   model_ref: number; connection_id: number; model_id: string; company: string; region: string; retention: string;
   profile: AiProfile | null; tested: boolean; copied_from_env: boolean; tested_at: string | null;
   test_ms: number | null; last_error: string | null;
 }
-export interface AiJobChoice { primary_ref: number; fallback_ref: number | null }
+export interface AiJobChoice { primary_ref: number; fallback_ref: number | null; thinking: AiThinkingLevel }
 export interface AiSettings {
   connections: AiConnection[]; models: AiModel[]; jobs: Record<AiJob, AiJobChoice>;
   /** Per job: true when its main or backup model is tested and its connection has a readable key (as saved). */
