@@ -142,3 +142,29 @@ def test_a_200_with_an_unexpected_shape_is_a_failure_not_an_exception(body):
     send, _ = _service((lambda p: True, (200, body, 100)))
     result = ai_profile.detect(send, "openai")
     assert result["ok"] is False and result["error"] == "The model answered with no text."
+
+
+NOT_CHAT = ("This is not a chat model and thus not supported in the v1/chat/completions endpoint. "
+            "Did you mean to use v1/completions?")   # OpenAI's real 404 for a voice-only model (gpt-live-1)
+
+
+@pytest.mark.parametrize("response", [
+    _bad(NOT_CHAT, 404),
+    _bad(NOT_CHAT, 400),
+    _bad("THIS IS NOT A CHAT MODEL.", 404),
+    _bad("gpt-x-tts is not supported in the v1/chat/completions endpoint.", 404),
+])
+def test_a_voice_only_model_gets_the_not_chat_model_code(response):
+    send, sent = _service((lambda p: True, response))
+    result = ai_profile.detect(send, "openai")
+    assert result == {"ok": False, "profile": None, "ms": 120, "sample": None, "error": "not_chat_model"}
+    assert ai_profile.NOT_CHAT_MODEL == "not_chat_model" and len(sent) == 1   # no setting can fix it: one request
+
+
+@pytest.mark.parametrize("response, error", [
+    (_bad(NOT_CHAT, 500), f"HTTP 500: {NOT_CHAT}"),   # only a 404 or a 400 says so
+    (_bad("The model `gpt-9` does not exist", 404), "HTTP 404: The model `gpt-9` does not exist"),
+])
+def test_other_failures_keep_the_services_words(response, error):
+    send, _ = _service((lambda p: True, response))
+    assert ai_profile.detect(send, "openai")["error"] == error
