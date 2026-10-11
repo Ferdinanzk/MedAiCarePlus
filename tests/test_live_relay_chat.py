@@ -145,6 +145,12 @@ class LiveDB:
             self.turns.append({"turn_id": len(self.turns) + 1, "conversation_id": cid, "role": role, "text": text,
                                "flagged": flagged, "metrics": None if metrics is None else json.loads(metrics)})
             return len(self.turns)
+        if "SET risk_flag = TRUE" in query:   # conversation.alert_family: once per conversation
+            row = self.conversations[args[0]]
+            if row.get("risk_flag"):
+                return None
+            row["risk_flag"] = True
+            return args[0]
         if "SET ended_at = NOW()" in query:
             row = self.conversations[args[0]]
             if row["ended_at"] is not None:
@@ -161,8 +167,21 @@ class LiveDB:
             row = self.conversations[args[0]]
             if row["ended_at"] is None:
                 row["live"] = json.loads(args[1])
+        elif "UPDATE conversation_turn SET flagged = TRUE WHERE turn_id = $1" in query:
+            self.turns[args[0] - 1]["flagged"] = True
+        elif "UPDATE conversation_turn SET metrics" in query and "jsonb_build_object('live'" in query:
+            turn = self.turns[args[0] - 1]
+            metrics = turn["metrics"] or {}
+            turn["metrics"] = {**metrics, "live": {**metrics.get("live", {}), **json.loads(args[1])}}
         else:
             raise AssertionError(query)
+
+    async def fetch(self, query, *args):
+        if "SELECT turn_id, role, text FROM conversation_turn" in query:
+            until = args[1] if "turn_id <= $2" in query else None
+            return [{"turn_id": t["turn_id"], "role": t["role"], "text": t["text"]} for t in self.turns
+                    if t["conversation_id"] == args[0] and (until is None or t["turn_id"] <= until)]
+        raise AssertionError(query)
 
     def chat(self) -> dict:
         (row,) = self.conversations.values()
@@ -346,7 +365,9 @@ def test_transcripts_become_turns_with_their_live_timings(world):
         assert len(world.db.turns) == 1                # 1.4 s is no pause yet
         await _step(world, relay, 0.2)                 # 1.6 s: the patient's turn is closed
         assert world.db.rows()[1:] == [("patient", "我很好")]
-        assert world.db.turns[1]["metrics"] == {"live": {"transcript_ms": 300, "fragments": 2}}
+        assert world.db.turns[1]["metrics"] == {"live": {"transcript_ms": 300, "fragments": 2, "risk_ms": 1,
+                                                         "risk_result": "none", "risk_attempts": [],
+                                                         "risk_source": "none"}}
         await _live(world, _reachy("太好了。"))
         await _step(world, relay, 0.1)
         await _live(world, _sound())                   # 1.7 s after the patient's last words
