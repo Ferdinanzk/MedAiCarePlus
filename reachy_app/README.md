@@ -76,8 +76,34 @@ on your robot over SSH:
 
 While a reminder runs, the settings page also shows the live **Camera landmarks** rate.
 
+## When the camera stops
+
+From 0.7.0 the app watches its camera while it looks for the patient or watches a dose:
+
+- **No new frame for 2 seconds** is a stall. The app logs an error with the robot daemon's media status and tries to
+  get the camera back, at most once every 5 seconds: when the daemon says the camera was released, the app asks for it
+  back; otherwise it reopens its own camera feed. A slow camera is not a stall; only a 2-second gap is. The stall is
+  over only after 5 seconds of steady frames, so a camera that gives one frame and stops again is still in the same
+  stall.
+- **Still no steady frames 15 seconds after the stall began:** the app ends the search with the reason
+  `camera_unavailable` and puts the robot to sleep. The server then handles the reminder as for a patient it could not
+  find; the camera alone never records or skips a dose.
+- The heartbeat tells the server the camera state, and the web app's Reachy card shows "Robot camera not working".
+
+**Don't run TCU's Reachy AI Companion at the same time.** It connects to the robot without media
+(`media_backend="no_media"`), and Reachy Mini's SDK 1.11.0 then makes the daemon release the camera and audio. This
+app's camera feed stops, and nothing asks for the camera back. Disable the companion at boot over SSH
+(`sudo systemctl disable --now reachy-ai-companion`); it also uses this app's port, 8042. To check the camera over
+SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when another program took it, and
+`curl -s -X POST localhost:8000/api/media/acquire` gives it back.
+
 ## Status
 
+- **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
+  about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
+  Two quick restarts from the settings page no longer start two copies of the app's worker.
+- This Hugging Face space currently carries a different line, an ElevenLabs voice numbered 0.6.0 that is not on GitHub;
+  0.7.0 is deployed to the robot by SSH only and is not published here yet.
 - **0.3.0**: emotion is scored on the robot too; snapshots to the server are identity-only, 2 a second (was 5).
 - **0.2.0**: vision runs on the robot (above). Tested against MediaPipe and the Reachy Mini simulator; frame rate on
   a real robot is not measured yet; run the bench above.
