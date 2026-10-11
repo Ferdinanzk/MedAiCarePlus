@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from collections import Counter
+from typing import Literal
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
@@ -60,6 +61,7 @@ class ModelChange(BaseModel):
 class JobChoice(BaseModel):
     primary_ref: int
     fallback_ref: int | None = None
+    thinking: Literal["off", "low", "medium", "high"] = "off"   # each model gets it or its nearest lower level
 
 
 class Jobs(BaseModel):
@@ -294,14 +296,15 @@ async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
 async def set_jobs(body: Jobs, user: dict = Depends(get_consented_user)):
     snapshot = ai_settings.current()
     chosen = {job: (getattr(body, job).primary_ref, getattr(body, job).fallback_ref) for job in ai_settings.JOBS}
+    thinking = {job: getattr(body, job).thinking for job in ai_settings.JOBS}
     for ref in (ref for refs in chosen.values() for ref in refs if ref is not None):
         model = snapshot.models.get(ref)
         if model is None:
             raise HTTPException(404, "not_found")
         if model.profile is None:
             raise HTTPException(400, "untested_model")
-    _guard(dataclasses.replace(snapshot, jobs=chosen))
+    _guard(dataclasses.replace(snapshot, jobs=chosen, thinking=thinking))
     async with get_pool().acquire() as conn:
         async with ai_store.change(conn):
-            await ai_store.set_jobs(conn, chosen)
+            await ai_store.set_jobs(conn, chosen, thinking)
     return _card()
