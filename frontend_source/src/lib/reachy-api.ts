@@ -13,6 +13,15 @@ export interface ReachyStatus {
   device_id?: string;
   label?: string;
   auto_record?: boolean;
+  /** What Reachy calls the patient when memory gives no name: the name saved on this card, else the registered name
+   *  (null: neither can be used, so Reachy greets without a name). */
+  call_name?: string | null;
+  /** True when call_name was saved on this card; false when it is the registered name. */
+  call_name_custom?: boolean;
+  /** This robot's check-ins use the live voice (a test). */
+  live_voice?: boolean;
+  /** The server allows the live voice test (LIVE_VOICE_TEST=1 in its .env); the card shows the switch only then. */
+  live_voice_test?: boolean;
   last_seen_at?: string | null;
   online?: boolean;
   robot_reachable?: boolean | null;
@@ -52,8 +61,17 @@ export const pairReachy = () => call<{ device_id: string; token: string }>('/api
 
 export const unpairReachy = () => call<ReachyStatus>('/api/reachy/pairing', { method: 'DELETE' });
 
-export const setAutoRecord = (autoRecord: boolean) =>
-  call<ReachyStatus>('/api/reachy/settings', { method: 'PATCH', body: JSON.stringify({ auto_record: autoRecord }) });
+/** What PATCH /api/reachy/settings takes. A field left out keeps its value on the server. */
+export interface ReachySettings {
+  auto_record?: boolean;
+  /** What Reachy calls the patient; "" goes back to the registered name. */
+  call_name?: string;
+  live_voice?: boolean;
+}
+
+/** Sends only the fields given: JSON.stringify leaves out the ones that are undefined. */
+export const updateReachySettings = (partial: ReachySettings) =>
+  call<ReachyStatus>('/api/reachy/settings', { method: 'PATCH', body: JSON.stringify(partial) });
 
 export const queueReachyTask = (intkId: number) =>
   call<{ task_id: string; status: string }>('/api/reachy/tasks', { method: 'POST', body: JSON.stringify({ intk_id: intkId }) });

@@ -6,7 +6,7 @@ import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalR
 import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
 import { deleteAllMemory } from '../lib/memory-api';
 import { fetchOverdoseProtection } from '../lib/notify-api';
-import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
+import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, startCheckin, unpairReachy, updateReachySettings, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
 /** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
@@ -35,6 +35,9 @@ export default function ReachyCard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
+  /** The call name being typed; null shows the saved one. */
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const [nameNotice, setNameNotice] = useState<'saved' | 'invalid' | null>(null);
 
   const load = useCallback(async () => {
     const [robot, consent] = await Promise.all([fetchReachyStatus(), fetchConsentStatus()]);
@@ -67,6 +70,7 @@ export default function ReachyCard() {
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
     setError('');
+    setNameNotice(null);
     try {
       await action();
     } catch (cause) {
@@ -145,7 +149,25 @@ export default function ReachyCard() {
     await refresh();
   });
 
-  const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await setAutoRecord(value)));
+  const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await updateReachySettings({ auto_record: value })));
+
+  const toggleLiveVoice = (value: boolean) => run(async () => setStatus(await updateReachySettings({ live_voice: value })));
+
+  // "" goes back to the registered name. A name the server refuses (422 invalid_call_name) is explained next to the
+  // field, and the typed name stays so it can be fixed.
+  const saveCallName = (value: string) => run(async () => {
+    try {
+      setStatus(await updateReachySettings({ call_name: value }));
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 422) {
+        setNameNotice('invalid');
+        return;
+      }
+      throw cause;
+    }
+    setNameDraft(null);
+    setNameNotice('saved');
+  });
 
   const toggleCheckins = (value: boolean) => run(async () => {
     const legal = await fetchLegal('robot', i18n.language);
@@ -331,6 +353,37 @@ export default function ReachyCard() {
             <p role="alert" className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-sm text-amber-900">
               {t('reachy.noAlertContacts')}
             </p>
+          )}
+          <form className="rounded-xl bg-gray-50 p-4 space-y-2"
+            onSubmit={event => { event.preventDefault(); if (nameDraft !== null) void saveCallName(nameDraft.trim()); }}>
+            <label htmlFor="reachy-call-name" className="block text-sm font-medium text-gray-900">{t('reachy.callName')}</label>
+            <p id="reachy-call-name-help" className="text-xs text-gray-500">{t('reachy.callNameHelp')}</p>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <input id="reachy-call-name" type="text" maxLength={40} autoComplete="off" aria-describedby="reachy-call-name-help"
+                placeholder={t('reachy.callNamePlaceholder')} value={nameDraft ?? status.call_name ?? ''} disabled={busy}
+                onChange={event => { setNameDraft(event.target.value); setNameNotice(null); }}
+                className="min-h-12 flex-1 min-w-0 rounded-xl border border-gray-200 bg-white px-4 text-base text-gray-900" />
+              <button type="submit" disabled={busy || nameDraft === null} className="min-h-12 px-5 py-3 rounded-xl bg-[#0057B8] text-white font-semibold disabled:opacity-50">
+                {t('common.save')}
+              </button>
+            </div>
+            {status.call_name_custom && (
+              <button type="button" onClick={() => void saveCallName('')} disabled={busy} className="min-h-12 text-sm text-[#0057B8] underline disabled:opacity-50">
+                {t('reachy.callNameReset')}
+              </button>
+            )}
+            {nameNotice === 'invalid' && <p role="alert" className="text-sm text-red-700">{t('reachy.callNameInvalid')}</p>}
+            {nameNotice === 'saved' && <p role="status" className="text-sm text-green-700">{t('reachy.callNameSaved')}</p>}
+          </form>
+          {status.live_voice_test && (
+            <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
+              <input type="checkbox" className="mt-1 w-5 h-5" checked={!!status.live_voice} disabled={busy}
+                onChange={event => void toggleLiveVoice(event.target.checked)} />
+              <span>
+                <span className="block text-sm font-medium text-gray-900">{t('reachy.liveVoice')}</span>
+                <span className="block text-xs text-gray-500 mt-1">{t('reachy.liveVoiceHelp')}</span>
+              </span>
+            </label>
           )}
           <div className="flex flex-col sm:flex-row gap-3">
             <button onClick={sendTestAlert} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-[#0057B8] text-white font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
