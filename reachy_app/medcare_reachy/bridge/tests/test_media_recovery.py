@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from medcare_reachy.bridge import media as media_module
-from medcare_reachy.bridge.media import ReachyRobot
+from medcare_reachy.bridge.media import RESTORE_RETRY_SECONDS, ReachyRobot
 from medcare_reachy.bridge.runner import MonitorStream, Runner
 from medcare_reachy.bridge.tests.fakes import FakeClips
 
@@ -234,12 +234,16 @@ def test_a_refused_restore_warns_once_per_streak_and_never_raises(caplog):
     mini = MediaMini(gives_back=False)
     robot = robot_with(mini)
     _released(mini)
+    clock = [100.0]
+    robot._now = lambda: clock[0]
     with caplog.at_level("WARNING", logger="medcare_reachy.bridge.media"):
         assert robot.restore_media() is False
+        clock[0] += RESTORE_RETRY_SECONDS
         assert robot.restore_media() is False
         assert len(caplog.records) == 1
         assert "the speaker and microphone stay off" in caplog.records[0].getMessage()
         mini.gives_back = True
+        clock[0] += RESTORE_RETRY_SECONDS
         assert robot.restore_media() is True
         mini.gives_back = False
         _released(mini)
@@ -301,6 +305,7 @@ def test_after_a_refused_recovery_gives_up_the_next_heartbeat_gets_the_speaker_a
     robot = robot_with(mini, RELEASED)
     mini.managers[0].get_frame = lambda: None          # the camera feed is dead; its audio still works
     clock = _Clock()
+    robot._now = lambda: clock.t                       # restore_media() paces its retries on the same clock
     stream = MonitorStream(_App(), robot, None, clock=clock, run_blocking=_inline, stream_encode=lambda frame: b"j")
     clips = FakeClips()
     clips.missing_count = 0
@@ -319,6 +324,7 @@ def test_after_a_refused_recovery_gives_up_the_next_heartbeat_gets_the_speaker_a
             await runner.heartbeat_once()
         assert robot.play_clip(path, wait=False) is False and robot.get_audio() is None
         mini.gives_back = True                         # the daemon can give the media back now
+        clock.t += RESTORE_RETRY_SECONDS               # the first heartbeat after the retry pause asks again
         await runner.heartbeat_once()
 
     with caplog.at_level("INFO"):
@@ -328,3 +334,22 @@ def test_after_a_refused_recovery_gives_up_the_next_heartbeat_gets_the_speaker_a
     assert mini.calls.count("release_media") == 1      # the first recovery's; nothing after it releases
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert len([m for m in errors if "the speaker and microphone are off" in m]) == 1
+
+
+def test_a_refused_restore_waits_a_minute_before_asking_the_daemon_again():
+    # The SDK logs a WARNING and an ERROR for every refused acquire, and each request can take up to 10 s: asking at
+    # every 10 s heartbeat filled the robot's log and delayed the heartbeat while the daemon kept refusing.
+    mini = MediaMini(gives_back=False)
+    robot = robot_with(mini)
+    _released(mini)
+    clock = [100.0]
+    robot._now = lambda: clock[0]
+    assert robot.restore_media() is False and mini.calls == ["acquire_media"]
+    clock[0] += 10                                     # the next heartbeat
+    assert robot.restore_media() is False and mini.calls == ["acquire_media"]   # not asked again yet
+    clock[0] += RESTORE_RETRY_SECONDS - 10
+    mini.gives_back = True
+    assert robot.restore_media() is True and mini.calls == ["acquire_media", "acquire_media"]
+    mini.gives_back = False
+    _released(mini)
+    assert robot.restore_media() is False and mini.calls == ["acquire_media"]   # a new streak asks at once
