@@ -107,8 +107,8 @@ SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when ano
 - **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
   Two quick restarts from the settings page no longer start two copies of the app's worker.
-- This Hugging Face space currently carries a different line, an ElevenLabs voice numbered 0.6.0 that is not on GitHub;
-  0.7.0 is deployed to the robot by SSH only and is not published here yet.
+- 0.7.0 is the version on this space since 12 Oct 2026. The space's history also holds an ElevenLabs voice line
+  (0.6.0, 4-5 Oct) that is not in 0.7.0; it is kept for a later version.
 - **0.3.0**: emotion is scored on the robot too; snapshots to the server are identity-only, 2 a second (was 5).
 - **0.2.0**: vision runs on the robot (above). Tested against MediaPipe and the Reachy Mini simulator; frame rate on
   a real robot is not measured yet; run the bench above.
