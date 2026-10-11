@@ -9,6 +9,8 @@ rate-limited, with numbers only (spec 2026-10-11, B1 and B2).
 import asyncio
 import logging
 
+import cv2
+import numpy as np
 import pytest
 
 from tests.test_monitor_backend import _Detector, _Emotion, _jpeg, _packet
@@ -52,12 +54,19 @@ async def _never_commit(state, candidate, method):
     raise AssertionError("an identity check must not record a dose")
 
 
-async def _identity_checks(registry, state, packets):
+def _robot_frame():
+    """A frame the size the robot streams (480x360)."""
+    ok, encoded = cv2.imencode(".jpg", np.zeros((360, 480, 3), dtype=np.uint8))
+    assert ok
+    return encoded.tobytes()
+
+
+async def _identity_checks(registry, state, packets, jpeg=None):
     """One landmark packet, then one identity check on the same frame, as the robot's frame stream does."""
     result = None
     for packet in packets:
         await registry.landmarks(state, packet)
-        result = await registry.vision(state, packet["frame_seq"], _jpeg(), _never_commit)
+        result = await registry.vision(state, packet["frame_seq"], jpeg or _jpeg(), _never_commit)
     return result
 
 
@@ -119,6 +128,27 @@ def test_a_search_session_needs_two_hits_in_a_row_on_overlapping_boxes(faces):
         result = await _identity_checks(registry, state, [_far(3)])
         assert result["identity_status"] == "verified"
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("width,status,hits", [(28, "searching", 0), (40, "verified", 2)])
+def test_a_search_session_needs_a_patient_face_at_least_6_5_percent_of_the_frame_wide(faces, caplog, width, status,
+                                                                                         hits):
+    # Final review of 11 Oct: without MediaPipe's implicit floor (about 50 px), faces of about 24 px matched near the
+    # 0.3 distance threshold. The floor is 6.5% of the frame's width: about 32 px of the robot's 480x360 frame.
+    faces.faces = [{**PATIENT, "box": [200, 150, width, width]}]
+
+    async def scenario():
+        registry = MonitorRegistry()
+        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy")
+        result = await _identity_checks(registry, state, [_far(1), _far(2)], _robot_frame())
+        return state, result
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        state, result = asyncio.run(scenario())
+    assert result["identity_status"] == status and state.identity_hits == hits
+    assert (result["target_box"] is None) is (status == "searching")
+    last = _identity_lines(caplog)[-1].getMessage()
+    assert f"status={status} rule=openvino_only distance=0.310 box_px={width} " in last
 
 
 @pytest.mark.parametrize("client_type", ["reachy", "browser"])
