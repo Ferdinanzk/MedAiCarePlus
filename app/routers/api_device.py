@@ -24,6 +24,7 @@ from app.services.device_auth import get_device, get_device_for_heartbeat, get_d
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
+from app.services.live_session import _in_background
 from app.services.monitor_service import LABELS, BusyOtherClient, registry
 
 log = logging.getLogger(__name__)
@@ -105,10 +106,7 @@ def _uuid(value: str | None) -> str | None:
 
 
 async def _leased_task(conn, device: dict, task_id: str):
-    task = await conn.fetchrow(
-        "SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
-        "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid",
-        _uuid(task_id), device["u_id"], device["device_id"])
+    task = await conn.fetchrow(live_session.LEASED_TASK_SQL, _uuid(task_id), device["u_id"], device["device_id"])
     if not task:
         raise HTTPException(404, "Task not found")
     return task
@@ -265,17 +263,6 @@ class ConversationEndPayload(BaseModel):
     reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error"] = "finished"
 
 
-_background: set = set()
-
-
-def _in_background(coro) -> asyncio.Task:
-    """Run after the response; the reference keeps the task from being garbage-collected mid-run."""
-    task = asyncio.create_task(coro)
-    _background.add(task)
-    task.add_done_callback(_background.discard)
-    return task
-
-
 def _ms_since(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
@@ -308,8 +295,7 @@ async def _history(conn, conversation_id) -> list[dict]:
 async def _add_turn(conn, conversation_id, u_id: int, role: str, text: str, flagged: bool = False,
                     metrics: dict | None = None) -> int:
     return await conn.fetchval(
-        "INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
-        "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id",
+        live_session.INSERT_TURN_SQL,
         str(conversation_id), u_id, role, text, flagged, json.dumps(metrics) if metrics is not None else None)
 
 
