@@ -1,5 +1,6 @@
 """Robot pairing, status and settings for the signed-in patient (public port, user auth)."""
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -30,9 +31,19 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
+def _camera(status_detail) -> dict | None:
+    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.6.0 send none).
+    asyncpg hands JSONB back as text."""
+    if status_detail is None:
+        return None
+    detail = json.loads(status_detail) if isinstance(status_detail, str) else status_detail
+    camera = detail.get("camera") if isinstance(detail, dict) else None
+    return camera if isinstance(camera, dict) else None
+
+
 async def _status(conn, u_id: int) -> dict:
     device = await conn.fetchrow(
-        "SELECT device_id, label, auto_record, last_seen_at, robot_reachable, landmark_fps "
+        "SELECT device_id, label, auto_record, last_seen_at, robot_reachable, landmark_fps, status_detail "
         "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
     if not device:
         return {"paired": False}
@@ -51,6 +62,7 @@ async def _status(conn, u_id: int) -> dict:
         "auto_record": bool(device["auto_record"]), "last_seen_at": _iso(last_seen), "online": online,
         "robot_reachable": device["robot_reachable"],
         "landmark_fps": float(device["landmark_fps"]) if device["landmark_fps"] is not None else None,
+        "camera": _camera(device["status_detail"]),
         "last_task": {"task_id": str(task["task_id"]), "status": task["status"],
                       "slot_time": _iso(task["slot_time"]), "finished_at": _iso(task["finished_at"])}
         if task else None,

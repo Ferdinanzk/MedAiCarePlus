@@ -72,12 +72,21 @@ class ExtraEventPayload(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+class CameraReport(BaseModel):
+    """The robot's camera as its watchdog reports it (robot app 0.6.0+). idle: no session, so 0 fps is normal."""
+    state: Literal["idle", "ok", "stalled", "recovering", "unavailable"]
+    fps: float | None = Field(default=None, ge=0, le=240)
+    since: float | None = None   # unix seconds (robot clock) of the last state change
+    media: dict | None = None    # the robot daemon's GET /api/media/status answer, e.g. {"available", "released"}
+
+
 class HeartbeatPayload(BaseModel):
     robot_reachable: bool | None = None
     landmark_fps: float | None = Field(default=None, ge=0, le=240)
     vision_fps: float | None = Field(default=None, ge=0, le=240)
     bridge_version: str | None = Field(default=None, max_length=50)
     missing_clips: int | list[str] | None = None
+    camera: CameraReport | None = None   # robots older than 0.6.0 send none
 
 
 class MonitorStartPayload(BaseModel):
@@ -527,6 +536,8 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         return {"stop_all": True, "microphone": False, "server_time": server_time}
     detail = {"vision_fps": payload.vision_fps, "bridge_version": payload.bridge_version,
               "missing_clips": payload.missing_clips}
+    if payload.camera is not None:
+        detail["camera"] = payload.camera.model_dump()   # the Reachy card reads it through /api/reachy/status
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE reachy_device SET last_seen_at = NOW(), robot_reachable = $2, landmark_fps = $3, "
