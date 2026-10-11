@@ -1,0 +1,581 @@
+"""The live relay (live_session.LiveRelay) once GPT-Live has started: the opening, audio both ways, the 0.5 s hold,
+turns from the transcripts, the endings and the fallback to today's text chat. A fake GPT-Live plays scripted events,
+a fake robot records what it is sent, a fake clock drives every timer and a fake database keeps the rows. The start
+itself (its checks, GPT-Live's start, the conversation row) is Task 6's and is tested there: _begin replaces
+LiveRelay._open with what a successful start leaves behind."""
+
+import asyncio
+import json
+import sys
+import types
+import uuid
+
+import numpy as np
+import pytest
+
+_asyncpg_stub = types.ModuleType("asyncpg")
+_asyncpg_stub.Pool = object
+sys.modules.setdefault("asyncpg", _asyncpg_stub)
+
+from app.services import after_chat, conversation, live_session  # noqa: E402
+from app.services.live_client import LiveError, LiveEvent  # noqa: E402
+
+DEVICE_ID = str(uuid.uuid4())
+TASK_ID = str(uuid.uuid4())
+DEVICE = {"device_id": DEVICE_ID, "u_id": 7, "auto_record": False, "face_label": "pearl", "name": "Pearl"}
+LOUD, QUIET = 3000, 40   # PCM16 levels: GPT-Live speaking, and its near-silence (peak 45 measured)
+OPENING = "王奶奶，今天感覺怎麼樣？想跟我聊聊嗎？"
+
+
+def _pcm(level: int, ms: int = 100) -> bytes:
+    return np.full(16 * ms, level, dtype="<i2").tobytes()
+
+
+def _error(code: str) -> LiveError:
+    error = LiveError(code)
+    error.code = code
+    return error
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeRobot:
+    """The device WebSocket adapter: the test puts the robot's messages in `inbox` (None: the robot hung up)."""
+
+    def __init__(self):
+        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.sent: list = []
+        self.closed = None
+
+    async def receive(self):
+        return await self.inbox.get()
+
+    async def send_json(self, message):
+        self.sent.append(message)
+
+    async def send_bytes(self, data):
+        self.sent.append(bytes(data))
+
+    async def close(self, code=1000):
+        self.closed = code
+
+    def json(self, kind=None):
+        return [m for m in self.sent if isinstance(m, dict) and kind in (None, m["type"])]
+
+    def audio(self):
+        return [m for m in self.sent if isinstance(m, bytes)]
+
+
+class FakeLive:
+    """GPT-Live: the test puts LiveEvents in `events_in` (an exception is raised from events(), None ends it).
+    world.gone makes every send raise LiveError("live_closed"), as once GPT-Live has closed the session."""
+
+    def __init__(self, world, api_key, model, voice, instructions, *, rate=16000, connect=None):
+        self.world, self.args = world, (api_key, model, voice, instructions, rate)
+        self.events_in: asyncio.Queue = asyncio.Queue()
+        self.audio, self.commentaries, self.closes = [], [], 0
+
+    async def start(self, timeout=8.0):
+        assert timeout == live_session.CONNECT_TIMEOUT
+
+    async def send_audio(self, pcm):
+        if self.world.gone:
+            raise _error("live_closed")
+        self.audio.append(pcm)
+
+    async def mute(self):
+        pass
+
+    async def unmute(self):
+        pass
+
+    async def commentary(self, text):
+        if self.world.gone:
+            raise _error("live_closed")
+        self.commentaries.append(text)
+
+    async def instructions_append(self, text):
+        pass
+
+    async def events(self):
+        while True:
+            event = await self.events_in.get()
+            if event is None:
+                return
+            if isinstance(event, Exception):
+                raise event
+            yield event
+
+    async def close(self, wait=2.0):
+        self.closes += 1
+        return self.world.usage
+
+
+class LiveDB:
+    """The conversation row the start wrote and its turns. `slow` (an asyncio.Event): storing a patient turn waits
+    for it."""
+
+    def __init__(self):
+        self.conversations, self.turns = {}, []
+        self.slow: asyncio.Event | None = None
+
+    def acquire(self):
+        return self
+
+    def transaction(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def fetchval(self, query, *args):
+        if "INSERT INTO conversation_turn" in query:
+            cid, u_id, role, text, flagged, metrics = args
+            if self.slow is not None and role == "patient":
+                await self.slow.wait()
+            self.turns.append({"turn_id": len(self.turns) + 1, "conversation_id": cid, "role": role, "text": text,
+                               "flagged": flagged, "metrics": None if metrics is None else json.loads(metrics)})
+            return len(self.turns)
+        if "SET ended_at = NOW()" in query:
+            row = self.conversations[args[0]]
+            if row["ended_at"] is not None:
+                return None
+            row.update(ended_at="now", end_reason=args[1], after_chat_state="pending", live=json.loads(args[2]))
+            return args[0]
+        raise AssertionError(query)
+
+    async def execute(self, query, *args):
+        if "UPDATE conversation_turn SET text" in query:
+            turn_id, text, metrics = args
+            self.turns[turn_id - 1].update(text=text, metrics=json.loads(metrics))
+        elif "UPDATE conversation SET live" in query:
+            row = self.conversations[args[0]]
+            if row["ended_at"] is None:
+                row["live"] = json.loads(args[1])
+        else:
+            raise AssertionError(query)
+
+    def chat(self) -> dict:
+        (row,) = self.conversations.values()
+        return row
+
+    def rows(self, role=None):
+        return [(t["role"], t["text"]) for t in self.turns if role in (None, t["role"])]
+
+
+@pytest.fixture
+def world(monkeypatch):
+    """Everything around the relay; the background ticker never fires (TICK_SECONDS is an hour), so each test moves
+    the fake clock and runs relay._tick() itself (_step)."""
+    w = types.SimpleNamespace(db=LiveDB(), robot=FakeRobot(), clock=Clock(), clients=[], after_chat=[], usage=42.0,
+                              gone=False)
+
+    async def classify_risk(history, language, late=False):   # what a later safety check may ask: no risk
+        return None, {"risk_ms": 1, "risk_result": "none", "risk_attempts": []}
+
+    async def process(conversation_id, u_id):
+        w.after_chat.append((conversation_id, u_id))
+        return "done"
+
+    def factory(*args, **kwargs):
+        w.clients.append(FakeLive(w, *args, **kwargs))
+        return w.clients[-1]
+
+    w.factory = factory
+    monkeypatch.setattr(live_session, "get_pool", lambda: w.db)
+    monkeypatch.setattr(live_session, "TICK_SECONDS", 3600)
+    monkeypatch.setattr(conversation, "classify_risk", classify_risk)
+    monkeypatch.setattr(after_chat, "process", process)
+    return w
+
+
+async def _settle():
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def _begin(w):
+    """A relay whose start went through: GPT-Live started (a FakeLive from the factory), the conversation row and
+    its opening turn stored, `ready` sent. Its chat then runs in the background."""
+    relay = live_session.LiveRelay(w.robot, dict(DEVICE), client_factory=w.factory, clock=w.clock)
+
+    async def started(start):
+        relay.language = "zh-TW"
+        relay.client = w.factory("sk-test", "gpt-live-1", "marin", "INSTRUCTIONS", rate=16000)
+        await relay.client.start(timeout=live_session.CONNECT_TIMEOUT)
+        relay.conversation_id = cid = str(uuid.uuid4())
+        w.db.conversations[cid] = {"conversation_id": cid, "u_id": 7, "task_id": start["task_id"],
+                                   "language": "zh-TW", "model": "gpt-live-1", "mode": "live",
+                                   "followup_memory_id": None, "ended_at": None, "end_reason": None, "live": None}
+        relay.opening = OPENING
+        relay.opening_turn_id = await w.db.fetchval(
+            "INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
+            "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id", cid, 7, "reachy", OPENING, False, None)
+        await w.robot.send_json({"type": "ready", "conversation_id": cid})
+        return True
+
+    relay._open = started
+    running = asyncio.create_task(relay.run())
+    w.robot.inbox.put_nowait({"type": "start", "task_id": TASK_ID, "language": "zh-TW", "rate": 16000,
+                              "bridge_version": "0.8.0"})
+    await _settle()
+    return relay, running
+
+
+async def _step(w, relay, seconds=0.0):
+    w.clock.now += seconds
+    await relay._tick()
+    await _settle()
+
+
+async def _live(w, *events):
+    for event in events:
+        w.clients[-1].events_in.put_nowait(event)
+    await _settle()
+
+
+def _said(text):
+    return LiveEvent(type="input_text", text=text)
+
+
+def _reachy(text):
+    return LiveEvent(type="output_text", text=text)
+
+
+def _sound(level=LOUD):
+    return LiveEvent(type="audio", data=_pcm(level))
+
+
+async def _over(w, running):
+    await asyncio.wait_for(running, 5)
+    await asyncio.gather(*list(live_session._background))
+
+
+def test_the_opening_goes_to_gpt_live_as_commentary_quoted_as_data(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        (client,) = world.clients
+        assert client.commentaries == [live_session.OPENING_COMMENTARY["zh-TW"]
+                                       + json.dumps(OPENING, ensure_ascii=False)]
+        assert world.robot.json() == [{"type": "ready", "conversation_id": relay.conversation_id}]
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_the_robots_microphone_goes_to_gpt_live(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        frames = [_pcm(200, 20), _pcm(0, 40)]
+        for frame in frames + [b"\x01"]:   # an odd number of bytes is not PCM16: dropped
+            world.robot.inbox.put_nowait(frame)
+        await _settle()
+        assert world.clients[0].audio == frames
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_no_reply_audio_reaches_the_robot_before_the_hold(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("今天天氣很好"))         # the patient spoke: GPT-Live's next sound is a reply
+        await _live(world, _sound(QUIET), _sound(QUIET))   # GPT-Live's stream starts with silence
+        assert world.robot.audio() == []
+        for index in range(4):                         # the onset, then a chunk every 0.125 s
+            if index:
+                await _step(world, relay, 0.125)
+            await _live(world, _sound())
+        assert world.robot.audio() == []               # 0.375 s after the onset
+        await _step(world, relay, 0.125)               # 0.5 s: the tick lets the reply out, in order
+        chunks = [_pcm(LOUD)] * 4
+        assert world.robot.audio() == chunks
+        await _live(world, _sound(QUIET))   # after the onset, everything flows as it comes
+        assert world.robot.audio() == chunks + [_pcm(QUIET)]
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_after_a_pause_the_same_reply_flows_and_a_reply_to_new_words_is_held_again(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _sound())                  # nobody spoke yet (the opening): not held
+        assert len(world.robot.audio()) == 1
+        await _step(world, relay, 0.7)                # 0.6 s without sound: GPT-Live stopped
+        await _live(world, _sound(QUIET))             # silence between sentences is dropped
+        await _live(world, _sound())                  # it goes on without the patient speaking: no new hold
+        assert len(world.robot.audio()) == 2
+        await _step(world, relay, 1.0)
+        await _live(world, _said("嗯"), _sound())     # the patient spoke: the next sound is held
+        assert len(world.robot.audio()) == 2
+        await _step(world, relay, 0.5)
+        assert len(world.robot.audio()) == 3
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_transcripts_become_turns_with_their_live_timings(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _reachy("王奶奶，"), _reachy("今天好嗎？"))
+        await _step(world, relay, 1.0)
+        await _live(world, _sound())                   # the spoken opening, 1.0 s after the commentary: not held
+        await _step(world, relay, 4.0)
+        await _live(world, _said("我"))
+        await _step(world, relay, 0.3)
+        await _live(world, _said("很好"))
+        assert world.db.rows() == [("reachy", "王奶奶，今天好嗎？")]   # GPT-Live's words replace the opening
+        assert world.db.turns[0]["metrics"] == {"live": {"first_audio_ms": 1000, "hold_ms": 0, "cut": False,
+                                                         "robot_playing_ms": None}}
+        await _step(world, relay, 1.4)
+        assert len(world.db.turns) == 1                # 1.4 s is no pause yet
+        await _step(world, relay, 0.2)                 # 1.6 s: the patient's turn is closed
+        assert world.db.rows()[1:] == [("patient", "我很好")]
+        assert world.db.turns[1]["metrics"] == {"live": {"transcript_ms": 300, "fragments": 2}}
+        await _live(world, _reachy("太好了。"))
+        await _step(world, relay, 0.1)
+        await _live(world, _sound())                   # 1.7 s after the patient's last words
+        await _step(world, relay, 0.5)
+        world.robot.inbox.put_nowait({"type": "playing"})   # the robot reports its first sound
+        await _settle()
+        await _step(world, relay, 0.3)
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        assert world.db.rows()[2:] == [("reachy", "太好了。")]
+        assert world.db.turns[2]["metrics"] == {"live": {"first_audio_ms": 2200, "hold_ms": 500, "cut": False,
+                                                         "robot_playing_ms": 2200}}
+
+    asyncio.run(scenario())
+
+
+def test_reachys_first_words_after_the_patient_spoke_are_a_turn_of_their_own(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("哈囉"))
+        await _live(world, _reachy("哈囉，王奶奶"))
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        assert world.db.rows() == [("reachy", OPENING), ("patient", "哈囉"), ("reachy", "哈囉，王奶奶")]
+
+    asyncio.run(scenario())
+
+
+def test_a_role_switch_or_a_pause_over_1_5_s_closes_a_turn(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("我今天"))
+        await _step(world, relay, 1.4)
+        await _live(world, _said("去公園"))             # 1.4 s apart: the same turn
+        await _step(world, relay, 1.6)
+        await _live(world, _said("散步"))               # 1.6 s apart: a new turn
+        await _live(world, _reachy("真好"))             # Reachy's words close the patient's turn at once
+        await _live(world, _said("對啊"))
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        assert world.db.rows() == [("reachy", OPENING), ("patient", "我今天去公園"), ("patient", "散步"),
+                                   ("reachy", "真好"), ("patient", "對啊")]
+
+    asyncio.run(scenario())
+
+
+def test_a_pause_the_timers_have_not_closed_yet_still_starts_a_new_turn(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("我今天"))
+        world.clock.now += 2.0                          # no tick ran in between
+        await _live(world, _said("想出門"))
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        assert world.db.rows("patient") == [("patient", "我今天"), ("patient", "想出門")]
+
+    asyncio.run(scenario())
+
+
+def _ended(world, reason):
+    chat = world.db.chat()
+    assert (chat["ended_at"], chat["end_reason"], chat["after_chat_state"]) == ("now", reason, "pending")
+    assert chat["live"] == {"usage_seconds": 42.0, "close_reason": "close_requested", "fallback_reason": None}
+    assert world.after_chat == [(chat["conversation_id"], 7)]   # the post-chat work, once
+    assert world.robot.json("end") == [{"type": "end", "reason": reason, "risk": False}]
+    assert world.robot.json("fallback") == [] and world.robot.closed == 1000
+    assert world.clients[0].closes == 1
+
+
+def test_a_goodbye_ends_the_chat_3_s_after_gpt_lives_answer(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("好，拜拜"))
+        await _step(world, relay, 1.6)                 # the goodbye turn is closed
+        await _step(world, relay, 1.0)
+        await _live(world, _sound())                   # GPT-Live answers
+        await _step(world, relay, 0.5)
+        await _live(world, _sound())
+        await _step(world, relay, 0.7)                 # its sound stopped 0.6 s ago
+        await _step(world, relay, 2.9)
+        assert world.robot.json("end") == []
+        await _step(world, relay, 0.4)                 # 3 s after the end of its sound was seen
+        await _over(world, running)
+        _ended(world, "goodbye")
+        assert world.db.rows("patient") == [("patient", "好，拜拜")]
+
+    asyncio.run(scenario())
+
+
+def test_a_goodbye_gpt_live_does_not_answer_ends_the_chat_3_s_later(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("我不聊了"))
+        await _step(world, relay, 1.6)                 # the goodbye turn is closed
+        await _step(world, relay, 2.9)
+        assert world.robot.json("end") == []
+        await _step(world, relay, 0.2)
+        await _over(world, running)
+        _ended(world, "goodbye")
+
+    asyncio.run(scenario())
+
+
+def test_45_s_without_patient_speech_ends_the_chat(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _step(world, relay, 30)
+        await _live(world, _said("嗯"))
+        await _step(world, relay, 44.5)
+        assert world.robot.json("end") == []
+        await _step(world, relay, 0.5)                 # 45 s after the patient's last words
+        await _over(world, running)
+        _ended(world, "silence")
+
+    asyncio.run(scenario())
+
+
+def test_a_live_chat_ends_after_live_max_seconds(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        for _ in range(14):                            # the patient keeps talking: 14 x 40 s = 560 s
+            await _step(world, relay, 40)
+            await _live(world, _said("還有"))
+        await _step(world, relay, 39.5)
+        assert world.robot.json("end") == []
+        await _step(world, relay, 0.5)                 # 600 s
+        await _over(world, running)
+        _ended(world, "limit")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("message, reason", [({"type": "end", "reason": "stopped"}, "stopped"),
+                                             ({"type": "end", "reason": "patient_left"}, "patient_left"),
+                                             ({"type": "end", "reason": "risk"}, "stopped"),
+                                             (None, "disconnected")])
+def test_the_robots_end_or_a_dropped_robot_ends_the_chat_with_the_open_turn_stored(world, message, reason):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("我想去睡了"))
+        world.robot.inbox.put_nowait(message)
+        await _over(world, running)
+        _ended(world, reason)
+        assert world.db.rows("patient") == [("patient", "我想去睡了")]   # stored before the post-chat work
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_being_stored_when_the_chat_ends_is_never_lost(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        world.db.slow = asyncio.Event()
+        await _live(world, _said("我想去睡了"), _reachy("好"))   # Reachy's words close the turn: storing it waits
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})   # the robot ends meanwhile
+        await _settle()
+        assert world.robot.json("end") == []           # the ending waits for the turn being stored
+        world.db.slow.set()
+        await _over(world, running)
+        _ended(world, "stopped")
+        assert world.db.rows() == [("reachy", OPENING), ("patient", "我想去睡了"), ("reachy", "好")]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("event, reason, close_reason", [
+    (LiveEvent(type="error", code="rate_limit_exceeded"), "rate_limit_exceeded", "close_requested"),
+    (LiveEvent(type="closed", reason="connection_lost", usage_seconds=12.0), "live_closed", "connection_lost"),
+    (_error("live_closed"), "live_closed", "close_requested"),
+    (None, "live_closed", "close_requested"),
+])
+def test_gpt_live_failing_mid_chat_falls_back_with_the_conversation_id(world, event, reason, close_reason):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("今天天氣很好"))
+        await _step(world, relay, 1.6)
+        await _live(world, _reachy("出去走走吧"))
+        await _live(world, event)
+        await _over(world, running)
+        chat = world.db.chat()
+        assert world.robot.json("fallback") == [{"type": "fallback", "reason": reason,
+                                                 "conversation_id": chat["conversation_id"]}]
+        assert world.robot.json("end") == [] and world.robot.closed == 1000
+        assert chat["ended_at"] is None and chat["mode"] == "live" and world.after_chat == []
+        usage = 12.0 if close_reason == "connection_lost" else 42.0
+        assert chat["live"] == {"usage_seconds": usage, "close_reason": close_reason, "fallback_reason": reason,
+                                "live_patient_turns": 1}
+        assert world.db.rows() == [("reachy", OPENING), ("patient", "今天天氣很好"), ("reachy", "出去走走吧")]
+
+    asyncio.run(scenario())
+
+
+def test_a_moderation_stop_with_no_risk_found_falls_back_as_live_ended(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        await _live(world, _said("我跟老伴吵架了"))
+        await _live(world, LiveEvent(type="error", code="content_filter"))
+        await _over(world, running)
+        chat = world.db.chat()
+        assert world.robot.json("fallback") == [{"type": "fallback", "reason": "live_ended",
+                                                 "conversation_id": chat["conversation_id"]}]
+        assert chat["ended_at"] is None and chat["live"]["fallback_reason"] == "live_ended"
+        assert chat["live"]["close_reason"] == "content"
+
+    asyncio.run(scenario())
+
+
+def test_audio_gpt_live_refuses_waits_for_gpt_lives_own_close(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        world.gone = True                              # GPT-Live closed; its events are still on their way
+        world.robot.inbox.put_nowait(_pcm(200, 20))
+        await _settle()
+        assert world.robot.json("fallback") == [] and not running.done()
+        await _live(world, LiveEvent(type="error", code="content_filter"),
+                    LiveEvent(type="closed", reason="content", usage_seconds=9.0))
+        await _over(world, running)
+        assert world.robot.json("fallback")[0]["reason"] == "live_ended"   # not a plain live_closed
+
+    asyncio.run(scenario())
+
+
+def test_an_ending_and_a_fallback_at_the_same_moment_end_the_chat_once(world):
+    async def scenario():
+        relay, running = await _begin(world)
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        world.clients[0].events_in.put_nowait(LiveEvent(type="error", code="live_unavailable"))
+        await _over(world, running)
+        sent = world.robot.json("end") + world.robot.json("fallback")
+        assert len(sent) == 1 and world.clients[0].closes == 1
+        assert len(world.after_chat) == (1 if sent[0]["type"] == "end" else 0)
+
+    asyncio.run(scenario())

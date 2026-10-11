@@ -278,7 +278,7 @@ async def _own_conversation(conn, device: dict, conversation_id: str):
     except ValueError as exc:
         raise HTTPException(404, "Conversation not found") from exc
     row = await conn.fetchrow(
-        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id FROM conversation "
+        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id, live FROM conversation "
         "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
     if not row:
         raise HTTPException(404, "Conversation not found")
@@ -290,6 +290,14 @@ async def _history(conn, conversation_id) -> list[dict]:
         "SELECT role, text FROM conversation_turn WHERE conversation_id = $1::uuid ORDER BY turn_id",
         str(conversation_id))
     return [dict(row) for row in rows]
+
+
+def _live_patient_turns(row) -> int:
+    """Patient turns a live chat stored before it fell back to this text chat (live_session, spec C3): the text
+    chat's turn limit counts from the fallback, so they are left out of it."""
+    live = row.get("live")
+    live = json.loads(live) if isinstance(live, str) else live   # asyncpg hands JSONB back as text
+    return int((live or {}).get("live_patient_turns") or 0)
 
 
 async def _add_turn(conn, conversation_id, u_id: int, role: str, text: str, flagged: bool = False,
@@ -369,7 +377,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         turn_id = await _add_turn(conn, cid, device["u_id"], "patient", text, bool(keyword),
                                   metrics=None if payload.metrics is None else {"robot": payload.metrics})
         history = await _history(conn, cid)
-        patient_turns = sum(1 for turn in history if turn["role"] == "patient")
+        patient_turns = sum(1 for turn in history if turn["role"] == "patient") - _live_patient_turns(row)
         closing = conversation.wants_to_end(text) or patient_turns >= conversation.MAX_PATIENT_TURNS
         block = ""
         # The memory block (facts only) goes to the reply alone, so it is built only when the model will write

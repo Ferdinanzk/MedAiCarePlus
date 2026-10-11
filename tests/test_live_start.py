@@ -22,7 +22,7 @@ from app import config
 from app.config import DEVICE_PORT
 from app.routers import api_device
 from app.services import after_chat, ai_settings, consent_service, conversation, device_auth, live_session, memory
-from app.services.live_client import LiveError
+from app.services.live_client import LiveError, LiveEvent
 
 DEVICE_ID = str(uuid.uuid4())
 TASK_ID = str(uuid.uuid4())
@@ -111,8 +111,8 @@ class Pool:
 
 
 class FakeLive:
-    """GPT-Live as the relay uses it (live_client.LiveClient). world["fail"] makes start() raise that LiveError, and
-    world["gone"] makes commentary() raise LiveError("live_closed") (the session closed right after its start)."""
+    """GPT-Live as the relay uses it (live_client.LiveClient). world["fail"] makes start() raise that LiveError. Once
+    started it stays quiet: no events, and the robot's audio goes nowhere."""
 
     def __init__(self, world, api_key, model, voice, instructions, *, rate=16000, connect=None):
         self.world = world
@@ -128,10 +128,15 @@ class FakeLive:
             raise LiveError(self.world["fail"])
 
     async def commentary(self, text):
-        if self.world.get("gone"):
-            raise LiveError("live_closed")
         self.commentaries.append(text)
         self.world["order"].append("commentary")
+
+    async def send_audio(self, pcm):
+        pass
+
+    async def events(self):
+        await asyncio.Event().wait()
+        yield LiveEvent("started")
 
     async def close(self, wait=2.0):
         self.closes += 1
@@ -377,16 +382,6 @@ def test_the_chat_ends_on_the_robots_end_or_its_leaving(live, ending, reason):
     row = live.db.conversations[cid]
     assert row["end_reason"] == reason and live.world["after_chat"] == [(cid, 7)]
     assert robot.sent[-1] == {"type": "end", "reason": reason, "risk": False} and robot.closed == 1000
-    assert live.world["clients"][0].closes == 1
-
-
-def test_a_gpt_live_session_that_closes_before_the_opening_ends_the_chat(live):
-    live.world["gone"] = True
-    robot = FakeRobot(START)
-    _run(live, robot)
-    (cid,) = live.db.conversations
-    assert live.db.conversations[cid]["end_reason"] == "error" and live.world["after_chat"] == [(cid, 7)]
-    assert robot.sent[-1] == {"type": "end", "reason": "error", "risk": False} and robot.closed == 1000
     assert live.world["clients"][0].closes == 1
 
 

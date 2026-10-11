@@ -1434,3 +1434,19 @@ def test_a_turn_after_a_risk_turn_never_reaches_the_model(robot):
     body = _turn(robot, cid, "今天天氣很好").json()
     assert body["end"] is True and body["risk"] is True and body["reply"] == conversation.HELPLINE["zh-TW"]
     assert robot.prompts == [] and robot.checks == [] and len(robot.alerts) == 1
+
+
+def test_after_a_live_chat_falls_back_the_turn_limit_counts_from_the_fallback(robot):
+    # A live chat (live_session) that fell back to this text chat left its patient turns in the conversation and
+    # their number in conversation.live: the text chat's turn limit counts from the fallback (spec C3).
+    cid = _start(robot)["conversation_id"]
+    for number in range(8):
+        robot.db.turns.append({"turn_id": len(robot.db.turns) + 1, "conversation_id": cid, "role": "patient",
+                               "text": f"第{number}句", "flagged": False, "metrics": None})
+    robot.db.conversations[cid]["live"] = json.dumps({"usage_seconds": 30.0, "close_reason": "connection_lost",
+                                                      "fallback_reason": "live_closed", "live_patient_turns": 8})
+    for _ in range(conversation.MAX_PATIENT_TURNS - 1):
+        assert _turn(robot, cid, "嗯").json()["end"] is False
+    last = _turn(robot, cid, "嗯").json()
+    assert last["end"] is True and last["reply"] == conversation.CLOSING["zh-TW"]
+    assert len(robot.prompts[0]) == 10   # the replies still read the live chat's turns
