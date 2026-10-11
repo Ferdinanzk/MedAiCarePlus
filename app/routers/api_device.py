@@ -75,8 +75,8 @@ class ExtraEventPayload(BaseModel):
 class CameraReport(BaseModel):
     """The robot's camera as its watchdog reports it (robot app 0.6.0+). idle: no session, so 0 fps is normal."""
     state: Literal["idle", "ok", "stalled", "recovering", "unavailable"]
-    fps: float | None = Field(default=None, ge=0, le=240)
-    since: float | None = None   # unix seconds (robot clock) of the last state change
+    fps: float | None = Field(default=None, ge=0, le=240, allow_inf_nan=False)
+    since: float | None = Field(default=None, allow_inf_nan=False)   # unix seconds (robot clock) of the last state change
     media: dict | None = None    # the robot daemon's GET /api/media/status answer, e.g. {"available", "released"}
 
 

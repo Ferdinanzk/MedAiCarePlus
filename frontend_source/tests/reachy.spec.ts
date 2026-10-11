@@ -390,7 +390,9 @@ test('the Reachy card shows no camera warning when the camera works, the robot i
 
   api.camera = robotCamera('idle', 0);                                       // no session: no rate, no warning
   await page.reload();
+  await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();      // the card has its status first, or a count of 0 proves nothing
   await expect(reachyCard(page).getByText(/Robot camera|機器人鏡頭/)).toHaveCount(0);
+  await expect(reachyCard(page).getByRole('alert').filter({ hasText: CAMERA_WARNING })).toHaveCount(0);
 
   api.camera = robotCamera('unavailable', 0);                               // last report of a robot now offline
   api.online = false;

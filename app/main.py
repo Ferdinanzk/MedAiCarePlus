@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
 from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -67,9 +68,13 @@ async def dose_refused(request, exc: DoseRefused):
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request, exc: RequestValidationError):
     """FastAPI's 422 copies the request input back. On the AI card that input holds a plain API key, so the card
-    answers a bare code; every other route keeps the default answer."""
+    answers a bare code. A device route answers without the input: a robot's NaN or Infinity cannot be written back
+    as JSON, and the default answer then failed with a 500. Every other route keeps the default answer."""
     if request.url.path.startswith("/api/ai/"):
         return JSONResponse({"detail": "invalid_request"}, status_code=422)
+    if request.url.path.startswith("/api/device/"):
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+        return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
     return await request_validation_exception_handler(request, exc)
 
 
