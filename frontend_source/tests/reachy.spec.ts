@@ -369,23 +369,32 @@ const CAMERA_WARNING = /Robot camera not working|機器人鏡頭無法使用/;
 const robotCamera = (state: string, fps: number) =>
   ({ state, fps, since: 1791700000.5, media: { available: true, released: false, no_media: false } });
 
+/** The value next to the card's "Robot camera" row. */
+const robotCameraRate = (page: Page) =>
+  reachyCard(page).locator('dt', { hasText: /^(Robot camera|機器人鏡頭)$/ }).locator('xpath=following-sibling::dd[1]');
+
 test('the Reachy card warns when the robot camera is stalled, recovering or unavailable', async ({ page }) => {
   await seedSession(page);
-  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('stalled', 0) });
-  await page.goto('/settings');
+  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('stalled', 4.2) });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
   for (const state of ['stalled', 'recovering', 'unavailable']) {
-    api.camera = robotCamera(state, 0);
+    // a 10 s average that still counts the frames from before the stall: not shown
+    api.camera = robotCamera(state, 4.2);
     await page.reload();
-    await expect(reachyCard(page).getByRole('alert')).toHaveText(CAMERA_WARNING);
-    await expect(reachyCard(page).getByText('0.0 fps')).toBeVisible();     // a session is running
+    await expect(reachyCard(page).getByRole('alert')).toHaveText('機器人鏡頭無法使用');   // exact: no English fallback
+    await expect(robotCameraRate(page)).toHaveText('—');
+    await expect(reachyCard(page).getByText('4.2 fps')).toHaveCount(0);
   }
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(reachyCard(page).getByRole('alert')).toHaveText('Robot camera not working');
+  await expect(robotCameraRate(page)).toHaveText('—');
 });
 
 test('the Reachy card shows no camera warning when the camera works, the robot is offline or older', async ({ page }) => {
   await seedSession(page);
   const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('ok', 9.8) });
   await page.goto('/settings');
-  await expect(reachyCard(page).getByText('9.8 fps')).toBeVisible();        // the camera's rate while a session runs
+  await expect(robotCameraRate(page)).toHaveText('9.8 fps');               // the camera's rate while a session runs
   await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
 
   api.camera = robotCamera('idle', 0);                                       // no session: no rate, no warning

@@ -14,7 +14,8 @@ export type AiThinkingLevel = 'off' | 'low' | 'medium' | 'high';
  *  'openrouter_effort', or null when the model can't think), the levels the model accepts, its time at each in ms,
  *  whether it always thinks (it refuses to stop), and whether a thinking request may carry a temperature. */
 export interface AiThinking { param: string | null; levels: string[]; ms: Record<string, number>; always: boolean; temperature: boolean }
-/** A profile saved before thinking levels existed has no `thinking`: that model can't think. */
+/** A profile saved before thinking levels existed has no `thinking`: not checked yet, so it is sent no level (the card
+ *  says "Not checked yet: press Test"). */
 export interface AiProfile {
   token_param: string; temperature: boolean; reasoning_off: Record<string, unknown> | null; thinking?: AiThinking;
 }

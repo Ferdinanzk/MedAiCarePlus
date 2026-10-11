@@ -273,7 +273,7 @@ test('a job offers off and the levels its main model accepts, with its time and 
   await thinking.selectOption('high');
   await expect(reply).toContainText('Main model took 7.2 s in the test.');
   await expect(reply.getByRole('alert').filter({ hasText: TOO_SLOW })).toBeVisible();
-  // a main model that can't think offers only off
+  // a main model whose thinking was never checked (a profile from before thinking levels) offers only off
   await expect(card(page).getByLabel('After-chat summary and memory: Thinking').locator('option')).toHaveText(['Off']);
   await card(page).getByRole('button', { name: 'Save jobs' }).click();
   await expect.poll(() => mock.requests.find(r => r.path === '/api/ai/jobs')?.body).toEqual({
@@ -327,19 +327,30 @@ test('a saved level its main model does not accept stays shown, with the level t
 
 test('each tested model says whether it can think, in both languages', async ({ page }) => {
   await seedSession(page);
-  await mockThinking(page);
+  await mockThinking(page, settings => {
+    // tested with thinking levels: it can't think
+    settings.models.push({ model_ref: 45, connection_id: 2, model_id: 'gpt-4.1-mini', company: 'OpenAI', region: 'USA',
+      retention: '30 days', profile: thinkingProfile({ param: null, levels: [], ms: {}, always: false, temperature: false }),
+      tested: true, copied_from_env: false, tested_at: '2026-10-11T10:00:00+00:00', test_ms: 700, last_error: null });
+  });
   await page.goto('/settings');   // the app starts in Traditional Chinese
   const luna = card(page).getByRole('group', { name: 'OpenAI · gpt-6-luna', exact: true });
+  // tested before thinking levels existed: its profile has no `thinking`, so nobody has checked yet
   const gemini = card(page).getByRole('group', { name: 'OpenRouter · google/gemini-2.5-flash-lite', exact: true });
+  const mini = card(page).getByRole('group', { name: 'OpenAI · gpt-4.1-mini', exact: true });
   await expect(luna).toContainText('可思考：低・中・高');
-  await expect(gemini).toContainText('不可思考');
+  await expect(gemini).toContainText('尚未檢查：請按「測試」');
+  await expect(gemini).not.toContainText('不可思考');
+  await expect(mini).toContainText('不可思考');
   await expect(card(page).getByLabel('Reachy 的回答: 思考等級').locator('option')).toHaveText(['關閉', '低', '中', '高']);
   await expect(card(page).getByRole('group', { name: '安全檢查', exact: true }))
     .toContainText('此思考等級花的時間超過這項工作的上限；Reachy 可能會說固定句子。');
   await page.getByRole('button', { name: '中文' }).first().click();
   await expect(luna).toContainText('Can think: low · medium · high');
   await expect(card(page).getByRole('group', { name: 'OpenAI · gpt-5.4-mini', exact: true })).toContainText('Can think: low');
-  await expect(gemini).toContainText("Can't think");
+  await expect(gemini).toContainText('Not checked yet: press Test');
+  await expect(gemini).not.toContainText("Can't think");
+  await expect(mini).toContainText("Can't think");
 });
 
 test('Test says the thinking levels are tested too, then the row says what the model can do', async ({ page }) => {
@@ -389,7 +400,7 @@ test('a model whose thinking used the whole budget says so, in both languages', 
   await mockThinking(page, settings => { settings.models.find((m: any) => m.model_ref === 41).last_error = 'thinking_budget'; });
   await page.goto('/settings');   // the app starts in Traditional Chinese
   const luna = card(page).getByRole('group', { name: 'OpenAI · gpt-6-luna', exact: true });
-  await expect(luna).toContainText('上次呼叫失敗：思考用完了全部的額度，所以沒有回答。');
+  await expect(luna).toContainText('上次呼叫失敗：思考用完了允許的回答長度，所以沒有回答。');
   await page.getByRole('button', { name: '中文' }).first().click();
   await expect(luna).toContainText('Last call failed: Thinking used the whole budget, so no answer came back.');
   await expect(luna).not.toContainText('thinking_budget');
