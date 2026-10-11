@@ -394,6 +394,17 @@ def test_heartbeat_refuses_a_bad_camera_report(env, monkeypatch, camera):
     assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
 
 
+def test_heartbeat_refuses_a_camera_number_that_is_not_finite(env, monkeypatch):
+    """json.dumps writes NaN and Infinity as bare words, which PostgreSQL's jsonb refuses: that must be a 422, not a 500."""
+    _no_leases(monkeypatch)
+    for field in ("since", "fps"):
+        for word in ("NaN", "Infinity", "-Infinity"):
+            body = '{"camera": {"state": "ok", "%s": %s}}' % (field, word)    # raw text: the test client would refuse to write it
+            response = env.robot.post("/api/device/heartbeat", content=body, headers={"content-type": "application/json"})
+            assert response.status_code == 422, f"{field}={word} gave {response.status_code}"
+    assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
+
+
 # ── Frame stream: the server computes the landmarks ─────────────────────────
 
 def _jpeg(width=64, height=48) -> bytes:
