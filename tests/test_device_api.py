@@ -51,7 +51,7 @@ class FakeConn:
     def __init__(self):
         self.depth = 0
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": SLOT, "intk_ids": [101, 102],
-                     "status": "in_progress", "lease_owner": DEVICE_ID}
+                     "status": "in_progress", "lease_owner": DEVICE_ID, "reason": "upcoming"}
         self.doses = {101: {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT},
                       102: {"dose_form": "liquid", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT},
                       103: {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT}}
@@ -572,11 +572,22 @@ def test_device_observe_session_has_no_dose(env):
 
 
 def test_device_sessions_keep_the_mode_they_started_in(env):
-    # The search before talking (observe) verifies with the OpenVINO match alone; a dose session never does.
-    search = env.registry.sessions[_start(env, mode="observe").json()["session_id"]]
-    assert search.started_mode == "observe" and monitor_service.openvino_only(search) is True
-    dose = env.registry.sessions[_start(env, mode="dose", intk_id=101, task_id=TASK_ID).json()["session_id"]]
+    # Only the search of a check-in task (observe) verifies with the OpenVINO match alone. The search of a dose task
+    # keeps the MediaPipe gate (final review of 11 Oct), and so does a dose session.
+    def session(**body):
+        return env.registry.sessions[_start(env, **body).json()["session_id"]]
+
+    dose_search = session(mode="observe", task_id=TASK_ID)
+    assert dose_search.started_mode == "observe" and dose_search.checkin_search is False
+    assert monitor_service.openvino_only(dose_search) is False
+    dose = session(mode="dose", intk_id=101, task_id=TASK_ID)
     assert dose.started_mode == "dose" and monitor_service.openvino_only(dose) is False
+    no_task = session(mode="observe")
+    assert no_task.checkin_search is False and monitor_service.openvino_only(no_task) is False
+    env.conn.task.update(reason="checkin", intk_ids=[])
+    checkin_search = session(mode="observe", task_id=TASK_ID)
+    assert checkin_search.started_mode == "observe" and checkin_search.checkin_search is True
+    assert monitor_service.openvino_only(checkin_search) is True
 
 
 def test_device_start_returns_503_when_models_not_ready(env, monkeypatch):
