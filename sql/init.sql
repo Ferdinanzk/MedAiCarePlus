@@ -536,3 +536,8 @@ CREATE TABLE IF NOT EXISTS ai_job (
     fallback_ref   BIGINT REFERENCES ai_model(model_ref),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Thinking level per job (spec 2026-10-11-robot-camera-identity-thinking-design.md D1). 'off' sends today's
+-- requests unchanged; a model that can't do the job's level gets the nearest lower level it accepts.
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS thinking VARCHAR(10) NOT NULL DEFAULT 'off';
+ALTER TABLE ai_job DROP CONSTRAINT IF EXISTS ai_job_thinking_check;
+ALTER TABLE ai_job ADD CONSTRAINT ai_job_thinking_check CHECK (thinking IN ('off','low','medium','high'));
