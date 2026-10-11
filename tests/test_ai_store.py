@@ -267,3 +267,66 @@ def test_a_note_never_raises_without_a_database(monkeypatch):
                         ai_settings.Snapshot({}, {11: ai_settings.Model(11, 1, "gpt-5.4-mini")}, {}, None))
     asyncio.run(ai_store.note_call(11, "HTTP 503"))
     assert ai_settings.current().models[11].last_error is None   # memory not updated when the write failed
+
+
+def _pool(monkeypatch, conn):
+    """get_pool() answering with conn; the change() around the writes reloads an empty setup and registers nothing."""
+    class Pool:
+        def acquire(self):
+            class Ctx:
+                async def __aenter__(self):
+                    return conn
+
+                async def __aexit__(self, *exc):
+                    return False
+            return Ctx()
+
+    async def load(conn):
+        return ai_settings.Snapshot({}, {}, {}, None)
+
+    async def register(conn):
+        return None
+
+    monkeypatch.setattr(ai_store, "get_pool", lambda: Pool())
+    monkeypatch.setattr(ai_store, "load", load)
+    monkeypatch.setattr(legal_service, "register_documents", register)
+
+
+def test_a_keyless_openrouter_connection_takes_the_env_key_at_start(monkeypatch, caplog):
+    key = "sk-or-v1-envFILL-2468"
+    conn = Conn({"ai_connection": [
+        {"connection_id": 1, "kind": "openrouter", "api_key_enc": None},
+        {"connection_id": 2, "kind": "openrouter", "api_key_enc": ai_crypto.encrypt("sk-or-v1-card-1357")},
+        {"connection_id": 3, "kind": "openai", "api_key_enc": None},
+        {"connection_id": 4, "kind": "openrouter", "api_key_enc": None},
+        {"connection_id": 5, "kind": "openrouter",   # saved under an older SECRET_KEY: still a key, never replaced
+         "api_key_enc": ai_crypto.encrypt("sk-or-v1-old-9753", secret="an-older-secret")}]})
+    _pool(monkeypatch, conn)
+    with caplog.at_level("DEBUG", logger=ai_store.log.name):
+        assert asyncio.run(ai_store.fill_openrouter_keys_from_env(f"  {key}\n")) == 2
+    updates = conn.statements("UPDATE ai_connection")
+    assert [args[0] for args in updates] == [1, 4]   # the keyed ones and the OpenAI connection are untouched
+    assert all(ai_crypto.decrypt(args[1]) == key and args[2] == "2468" for args in updates)
+    assert all("api_key_enc IS NULL" in entry[0] for entry in conn.sql
+               if isinstance(entry, tuple) and entry[0].startswith("UPDATE"))
+    assert conn.sql[1] == "BEGIN" and conn.sql[-1] == "COMMIT"   # both in one change()
+    assert "filled the key of 2 OpenRouter connection(s) from .env" in caplog.text
+    assert "envFILL" not in caplog.text   # the key is never logged
+
+
+def test_without_an_env_key_the_start_fills_nothing(monkeypatch):
+    def no_pool():
+        raise AssertionError("no database work without a key")
+
+    monkeypatch.setattr(ai_store, "get_pool", no_pool)
+    for empty in (None, "", "   "):
+        assert asyncio.run(ai_store.fill_openrouter_keys_from_env(empty)) == 0
+
+
+def test_when_every_openrouter_connection_has_a_key_the_start_changes_nothing(monkeypatch, caplog):
+    conn = Conn({"ai_connection": [
+        {"connection_id": 1, "kind": "openrouter", "api_key_enc": ai_crypto.encrypt("sk-or-v1-card-1357")}]})
+    _pool(monkeypatch, conn)
+    with caplog.at_level("INFO", logger=ai_store.log.name):
+        assert asyncio.run(ai_store.fill_openrouter_keys_from_env("sk-or-v1-envFILL-2468")) == 0
+    assert conn.statements("UPDATE") == [] and "BEGIN" not in conn.sql and "filled" not in caplog.text

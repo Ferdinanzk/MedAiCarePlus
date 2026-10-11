@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 import os
 from fastapi import FastAPI
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -8,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
+from app import config
 from app.database import init_pool, close_pool
 from app.config import FRONTEND_URL
 from app.services.face_recognition_service import FaceRecognitionService
@@ -30,6 +32,8 @@ from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
 from app.services.schedule import DoseRefused
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,7 +42,12 @@ async def lifespan(app: FastAPI):
     async with get_pool().acquire() as conn:
         await check_restore_state(conn)
         await ai_store.seed_from_env(conn)   # first start only; checks .env (check_ai_settings) before copying it
+        await ai_store.fill_openrouter_keys_from_env(config.OPENROUTER_API_KEY)   # every start: keyless ones only
         ai_settings.set_current(await ai_store.load(conn))
+        for job in ai_settings.JOBS:   # before check_ai_settings, which can stop a prod start
+            if not ai_settings.job_usable(ai_settings.current(), job):
+                log.warning("AI job %s has no usable model (a tested model whose connection has a key that can be "
+                            "read), so it can't run; choose one on the Settings page's AI connections card", job)
         check_ai_settings(ai_settings.current())
         await register_documents(conn)   # after the AI settings: the notices name the services in use
     FaceRecognitionService.get_instance()

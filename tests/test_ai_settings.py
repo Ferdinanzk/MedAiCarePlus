@@ -108,3 +108,36 @@ def test_a_key_is_never_in_a_repr():   # a log line or a traceback showing these
     for value in (connection, ai_settings.job_targets("reply", snapshot)[0], snapshot):
         assert "AIzaReprProbe-77" not in repr(value)
     assert connection.api_key == "AIzaReprProbe-77"
+
+
+def test_a_job_is_usable_with_a_tested_model_whose_key_can_be_read():
+    snapshot = _card_snapshot()   # reply: the OpenAI model (keyed); safety and after_chat: the keyless OpenRouter one
+    assert [ai_settings.job_usable(snapshot, job) for job in ai_settings.JOBS] == [True, False, False]
+    view = ai_settings.public(snapshot)
+    assert view["jobs_usable"] == {"reply": True, "safety": False, "after_chat": False}
+    assert view["no_key_in_use"] is False   # the older warning stays as it was
+
+
+def test_a_usable_backup_is_enough():
+    snapshot = dataclasses.replace(_card_snapshot(), jobs={**_card_snapshot().jobs, "safety": (21, 11)})
+    assert ai_settings.job_usable(snapshot, "safety") is True
+
+
+def test_an_untested_model_or_an_unreadable_key_is_not_usable():
+    snapshot = _card_snapshot()
+    untested = ai_settings.with_model(snapshot, dataclasses.replace(snapshot.models[11], profile=None))
+    assert ai_settings.job_usable(untested, "reply") is False   # and its backup (21) has no key
+    unreadable = dataclasses.replace(snapshot.connections[1], api_key="", key_readable=False)
+    snapshot = dataclasses.replace(snapshot, connections={**snapshot.connections, 1: unreadable})
+    assert ai_settings.job_usable(snapshot, "reply") is False
+
+
+def test_a_job_with_no_model_is_not_usable():
+    snapshot = dataclasses.replace(_card_snapshot(), jobs={"reply": (11, None)})
+    assert ai_settings.public(snapshot)["jobs_usable"] == {"reply": True, "safety": False, "after_chat": False}
+
+
+def test_before_loading_the_jobs_are_usable_only_with_the_env_key(monkeypatch):
+    assert all(ai_settings.job_usable(ai_settings.current(), job) for job in ai_settings.JOBS)
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+    assert not any(ai_settings.job_usable(ai_settings.current(), job) for job in ai_settings.JOBS)

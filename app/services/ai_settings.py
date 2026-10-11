@@ -173,6 +173,13 @@ def problems(snapshot: Snapshot) -> list[str]:
     return found
 
 
+def job_usable(snapshot: Snapshot, job: str) -> bool:
+    """The job has a model it can use (spec C1): its main or its backup model is tested (has a profile) and its
+    connection has a key this SECRET_KEY can read. The card warns under a job without one, and the start logs it."""
+    return any(target.model.profile is not None and target.connection.key_readable and bool(target.api_key)
+               for target in job_targets(job, snapshot))
+
+
 def with_model(snapshot: Snapshot, model: Model) -> Snapshot:
     return dataclasses.replace(snapshot, models={**snapshot.models, model.model_ref: model})
 
@@ -192,4 +199,5 @@ def public(snapshot: Snapshot) -> dict:
         "jobs": {job: {"primary_ref": refs[0], "fallback_ref": refs[1]} for job, refs in snapshot.jobs.items()},
         "seeded_at": snapshot.seeded_at.isoformat() if snapshot.seeded_at else None,
         "no_key_in_use": not any(target.api_key for target in in_use),
+        "jobs_usable": {job: job_usable(snapshot, job) for job in JOBS},
     }
