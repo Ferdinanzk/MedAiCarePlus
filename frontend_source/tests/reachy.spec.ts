@@ -44,7 +44,7 @@ interface MockOptions {
   memory?: boolean;
   /** What GET /api/memory lists. */
   memoryFacts?: Record<string, unknown>[];
-  /** The robot's camera from its last heartbeat (robot app 0.6.0+); left out: an older robot, no camera field. */
+  /** The robot's camera from its last heartbeat (robot app 0.7.0+); left out: an older robot, no camera field. */
   camera?: Record<string, unknown> | null;
   online?: boolean;
 }
@@ -362,7 +362,7 @@ test('the conversations page lists what Reachy remembers and deletes one note', 
   expect(dialogs).toEqual([expect.stringMatching(/Delete this note\?|刪除這則筆記/)]);
 });
 
-// ── The robot's camera (robot app 0.6.0): a warning while it is not working, its rate while a session runs ──
+// ── The robot's camera (robot app 0.7.0): a warning while it is not working, its rate while a session runs ──
 
 const reachyCard = (page: Page) => page.locator('section[aria-labelledby="reachy-title"]');
 const CAMERA_WARNING = /Robot camera not working|機器人鏡頭無法使用/;
@@ -400,7 +400,7 @@ test('the Reachy card shows no camera warning when the camera works, the robot i
   await expect(reachyCard(page).getByText(/Offline|離線/)).toBeVisible();
   await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
 
-  api.camera = undefined;                                                    // a robot older than 0.6.0
+  api.camera = undefined;                                                    // a robot older than 0.7.0
   api.online = true;
   await page.reload();
   await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();

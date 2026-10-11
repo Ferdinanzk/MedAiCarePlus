@@ -4,7 +4,7 @@
 
 **Goal:** Make the Reachy robot find the patient reliably before it talks (a camera watchdog and a fixed bridge race on the robot, an OpenVINO-only rule for the search on the server), fix the AI connections card's blind spots, and let each AI job think at a chosen level.
 
-**Architecture:** Robot app 0.6.0 (`reachy_app/`) gets a pure-logic `CameraWatchdog` driven by its frame stream, recovery through the SDK's public `release_media()`/`acquire_media()`, and a camera state in the heartbeat. The FastAPI server stores and shows that state, relaxes the identity rule only for robot sessions that started as a search, and logs identity outcomes. The AI connections card gains per-job usability, a `.env` key fill for keyless OpenRouter connections, a voice-only model message, and a per-job thinking level whose accepted levels each model's Test finds.
+**Architecture:** Robot app 0.7.0 (`reachy_app/`) gets a pure-logic `CameraWatchdog` driven by its frame stream, recovery through the SDK's public `release_media()`/`acquire_media()`, and a camera state in the heartbeat. The FastAPI server stores and shows that state, relaxes the identity rule only for robot sessions that started as a search, and logs identity outcomes. The AI connections card gains per-job usability, a `.env` key fill for keyless OpenRouter connections, a voice-only model message, and a per-job thinking level whose accepted levels each model's Test finds.
 
 **Tech Stack:** Python 3.11 (server, FastAPI, asyncpg, pytest with fake pools), Python 3.12 on the robot (reachy_mini SDK 1.11.0, pytest with fakes), React 19 + Vite + Tailwind + i18next (Playwright tests), PostgreSQL 16 (`sql/init.sql`, idempotent).
 
@@ -35,9 +35,9 @@
 - Tasks run in this order: **1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 10 (Part A only)**. Task 11 (the 「活著沒什麼意思」 keyword fix, flaw F21, added on the user's request) runs before Task 10, so Task 11's Step 7 ("make it live") does not apply: the stack is rebuilt once in Task 10 Part B.
 - **R1:** Task 6 Step 6b updates the card's "copied from .env" note, which Task 5's key fill makes untrue.
 - **R2:** Task 10 Step 4b adds `camera` to the docs that list the heartbeat fields.
-- **R3:** Task 10 Parts B (rebuild, live checks, deploy 0.6.0, robot checks) and C (vault, `flaw.md` part 2) are run by the controller after the final whole-branch review, not by an implementer.
+- **R3:** Task 10 Parts B (rebuild, live checks, deploy 0.7.0, robot checks) and C (vault, `flaw.md` part 2) are run by the controller after the final whole-branch review, not by an implementer.
 - Accepted deviations from the shared interface contract: `CameraWatchdog.detach()` keeps `unavailable` (spec A3 says it stays) instead of going to `idle`; the robot's `not_found` detail is `{"reason": "camera_unavailable", "outcomes": {...}}`, so the server reads `detail["reason"]`; `CameraWatchdog` takes one extra keyword-only `wall=time.time` for `since`.
-- Out of scope (noted, not planned): pushing robot app 0.6.0 to the Hugging Face space `pearlyjam21/medcare_reachy`.
+- Out of scope (noted, not planned): pushing robot app 0.7.0 to the Hugging Face space `pearlyjam21/medcare_reachy`.
 
 ## Expected test counts after each task
 
@@ -756,7 +756,7 @@ rest of that page:
 
 The rule applies to the web app's `i18n.ts`, which this task doesn't touch.
 
-**Not in this task.** The version bump to 0.6.0 is not in this task. It is Task 2's Part F (spec A4); the deploy to
+**Not in this task.** The version bump to 0.7.0 is not in this task. It is Task 2's Part F (spec A4); the deploy to
 the robot is Task 10's Part B:
 - `reachy_app/pyproject.toml:8` (`version = "0.5.4"`).
 - `reachy_app/medcare_reachy/bridge/__init__.py:3` (`__version__ = "0.5.4"`).
@@ -838,7 +838,7 @@ No other file in `reachy_app` pins the version.
 
 ---
 
-### Task 2: Robot app 0.6.0: camera watchdog, recovery, camera state in the heartbeat, early end of a search
+### Task 2: Robot app 0.7.0: camera watchdog, recovery, camera state in the heartbeat, early end of a search
 
 Spec: `docs/superpowers/specs/2026-10-11-robot-camera-identity-thinking-design.md` sections A2, A3 and the version part
 of A4. Work in `C:/Reachy_Mini/repo/MedAiCarePlus` on branch `robot-camera-thinking` (check with
@@ -899,7 +899,7 @@ file with the Write tool, give it CRLF too (run from `C:/Reachy_Mini/repo/MedAiC
     | {"available": bool, "released": bool, "no_media": bool}}}` (what the server's `CameraReport` validates).
   - When the watchdog gives up during SEARCHING: `POST /api/device/tasks/{id}/status` with `{"status": "not_found",
     "detail": {"reason": "camera_unavailable", "outcomes": {...}}}` (the existing not_found path adds `outcomes`).
-  - `__version__ == "0.6.0"`; heartbeats report `bridge_version` 0.6.0.
+  - `__version__ == "0.7.0"`; heartbeats report `bridge_version` 0.7.0.
 
 Commands (run from `C:/Reachy_Mini/repo/MedAiCarePlus/reachy_app`):
 - one file: `../.venv/Scripts/python.exe -m pytest medcare_reachy/bridge/tests/<file>.py -q -p no:cacheprovider`
@@ -2501,7 +2501,7 @@ git commit -m "Robot app: a search with an unavailable camera ends as not_found 
 
 ---
 
-#### Part F: version 0.6.0
+#### Part F: version 0.7.0
 
 The version is pinned in two places only (searched the whole repo for `0.5.4` and `__version__`):
 `reachy_app/pyproject.toml:8` and `reachy_app/medcare_reachy/bridge/__init__.py:3`. `test_runner.py` reads
@@ -2511,8 +2511,8 @@ describe history and belong to the docs update, not this task.
 - [ ] **Step 23: Bump the version**
 
 In `reachy_app/medcare_reachy/bridge/__init__.py` line 3, replace `__version__ = "0.5.4"` with
-`__version__ = "0.6.0"`. In `reachy_app/pyproject.toml` line 8, replace `version = "0.5.4"` with
-`version = "0.6.0"`.
+`__version__ = "0.7.0"`. In `reachy_app/pyproject.toml` line 8, replace `version = "0.5.4"` with
+`version = "0.7.0"`.
 
 - [ ] **Step 24: Run the whole robot app suite**
 
@@ -2531,7 +2531,7 @@ The server suite is not affected by this task (no file under `app/` or `tests/` 
 ```bash
 cd C:/Reachy_Mini/repo/MedAiCarePlus
 git add reachy_app/medcare_reachy/bridge/__init__.py reachy_app/pyproject.toml
-git commit -m "Robot app 0.6.0: camera watchdog, recovery, camera state in the heartbeat" -m "Heartbeats now report bridge_version 0.6.0. Not deployed yet." -m "Co-Authored-By: <the model that wrote the commit> <noreply@anthropic.com>"
+git commit -m "Robot app 0.7.0: camera watchdog, recovery, camera state in the heartbeat" -m "Heartbeats now report bridge_version 0.7.0. Not deployed yet." -m "Co-Authored-By: <the model that wrote the commit> <noreply@anthropic.com>"
 ```
 
 #### NOTES
@@ -2640,7 +2640,7 @@ git commit -m "Robot app 0.6.0: camera watchdog, recovery, camera state in the h
   - `reachy_app/medcare_reachy/main.py:21` `request_media_backend = None` (so "default": LOCAL on the robot);
     `service.py:48` `ReachyRobot.attach(reachy_mini)`, `:60` `MonitorStream(app, robot, engine, ...)`.
   - `app/routers/api_device.py:58-60` `StatusPayload` accepts `not_found` with any dict detail; `:76-81`
-    `HeartbeatPayload` uses pydantic's default (extra keys ignored), so a 0.6.0 robot works with an older server.
+    `HeartbeatPayload` uses pydantic's default (extra keys ignored), so a 0.7.0 robot works with an older server.
 - Prototype: the complete change was applied to a scratch copy of `reachy_app` and run: RED for each part exactly as
   written above, then `530 passed, 6 skipped` (and once `529 passed` plus the known `test_speech.py` flake).
 
@@ -2687,7 +2687,7 @@ text, not by the number):
 **Interfaces:**
 - Consumes (Task 2, the robot): the heartbeat body gains `"camera": {"state", "fps", "since", "media"}`, the dict from
   `CameraWatchdog.snapshot()` (contract: `state` in `idle|ok|stalled|recovering|unavailable`; `media` is
-  `media_status()`, a dict or `None`). Robots older than 0.6.0 send no `camera`.
+  `media_status()`, a dict or `None`). Robots older than 0.7.0 send no `camera`.
 - Produces (exact contract names):
   - `app/routers/api_device.py`: `class CameraReport(BaseModel)` with `state: Literal["idle","ok","stalled",
     "recovering","unavailable"]`, `fps: float | None = Field(default=None, ge=0, le=240)`, `since: float | None = None`,
@@ -2829,7 +2829,7 @@ before the final `raise`):
 after, as between the other tests):
 
 ```python
-# ── The robot's camera (robot app 0.6.0): stored with the heartbeat, shown on the Reachy card ──
+# ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
 
 CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
 
@@ -2850,9 +2850,9 @@ def _stored_detail(env) -> dict:
 def test_heartbeat_stores_the_camera_report_and_status_returns_it(env, monkeypatch, state):
     _no_leases(monkeypatch)
     camera = {"state": state, "fps": 9.8 if state == "ok" else 0.0, "since": 1791700000.5, "media": CAMERA_MEDIA}
-    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.6.0", "camera": camera})
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.7.0", "camera": camera})
     assert response.status_code == 200
-    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.6.0", "missing_clips": None,
+    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.7.0", "missing_clips": None,
                                    "camera": camera}
     status = env.browser.get("/api/reachy/status")
     assert status.status_code == 200 and status.json()["camera"] == camera
@@ -2924,7 +2924,7 @@ class HeartbeatPayload(BaseModel):
 with
 ```python
 class CameraReport(BaseModel):
-    """The robot's camera as its watchdog reports it (robot app 0.6.0+). idle: no session, so 0 fps is normal."""
+    """The robot's camera as its watchdog reports it (robot app 0.7.0+). idle: no session, so 0 fps is normal."""
     state: Literal["idle", "ok", "stalled", "recovering", "unavailable"]
     fps: float | None = Field(default=None, ge=0, le=240)
     since: float | None = None   # unix seconds (robot clock) of the last state change
@@ -2937,7 +2937,7 @@ class HeartbeatPayload(BaseModel):
     vision_fps: float | None = Field(default=None, ge=0, le=240)
     bridge_version: str | None = Field(default=None, max_length=50)
     missing_clips: int | list[str] | None = None
-    camera: CameraReport | None = None   # robots older than 0.6.0 send none
+    camera: CameraReport | None = None   # robots older than 0.7.0 send none
 ```
 (`Literal`, `BaseModel` and `Field` are already imported, lines 14 and 17.)
 
@@ -2987,7 +2987,7 @@ def _iso(value):
 add (two blank lines before and after):
 ```python
 def _camera(status_detail) -> dict | None:
-    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.6.0 send none).
+    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.7.0 send none).
     asyncpg hands JSONB back as text."""
     if status_detail is None:
         return None
@@ -3061,11 +3061,11 @@ git diff --cached --stat
 git commit -F - <<'EOF'
 Server: store the robot camera state from the heartbeat, return it in status
 
-- HeartbeatPayload accepts an optional camera object (robot app 0.6.0+):
+- HeartbeatPayload accepts an optional camera object (robot app 0.7.0+):
   state idle|ok|stalled|recovering|unavailable, fps 0-240, since, and the
   daemon's media status. An unknown state or a bad field refuses the
   heartbeat with 422. It is stored as status_detail["camera"]; robots
-  older than 0.6.0 send none and nothing is stored.
+  older than 0.7.0 send none and nothing is stored.
 - GET /api/reachy/status (and PATCH /api/reachy/settings) returns camera
   (null when the robot never sent one).
 
@@ -3090,7 +3090,7 @@ with
 ```ts
   /** What GET /api/memory lists. */
   memoryFacts?: Record<string, unknown>[];
-  /** The robot's camera from its last heartbeat (robot app 0.6.0+); left out: an older robot, no camera field. */
+  /** The robot's camera from its last heartbeat (robot app 0.7.0+); left out: an older robot, no camera field. */
   camera?: Record<string, unknown> | null;
   online?: boolean;
 }
@@ -3125,7 +3125,7 @@ The existing tests pass no `camera`, so their status has no `camera` field (an o
 8c. Before the last test, `test('when every dose today is closed the test alert says so', ...)`, insert:
 
 ```ts
-// ── The robot's camera (robot app 0.6.0): a warning while it is not working, its rate while a session runs ──
+// ── The robot's camera (robot app 0.7.0): a warning while it is not working, its rate while a session runs ──
 
 const reachyCard = (page: Page) => page.locator('section[aria-labelledby="reachy-title"]');
 const CAMERA_WARNING = /Robot camera not working|機器人鏡頭無法使用/;
@@ -3161,7 +3161,7 @@ test('the Reachy card shows no camera warning when the camera works, the robot i
   await expect(reachyCard(page).getByText(/Offline|離線/)).toBeVisible();
   await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
 
-  api.camera = undefined;                                                    // a robot older than 0.6.0
+  api.camera = undefined;                                                    // a robot older than 0.7.0
   api.online = true;
   await page.reload();
   await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();
@@ -3193,7 +3193,7 @@ export interface ReachyStatus {
 ```
 with
 ```ts
-/** The robot's camera as its last heartbeat reported it (robot app 0.6.0+; older robots send none). */
+/** The robot's camera as its last heartbeat reported it (robot app 0.7.0+; older robots send none). */
 export type RobotCamera = {
   state: 'idle' | 'ok' | 'stalled' | 'recovering' | 'unavailable';
   fps?: number | null;
@@ -3260,7 +3260,7 @@ with
 import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
-/** Camera states the robot's watchdog reports when it gets no frames (robot app 0.6.0+). */
+/** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
 const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
 ```
 
@@ -3428,7 +3428,7 @@ Reachy card: warn when the robot camera is not working
   when the robot is online and its camera state is stalled, recovering
   or unavailable, and a "Robot camera" row with the camera's fps while a
   session runs (state not idle).
-- Robots older than 0.6.0 send no camera; the card shows nothing new.
+- Robots older than 0.7.0 send no camera; the card shows nothing new.
 - reachy-api.ts: RobotCamera type and ReachyStatus.camera.
 - Playwright: the warning for each failing state, and no warning when the
   camera works, the robot is idle, offline or older.
@@ -9226,7 +9226,7 @@ steps, and report any step that could not run as skipped, never as passed.
 - Modify: `reachy_app/README.md` (CRLF, wrapped at about 118 characters):
   - after line 77 (`While a reminder runs, the settings page also shows the live **Camera landmarks** rate.`): new section
     "## When the camera stops" (Edit E).
-  - line 81, first line of "## Status": insert the 0.6.0 line before it (Edit F).
+  - line 81, first line of "## Status": insert the 0.7.0 line before it (Edit F).
 - Test: none in the repo. Verification is `task10_check.py code` (names exist in the code), `task10_check.py docs`
   (the docs carry them, CRLF intact), and a read-back of every changed section.
 
@@ -9240,7 +9240,7 @@ in its file at `37ba84e`. Tasks 1-9 don't touch these two files; Step 1 confirms
     `CAMERA_RECOVER_INTERVAL = 5.0`, `CAMERA_GIVE_UP_SECONDS = 15.0`, module logger; `ReachyRobot.reopen_camera()`
     -> `"acquired" | "reopened" | "failed: <short reason>"`; `ReachyRobot.media_status()` -> `dict | None`
     (`GET http://127.0.0.1:8000/api/media/status`); `MonitorStream.camera`; `bridge/session.py` ending `SEARCHING`
-    with `not_found` and `{"reason": "camera_unavailable"}`; `BridgeService._restart_lock`; version `0.6.0`.
+    with `not_found` and `{"reason": "camera_unavailable"}`; `BridgeService._restart_lock`; version `0.7.0`.
   - Server: `api_device.CameraReport`, `HeartbeatPayload.camera` stored as `status_detail["camera"]`;
     `/api/reachy/status` `camera`; `MonitorSession.started_mode`, `monitor_service.openvino_only(state)`,
     `monitor_service._log_identity(...)`; `ai_settings.job_usable(snapshot, job)`, `public()["jobs_usable"]`,
@@ -9281,8 +9281,8 @@ CODE = [
         "CameraWatchdog", "self.camera", ".camera.frame(", ".camera.tick", ".camera.snapshot()"]),
     ("reachy_app/medcare_reachy/bridge/session.py", ["camera_unavailable", ".camera.state"]),
     ("reachy_app/medcare_reachy/service.py", ["_restart_lock"]),
-    ("reachy_app/pyproject.toml", ['version = "0.6.0"']),
-    ("reachy_app/medcare_reachy/bridge/__init__.py", ['__version__ = "0.6.0"']),
+    ("reachy_app/pyproject.toml", ['version = "0.7.0"']),
+    ("reachy_app/medcare_reachy/bridge/__init__.py", ['__version__ = "0.7.0"']),
     ("app/routers/api_device.py", ["class CameraReport(BaseModel)", "camera: CameraReport | None = None"]),
     ("app/routers/api_reachy.py", ['"camera"']),
     ("app/services/monitor_service.py", [
@@ -9306,18 +9306,18 @@ CODE = [
 ]
 
 CLAUDE_MD = [
-    "**Robot app 0.6.0: the camera watchdog**", "`CameraWatchdog`", "`medcare_reachy.bridge.camera_watch`", "`CAMERA_STALL_SECONDS` (2 s)",
+    "**Robot app 0.7.0: the camera watchdog**", "`CameraWatchdog`", "`medcare_reachy.bridge.camera_watch`", "`CAMERA_STALL_SECONDS` (2 s)",
     "`CAMERA_RECOVER_INTERVAL` (5 s)", "`CAMERA_GIVE_UP_SECONDS` (15 s)", "`ReachyRobot.reopen_camera()`",
     "`ReachyRobot.media_status()`", '{"reason": "camera_unavailable"}', "`_restart_lock`",
     "**The TCU companion takes the camera away.**", 'media_backend="no_media"', "`monitor_service.openvino_only`",
     "`MonitorSession.started_mode`", "`_log_identity`", "`CameraReport`", 'status_detail["camera"]',
-    "Robot camera not working", "**Deploying robot app 0.6.0.**", "`curl -s -X POST localhost:8000/api/apps/restart-current-app`", "**Thinking level per job**",
+    "Robot camera not working", "**Deploying robot app 0.7.0.**", "`curl -s -X POST localhost:8000/api/apps/restart-current-app`", "**Thinking level per job**",
     "`ai_profile.detect_thinking`", "`ai_profile.effective_level`", "`ai_profile.ALLOWANCE`", "`Target.thinking`",
     "`thinking_budget`", "`reasoning_tokens`", "**AI card checks**", "`ai_settings.job_usable`", "`jobs_usable`",
     "`ai_store.fill_openrouter_keys_from_env`", "`not_chat_model`", "`ai_profile.NOT_CHAT_MODEL`",
     "except that `OPENROUTER_API_KEY` still fills", "the thinking levels it accepts) is its saved *profile*",
     "| `OPENROUTER_API_KEY` |"]
-README = ["## When the camera stops", "- **0.6.0**:", "`camera_unavailable`", "reachy-ai-companion",
+README = ["## When the camera stops", "- **0.7.0**:", "`camera_unavailable`", "reachy-ai-companion",
           'media_backend="no_media"', "/api/media/acquire", "Robot camera not working"]
 GONE = [("CLAUDE.md", "after that those lines are ignored (edit them on the card);")]
 
@@ -9414,7 +9414,7 @@ line or part of one line; each `new_string` keeps the old text and adds to it. T
 matches the file's other nested bullets.
 
 **Edit A** (line 89: the camera watchdog, the TCU companion clash, the search identity rule, the camera state on the
-card, and the 0.6.0 deploy).
+card, and the 0.7.0 deploy).
 
 old_string:
 
@@ -9426,7 +9426,7 @@ new_string:
 
 ```text
 The server logs any frame it held up over 0.25 s (`monitor frame N of session ... took`).
-- **Robot app 0.6.0: the camera watchdog** (`bridge/camera_watch.py`, `CameraWatchdog`). Before 0.6.0, a camera that stopped gave one stale frame and then `None` forever; the app logged nothing and searched for the full 10 minutes (`SEARCH_TIMEOUT`).
+- **Robot app 0.7.0: the camera watchdog** (`bridge/camera_watch.py`, `CameraWatchdog`). Before 0.7.0, a camera that stopped gave one stale frame and then `None` forever; the app logged nothing and searched for the full 10 minutes (`SEARCH_TIMEOUT`).
   - While a monitor session is attached, the stream (`MonitorStream.camera`, `bridge/runner.py`) calls the watchdog's `frame()` for every new frame and `tick()` when none came. Only a frame the SDK returns counts. A slow camera (5 fps) is not a stall: only a 2 s gap is.
   - **Stall:** no new frame for `CAMERA_STALL_SECONDS` (2 s). The app logs one ERROR line per stall, with the daemon's `GET /api/media/status` answer (`ReachyRobot.media_status()`).
   - **Recovery**, at most once per `CAMERA_RECOVER_INTERVAL` (5 s): `ReachyRobot.reopen_camera()` asks the daemon for the media back when it says the media is released or unavailable (result `acquired`), else reopens the app's own camera reader (`reopened`). Either way the SDK builds the app's media link again, and that link also carries the speaker and the microphone: after a recovery on the real robot, check that Reachy still speaks and hears. A failed attempt (`failed: <reason>`) is logged and never stops the stream or the session.
@@ -9434,11 +9434,11 @@ The server logs any frame it held up over 0.25 s (`monitor frame N of session ..
   - **Give up:** no frame `CAMERA_GIVE_UP_SECONDS` (15 s) after the stall began gives the state `unavailable`. A search (`SEARCHING`) then ends as `not_found` with detail `{"reason": "camera_unavailable"}` (the not_found path also adds `outcomes`), and Reachy goes to sleep as for any `not_found`. `camera_unavailable` never records or skips a dose by itself: for a dose task the server's missed-dose path decides, as for any `not_found`. `unavailable` outlasts the search, so the heartbeats and the card keep reporting it, until the next session starts and tries the camera afresh.
   - The watchdog's log lines come from the logger `medcare_reachy.bridge.camera_watch`.
   - **Restarts:** `BridgeService.restart()` runs under `_restart_lock`, so two overlapping restarts (two quick Saves) never leave two bridge threads running, and the settings page disables Save and Restart while a request is pending.
-- **The TCU companion takes the camera away.** TCU's Reachy AI Companion (the `reachy-mini-tcu` project, systemd unit `reachy-ai-companion`) connects with `media_backend="no_media"`. In reachy_mini 1.11.0 (`ReachyMini._configure_mediamanager`) such a connection makes the daemon release the camera and audio for direct use, and nothing asks for them back, so MedCare Reachy's camera reader (GStreamer `unixfdsrc`) stops. Don't run both: on our robot the companion is disabled at boot (`sudo systemctl disable --now reachy-ai-companion`). Both also serve their page on port 8042. On the robot, `curl -s localhost:8000/api/media/status` shows `"released": true` when a program took the media, and `curl -s -X POST localhost:8000/api/media/acquire` gives it back; during a session the 0.6.0 watchdog does that itself.
+- **The TCU companion takes the camera away.** TCU's Reachy AI Companion (the `reachy-mini-tcu` project, systemd unit `reachy-ai-companion`) connects with `media_backend="no_media"`. In reachy_mini 1.11.0 (`ReachyMini._configure_mediamanager`) such a connection makes the daemon release the camera and audio for direct use, and nothing asks for them back, so MedCare Reachy's camera reader (GStreamer `unixfdsrc`) stops. Don't run both: on our robot the companion is disabled at boot (`sudo systemctl disable --now reachy-ai-companion`). Both also serve their page on port 8042. On the robot, `curl -s localhost:8000/api/media/status` shows `"released": true` when a program took the media, and `curl -s -X POST localhost:8000/api/media/acquire` gives it back; during a session the 0.7.0 watchdog does that itself.
 - **Finding the patient before talking: OpenVINO alone** (`monitor_service.openvino_only`). A robot session that *started* in `observe` mode (the search before a check-in or before prompting a dose) verifies the patient with the OpenVINO match alone: exactly one face labelled as the patient, fewer than 4 OpenVINO faces (`saturated` false), and 2 hits in a row whose boxes overlap by at least 0.20. It needs no MediaPipe face box on the same frame. Every other session keeps the full rule, which also needs a MediaPipe face overlapping the match by at least 0.20 and fewer than 4 MediaPipe faces: dose sessions, browser sessions, and a dose session that switched to `observe` after recording. `MonitorSession.started_mode` keeps the mode a session started in, because `mode` changes after a record. Why: the server's MediaPipe short-range face detector misses faces under about 50 px wide in the robot's 480x360 frame, so the robot could not verify a patient further than about 1.35 m, while dashboard login (OpenVINO alone) worked. A search session still never records a dose, and the dose prompt still waits for verification in that session.
   - **Identity log** (`_log_identity`): for robot sessions, one INFO line at every `identity_status` change, else at most one per 5 s per session: session id, status, rule (`openvino_only` or `with_mediapipe`), best patient distance, patient box width in pixels, and the OpenVINO and MediaPipe face counts. No images, and no labels other than patient/other.
-- **Robot camera state on the Reachy card.** From robot app 0.6.0, every heartbeat carries `camera` (`CameraWatchdog.snapshot()`): `state` (`idle`, `ok`, `stalled`, `recovering` or `unavailable`), `fps`, `since` (when the state last changed) and `media` (the daemon's media status, or null). `idle` means no session is attached, so 0 fps is normal then. The server validates it (`CameraReport` in `api_device.py`; an unknown state is a 422), stores it as `reachy_device.status_detail["camera"]`, and `/api/reachy/status` returns it as `camera`. The card shows "Robot camera not working" (「機器人鏡頭無法使用」) while the robot is online and the state is `stalled`, `recovering` or `unavailable`, and the camera fps while a session runs. Robots older than 0.6.0 send no `camera`, and the card then shows nothing new. A task's `camera_unavailable` detail is stored with the task like any status detail.
-- **Deploying robot app 0.6.0.** From `reachy_app/`: `python tools/deploy_to_robot.py --host <the robot's address>` (user `pollen`; the SSH password comes from `REACHY_SSH_PASSWORD`, or it asks). It backs up the installed app, uploads the package, installs faster-whisper and Whisper Base, and renders changed clips. On 11 Oct 2026 the robot ran 0.5.4 with an older SenseVoice `voice.py`; the upload replaces it with the repo's Whisper Base version. Then restart the app through the daemon, on the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app` (when the app isn't running: `curl -s -X POST localhost:8000/api/apps/start-app/medcare_reachy`). Heartbeats then report `bridge_version` 0.6.0. Robot checks: one real check-in (frames at the camera rate, the patient verified, the chat runs), then a camera failure: `curl -s -X POST localhost:8000/api/media/release` during a search must end in a recovery, or in `camera_unavailable` within 15 s with the camera warning on the card.
+- **Robot camera state on the Reachy card.** From robot app 0.7.0, every heartbeat carries `camera` (`CameraWatchdog.snapshot()`): `state` (`idle`, `ok`, `stalled`, `recovering` or `unavailable`), `fps`, `since` (when the state last changed) and `media` (the daemon's media status, or null). `idle` means no session is attached, so 0 fps is normal then. The server validates it (`CameraReport` in `api_device.py`; an unknown state is a 422), stores it as `reachy_device.status_detail["camera"]`, and `/api/reachy/status` returns it as `camera`. The card shows "Robot camera not working" (「機器人鏡頭無法使用」) while the robot is online and the state is `stalled`, `recovering` or `unavailable`, and the camera fps while a session runs. Robots older than 0.7.0 send no `camera`, and the card then shows nothing new. A task's `camera_unavailable` detail is stored with the task like any status detail.
+- **Deploying robot app 0.7.0.** From `reachy_app/`: `python tools/deploy_to_robot.py --host <the robot's address>` (user `pollen`; the SSH password comes from `REACHY_SSH_PASSWORD`, or it asks). It backs up the installed app, uploads the package, installs faster-whisper and Whisper Base, and renders changed clips. On 11 Oct 2026 the robot ran 0.5.4 with an older SenseVoice `voice.py`; the upload replaces it with the repo's Whisper Base version. Then restart the app through the daemon, on the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app` (when the app isn't running: `curl -s -X POST localhost:8000/api/apps/start-app/medcare_reachy`). Heartbeats then report `bridge_version` 0.7.0. Robot checks: one real check-in (frames at the camera rate, the patient verified, the chat runs), then a camera failure: `curl -s -X POST localhost:8000/api/media/release` during a search must end in a recovery, or in `camera_unavailable` within 15 s with the camera warning on the card.
 ```
 
 **Edit B1** (line 112: the profile now also holds the thinking levels).
@@ -9529,7 +9529,7 @@ While a reminder runs, the settings page also shows the live **Camera landmarks*
 
 ## When the camera stops
 
-From 0.6.0 the app watches its camera while it looks for the patient or watches a dose:
+From 0.7.0 the app watches its camera while it looks for the patient or watches a dose:
 
 - **No new frame for 2 seconds** is a stall. The app logs an error with the robot daemon's media status and tries to
   get the camera back, at most once every 5 seconds: when the daemon says the camera was released, the app asks for it
@@ -9547,7 +9547,7 @@ SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when ano
 `curl -s -X POST localhost:8000/api/media/acquire` gives it back.
 ```
 
-**Edit F** (line 81: the 0.6.0 status line, first in the list).
+**Edit F** (line 81: the 0.7.0 status line, first in the list).
 
 old_string:
 
@@ -9558,7 +9558,7 @@ old_string:
 new_string:
 
 ```text
-- **0.6.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
+- **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   within 15 s instead of searching for 10 minutes. The heartbeat reports the camera state. Two quick restarts from the
   settings page no longer start two copies of the app's worker.
 - **0.3.0**: emotion is scored on the robot too; snapshots to the server are identity-only, 2 a second (was 5).
@@ -9569,7 +9569,7 @@ new_string:
 Run `grep -rn "missing_clips" docs` from the repo root. Today it finds `docs/ARCHITECTURE.md`, `docs/DATA_FLOW.md`,
 `docs/MODELS.md`, `docs/NEW_LAPTOP_SETUP.md` and `docs/reachy-data-transfer/02-data-contracts-and-failure-modes.md`.
 In each place that LISTS the heartbeat's fields (not every mention of `missing_clips`), add the new optional field in
-that document's own style, for example: "`camera` (robot app 0.6.0 and later: `{state, fps, since, media}`; state is
+that document's own style, for example: "`camera` (robot app 0.7.0 and later: `{state, fps, since, media}`; state is
 idle, ok, stalled, recovering or unavailable)". Leave places that only mention one field alone. Keep each file's
 line endings. Add every changed file to Step 7's `git add`.
 
@@ -9607,7 +9607,7 @@ Read the diff line by line and tick each against the contract and Tasks 1-9 (ope
 - Robot app: `CameraWatchdog`, `bridge/camera_watch.py`, `frame()`, `tick()`, `snapshot()` and its four keys, the
   five states, `CAMERA_STALL_SECONDS` 2 s, `CAMERA_RECOVER_INTERVAL` 5 s, `CAMERA_GIVE_UP_SECONDS` 15 s,
   `ReachyRobot.reopen_camera()` and its three results, `ReachyRobot.media_status()`, `MonitorStream.camera`,
-  `{"reason": "camera_unavailable"}` in `SEARCHING`, `_restart_lock`, `0.6.0`. In `reachy_app/medcare_reachy/bridge/media.py`,
+  `{"reason": "camera_unavailable"}` in `SEARCHING`, `_restart_lock`, `0.7.0`. In `reachy_app/medcare_reachy/bridge/media.py`,
   read `reopen_camera()`: the docs say `acquired` follows a released or unavailable daemon status and `reopened`
   otherwise. If Task 2 decided differently, change Edit A's Recovery sentence and README Edit E's first bullet to
   say what the code does.
@@ -9631,14 +9631,14 @@ Any fix goes back through the Edit tool, then rerun Step 5.
 
 ```bash
 cd /c/Reachy_Mini/repo/MedAiCarePlus && git add CLAUDE.md reachy_app/README.md && git commit -F - <<'EOF'
-Docs: camera watchdog, search identity rule, thinking per job, AI card checks (robot app 0.6.0)
+Docs: camera watchdog, search identity rule, thinking per job, AI card checks (robot app 0.7.0)
 
 CLAUDE.md: the robot app's camera watchdog and restart lock, the TCU companion's
 camera release, the OpenVINO-only rule for the search before talking and its log,
-the camera state on the Reachy card, deploying 0.6.0, thinking per job with token
+the camera state on the Reachy card, deploying 0.7.0, thinking per job with token
 allowances and the temperature rule, the per-job usability warning, the OpenRouter
 key fill from .env and the not_chat_model Test result.
-reachy_app/README.md: 0.6.0 status line, what happens when the camera stops, and
+reachy_app/README.md: 0.7.0 status line, what happens when the camera stops, and
 why the TCU companion must not run at the same time.
 
 Co-Authored-By: <the model that wrote the commit> <noreply@anthropic.com>
@@ -9649,7 +9649,7 @@ git log --oneline -1 && git status --short
 Replace `<the model that wrote the commit>` with your own model name (global constraints), for example
 `Claude Opus 5.5 (1M context)`. Expected: one new commit, a clean working tree.
 
-#### Part B: rebuild, live checks on this PC, deploy 0.6.0 and the robot checks (spec A4, section 5)
+#### Part B: rebuild, live checks on this PC, deploy 0.7.0 and the robot checks (spec A4, section 5)
 
 **Controller ruling R3: Parts B and C are run by the controller after the final whole-branch review, not by the Task 10 implementer.** The implementer does Part A (Steps 1-7, including 4b) and stops.
 
@@ -9780,7 +9780,7 @@ attempt `{'model_requested': 'gpt-5.4-mini', 'status': 200, 'level': 'low', 'rea
 'usable': True, ...}` with `ms` under the reply's 6 s per-call limit. If it fails with `error 'thinking_budget'`,
 report it: the allowance (+800) is too small for that model at `low`.
 
-- [ ] **Step 11: Deploy robot app 0.6.0 (spec A4)**
+- [ ] **Step 11: Deploy robot app 0.7.0 (spec A4)**
 
 ```bash
 cd /c/Reachy_Mini/repo/MedAiCarePlus/reachy_app && REACHY_SSH_PASSWORD=<robot SSH password> ../.venv/Scripts/python.exe tools/deploy_to_robot.py --host 192.168.137.235
@@ -9797,7 +9797,7 @@ cd /c/Reachy_Mini/repo/MedAiCarePlus && REACHY_HOST=192.168.137.235 REACHY_SSH_P
   "curl -s localhost:8000/api/media/status"
 ```
 
-Expected: `0.6.0`; `0` for SenseVoice (the older SenseVoice `voice.py` is gone, F15; `grep -c` exits 1 on no match,
+Expected: `0.7.0`; `0` for SenseVoice (the older SenseVoice `voice.py` is gone, F15; `grep -c` exits 1 on no match,
 which is fine); the restart answers; media status `{"available":true,"released":false,"no_media":false}`. If the app
 is not running after the restart, start it: `curl -s -X POST localhost:8000/api/apps/start-app/medcare_reachy`.
 About 30 s later, on this PC:
@@ -9806,7 +9806,7 @@ About 30 s later, on this PC:
 cd /c/Reachy_Mini/repo/MedAiCarePlus && docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "SELECT last_seen_at, status_detail FROM reachy_device WHERE revoked_at IS NULL"'
 ```
 
-Expected: `last_seen_at` within the last minute, and `status_detail` with `"bridge_version": "0.6.0"` and
+Expected: `last_seen_at` within the last minute, and `status_detail` with `"bridge_version": "0.7.0"` and
 `"camera": {"state": "idle", ...}`.
 
 - [ ] **Step 12: Robot check 1: one real check-in (spec §5; needs the patient in front of the robot)**

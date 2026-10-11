@@ -346,7 +346,7 @@ def test_heartbeat_reports_microphone_consent(env, monkeypatch):
     assert env.robot.post("/api/device/heartbeat", json={}).json()["microphone"] is True
 
 
-# ── The robot's camera (robot app 0.6.0): stored with the heartbeat, shown on the Reachy card ──
+# ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
 
 CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
 
@@ -367,9 +367,9 @@ def _stored_detail(env) -> dict:
 def test_heartbeat_stores_the_camera_report_and_status_returns_it(env, monkeypatch, state):
     _no_leases(monkeypatch)
     camera = {"state": state, "fps": 9.8 if state == "ok" else 0.0, "since": 1791700000.5, "media": CAMERA_MEDIA}
-    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.6.0", "camera": camera})
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.7.0", "camera": camera})
     assert response.status_code == 200
-    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.6.0", "missing_clips": None,
+    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.7.0", "missing_clips": None,
                                    "camera": camera}
     status = env.browser.get("/api/reachy/status")
     assert status.status_code == 200 and status.json()["camera"] == camera
