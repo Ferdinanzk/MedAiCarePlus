@@ -6,6 +6,7 @@ LUNA_REFUSES_MAX and ASTRA_REFUSES_NONE on 2026-10-11. ASTRA_REFUSES_MAX is the 
 test. The OpenRouter entries are cut from its public model list, fetched 2026-10-11."""
 
 import copy
+import json
 
 import pytest
 
@@ -399,3 +400,71 @@ def test_openrouter_thinking_is_hidden_and_keeps_temperature_only_when_listed():
                                                         level="medium")   # a caller's None sends none
     profile["thinking"]["temperature"] = False
     assert "temperature" not in ai_profile.request_body(profile, "openai/gpt-6-luna", [], 1800, 0.7, level="medium")
+
+
+# ── Thinking levels: the request shapes Task 8's calls rely on (spec 2026-10-11 D3) ──
+
+THINKING_PART = {"param": "reasoning_effort", "levels": ["low", "medium", "high"],
+                 "ms": {"low": 1900, "medium": 2700, "high": 4100}, "always": False, "temperature": False}
+MINI_PROFILE = {"token_param": "max_completion_tokens", "temperature": True,
+                "reasoning_off": {"reasoning_effort": "none"}, "thinking": THINKING_PART}
+ROUTER_PROFILE = {"token_param": "max_tokens", "temperature": True, "reasoning_off": {"reasoning": {"enabled": False}},
+                  "thinking": {**THINKING_PART, "param": "openrouter_effort", "temperature": True}}
+HI_MESSAGES = [{"role": "user", "content": "hi"}]
+
+
+def _todays_body(profile, model_id, messages, max_tokens, temperature, extras=None):
+    """request_body as it was before thinking levels (commit 37ba84e): what level "off" must still send."""
+    body = {"model": model_id, "messages": messages, profile["token_param"]: max_tokens}
+    if profile["temperature"]:
+        body["temperature"] = temperature
+    body.update(copy.deepcopy(profile["reasoning_off"] or {}))
+    body.update(extras or {})
+    return body
+
+
+@pytest.mark.parametrize("old", [
+    ai_profile.starting_profile("openrouter"), ai_profile.starting_profile("openai"),
+    {"token_param": "max_completion_tokens", "temperature": False, "reasoning_off": {"reasoning_effort": "none"}},
+    {"token_param": "max_completion_tokens", "temperature": True, "reasoning_off": None},
+])
+@pytest.mark.parametrize("temperature", [0.7, 0])
+def test_off_sends_todays_request_byte_for_byte(old, temperature):
+    """Every job's default: not one byte changes, whether or not the profile has a thinking part."""
+    extras = {"provider": {"only": ["x"]}}
+    today = json.dumps(_todays_body(old, "m", HI_MESSAGES, 200, temperature, extras))
+    for profile in (old, {**old, "thinking": THINKING_PART}):
+        assert json.dumps(ai_profile.request_body(profile, "m", HI_MESSAGES, 200, temperature, extras)) == today
+        assert json.dumps(ai_profile.request_body(profile, "m", HI_MESSAGES, 200, temperature, extras,
+                                                  level="off")) == today
+
+
+@pytest.mark.parametrize("level", ai_profile.THINKING_LEVELS)
+def test_openai_thinking_sends_its_level_and_no_temperature(level):
+    body = ai_profile.request_body(MINI_PROFILE, "gpt-5.4-mini", HI_MESSAGES, 1000, 0.7, level=level)
+    assert body == {"model": "gpt-5.4-mini", "messages": HI_MESSAGES, "max_completion_tokens": 1000,
+                    "reasoning_effort": level}
+
+
+@pytest.mark.parametrize("level", ai_profile.THINKING_LEVELS)
+def test_openrouter_thinking_sends_a_hidden_effort_and_a_temperature_only_when_listed(level):
+    body = ai_profile.request_body(ROUTER_PROFILE, "deepseek/deepseek-r1", HI_MESSAGES, 1000, 0.7,
+                                   {"provider": {"only": ["x"]}}, level=level)
+    assert body == {"model": "deepseek/deepseek-r1", "messages": HI_MESSAGES, "max_tokens": 1000, "temperature": 0.7,
+                    "reasoning": {"effort": level, "exclude": True}, "provider": {"only": ["x"]}}
+    unlisted = {**ROUTER_PROFILE, "thinking": {**ROUTER_PROFILE["thinking"], "temperature": False}}
+    body = ai_profile.request_body(unlisted, "deepseek/deepseek-r1", HI_MESSAGES, 1000, 0.7, level=level)
+    assert body == {"model": "deepseek/deepseek-r1", "messages": HI_MESSAGES, "max_tokens": 1000,
+                    "reasoning": {"effort": level, "exclude": True}}
+
+
+@pytest.mark.parametrize("profile", [ai_profile.starting_profile("openai"), ai_profile.starting_profile("openrouter"),
+                                     {**MINI_PROFILE, "thinking": {**THINKING_PART, "param": None, "levels": []}}])
+def test_a_model_that_cannot_think_gets_the_off_request_at_any_level(profile):
+    assert (ai_profile.request_body(profile, "m", HI_MESSAGES, 200, 0.7, level="high")
+            == _todays_body(profile, "m", HI_MESSAGES, 200, 0.7))
+
+
+def test_no_temperature_is_sent_when_none_is_given():
+    body = ai_profile.request_body(ai_profile.starting_profile("openrouter"), "m", HI_MESSAGES, 1000, None)
+    assert body == {"model": "m", "messages": HI_MESSAGES, "max_tokens": 1000, "reasoning": {"enabled": False}}
