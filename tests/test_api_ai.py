@@ -40,7 +40,7 @@ class FakeStore:
     InUse = ai_store.InUse
 
     def __init__(self):
-        self.calls, self.next_id, self.saved_tests = [], 100, []
+        self.calls, self.next_id, self.saved_tests, self.saved_thinking = [], 100, [], []
 
     @asynccontextmanager
     async def change(self, conn):
@@ -89,9 +89,10 @@ class FakeStore:
         self.calls.append(("save_test", model_ref, result["ok"], result["profile"]))
         self.saved_tests.append(result)
 
-    async def set_jobs(self, conn, jobs):
+    async def set_jobs(self, conn, jobs, thinking=None):
         self.calls.append(("set_jobs", jobs))
-        self._put(jobs=dict(jobs))
+        self.saved_thinking.append(thinking)
+        self._put(jobs=dict(jobs), thinking=dict(thinking or {}))
 
 
 class Pool:
@@ -522,3 +523,22 @@ def test_a_failed_thinking_step_still_saves_the_base_profile(api, monkeypatch, c
     assert api.store.calls[-1] == ("save_test", 13, True, ai_profile.starting_profile("openrouter"))
     assert "thinking levels of AI model 13 not found: ConnectionError" in caplog.text
     assert "routerSECRET" not in caplog.text
+
+
+def test_each_job_takes_a_thinking_level(api):
+    jobs = {"reply": {"primary_ref": 11, "fallback_ref": 12, "thinking": "medium"}, "safety": {"primary_ref": 11},
+            "after_chat": {"primary_ref": 11, "thinking": "low"}}
+    response = api.client.put("/api/ai/jobs", json=jobs)
+    assert response.status_code == 200
+    assert api.store.saved_thinking[-1] == {"reply": "medium", "safety": "off", "after_chat": "low"}   # off by default
+    assert {job: entry["thinking"] for job, entry in response.json()["jobs"].items()} == {
+        "reply": "medium", "safety": "off", "after_chat": "low"}
+
+
+@pytest.mark.parametrize("thinking", ["max", "OFF", "", None, 2, "minimal"])
+def test_a_thinking_level_other_than_off_low_medium_high_is_refused(api, thinking):
+    jobs = {"reply": {"primary_ref": 11, "thinking": thinking}, "safety": {"primary_ref": 11},
+            "after_chat": {"primary_ref": 11}}
+    response = api.client.put("/api/ai/jobs", json=jobs)
+    assert (response.status_code, response.json()) == (422, {"detail": "invalid_request"})
+    assert api.store.calls == []
