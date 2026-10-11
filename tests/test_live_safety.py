@@ -367,3 +367,79 @@ def test_two_checks_finding_risks_alert_once_and_flag_both_turns(safe):
         _blocked(safe, flagged=[2, 3], quote="我想去死", source="keyword", dedupe=3)
 
     asyncio.run(scenario())
+
+
+# ── hardenings (Task 8b): OpenAI's cut-off, the screening hold and a block landing meanwhile ───────────────────────
+
+
+@pytest.mark.parametrize("result", ["maybe", None])
+def test_openais_cut_off_with_an_answer_that_is_not_an_explicit_none_blocks_the_chat(safe, result):
+    async def scenario():
+        safe.verdicts[UNHEARD] = [(None, result)]              # neither a risk nor "none"
+        relay, running = await _begin(safe)
+        await _live(safe, _said(UNHEARD), LiveEvent(type="error", code="content_filter"))
+        await _over(safe, running)
+        _blocked(safe, flagged=[2], quote=UNHEARD, source="content")
+
+    asyncio.run(scenario())
+
+
+def test_openais_cut_off_blocks_when_reading_the_turns_fails(safe, caplog):
+    async def scenario():
+        relay, running = await _begin(safe)
+
+        async def broken(query, *args):
+            raise ConnectionError("the database is gone")
+
+        safe.db.fetch = broken                                 # the stored turns cannot be read for the check
+        await _live(safe, _said("我跟老伴吵架了"), LiveEvent(type="error", code="content_filter"))
+        await _over(safe, running)
+        _blocked(safe, flagged=[], quote="", source="content", dedupe="content")
+        assert safe.checks == [] and safe.robot.json("fallback") == []
+
+    with caplog.at_level(logging.ERROR, logger="app.services.live_session"):
+        asyncio.run(scenario())
+    assert "the check after OpenAI's cut-off failed; blocking" in caplog.text
+
+
+@pytest.mark.parametrize("words, confirmed", [(["我想自殺"], True), (["好久沒看到孫子了，真是想死", "他了"], False)])
+def test_a_turn_stored_during_a_screening_hold_is_judged_only_when_the_hit_clears(safe, words, confirmed):
+    text = "".join(words)
+
+    async def scenario():
+        relay, running = await _begin(safe)
+        await _live(safe, *[_said(part) for part in words], _reachy("嗯"))   # Reachy's 「嗯」 stores the turn
+        assert safe.db.rows("patient") == [("patient", text)] and safe.checks == []   # during the hold: not judged
+        await _step(safe, relay, 0.45)                         # the words settled: the hit is confirmed or cleared
+        if confirmed:
+            await _over(safe, running)
+            _blocked(safe, flagged=[2], quote=text, source="keyword")
+            assert safe.checks == []                           # never judged by the model
+        else:
+            assert [check[0] for check in safe.checks] == [text]   # judged once the hit cleared
+            safe.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+            await _over(safe, running)
+            assert [check[0] for check in safe.checks] == [text]   # and only once
+            assert safe.alerts == [] and _flagged(safe) == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("words, flagged", [(["我想自殺"], [2, 3]), (["好久沒看到孫子了，", "真是想死", "他"], [2])])
+def test_a_model_block_landing_while_a_hit_settles_flags_its_turns_while_they_still_screen_as_a_risk(safe, words,
+                                                                                                    flagged):
+    async def scenario():
+        gate = safe.gates[QUIET_RISK] = asyncio.Event()
+        safe.verdicts[QUIET_RISK] = [("self_harm", "self_harm")]
+        relay, running = await _begin(safe)
+        await _live(safe, _said(QUIET_RISK))
+        await _step(safe, relay, 1.6)                          # the turn is stored; its check waits
+        await _live(safe, *[_said(part) for part in words], _reachy("嗯"))   # a hit holds; 「嗯」 stores its turn
+        assert safe.robot.json()[1:] == [FLUSH] and relay._hit_at is not None   # still settling
+        gate.set()                                             # the model's block lands meanwhile
+        await _over(safe, running)
+        # 我想自殺 still screens as a risk: its turn is flagged too. 想死他 is "I miss him so": it is not.
+        _blocked(safe, flagged=flagged, quote=QUIET_RISK, source="model")
+        assert safe.db.rows("patient")[1] == ("patient", "".join(words))
+
+    asyncio.run(scenario())
