@@ -417,3 +417,15 @@ test('when every dose today is closed the test alert says so', async ({ page }) 
   await expect(page.getByText(/Every dose today is already taken|今天的藥都已服用/)).toBeVisible();
   expect(api.taskPosts).toEqual([]);
 });
+
+test('the check-ins help names the AI connections card, not a company', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  const help = page.locator('label').filter({ has: checkinSwitch(page) });
+  await expect(help).toContainText('只有文字會傳送到「AI 連線」卡片上選定的 AI 服務');
+  await expect(help).not.toContainText('OpenRouter');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(help).toContainText('only the text is sent to the AI service chosen on the AI connections card');
+  await expect(help).not.toContainText('OpenRouter');
+});

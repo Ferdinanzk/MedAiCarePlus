@@ -11,6 +11,8 @@ import {
 /** Codes api_ai.py answers with; anything else shows the general message. */
 const KNOWN_ERRORS = ['in_use', 'untested_model', 'not_found', 'invalid_base_url', 'invalid_name', 'invalid_kind',
   'key_unreadable', 'no_key', 'already_exists', 'notice_incomplete', 'remote_models_unavailable', 'invalid_request'];
+/** Codes a model's Test result or last call can carry instead of the service's own words (ai_profile.py). */
+const MODEL_ERRORS = ['not_chat_model'];
 const field = 'w-full px-3 py-2 border border-gray-200 rounded-xl text-sm';
 const primary = 'px-3 py-2 rounded-xl text-sm font-medium bg-[#0057B8] text-white disabled:opacity-50';
 const secondary = 'px-3 py-2 rounded-xl text-sm font-medium border border-gray-200 text-gray-700 disabled:opacity-50';
@@ -128,10 +130,14 @@ export default function AiConnectionsCard() {
     <p role="alert" ref={reveal} className="rounded-xl bg-red-50 p-3 text-sm text-red-700">{t(`aiConnections.errors.${error.code}`)}</p>
   );
 
+  /** A known code in the card's own words; anything else is the service's message, shown as it came. */
+  const modelError = (error: string | null) =>
+    (error && MODEL_ERRORS.includes(error) ? t(`aiConnections.modelErrors.${error}`) : error);
+
   const status = (model: AiModel) => {
     const result = results[model.model_ref];
-    if (result && !result.ok) return <span className="text-red-700"><XCircle className="inline w-4 h-4" /> {result.error}</span>;
-    if (model.last_error) return <span className="text-red-700">{t('aiConnections.lastCallFailed', { error: model.last_error })}</span>;
+    if (result && !result.ok) return <span className="text-red-700"><XCircle className="inline w-4 h-4" /> {modelError(result.error)}</span>;
+    if (model.last_error) return <span className="text-red-700">{t('aiConnections.lastCallFailed', { error: modelError(model.last_error) })}</span>;
     if (model.test_ms != null) {
       return (
         <span className="text-green-700"><CheckCircle2 className="inline w-4 h-4" /> {t('aiConnections.testOk', { seconds: (model.test_ms / 1000).toFixed(1) })}
@@ -337,27 +343,36 @@ export default function AiConnectionsCard() {
         <h3 className="text-sm font-semibold text-gray-900">{t('aiConnections.jobs')}</h3>
         <p className="text-xs text-gray-500">{t('aiConnections.onlyTested')}</p>
         {AI_JOBS.map(job => (
-          <div key={job} className="grid gap-2 sm:grid-cols-3 sm:items-end">
-            <span className="text-sm text-gray-900 sm:pb-2">{t(`aiConnections.jobNames.${job}`)}</span>
-            <label className="block text-xs text-gray-600">{t('aiConnections.main')}
-              <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.main')}`} value={jobs[job].primary_ref}
-                onChange={event => {
-                  setJobsSaved(false);
-                  setJobs({ ...jobs, [job]: { ...jobs[job], primary_ref: Number(event.target.value) } });
-                }}>
-                {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
-              </select>
-            </label>
-            <label className="block text-xs text-gray-600">{t('aiConnections.backup')}
-              <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.backup')}`} value={jobs[job].fallback_ref ?? ''}
-                onChange={event => {
-                  setJobsSaved(false);
-                  setJobs({ ...jobs, [job]: { ...jobs[job], fallback_ref: event.target.value ? Number(event.target.value) : null } });
-                }}>
-                <option value="">{t('aiConnections.noBackup')}</option>
-                {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
-              </select>
-            </label>
+          <div key={job} role="group" aria-label={t(`aiConnections.jobNames.${job}`)} className="space-y-2">
+            <div className="grid gap-2 sm:grid-cols-3 sm:items-end">
+              <span className="text-sm text-gray-900 sm:pb-2">{t(`aiConnections.jobNames.${job}`)}</span>
+              <label className="block text-xs text-gray-600">{t('aiConnections.main')}
+                <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.main')}`} value={jobs[job].primary_ref}
+                  onChange={event => {
+                    setJobsSaved(false);
+                    setJobs({ ...jobs, [job]: { ...jobs[job], primary_ref: Number(event.target.value) } });
+                  }}>
+                  {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
+                </select>
+              </label>
+              <label className="block text-xs text-gray-600">{t('aiConnections.backup')}
+                <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.backup')}`} value={jobs[job].fallback_ref ?? ''}
+                  onChange={event => {
+                    setJobsSaved(false);
+                    setJobs({ ...jobs, [job]: { ...jobs[job], fallback_ref: event.target.value ? Number(event.target.value) : null } });
+                  }}>
+                  <option value="">{t('aiConnections.noBackup')}</option>
+                  {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
+                </select>
+              </label>
+            </div>
+            {/* The saved setup, as the server judged it; `?.`: change answers are not shape-checked like the first load. */}
+            {settings.jobs_usable?.[job] === false && (
+              <p role="alert" className={warning}>
+                <TriangleAlert className="inline w-4 h-4" /> {t('aiConnections.jobUnusable')}
+                {job !== 'reply' && <span className="block mt-1">{t(`aiConnections.jobUnusableEffect.${job}`)}</span>}
+              </p>
+            )}
           </div>
         ))}
         <div className="flex flex-wrap items-center gap-3">

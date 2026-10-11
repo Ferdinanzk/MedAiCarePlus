@@ -14,8 +14,27 @@ function startingSettings() {
     models: [copied(11, 'google/gemini-2.5-flash-lite'), copied(12, 'google/gemini-2.5-flash')],
     jobs: { reply: { primary_ref: 11, fallback_ref: 12 }, safety: { primary_ref: 11, fallback_ref: 12 },
       after_chat: { primary_ref: 11, fallback_ref: 12 } },
+    jobs_usable: { reply: true, safety: true, after_chat: true },
     seeded_at: '2026-10-10T12:00:00+00:00', weak_secret: true, no_key_in_use: false,
   };
+}
+
+/** Flaw F12 (11 Oct 2026): the replies run on an OpenAI model with a key, but the safety check and the after-chat
+ *  work run on an OpenRouter connection whose key was never filled in. A key is in use, so no_key_in_use is false. */
+function keylessOpenRouterSettings() {
+  const settings: any = startingSettings();
+  settings.connections = [
+    { ...settings.connections[0], key_last4: null, has_key: false },
+    { connection_id: 2, name: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', key_last4: '9876',
+      key_readable: true, has_key: true, service_name: 'OpenAI' },
+  ];
+  settings.models.push({ model_ref: 21, connection_id: 2, model_id: 'gpt-5.4-mini', company: 'OpenAI', region: 'USA',
+    retention: '30 days', profile: { token_param: 'max_completion_tokens', temperature: true, reasoning_off: { reasoning_effort: 'none' } },
+    tested: true, copied_from_env: false, tested_at: '2026-10-10T13:00:00+00:00', test_ms: 812, last_error: null });
+  settings.jobs.reply = { primary_ref: 21, fallback_ref: null };
+  settings.jobs_usable = { reply: true, safety: false, after_chat: false };
+  settings.weak_secret = false;
+  return settings;
 }
 
 async function seedSession(page: Page) {
@@ -26,7 +45,7 @@ async function seedSession(page: Page) {
   });
 }
 
-async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown; jobsRefused?: boolean } = {}) {
+async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown; jobsRefused?: boolean; testError?: string } = {}) {
   const mock = { settings: startingSettings(), requests: [] as { method: string; path: string; body: any }[] };
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -57,6 +76,10 @@ async function mockApi(page: Page, options: { aiDown?: boolean; aiBody?: unknown
     }
     if (path === '/api/ai/models/21/test') {
       const model: any = mock.settings.models.find(m => m.model_ref === 21);
+      if (options.testError) {
+        model.last_error = options.testError;   // as ai_store.save_test: the reason is saved, the model stays untested
+        return route.fulfill({ json: { ok: false, ms: 412, sample: null, profile: null, error: options.testError, settings: mock.settings } });
+      }
       Object.assign(model, { profile: { token_param: 'max_completion_tokens', temperature: true, reasoning_off: { reasoning_effort: 'none' } },
         tested: true, tested_at: '2026-10-10T13:00:00+00:00', test_ms: 812 });
       return route.fulfill({ json: { ok: true, ms: 812, sample: '您好！很高興見到您。', profile: model.profile, error: null, settings: mock.settings } });
@@ -195,4 +218,71 @@ test('a job choice not yet saved survives adding another model', async ({ page }
   await card(page).getByRole('button', { name: 'Add', exact: true }).click();
   await expect(card(page).getByRole('group', { name: 'OpenAI · gpt-5.4-mini' })).toBeVisible();
   await expect(main).toHaveValue('12');
+});
+
+// ── Spec 2026-10-11 C1 and C3: a warning under each job that can't run, and the voice-only Test message ──
+
+const job = (page: Page, name: string) => card(page).getByRole('group', { name, exact: true });
+
+test('each job without a usable model says so and what stops with it, in both languages', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { aiBody: keylessOpenRouterSettings() });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  await expect(job(page, '安全檢查')).toContainText('沒有可用的模型：這項工作無法執行。');
+  await expect(job(page, '安全檢查')).toContainText('Reachy 的模型安全檢查已停止。');
+  await expect(job(page, '聊天後的摘要與記憶')).toContainText('沒有可用的模型：這項工作無法執行。');
+  await expect(job(page, '聊天後的摘要與記憶')).toContainText('摘要與摘要安全檢查已停止。');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  const safety = job(page, 'Safety check');
+  await expect(safety.getByRole('alert')).toContainText("No usable model: this job can't run.");
+  await expect(safety.getByRole('alert')).toContainText("Reachy's model safety check is off.");
+  const afterChat = job(page, 'After-chat summary and memory');
+  await expect(afterChat.getByRole('alert')).toContainText("No usable model: this job can't run.");
+  await expect(afterChat.getByRole('alert')).toContainText('Summaries and the summary safety check are off.');
+  await expect(afterChat).not.toContainText("Reachy's model safety check is off.");
+  // the replies have a model with a key: no warning there, and the card-wide "no key" warning stays silent
+  await expect(job(page, "Reachy's replies").getByRole('alert')).toHaveCount(0);
+  await expect(card(page).getByText('No model in use has an API key')).toHaveCount(0);
+});
+
+for (const [what, jobsUsable] of [['missing', undefined], ['incomplete', { reply: true, safety: 'no' }]] as const) {
+  test(`an AI settings answer with jobs_usable ${what} is a load failure, not a crash`, async ({ page }) => {
+    await seedSession(page);
+    await mockApi(page, { aiBody: { ...startingSettings(), jobs_usable: jobsUsable } });
+    await openSettings(page);
+    await expect(card(page)).toContainText('Could not load the AI settings.');
+    await expect(page.locator('section[aria-labelledby="reachy-title"]')).toBeVisible();
+  });
+}
+
+test("Test on a voice-only model shows the card's own words, not the code", async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { testError: 'not_chat_model' });
+  await openSettings(page);
+  await addOpenAi(page);
+  await card(page).getByRole('button', { name: 'Add model' }).click();
+  await card(page).getByLabel('Connection', { exact: true }).selectOption({ label: 'OpenAI' });
+  await card(page).getByLabel('Model name').fill('gpt-live-1');
+  await card(page).getByRole('button', { name: 'Add', exact: true }).click();
+  const row = card(page).getByRole('group', { name: 'OpenAI · gpt-live-1' });
+  await row.getByRole('button', { name: 'Test' }).click();
+  await expect(row).toContainText("Voice-only model (like GPT-Live or a TTS model): it can't write Reachy's text replies.");
+  await expect(row).not.toContainText('not_chat_model');
+  // still untested, so no job can be given to it
+  await expect(card(page).getByLabel("Reachy's replies: Main model").locator('option', { hasText: 'gpt-live-1' })).toHaveCount(0);
+});
+
+test('a saved voice-only failure shows the same words as the last call, in both languages', async ({ page }) => {
+  await seedSession(page);
+  const settings: any = startingSettings();
+  settings.models.push({ model_ref: 22, connection_id: 1, model_id: 'openai/gpt-live-1', company: 'OpenAI', region: 'USA',
+    retention: '30 days', profile: null, tested: false, copied_from_env: false, tested_at: null, test_ms: null,
+    last_error: 'not_chat_model' });
+  await mockApi(page, { aiBody: settings });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  const row = card(page).getByRole('group', { name: 'OpenRouter · openai/gpt-live-1', exact: true });
+  await expect(row).toContainText('上次呼叫失敗：語音專用模型（例如 GPT-Live 或 TTS）：無法撰寫 Reachy 的文字回覆。');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(row).toContainText("Last call failed: Voice-only model (like GPT-Live or a TTS model): it can't write Reachy's text replies.");
+  await expect(row).not.toContainText('not_chat_model');
 });

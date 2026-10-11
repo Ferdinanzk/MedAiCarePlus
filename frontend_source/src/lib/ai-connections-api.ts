@@ -16,6 +16,8 @@ export interface AiModel {
 export interface AiJobChoice { primary_ref: number; fallback_ref: number | null }
 export interface AiSettings {
   connections: AiConnection[]; models: AiModel[]; jobs: Record<AiJob, AiJobChoice>;
+  /** Per job: true when its main or backup model is tested and its connection has a readable key (as saved). */
+  jobs_usable: Record<string, boolean>;
   seeded_at: string | null; weak_secret: boolean; no_key_in_use: boolean;
 }
 export interface AiTestResult { ok: boolean; ms: number | null; sample: string | null; profile: AiProfile | null; error: string | null }
@@ -32,13 +34,16 @@ const isNumber = (value: unknown) => typeof value === 'number' && Number.isFinit
 
 /** True only when every part the card reads has the shape it expects. */
 function isAiSettings(value: unknown): value is AiSettings {
-  if (!isObject(value) || !Array.isArray(value.connections) || !Array.isArray(value.models) || !isObject(value.jobs)) return false;
+  if (!isObject(value) || !Array.isArray(value.connections) || !Array.isArray(value.models) || !isObject(value.jobs)
+    || !isObject(value.jobs_usable)) return false;
   const jobs = value.jobs;
+  const usable = value.jobs_usable;
   return value.connections.every(c => isObject(c) && isNumber(c.connection_id) && typeof c.name === 'string' && typeof c.kind === 'string')
     && value.models.every(m => isObject(m) && isNumber(m.model_ref) && isNumber(m.connection_id) && typeof m.model_id === 'string')
     && AI_JOBS.every(job => {
       const choice = jobs[job];
-      return isObject(choice) && isNumber(choice.primary_ref) && (choice.fallback_ref === null || isNumber(choice.fallback_ref));
+      return isObject(choice) && isNumber(choice.primary_ref) && (choice.fallback_ref === null || isNumber(choice.fallback_ref))
+        && typeof usable[job] === 'boolean';
     });
 }
 
