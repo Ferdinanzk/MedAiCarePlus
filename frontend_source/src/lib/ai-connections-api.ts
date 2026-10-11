@@ -1,3 +1,4 @@
+import { isThinkingChoice } from './ai-thinking';
 import { ApiError, call } from './reachy-api';
 
 export type AiKind = 'openrouter' | 'openai' | 'openai_compatible';
@@ -40,6 +41,12 @@ const send = (method: string, body?: unknown): RequestInit =>
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 const isNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value);
+/** No `thinking` (a profile saved before thinking levels) is fine; a present one needs every part the card reads. */
+const isThinking = (value: unknown) => value === undefined || value === null || (isObject(value)
+  && (value.param === null || typeof value.param === 'string') && Array.isArray(value.levels)
+  && value.levels.every(level => typeof level === 'string') && isObject(value.ms) && Object.values(value.ms).every(isNumber)
+  && typeof value.always === 'boolean');
+const hasThinking = (choice: unknown) => isObject(choice) && isThinkingChoice(choice.thinking);
 
 /** True only when every part the card reads has the shape it expects. */
 function isAiSettings(value: unknown): value is AiSettings {
@@ -48,7 +55,9 @@ function isAiSettings(value: unknown): value is AiSettings {
   const jobs = value.jobs;
   const usable = value.jobs_usable;
   return value.connections.every(c => isObject(c) && isNumber(c.connection_id) && typeof c.name === 'string' && typeof c.kind === 'string')
-    && value.models.every(m => isObject(m) && isNumber(m.model_ref) && isNumber(m.connection_id) && typeof m.model_id === 'string')
+    && value.models.every(m => isObject(m) && isNumber(m.model_ref) && isNumber(m.connection_id) && typeof m.model_id === 'string'
+      && (m.profile === null || (isObject(m.profile) && isThinking(m.profile.thinking))))
+    && AI_JOBS.every(job => hasThinking(jobs[job]))
     && AI_JOBS.every(job => {
       const choice = jobs[job];
       return isObject(choice) && isNumber(choice.primary_ref) && (choice.fallback_ref === null || isNumber(choice.fallback_ref))
