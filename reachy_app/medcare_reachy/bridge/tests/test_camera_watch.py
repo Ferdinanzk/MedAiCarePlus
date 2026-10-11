@@ -5,7 +5,7 @@ without a log line: the TCU companion had released the daemon's camera.
 """
 
 from medcare_reachy.bridge.camera_watch import (
-    CAMERA_GIVE_UP_SECONDS, CAMERA_RECOVER_INTERVAL, CAMERA_STALL_SECONDS, CameraWatchdog)
+    CAMERA_GIVE_UP_SECONDS, CAMERA_HEALTHY_SECONDS, CAMERA_RECOVER_INTERVAL, CAMERA_STALL_SECONDS, CameraWatchdog)
 from medcare_reachy.bridge.tests.fakes import FakeClock
 
 LOGGER = "medcare_reachy.bridge.camera_watch"
@@ -32,7 +32,7 @@ class Recovery:
         return result
 
 
-def make_watchdog(*results, media=RELEASED, during=None):
+def make_watchdog(*results, media=RELEASED, during=None, **limits):
     clock = FakeClock()
     recovery = Recovery(clock, *results, during=during)
 
@@ -41,7 +41,7 @@ def make_watchdog(*results, media=RELEASED, during=None):
             raise media
         return media
 
-    watchdog = CameraWatchdog(recovery, media_status, clock=clock.monotonic, wall=lambda: WALL + clock.t)
+    watchdog = CameraWatchdog(recovery, media_status, clock=clock.monotonic, wall=lambda: WALL + clock.t, **limits)
     return watchdog, clock, recovery
 
 
@@ -54,12 +54,29 @@ def reads(watchdog, clock, seconds):
     return states
 
 
+def frames(watchdog, clock, seconds):
+    """New frames, one every STEP s, for `seconds`."""
+    for _ in range(round(seconds / STEP)):
+        clock.t += STEP
+        watchdog.frame()
+
+
+def when_unavailable(watchdog, clock, seconds):
+    """Reads that find no new frame, one every STEP s: the clock time of the first "unavailable", else None."""
+    for _ in range(round(seconds / STEP)):
+        clock.t += STEP
+        if watchdog.tick() == "unavailable":
+            return clock.t
+    return None
+
+
 def lines(caplog, level):
     return [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelname == level]
 
 
 def test_the_limits_are_the_spec_s():
     assert (CAMERA_STALL_SECONDS, CAMERA_RECOVER_INTERVAL, CAMERA_GIVE_UP_SECONDS) == (2.0, 5.0, 15.0)
+    assert CAMERA_HEALTHY_SECONDS == 5.0      # steady frames this long end a stall (review finding F1)
 
 
 def test_idle_without_a_session_never_tries_a_recovery():
@@ -151,18 +168,104 @@ def test_a_recovery_or_a_status_read_that_raises_is_logged_and_counted_and_never
     assert watchdog.snapshot()["media"] is None
 
 
-def test_a_new_frame_after_a_stall_logs_its_length_and_starts_afresh(caplog):
+def test_a_new_frame_after_a_stall_shows_ok_but_the_stall_ends_only_after_5_s_of_steady_frames(caplog):
     watchdog, clock, recovery = make_watchdog()
     watchdog.attach()
     with caplog.at_level("INFO", logger=LOGGER):
         reads(watchdog, clock, 3.5)
-        watchdog.frame()
+        watchdog.frame()                                          # 1003.5: the feed is back
         assert watchdog.state == "ok" and watchdog.snapshot()["media"] is None
-        assert "camera recovered: a new frame 3.5 s after the last one (1 recovery attempt(s), 0 failed)" in \
-            lines(caplog, "INFO")
+        frames(watchdog, clock, 4.75)                             # steady for 4.75 s: not yet 5 s
+        assert not [line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]
+        frames(watchdog, clock, STEP)                             # steady for 5.0 s: the stall is over
+        [recovered] = [line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]
+        assert recovered == ("camera recovered: new frames for 5.0 s without a gap; the stall began 6.5 s ago "
+                             "(1 recovery attempt(s), 0 failed)")
         reads(watchdog, clock, 2)                                 # a second stall: logged and recovered at once
     assert len([line for line in lines(caplog, "ERROR") if line.startswith("camera stalled")]) == 2
-    assert recovery.calls == [1002.0, 1005.5]
+    assert recovery.calls == [1002.0, 1010.5]
+
+
+def test_a_flapping_feed_is_recovered_at_most_every_5_s_and_still_ends_unavailable(caplog):
+    """One frame after each recovery, then nothing (what the camera did on 11 Oct): the frame must not buy another
+    recovery 2 s later, nor stretch the 15 s that count from the first stall."""
+    watchdog, clock, recovery = make_watchdog()
+    watchdog.attach()
+    answered, given_up = 0, None
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(round(60 / STEP)):
+            clock.t += STEP
+            if len(recovery.calls) > answered:                    # the recovery got one frame, then nothing again
+                answered = len(recovery.calls)
+                watchdog.frame()
+            else:
+                watchdog.tick()
+            if given_up is None and watchdog.state == "unavailable":
+                given_up = clock.t
+    assert recovery.calls == [1002.0, 1007.0, 1012.0]
+    assert all(later - earlier >= CAMERA_RECOVER_INTERVAL for earlier, later in zip(recovery.calls, recovery.calls[1:]))
+    assert given_up == 1017.0                                     # 15 s after the first stall, at 1002.0
+    assert watchdog.state == "unavailable"
+    errors = lines(caplog, "ERROR")
+    assert len([line for line in errors if line.startswith("camera stalled")]) == 1     # one episode
+    assert len([line for line in errors if line.startswith("camera unavailable")]) == 1
+    assert "3 recovery attempt(s), 0 failed" in [line for line in errors if line.startswith("camera unavailable")][0]
+    assert len([line for line in lines(caplog, "WARNING") if line.startswith("camera stalled again")]) == 3
+
+
+def test_a_feed_that_stays_healthy_for_5_s_ends_the_stall_and_the_next_one_gets_a_full_15_s(caplog):
+    watchdog, clock, recovery = make_watchdog()
+    watchdog.attach()
+    reads(watchdog, clock, 12)                                    # a stall since 1002.0, three recoveries tried
+    assert recovery.calls == [1002.0, 1007.0, 1012.0]
+    frames(watchdog, clock, 5.5)                                  # healthy from 1012.25: over at 1017.25
+    last_frame = clock.t
+    with caplog.at_level("INFO", logger=LOGGER):
+        assert when_unavailable(watchdog, clock, 20) == last_frame + 2.0 + 15.0   # a new stall: 15 s again
+    assert recovery.calls[3:] == [last_frame + 2.0, last_frame + 7.0, last_frame + 12.0]   # at once, then every 5 s
+    [unavailable] = [line for line in lines(caplog, "ERROR") if line.startswith("camera unavailable")]
+    assert "3 recovery attempt(s), 0 failed" in unavailable      # counted afresh, not 6
+
+
+def test_a_gap_the_reads_missed_still_breaks_the_healthy_stretch(caplog):
+    watchdog, clock, recovery = make_watchdog()
+    watchdog.attach()
+    with caplog.at_level("INFO", logger=LOGGER):
+        reads(watchdog, clock, 3.5)
+        watchdog.frame()                                          # 1003.5: a healthy stretch begins
+        clock.t += 3.0
+        watchdog.frame()                                          # 1006.5: 3 s without a frame, no read in between
+        frames(watchdog, clock, 4.75)                             # 4.75 s since the gap, 7.75 s since 1003.5
+        assert not [line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]
+        frames(watchdog, clock, STEP)
+        assert len([line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]) == 1
+
+
+def test_healthy_seconds_sets_how_long_the_frames_must_be_steady(caplog):
+    watchdog, clock, recovery = make_watchdog(healthy_seconds=2.0)
+    watchdog.attach()
+    with caplog.at_level("INFO", logger=LOGGER):
+        reads(watchdog, clock, 3.5)
+        watchdog.frame()
+        frames(watchdog, clock, 1.75)
+        assert not [line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]
+        frames(watchdog, clock, STEP)
+        assert len([line for line in lines(caplog, "INFO") if line.startswith("camera recovered")]) == 1
+
+
+def test_steady_5_fps_frames_never_stall(caplog):
+    watchdog, clock, recovery = make_watchdog()
+    watchdog.attach()
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(300):        # 60 s at 5 fps, with a read that finds nothing between two frames
+            clock.t += 0.1
+            assert watchdog.tick() == "ok"
+            clock.t += 0.1
+            watchdog.frame()
+    snapshot = watchdog.snapshot()
+    assert snapshot["state"] == "ok" and 4.9 <= snapshot["fps"] <= 5.1
+    assert snapshot["since"] == WALL + 1000.0 and recovery.calls == []
+    assert not [r for r in caplog.records if r.name == LOGGER]
 
 
 def test_the_state_gives_up_on_time_even_while_a_recovery_blocks():

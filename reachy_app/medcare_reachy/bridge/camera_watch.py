@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 CAMERA_STALL_SECONDS = 2.0       # no new frame this long while a session streams: the camera has stalled
 CAMERA_RECOVER_INTERVAL = 5.0    # at most one recovery attempt per this long
 CAMERA_GIVE_UP_SECONDS = 15.0    # no new frame this long after the stall began: the camera is unavailable
+CAMERA_HEALTHY_SECONDS = 5.0     # frames must come without a gap this long before a stall is over
 FPS_WINDOW = 10.0                # the heartbeat's camera fps, over the same window as the stream's other rates
 
 IDLE, OK, STALLED, RECOVERING, UNAVAILABLE = "idle", "ok", "stalled", "recovering", "unavailable"
@@ -34,8 +35,16 @@ class CameraWatchdog:
     - ok: new frames keep coming (a slow camera is ok: only a gap of stall_seconds counts);
     - stalled: no new frame for stall_seconds, or the last recovery attempt failed;
     - recovering: a recovery attempt is running, or succeeded and the first new frame is awaited;
-    - unavailable: no new frame for give_up_seconds since the stall began. It outlasts the session (detach() keeps
-      it, so the heartbeat still reports it while the robot sleeps) until the next session starts a fresh try.
+    - unavailable: the camera has not stayed healthy for give_up_seconds since the stall began. It outlasts the
+      session (detach() keeps it, so the heartbeat still reports it while the robot sleeps) until the next session
+      starts a fresh try.
+
+    A stall is an episode, not a moment: it ends only when frames have come without a gap of stall_seconds for
+    healthy_seconds. Until then a new frame shows "ok" but changes nothing else, a new stall continues the same
+    episode, and give_up_seconds count from the episode's first stall. On 11 Oct the camera gave one stale frame
+    after each recovery and then nothing: with every frame ending the stall, the recoveries came every ~2 s and the
+    state never left ok/recovering. The recovery limit (once per recover_interval) holds for the whole session; only
+    attach() lifts it.
 
     The stream calls attach()/detach() with its session, frame() for every new frame and tick() for every read that
     found none. Only tick() calls `recover` and `media_status`, outside the lock, so the heartbeat's snapshot() and the
@@ -45,16 +54,16 @@ class CameraWatchdog:
     def __init__(self, recover: Callable[[], str], media_status: Callable[[], dict | None],
                  clock: Callable[[], float] = time.monotonic, stall_seconds: float = CAMERA_STALL_SECONDS,
                  recover_interval: float = CAMERA_RECOVER_INTERVAL, give_up_seconds: float = CAMERA_GIVE_UP_SECONDS,
-                 *, wall: Callable[[], float] = time.time):
+                 *, wall: Callable[[], float] = time.time, healthy_seconds: float = CAMERA_HEALTHY_SECONDS):
         self._recover, self._media_status = recover, media_status
         self.clock, self.wall = clock, wall
         self.stall_seconds, self.recover_interval = stall_seconds, recover_interval
-        self.give_up_seconds = give_up_seconds
+        self.give_up_seconds, self.healthy_seconds = give_up_seconds, healthy_seconds
         self._lock = threading.Lock()
         self._frames: deque = deque()   # when each new frame came, for the fps
         self._state = IDLE
         self._since = wall()            # unix seconds of the last state change
-        self._media: dict | None = None   # the daemon's media status, as read during the current stall
+        self._media: dict | None = None   # the daemon's media status, as read during the current stall episode
         self._generation = 0            # bumped by attach() and detach(): a late recovery result is ignored
         self._reset(clock())
 
@@ -84,17 +93,20 @@ class CameraWatchdog:
                 self._set(IDLE)
 
     def frame(self) -> None:
-        """A new frame came: any stall is over."""
+        """A new frame came. It shows "ok", but an open stall episode ends only after healthy_seconds of frames
+        without a gap (a gap of stall_seconds starts the count again)."""
         with self._lock:
             now = self.clock()
             self._frames.append(now)
             self._prune(now)
-            if self._state in NOT_WORKING:
-                log.info("camera recovered: a new frame %.1f s after the last one (%d recovery attempt(s), %d failed)",
-                         now - self._last_frame, self._attempts, self._failures)
-                self._media = None
-                self._set(OK)
-            self._reset(now)
+            if self._stall_since is not None:
+                if self._healthy_since is None or now - self._last_frame >= self.stall_seconds:
+                    self._healthy_since = now   # the healthy stretch starts with this frame
+                elif now - self._healthy_since >= self.healthy_seconds:
+                    self._end_episode(now)
+                if self._state in NOT_WORKING:
+                    self._set(OK)
+            self._last_frame = now
 
     def tick(self) -> str:
         """A read found no new frame. Notices a stall (one ERROR line, with the daemon's media status), tries a
@@ -108,13 +120,14 @@ class CameraWatchdog:
 
     def snapshot(self) -> dict:
         """For the heartbeat: the state, new frames per second over the last FPS_WINDOW s, the unix time of the last
-        state change, and the daemon's media status read during the current stall (None otherwise)."""
+        state change, and the daemon's media status read during the current stall episode (None while the state is
+        ok)."""
         with self._lock:
             now = self.clock()
             self._give_up_if_due(now)
             self._prune(now)
             return {"state": self._state, "fps": round(len(self._frames) / FPS_WINDOW, 1), "since": self._since,
-                    "media": None if self._media is None else dict(self._media)}
+                    "media": None if self._media is None or self._state == OK else dict(self._media)}
 
     # ── inside ───────────────────────────────────────────────────────────
     def _tick(self) -> str:
@@ -123,12 +136,23 @@ class CameraWatchdog:
             self._give_up_if_due(now)
             if self._state in (IDLE, UNAVAILABLE):
                 return self._state
-            new_stall = self._state == OK and now - self._last_frame >= self.stall_seconds
-            if self._state == OK and not new_stall:
+            stalled = self._state == OK and now - self._last_frame >= self.stall_seconds
+            if self._state == OK and not stalled:
                 return OK
-            if new_stall:
-                self._stall_since = now
+            new_stall = False
+            if stalled:
+                self._healthy_since = None
+                new_stall = self._stall_since is None   # else it continues the open episode
+                if new_stall:
+                    self._stall_since = now
+                else:
+                    log.warning("camera stalled again: no new frame for %.1f s, %.1f s after the stall began "
+                                "(%d recovery attempt(s), %d failed)", now - self._last_frame, now - self._stall_since,
+                                self._attempts, self._failures)
                 self._set(STALLED)
+                self._give_up_if_due(now)
+                if self._state == UNAVAILABLE:
+                    return UNAVAILABLE
             if now - self._last_attempt < self.recover_interval:
                 return self._state
             self._last_attempt = now
@@ -174,17 +198,30 @@ class CameraWatchdog:
     def _give_up_if_due(self, now: float) -> None:
         """With the lock held."""
         if self._state in (STALLED, RECOVERING) and now - self._stall_since >= self.give_up_seconds:
-            log.error("camera unavailable: no new frame for %.1f s since the stall began (%d recovery attempt(s), "
+            log.error("camera unavailable: no steady frames for %.1f s since the stall began (%d recovery attempt(s), "
                       "%d failed); a search ends with camera_unavailable",
                       now - self._stall_since, self._attempts, self._failures)
             self._set(UNAVAILABLE)
 
     def _reset(self, now: float) -> None:
+        """A fresh session (and the constructor): everything, the recovery limit included."""
         self._last_frame = now
+        self._last_attempt = float("-inf")   # only a new session lifts the limit of one recovery per interval
+        self._clear_episode()
+
+    def _end_episode(self, now: float) -> None:
+        """With the lock held: the feed has been healthy for healthy_seconds. The recovery limit stays."""
+        log.info("camera recovered: new frames for %.1f s without a gap; the stall began %.1f s ago "
+                 "(%d recovery attempt(s), %d failed)", now - self._healthy_since, now - self._stall_since,
+                 self._attempts, self._failures)
+        self._clear_episode()
+
+    def _clear_episode(self) -> None:
         self._stall_since = None
-        self._last_attempt = float("-inf")
+        self._healthy_since = None   # when the frames of the current healthy stretch began
         self._attempts = 0
         self._failures = 0
+        self._media = None
 
     def _set(self, state: str) -> None:
         if state != self._state:
