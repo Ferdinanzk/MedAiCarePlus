@@ -1,5 +1,6 @@
 """Device API routes on the private port, the browser/robot 409, and manual 'Use Reachy' tasks."""
 
+import json
 import os
 import sys
 import types
@@ -62,6 +63,7 @@ class FakeConn:
         self.facts_asked = []
         self.device_row = {"device_id": uuid.UUID(DEVICE_ID)}
         self.source = self.doses   # monitor starts read `doses`, manual tasks `intakes`
+        self.status_detail = None  # what the heartbeat stored (asyncpg hands JSONB back as text)
 
     def transaction(self):
         return _Transaction(self)
@@ -91,6 +93,13 @@ class FakeConn:
             return {"intk_id": args[0],
                     **self.doses.get(args[0], {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"),
                                                "intake_time_stamp": SLOT})}
+        if "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL" in query:
+            assert "status_detail" in query   # api_reachy._status reads the robot's camera from it
+            return {"device_id": uuid.UUID(DEVICE_ID), "label": "Reachy Mini", "auto_record": False,
+                    "last_seen_at": datetime.now(timezone.utc), "robot_reachable": True, "landmark_fps": 9.9,
+                    "status_detail": self.status_detail}
+        if "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1" in query:
+            return None
         raise AssertionError(query)
 
     def _stamp(self, intk_id):
@@ -129,10 +138,14 @@ class FakeConn:
             return "Pearl"
         if "FROM notification_outbox" in query and "kind = 'double_dose_alert'" in query:
             return None      # no alert for this dose within the hour
+        if "FROM family_contacts" in query:
+            return 1         # contacts that can receive family alerts (the Reachy card's status)
         raise AssertionError(query)
 
     async def execute(self, query, *args):
         self.executed.append((query, args, self.depth))
+        if "status_detail = $4::jsonb" in query:
+            self.status_detail = args[3]
 
 
 class FakePool:
@@ -331,6 +344,54 @@ def test_heartbeat_reports_microphone_consent(env, monkeypatch):
     monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
     monkeypatch.setattr(consent_service, "get_state", get_state)
     assert env.robot.post("/api/device/heartbeat", json={}).json()["microphone"] is True
+
+
+# ── The robot's camera (robot app 0.6.0): stored with the heartbeat, shown on the Reachy card ──
+
+CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
+
+
+def _no_leases(monkeypatch):
+    async def extend_leases(conn, device_id):
+        return None
+
+    monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
+
+
+def _stored_detail(env) -> dict:
+    update = next(entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0])
+    return json.loads(update[1][3])
+
+
+@pytest.mark.parametrize("state", ["idle", "ok", "stalled", "recovering", "unavailable"])
+def test_heartbeat_stores_the_camera_report_and_status_returns_it(env, monkeypatch, state):
+    _no_leases(monkeypatch)
+    camera = {"state": state, "fps": 9.8 if state == "ok" else 0.0, "since": 1791700000.5, "media": CAMERA_MEDIA}
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.6.0", "camera": camera})
+    assert response.status_code == 200
+    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.6.0", "missing_clips": None,
+                                   "camera": camera}
+    status = env.browser.get("/api/reachy/status")
+    assert status.status_code == 200 and status.json()["camera"] == camera
+
+
+def test_an_older_robot_sends_no_camera_and_status_returns_none(env, monkeypatch):
+    _no_leases(monkeypatch)
+    assert env.browser.get("/api/reachy/status").json()["camera"] is None       # no heartbeat yet
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.5.4"}).status_code == 200
+    assert "camera" not in _stored_detail(env)
+    assert env.browser.get("/api/reachy/status").json()["camera"] is None
+
+
+@pytest.mark.parametrize("camera", [
+    {"state": "broken"}, {"state": "OK"}, {"fps": 9.8}, {"state": "ok", "fps": -1}, {"state": "ok", "fps": 241},
+    {"state": "ok", "media": "released"}, "stalled",
+])
+def test_heartbeat_refuses_a_bad_camera_report(env, monkeypatch, camera):
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"camera": camera})
+    assert response.status_code == 422
+    assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
 
 
 # ── Frame stream: the server computes the landmarks ─────────────────────────
