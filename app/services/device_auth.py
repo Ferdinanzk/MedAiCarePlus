@@ -2,13 +2,15 @@
 
 A device token authorises only /api/device/* (private port) and only for its own
 u_id. get_current_user never accepts one, and main.py rejects any "rdv1." bearer
-token on the public port.
+token on the public port. WebSocket routes use get_device_ws: HTTPBearer, and so
+get_device, raises TypeError there (it needs a Request).
 """
 
 import hashlib
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 from app.config import SECRET_KEY
@@ -16,6 +18,8 @@ from app.database import get_pool
 from app.services import consent_service
 
 TOKEN_PREFIX = "rdv1."
+WS_BAD_KEY = 4401      # WebSocket close code: a missing, invalid or revoked device token
+WS_NO_CONSENT = 4403   # WebSocket close code: the patient's robot consent is not current
 _signer = URLSafeTimedSerializer(SECRET_KEY, salt="reachy-device")
 _bearer = HTTPBearer(auto_error=False)
 
@@ -82,4 +86,30 @@ async def get_device_for_heartbeat(credentials: HTTPAuthorizationCredentials = D
     """Like get_device, but a revoked device or withdrawn consent yields stop_all instead of an error."""
     device = await _lookup(credentials)
     device["consent_current"] = robot_consent_current(await consent_service.get_state(device["u_id"]))
+    return device
+
+
+async def get_device_ws(websocket: WebSocket) -> dict | None:
+    """get_device for a WebSocket route: the same device dict, under the same lookup, revoked and consent rules.
+
+    The token comes from the upgrade request's Authorization header (parsed as HTTPBearer does), never from the URL,
+    which ends up in logs. On a failure the socket is accepted and then closed with WS_BAD_KEY (4401, reason
+    invalid_token) or WS_NO_CONSENT (4403, reason consent_required), so the robot sees the code (a close before the
+    accept reaches it only as HTTP 403), and None is returned: the route then just returns. On success the socket is
+    left for the route to accept."""
+    scheme, token = get_authorization_scheme_param(websocket.headers.get("authorization"))
+    credentials = (HTTPAuthorizationCredentials(scheme=scheme, credentials=token)
+                   if scheme.lower() == "bearer" and token else None)
+    try:
+        device = await _lookup(credentials)
+    except HTTPException:
+        device = None
+    if device is None or device.pop("revoked"):
+        await websocket.accept()
+        await websocket.close(code=WS_BAD_KEY, reason="invalid_token")
+        return None
+    if not robot_consent_current(await consent_service.get_state(device["u_id"])):
+        await websocket.accept()
+        await websocket.close(code=WS_NO_CONSENT, reason="consent_required")
+        return None
     return device
