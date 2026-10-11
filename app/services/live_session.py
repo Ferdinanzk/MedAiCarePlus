@@ -24,9 +24,11 @@ turns non-silent (a sample above ONSET_LEVEL) after the patient spoke; after tha
 silence between replies never goes to the robot. GPT-Live's transcripts become conversation turns (C1): fragments
 are grouped per role, a role switch closes the other role's group and a pause over TURN_GAP_SECONDS closes the
 patient's. The chat ends (C2) on a goodbye, SILENCE_END_SECONDS without patient speech, LIVE_MAX_SECONDS, the robot's
-`end` or a dropped robot; every ending stores conversation.live and runs the post-chat work as
-/conversations/{id}/end does. When GPT-Live fails after the chat started, the robot gets `fallback` with the
-conversation id and goes on with today's text chat (C3).
+`end`, a dropped robot, or access withdrawn (access_withdrawn: every ACCESS_RECHECK_SECONDS the chat re-checks what
+the text chat checks at every call, A2 and E1: the robot not unpaired, its live switch on, robot and check-in consent
+current); every ending stores conversation.live and runs the post-chat work as /conversations/{id}/end does. When
+GPT-Live fails after the chat started, the robot gets `fallback` with the conversation id and goes on with today's
+text chat (C3).
 """
 
 import asyncio
@@ -42,7 +44,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app import config
 from app.database import get_pool
-from app.services import after_chat, ai_settings, consent_service, conversation, memory, reachy_tasks
+from app.services import after_chat, ai_settings, consent_service, conversation, device_auth, memory, reachy_tasks
 from app.services.live_client import LiveClient, LiveError
 
 log = logging.getLogger(__name__)
@@ -63,6 +65,7 @@ QUIET_SECONDS = 1.0           # ... or this long after its last chunk of any kin
 MAX_GROUP_CHARS = 2000        # a transcript group this long is closed, and the next fragment starts a new one
 TICK_SECONDS = 0.1            # how often the hold, the turn gap and the endings are checked
 MUTE_WAIT_SECONDS = 1.0       # a block waits this long for GPT-Live to acknowledge the mute; it is closed anyway
+ACCESS_RECHECK_SECONDS = 10.0  # the running chat re-checks what the text chat checks at every call (A2, E1)
 ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "stopped", "error")   # anything else: stopped
 
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
@@ -70,6 +73,7 @@ LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FR
 LIVE_SWITCH_SQL = "SELECT live_voice FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL"
 INSERT_TURN_SQL = ("INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
                    "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id")   # api_device uses it too
+FLAG_TURN_SQL = "UPDATE conversation_turn SET flagged = TRUE WHERE turn_id = $1"
 
 # Spec A3: the live rules after Reachy's reply prompt. GPT-Live broke the 30-character rule in half its replies in the
 # spike, so it is stated again, firmly. The help line itself is never GPT-Live's: the robot says it (spec B3).
@@ -251,6 +255,8 @@ class LiveRelay:
         self._armed = False                     # the patient spoke since GPT-Live's last onset: hold the next one
         self._reply_metrics: dict | None = None  # the open Reachy reply's timings, stored with its turn
         self._started_at = self._last_patient_at = self._reply_due_at = 0.0
+        self._access_checked_at = 0.0                # the last access re-check started then (_check_access)
+        self._access_check: asyncio.Task | None = None
         self._goodbye = False
         self._goodbye_replied = False
         self._goodbye_end_at: float | None = None
@@ -261,6 +267,7 @@ class LiveRelay:
         self._heard_turns: list[int] = []            # the patient turns stored from those words
         self._hit_at: float | None = None            # a screening hit holds GPT-Live's voice since then (B1)
         self._deferred: list[tuple[int, str]] = []   # patient turns stored during that hold: judged if it clears
+        self._keyword_too = False                    # a block landed during that hold on words still a risk (B3)
         self._cut_off = False                        # OpenAI's moderation stopped GPT-Live (B4)
         self._wrapping = False                       # the outcome is being carried out (_wrap_up)
 
@@ -377,7 +384,7 @@ class LiveRelay:
         (_ticker). GPT-Live's events and the timers are handled under _handler_lock, one at a time, and the loops are
         stopped only once the one being handled has finished, so a turn being stored is never cut off part way."""
         now = self.clock()
-        self._started_at = self._last_patient_at = self._reply_due_at = now
+        self._started_at = self._last_patient_at = self._reply_due_at = self._access_checked_at = now
         try:
             await self.client.commentary(OPENING_COMMENTARY[self.language]
                                          + json.dumps(self.opening, ensure_ascii=False))
@@ -392,6 +399,9 @@ class LiveRelay:
         finally:
             for loop in loops:
                 loop.cancel()
+            if self._access_check is not None:   # no access check outlives the loops
+                self._access_check.cancel()
+                loops.append(self._access_check)
             await asyncio.gather(*loops, return_exceptions=True)
         await self._wrap_up()
 
@@ -453,7 +463,8 @@ class LiveRelay:
 
     async def _tick(self) -> None:
         """The timers: a screening hit's confirmation (B1), the end of the hold, the end of GPT-Live's sound, the
-        patient's turn gap, and the endings."""
+        patient's turn gap, the access re-check (A2, E1: started here, never awaited, so a slow database never delays
+        the rest), and the endings: goodbye, silence and limit here, access_withdrawn from the re-check."""
         now = self.clock()
         if self._hit_at is not None and now - self._heard_at >= CONFIRM_SECONDS:
             await self._confirm()
@@ -468,12 +479,36 @@ class LiveRelay:
                 self._sound_ended(now)
         if self._patient is not None and now - self._patient.last > TURN_GAP_SECONDS:
             await self._close_patient()
+        if (now - self._access_checked_at >= ACCESS_RECHECK_SECONDS
+                and (self._access_check is None or self._access_check.done())):
+            self._access_checked_at = now
+            self._access_check = asyncio.create_task(self._check_access())
         if self._goodbye_end_at is not None and now >= self._goodbye_end_at:
             self._finish("end", "goodbye")
         elif now - self._last_patient_at >= SILENCE_END_SECONDS:
             self._finish("end", "silence")
         elif now - self._started_at >= LIVE_MAX_SECONDS:
             self._finish("end", "limit")
+
+    async def _check_access(self) -> None:
+        """Spec A2 and E1: what the text chat checks at every call (get_device, reachy_tasks.checkin_allowed), the
+        running chat re-checks every ACCESS_RECHECK_SECONDS: the robot not unpaired and the patient's live switch on
+        (LIVE_SWITCH_SQL), robot consent and check-in consent current. When one is gone the chat ends at once with
+        reason access_withdrawn, as any ending (_end_chat), so the patient's voice stops going to OpenAI; a risk found
+        meanwhile still outranks it (_wrap_up). A read that fails is logged and tried again at the next re-check: it
+        never ends the chat."""
+        try:
+            async with get_pool().acquire() as conn:
+                switched_on = await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"])
+            state = await consent_service.get_state(self.u_id)
+        except Exception as exc:
+            log.warning("live chat %s: re-checking access failed (%s); trying again", self.conversation_id,
+                        type(exc).__name__)
+            return
+        if switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state):
+            return
+        log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id, self.u_id)
+        self._finish("end", "access_withdrawn")
 
     def _on_robot_message(self, message: dict) -> None:
         kind = message.get("type")
@@ -509,10 +544,11 @@ class LiveRelay:
         """OpenAI's moderation stopped GPT-Live (spec B4, Q5 A): an error content_filter, or session.closed with
         reason content (measured 0.2 s after the error: one decision for both). GPT-Live's voice stops, the robot's
         queue is flushed, and our own check decides at once: classify_risk() on the stored turns (the open groups
-        stored first), whose last patient turn is the one judged. SELF_HARM, OVERDOSE or no answer ("unknown")
-        blocks the chat; NONE lets it go on as today's text chat (fallback live_ended, C3). A check that fails blocks
-        too: no answer is never a clear. It runs as a GPT-Live event's handler (_handler_lock), so an ending decided
-        meanwhile waits for it (at most conversation.RISK_DEADLINE_SECONDS)."""
+        stored first), whose last patient turn is the one judged. Only an explicit NONE lets the chat go on as today's
+        text chat (fallback live_ended, C3); any other answer blocks it: SELF_HARM, OVERDOSE, no answer ("unknown")
+        or anything else. A check that fails blocks too: no answer is never a clear. It runs as a GPT-Live event's
+        handler (_handler_lock), so an ending decided meanwhile waits for it (at most
+        conversation.RISK_DEADLINE_SECONDS)."""
         if self._cut_off:
             return
         self._cut_off = True
@@ -526,7 +562,7 @@ class LiveRelay:
             last = next((turn for turn in reversed(history) if turn["role"] == "patient"), None)
             turn_id, quote = (last["turn_id"], last["text"]) if last else (None, "")
             kind, check = await conversation.classify_risk(history, self.language)
-            if kind or check["risk_result"] == "unknown":
+            if kind or check.get("risk_result") != "none":
                 await self.block("content", kind=kind, quote=quote, turn_id=turn_id)
             else:
                 self._finish("fallback", "live_ended")
@@ -812,8 +848,12 @@ class LiveRelay:
         GPT-Live, flags the turns, alerts family, stores the help line and sends `end` with risk true. A risk
         outranks an ending or a fallback decided but not carried out yet. Once the wrap-up is under way, the turn is
         only flagged and family alerted (alert_family: once per conversation, whichever check comes first); after a
-        fallback the text chat answers the next turn with the help line, because risk_flag is set."""
+        fallback the text chat answers the next turn with the help line, because risk_flag is set. A block that lands
+        while a screening hit is still settling, on words that still screen as a risk, flags their turns
+        (_heard_turns) too; words an idiom cleared (想死他) are not flagged."""
         held = self._voice_held()
+        if self._hit_at is not None and conversation.screen(self._heard) is not None:
+            self._keyword_too = True
         self._hit_at = None
         if self._risk is not None:
             if turn_id is not None:
@@ -822,7 +862,8 @@ class LiveRelay:
         self._risk = _Risk(reason, kind or "self_harm", quote, turn_id)
         log.warning("live chat %s: the %s check found a risk; the chat stops", self.conversation_id, reason)
         if self._wrapping:
-            await self._store_risk([turn_id] if turn_id is not None else [])
+            flag = [turn_id] if turn_id is not None else []
+            await self._store_risk(flag + (self._heard_turns if self._keyword_too else []))
             return
         self._stop_voice()
         if not held:
@@ -844,7 +885,7 @@ class LiveRelay:
                 log.info("live chat %s: GPT-Live was not muted (%s)", self.conversation_id, type(exc).__name__)
         await self._close_live()
         await self._store_groups()
-        flag = list(self._heard_turns) if self._risk.source == "keyword" else []
+        flag = list(self._heard_turns) if self._risk.source == "keyword" or self._keyword_too else []
         if self._risk.turn_id is not None:
             flag.append(self._risk.turn_id)
         await self._store_risk(flag, helpline)
@@ -854,7 +895,7 @@ class LiveRelay:
         """Flag one more patient turn of a chat already blocked (its family alert went once already)."""
         try:
             async with get_pool().acquire() as conn:
-                await conn.execute("UPDATE conversation_turn SET flagged = TRUE WHERE turn_id = $1", turn_id)
+                await conn.execute(FLAG_TURN_SQL, turn_id)
         except Exception:
             log.exception("live chat %s: flagging turn %s failed", self.conversation_id, turn_id)
 
@@ -867,7 +908,7 @@ class LiveRelay:
         try:
             async with get_pool().acquire() as conn, conn.transaction():
                 for turn_id in sorted(set(flag)):
-                    await conn.execute("UPDATE conversation_turn SET flagged = TRUE WHERE turn_id = $1", turn_id)
+                    await conn.execute(FLAG_TURN_SQL, turn_id)
                 await conversation.alert_family(conn, self.u_id, self.conversation_id, text,
                                                 str(max(flag)) if flag else risk.source)
         except Exception:

@@ -17,12 +17,16 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app.services import after_chat, conversation, live_session  # noqa: E402
+from app import config  # noqa: E402
+from app.services import after_chat, consent_service, conversation, live_session  # noqa: E402
 from app.services.live_client import LiveError, LiveEvent  # noqa: E402
 
 DEVICE_ID = str(uuid.uuid4())
 TASK_ID = str(uuid.uuid4())
 DEVICE = {"device_id": DEVICE_ID, "u_id": 7, "auto_record": False, "face_label": "pearl", "name": "Pearl"}
+ALLOWED = {scope: {"granted": True, "terms_version": config.TERMS_VERSION}   # robot and check-in consent current
+           for scope in ("core", "robot_camera", "robot_microphone", "cloud_voice", "conversation_analysis",
+                         "safety_alerts")}
 LOUD, QUIET = 3000, 40   # PCM16 levels: GPT-Live speaking, and its near-silence (peak 45 measured)
 OPENING = "王奶奶，今天感覺怎麼樣？想跟我聊聊嗎？"
 
@@ -119,11 +123,15 @@ class FakeLive:
 
 class LiveDB:
     """The conversation row the start wrote and its turns. `slow` (an asyncio.Event): storing a patient turn waits
-    for it."""
+    for it. `live_switch` answers the access re-check's read of the robot's live switch (None: the robot is revoked
+    or gone, False: switched off), counted in `access_reads`; `access_error`, when set, is raised by that read."""
 
     def __init__(self):
         self.conversations, self.turns = {}, []
         self.slow: asyncio.Event | None = None
+        self.live_switch: bool | None = True
+        self.access_reads = 0
+        self.access_error: Exception | None = None
 
     def acquire(self):
         return self
@@ -157,6 +165,11 @@ class LiveDB:
                 return None
             row.update(ended_at="now", end_reason=args[1], after_chat_state="pending", live=json.loads(args[2]))
             return args[0]
+        if "SELECT live_voice FROM reachy_device" in query:
+            self.access_reads += 1
+            if self.access_error is not None:
+                raise self.access_error
+            return self.live_switch
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -194,12 +207,19 @@ class LiveDB:
 @pytest.fixture
 def world(monkeypatch):
     """Everything around the relay; the background ticker never fires (TICK_SECONDS is an hour), so each test moves
-    the fake clock and runs relay._tick() itself (_step)."""
+    the fake clock and runs relay._tick() itself (_step). The access re-check reads the patient's consent from
+    `consent` (every scope current), first waiting for `consent_gate` when it is set."""
     w = types.SimpleNamespace(db=LiveDB(), robot=FakeRobot(), clock=Clock(), clients=[], after_chat=[], usage=42.0,
-                              gone=False)
+                              gone=False, consent={scope: dict(value) for scope, value in ALLOWED.items()},
+                              consent_gate=None)
 
     async def classify_risk(history, language, late=False):   # what a later safety check may ask: no risk
         return None, {"risk_ms": 1, "risk_result": "none", "risk_attempts": []}
+
+    async def get_state(u_id):
+        if w.consent_gate is not None:
+            await w.consent_gate.wait()
+        return w.consent
 
     async def process(conversation_id, u_id):
         w.after_chat.append((conversation_id, u_id))
@@ -213,6 +233,7 @@ def world(monkeypatch):
     monkeypatch.setattr(live_session, "get_pool", lambda: w.db)
     monkeypatch.setattr(live_session, "TICK_SECONDS", 3600)
     monkeypatch.setattr(conversation, "classify_risk", classify_risk)
+    monkeypatch.setattr(consent_service, "get_state", get_state)
     monkeypatch.setattr(after_chat, "process", process)
     return w
 
