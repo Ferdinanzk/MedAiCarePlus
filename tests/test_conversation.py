@@ -420,6 +420,7 @@ class FakeDB:
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": None, "intk_ids": [],
                      "status": "in_progress", "lease_owner": DEVICE_ID}
         self.conversations, self.turns, self.notifications = {}, [], []
+        self.user = {"reachy_call_name": None, "name": "Pearl"}   # the patient's "user" row (memory.call_name)
 
     def transaction(self):
         return self
@@ -431,6 +432,8 @@ class FakeDB:
         return False
 
     async def fetchrow(self, query, *args):
+        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
+            return dict(self.user) if args[0] == 7 else None
         if "FROM reachy_task WHERE task_id" in query:
             ok = str(self.task["task_id"]) == args[0] and self.task["u_id"] == args[1] and self.task["lease_owner"] == args[2]
             return dict(self.task) if ok else None
@@ -653,7 +656,9 @@ def test_conversation_needs_every_checkin_consent(robot):
 
 def test_start_and_a_normal_turn(robot):
     opened = _start(robot)
-    assert opened["reply"] == conversation.OPENING["zh-TW"] and opened["speech_text"] == "今天感觉怎么样？想跟我聊聊吗？"
+    # Reachy calls the patient by the registered name (spec D), with or without memory consent.
+    assert opened["reply"] == "Pearl，" + conversation.OPENING["zh-TW"]
+    assert opened["speech_text"] == "Pearl，今天感觉怎么样？想跟我聊聊吗？"
     assert opened["reply_turn_id"] == 1
     body = _turn(robot, opened["conversation_id"], "我早上去散步了").json()
     assert isinstance(body.pop("server_ms"), int)
@@ -1295,6 +1300,43 @@ def test_memory_on_names_the_patient_and_sends_the_block(robot, monkeypatch):
     _turn(robot, opened["conversation_id"], "我去散步了")
     assert robot.memories == [BLOCK]
     assert len(robot.checks) == 1 and _never_in_a_risk_check(robot, BLOCK)   # the risk check never gets it
+
+
+# ── What Reachy calls the patient (live voice spec D): with or without memory consent ──
+
+NAME_FACT = {"kind": "name", "subject": "preferred_name", "text": "王奶奶", "event_date": None, "source": "patient",
+             "created_at": None, "memory_id": "m", "followed_up_at": None}
+
+
+def test_without_memory_consent_the_opening_uses_the_cards_call_name(robot, monkeypatch):
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch, facts=[NAME_FACT])   # memory is off: the patient's memory name is not used
+    opened = _start(robot)
+    assert opened["reply"] == "阿嬤，" + conversation.OPENING["zh-TW"]
+    assert opened["speech_text"] == "阿嬷，今天感觉怎么样？想跟我聊聊吗？"
+    assert robot.db.turns[0] == {"turn_id": 1, "conversation_id": opened["conversation_id"], "role": "reachy",
+                                 "text": opened["reply"], "flagged": False, "metrics": None}
+
+
+def test_with_memory_consent_the_patients_memory_name_wins(robot, monkeypatch):
+    robot.state["consent"] = MEMORY_ON
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch, facts=[NAME_FACT])
+    assert _start(robot)["reply"] == "王奶奶，" + conversation.OPENING["zh-TW"]
+
+
+def test_with_memory_consent_and_no_memory_name_the_cards_call_name_is_used(robot, monkeypatch):
+    robot.state["consent"] = MEMORY_ON
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch)
+    assert _start(robot)["reply"] == "阿嬤，" + conversation.OPENING["zh-TW"]
+
+
+def test_the_registered_name_is_used_only_when_it_passes_the_name_rules(robot):
+    english = robot.client.post("/api/device/conversations", json={"task_id": TASK_ID, "language": "en"}).json()
+    assert english["reply"] == "Pearl, how are you feeling today? Would you like to chat?"
+    robot.db.user["name"] = "Demo Patient 1790963685"
+    assert _start(robot)["reply"] == conversation.OPENING["zh-TW"]
 
 
 def test_no_memory_block_is_built_for_a_turn_the_model_does_not_answer(robot, monkeypatch):

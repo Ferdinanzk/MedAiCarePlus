@@ -541,3 +541,26 @@ CREATE TABLE IF NOT EXISTS ai_job (
 ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS thinking VARCHAR(10) NOT NULL DEFAULT 'off';
 ALTER TABLE ai_job DROP CONSTRAINT IF EXISTS ai_job_thinking_check;
 ALTER TABLE ai_job ADD CONSTRAINT ai_job_thinking_check CHECK (thinking IN ('off','low','medium','high'));
+
+-- Live voice check-ins with GPT-Live, first version (spec 2026-10-12-live-voice-2a-design.md).
+-- D: what Reachy calls the patient, set on the Reachy card; NULL = the registered name ("user".name).
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_call_name VARCHAR(40);
+-- E1: the Reachy card's "Live voice (test)" switch. It has an effect only while .env has LIVE_VOICE_TEST=1.
+ALTER TABLE reachy_device ADD COLUMN IF NOT EXISTS live_voice BOOLEAN NOT NULL DEFAULT FALSE;
+-- How a check-in ran: 'text' (today's turns) or 'live' (GPT-Live; it stays 'live' after a fallback to text).
+-- live = {usage_seconds, close_reason, fallback_reason} for a live chat (C2, C3).
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS mode VARCHAR(10) NOT NULL DEFAULT 'text'
+    CHECK (mode IN ('text','live'));
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS live JSONB;
+-- E2: the live model on the AI connections card. One row (id is always TRUE): an OpenAI connection, the model id,
+-- the voice and the last Check. No ON DELETE: a connection this row uses cannot be deleted (409 in_use).
+CREATE TABLE IF NOT EXISTS ai_live (
+    id             BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    connection_id  BIGINT REFERENCES ai_connection(connection_id),
+    model_id       VARCHAR(100) NOT NULL DEFAULT 'gpt-live-1',
+    voice          VARCHAR(20)  NOT NULL DEFAULT 'marin',
+    tested_at      TIMESTAMPTZ,
+    test_ms        INTEGER,
+    last_error     TEXT,                     -- the last Check's error code; NULL after a pass
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);

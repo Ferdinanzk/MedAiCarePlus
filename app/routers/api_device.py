@@ -332,10 +332,9 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
     memory_on = memory.consent_current(await consent_service.get_state(device["u_id"]))
     async with get_pool().acquire() as conn, conn.transaction():
         task = await _leased_task(conn, device, payload.task_id)
-        name, followup = None, None
-        if memory_on:
-            name = memory.preferred_name(await memory.current_facts(conn, device["u_id"]))
-            followup = await memory.pick_followup(conn, device["u_id"], memory.local_today())
+        # The name: the memory 'name' entry (memory on), else the Reachy card's call name, else the registered name.
+        name = await memory.call_name(conn, device["u_id"], memory_on)
+        followup = await memory.pick_followup(conn, device["u_id"], memory.local_today()) if memory_on else None
         opening = memory.opening_line(language, name)
         await conn.execute(
             "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
