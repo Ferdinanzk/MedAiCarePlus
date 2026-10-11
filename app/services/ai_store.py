@@ -71,6 +71,28 @@ async def seed_from_env(conn) -> bool:
     return True
 
 
+async def fill_openrouter_keys_from_env(api_key: str | None) -> int:
+    """Every start, after the first-start copy: each OpenRouter connection with no key gets .env's
+    OPENROUTER_API_KEY (spec C2), in one change(); returns how many. The first start copies whatever .env held then,
+    so a key added to .env later never reached the card. A connection that has a key (even one this SECRET_KEY
+    can't read) is never touched: the card stays the place to change keys. The key is never logged."""
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return 0
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch("SELECT connection_id, kind, api_key_enc FROM ai_connection ORDER BY connection_id")
+        keyless = [row["connection_id"] for row in rows if row["kind"] == "openrouter" and row["api_key_enc"] is None]
+        if not keyless:
+            return 0
+        async with change(conn):
+            for connection_id in keyless:
+                await conn.execute("UPDATE ai_connection SET api_key_enc = $2, api_key_last4 = $3, updated_at = NOW() "
+                                   "WHERE connection_id = $1 AND api_key_enc IS NULL", connection_id,
+                                   ai_crypto.encrypt(api_key), ai_crypto.last4(api_key))
+    log.info("filled the key of %d OpenRouter connection(s) from .env", len(keyless))
+    return len(keyless)
+
+
 @asynccontextmanager
 async def change(conn):
     """One change on the card: the caller's writes, then the new snapshot and the re-worded notices registered, all in
