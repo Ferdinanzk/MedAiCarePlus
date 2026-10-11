@@ -1,6 +1,7 @@
 """Leased robot tasks: enqueue rules, leasing, transitions, lease expiry and the reminder hook."""
 
 import asyncio
+import dataclasses
 import os
 import sys
 import types
@@ -19,7 +20,7 @@ import dose_facts  # noqa: E402
 
 from app import config  # noqa: E402
 from app.jobs import missed_dose_job, reachy_task_job  # noqa: E402
-from app.services import consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
+from app.services import ai_settings, consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
 
 T0 = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)          # 08:00 in Taipei
 OPEN = ("queued", "leased", "searching", "in_progress")
@@ -49,7 +50,8 @@ class FakeDB:
         self.now = T0
         self.depth = 0
         self.tasks = []
-        self.devices = {7: {"device_id": DEVICE, "auto_record": False, "last_seen_at": T0, "revoked": False}}
+        self.devices = {7: {"device_id": DEVICE, "auto_record": False, "live_voice": False, "last_seen_at": T0,
+                            "revoked": False}}
         self.users = {7: "Pearl"}
         self.doses = {
             101: {"intk_id": 101, "med_id": 2, "med_name": "Metformin", "pill_description": "white round",
@@ -152,10 +154,11 @@ class FakeDB:
             task = queued[0]
             task.update(status="leased", lease_owner=args[1], lease_until=self.now + timedelta(seconds=60))
             return dict(task)
-        if 'SELECT u.name, d.auto_record' in query:
+        if 'SELECT u.name, d.auto_record, d.live_voice' in query:
             device = self.devices.get(args[0])
-            return {"name": self.users[args[0]],
-                    "auto_record": device["auto_record"] if device and not device["revoked"] else None}
+            active = device if device and not device["revoked"] else None
+            return {"name": self.users[args[0]], "auto_record": active["auto_record"] if active else None,
+                    "live_voice": active["live_voice"] if active else None}
         if "WHERE u_id = $1 AND lease_owner = $2::uuid" in query:
             tasks = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["lease_owner"] == args[1]
                             and t["status"] in ("leased", "searching", "in_progress")),
@@ -316,8 +319,9 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     task = run(reachy_tasks.lease_next(7, DEVICE, 0))
     assert task["task_id"] == first and task["status"] == "leased"
     assert set(task) == {"task_id", "slot_time", "reason", "attempt", "status", "expires_at",
-                         "patient_name", "auto_record", "microphone", "checkin", "doses"}
+                         "patient_name", "auto_record", "microphone", "checkin", "live", "doses"}
     assert task["patient_name"] == "Pearl" and task["auto_record"] is False
+    assert task["live"] is False         # no live test switch, robot switch or live model in the fixture
     assert task["microphone"] is False   # no robot_microphone consent in the fixture
     assert task["checkin"] is False      # nor the check-in scopes
     assert [d["med_name"] for d in task["doses"]] == ["Aspirin", "Metformin", "Zinc"]
@@ -817,3 +821,52 @@ def test_with_protection_off_a_task_for_a_later_dose_is_leased_at_once(db):
     assert enqueue(db, reason="manual", slot=T0 + timedelta(hours=12), intk_ids=(104,),
                    expires=T0 + timedelta(hours=13))
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["doses"][0]["intk_id"] == 104
+
+
+# ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────
+
+CHECKIN_CONSENT = {**ROBOT_CONSENT, **{scope: {"granted": True, "terms_version": config.TERMS_VERSION}
+                                       for scope in reachy_tasks.CHECKIN_SCOPES}}
+
+
+@pytest.fixture
+def live_ready(db, monkeypatch):
+    """Everything a live check-in needs: the .env test switch, the robot's switch, check-in consent and a checked
+    live model on an OpenAI connection."""
+    openai = ai_settings.Connection(2, "OpenAI", "openai", "https://api.openai.com/v1", "sk-proj-live-4444", "4444",
+                                    True, "OpenAI")
+    live = ai_settings.LiveSetting(2, "gpt-live-1", "marin", T0, 1180, None)
+    monkeypatch.setattr(ai_settings, "_snapshot", ai_settings.Snapshot({2: openai}, {}, {}, live=live))
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    db.devices[7]["live_voice"] = True
+    db.consent[7] = CHECKIN_CONSENT
+    return db
+
+
+@pytest.mark.parametrize("reason, intk_ids", [("checkin", ()), ("upcoming", (101, 102, 103))])
+def test_a_task_says_live_when_every_condition_holds(live_ready, reason, intk_ids):
+    enqueue(live_ready, reason=reason, intk_ids=intk_ids)   # a dose task's check-in follows the same rule
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task["checkin"] is True and task["live"] is True
+    assert "sk-proj-live-4444" not in str(task)   # the robot never sees the OpenAI key
+
+
+@pytest.mark.parametrize("missing", ["test_switch", "robot_switch", "checkin_consent", "passed_check",
+                                     "device_revoked"])
+def test_a_task_says_no_live_when_any_condition_is_missing(live_ready, monkeypatch, missing):
+    enqueue(live_ready, reason="checkin", intk_ids=())
+    if missing == "test_switch":
+        monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
+    elif missing == "robot_switch":
+        live_ready.devices[7]["live_voice"] = False
+    elif missing == "checkin_consent":   # safety alerts withdrawn: no check-in at all, so no live one either
+        live_ready.consent[7] = {**CHECKIN_CONSENT,
+                                 "safety_alerts": {"granted": False, "terms_version": config.TERMS_VERSION}}
+    elif missing == "passed_check":
+        snapshot = ai_settings.current()
+        monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+            snapshot, live=dataclasses.replace(snapshot.live, last_error="live_auth")))
+    else:
+        live_ready.devices[7]["revoked"] = True
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task["live"] is False

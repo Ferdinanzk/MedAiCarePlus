@@ -12,9 +12,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from app import config
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import consent_service, dose_safety, outbox
+from app.services import ai_settings, consent_service, dose_safety, outbox
 
 LEASE_SECONDS = 60
 OFFLINE_AFTER_SECONDS = 60
@@ -67,10 +68,11 @@ async def task_payload(conn, task) -> dict:
         "WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) ORDER BY m.med_name, m.med_id, i.intk_id",
         task["u_id"], list(task["intk_ids"]))
     head = await conn.fetchrow(
-        'SELECT u.name, d.auto_record FROM "user" u '
+        'SELECT u.name, d.auto_record, d.live_voice FROM "user" u '
         "LEFT JOIN reachy_device d ON d.u_id = u.u_id AND d.revoked_at IS NULL WHERE u.u_id = $1",
         task["u_id"])
     consent = await consent_service.fetch_state(conn, task["u_id"])
+    checkin = checkin_allowed(consent)
     return {
         "task_id": str(task["task_id"]), "slot_time": _iso(task["slot_time"]), "reason": task["reason"],
         "attempt": task["attempt"], "status": task["status"], "expires_at": _iso(task["expires_at"]),
@@ -79,7 +81,11 @@ async def task_payload(conn, task) -> dict:
         # The robot may listen (speech-to-text on the robot) only while this consent is current.
         "microphone": consent_service.is_current(consent, "robot_microphone"),
         # A check-in conversation needs every check-in scope (notice: check-ins only with safety alerts on).
-        "checkin": checkin_allowed(consent),
+        "checkin": checkin,
+        # A live voice check-in (spec 2026-10-12 E1): .env's test switch, this robot's switch, check-ins allowed and a
+        # usable live model on the AI card. Otherwise false, and the robot runs today's text chat.
+        "live": bool(config.LIVE_VOICE_TEST and head and head["live_voice"] and checkin
+                     and ai_settings.live_target() is not None),
         "doses": [{
             "intk_id": d["intk_id"], "med_id": d["med_id"], "med_name": d["med_name"],
             "pill_description": d["pill_description"], "dose_form": d["dose_form"],

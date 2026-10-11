@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -195,3 +196,59 @@ def test_the_public_view_shows_each_jobs_thinking_level():
                             "safety": {"primary_ref": 21, "fallback_ref": None, "thinking": "off"},
                             "after_chat": {"primary_ref": 21, "fallback_ref": None, "thinking": "low"}}
     assert view["models"][0]["profile"]["thinking"]["levels"] == ["low", "medium", "high"]
+
+
+# ── Live voice model (spec 2026-10-12 E2) ──
+
+CHECKED = datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc)
+
+
+def _live_snapshot(**changes):
+    """_card_snapshot plus a checked live model on the OpenAI connection (1); `changes` edit the live row."""
+    live = ai_settings.LiveSetting(1, "gpt-live-1", "marin", CHECKED, 1180, None)
+    return dataclasses.replace(_card_snapshot(), live=dataclasses.replace(live, **changes))
+
+
+def test_a_checked_live_model_on_an_openai_connection_is_the_live_target(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    target = ai_settings.live_target(_live_snapshot(voice="cedar"))
+    assert (target.api_key, target.model_id, target.voice) == ("sk-proj-secret-abcd", "gpt-live-1", "cedar")
+    assert "sk-proj-secret-abcd" not in repr(target)   # a log line or a traceback never prints the key
+    monkeypatch.setattr(ai_settings, "_snapshot", _live_snapshot())
+    assert ai_settings.live_target() == ai_settings.LiveTarget("sk-proj-secret-abcd", "gpt-live-1", "marin")
+
+
+@pytest.mark.parametrize("change", [
+    {"tested_at": None},            # never checked, or saved again since the last Check
+    {"last_error": "live_auth"},    # the last Check failed
+    {"connection_id": 2},           # an OpenRouter connection
+    {"connection_id": 9},           # a connection that is gone
+    {"connection_id": None},
+])
+def test_a_live_model_is_usable_only_when_checked_on_an_openai_connection(monkeypatch, change):
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    assert ai_settings.live_target(_live_snapshot(**change)) is None
+
+
+def test_no_live_target_without_the_test_switch_a_saved_model_or_a_readable_key(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
+    assert ai_settings.live_target(_live_snapshot()) is None
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    assert ai_settings.live_target(_card_snapshot()) is None   # no live model saved
+    assert ai_settings.live_target() is None                   # the .env setup has none
+    snapshot = _live_snapshot()
+    unreadable = dataclasses.replace(snapshot.connections[1], api_key="", key_readable=False)
+    snapshot = dataclasses.replace(snapshot, connections={**snapshot.connections, 1: unreadable})
+    assert ai_settings.live_target(snapshot) is None
+
+
+def test_the_public_view_shows_the_live_model_without_its_key(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    view = ai_settings.public(_live_snapshot())
+    assert view["live"] == {"connection_id": 1, "model_id": "gpt-live-1", "voice": "marin",
+                            "tested_at": CHECKED.isoformat(), "test_ms": 1180, "last_error": None, "usable": True}
+    assert view["live_voice_test"] is True and "sk-proj-secret-abcd" not in json.dumps(view)
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
+    view = ai_settings.public(_live_snapshot())
+    assert view["live_voice_test"] is False and view["live"]["usable"] is False
+    assert ai_settings.public(_card_snapshot())["live"] is None   # nothing saved yet
