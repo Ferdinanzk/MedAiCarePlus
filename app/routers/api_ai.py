@@ -234,7 +234,9 @@ async def delete_model(model_ref: int, user: dict = Depends(get_consented_user))
 
 @router.post("/models/{model_ref}/test")
 async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
-    """Find the request settings this model accepts (ai_profile.detect) and save them, or why it failed."""
+    """Find the request settings this model accepts (ai_profile.detect) and save them, or why it failed. A model that
+    is not a chat model (a voice-only one such as gpt-live-1) fails with the code ai_profile.NOT_CHAT_MODEL, which the
+    card explains and last_error keeps."""
     model = _model(model_ref)
     connection = ai_settings.current().connections[model.connection_id]
     if not connection.key_readable:

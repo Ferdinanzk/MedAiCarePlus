@@ -25,6 +25,11 @@ TEST_MESSAGES = [{"role": "user", "content": "請用一句很短的繁體中文�
 TEST_MAX_TOKENS = 200   # conversation.REPLY_MAX_TOKENS: a model that cannot answer within it cannot serve replies
 TEST_TIMEOUT = 15
 _SETTINGS = ("max_completion_tokens", "max_tokens", "reasoning_effort", "reasoning", "temperature")
+# The Test result's error for a model that can't write chat replies (a voice-only model such as gpt-live-1, or a TTS
+# model). OpenAI answers /chat/completions for one with HTTP 404: "This is not a chat model and thus not supported in
+# the v1/chat/completions endpoint. Did you mean to use v1/completions?"
+NOT_CHAT_MODEL = "not_chat_model"
+_NOT_CHAT = re.compile(r"not a chat model|not supported in the v1/chat/completions endpoint", re.IGNORECASE)
 
 
 def starting_profile(kind: str) -> dict:
@@ -90,6 +95,11 @@ def _error_message(body) -> str:
     return str(body)
 
 
+def _not_chat_model(status: int, message: str) -> bool:
+    """A 404 (or 400) that says the model is not a chat model: no request setting can fix that."""
+    return status in (400, 404) and bool(_NOT_CHAT.search(message))
+
+
 def _failed(ms, error: str, secret: str) -> dict:
     return {"ok": False, "profile": None, "ms": ms, "sample": None, "error": redact(error, secret)[:300]}
 
@@ -115,6 +125,8 @@ def detect(send, kind: str, secret: str = "") -> dict:
                 return _failed(ms, "The answer was cut off by the length limit.", secret)
             return {"ok": True, "profile": profile, "ms": ms, "sample": content.strip()[:40], "error": None}
         message = _error_message(body)
+        if _not_chat_model(status, message):
+            return _failed(ms, NOT_CHAT_MODEL, secret)
         changed = adjust(profile, message) if status == 400 else None
         if changed is None:
             return _failed(ms, f"HTTP {status}: {message}" if status else message, secret)

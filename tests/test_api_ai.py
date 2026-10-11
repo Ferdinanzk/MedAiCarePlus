@@ -378,3 +378,26 @@ def test_a_failed_model_list_is_logged_without_the_key(api, monkeypatch, caplog,
         response = api.client.get("/api/ai/connections/1/remote-models")
     assert (response.status_code, response.json()) == (502, {"detail": "remote_models_unavailable"})
     assert "AI connection 1 failed" in caplog.text and "routerSECRET" not in caplog.text
+
+
+def test_a_voice_only_model_gets_a_clear_code_saved_as_its_last_error(api, monkeypatch):
+    snapshot = _snapshot()
+    openai = ai_settings.Connection(2, "OpenAI", "openai", ai_profile.BASE_URLS["openai"], "sk-proj-live-4444", "4444",
+                                    True, "OpenAI")
+    live = ai_settings.Model(31, 2, "gpt-live-1", "OpenAI", "USA", "30 days", None)
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, connections={**snapshot.connections, 2: openai}, models={**snapshot.models, 31: live}))
+    sent = []
+
+    def post(url, json, timeout, headers):
+        sent.append(url)
+        return Reply(404, {"error": {"message": "This is not a chat model and thus not supported in the "
+                                                "v1/chat/completions endpoint. Did you mean to use v1/completions?",
+                                     "type": "invalid_request_error", "param": "model", "code": None}})
+
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    response = api.client.post("/api/ai/models/31/test")
+    assert response.status_code == 200
+    assert (response.json()["ok"], response.json()["error"]) == (False, "not_chat_model")
+    assert api.store.saved_tests[-1]["error"] == "not_chat_model"   # last_error stores the same code
+    assert sent == ["https://api.openai.com/v1/chat/completions"]
