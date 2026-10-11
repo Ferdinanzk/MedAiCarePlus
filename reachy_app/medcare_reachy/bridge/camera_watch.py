@@ -48,14 +48,16 @@ class CameraWatchdog:
 
     The stream calls attach()/detach() with its session, frame() for every new frame and tick() for every read that
     found none. Only tick() calls `recover` and `media_status`, outside the lock, so the heartbeat's snapshot() and the
-    slot session's `state` never wait for a recovery.
+    slot session's `state` never wait for a recovery. `media_released` (optional, a quick read) says whether a
+    recovery left the app's media released: the give-up then also says the speaker and microphone are off.
     """
 
     def __init__(self, recover: Callable[[], str], media_status: Callable[[], dict | None],
                  clock: Callable[[], float] = time.monotonic, stall_seconds: float = CAMERA_STALL_SECONDS,
                  recover_interval: float = CAMERA_RECOVER_INTERVAL, give_up_seconds: float = CAMERA_GIVE_UP_SECONDS,
-                 *, wall: Callable[[], float] = time.time, healthy_seconds: float = CAMERA_HEALTHY_SECONDS):
-        self._recover, self._media_status = recover, media_status
+                 *, wall: Callable[[], float] = time.time, healthy_seconds: float = CAMERA_HEALTHY_SECONDS,
+                 media_released: Callable[[], bool] | None = None):
+        self._recover, self._media_status, self._media_released = recover, media_status, media_released
         self.clock, self.wall = clock, wall
         self.stall_seconds, self.recover_interval = stall_seconds, recover_interval
         self.give_up_seconds, self.healthy_seconds = give_up_seconds, healthy_seconds
@@ -202,6 +204,16 @@ class CameraWatchdog:
                       "%d failed); a search ends with camera_unavailable",
                       now - self._stall_since, self._attempts, self._failures)
             self._set(UNAVAILABLE)
+            if self._media_off():
+                log.error("this app's media is still released: the speaker and microphone are off until the robot's "
+                          "media comes back (asked for again at every heartbeat)")
+
+    def _media_off(self) -> bool:
+        """With the lock held: whether a recovery left the app's media released. Only for a log line."""
+        try:
+            return self._media_released is not None and bool(self._media_released())
+        except Exception:
+            return False
 
     def _reset(self, now: float) -> None:
         """A fresh session (and the constructor): everything, the recovery limit included."""

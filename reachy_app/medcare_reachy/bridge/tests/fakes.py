@@ -36,6 +36,10 @@ class FakeRobot:
         self.calls.append("is_reachable")
         return self.reachable
 
+    def restore_media(self):
+        self.calls.append("restore_media")
+        return True
+
     def wake(self):
         self.calls.append("wake")
 

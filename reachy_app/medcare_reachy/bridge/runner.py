@@ -108,7 +108,7 @@ class MonitorStream:
         self.app, self.robot, self.engine = app, robot, engine
         self.camera = camera if camera is not None else CameraWatchdog(
             getattr(robot, "reopen_camera", _cannot_reopen), getattr(robot, "media_status", _no_media_status),
-            clock=clock)
+            clock=clock, media_released=getattr(robot, "media_released", None))
         self.emotion, self.emotion_interval = emotion, emotion_interval
         self._last_emotion = float("-inf")
         self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
@@ -493,6 +493,10 @@ class Runner:
             self.robot_reachable = bool(await self.run_blocking(self.robot.is_reachable))
         except Exception:
             self.robot_reachable = False
+        if self.robot_reachable:
+            # A camera recovery the daemon refused leaves this app's media released, the speaker and the microphone
+            # with it, and outside a stalled session nothing else asks for it back (restore_media never raises).
+            await self.run_blocking(self.robot.restore_media)
         payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
                    "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
                    "missing_clips": self.clips.missing_count}
