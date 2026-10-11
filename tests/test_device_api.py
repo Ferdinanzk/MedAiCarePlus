@@ -571,6 +571,14 @@ def test_device_observe_session_has_no_dose(env):
     assert body["mode"] == "observe" and body["intk_id"] is None and body["auto_commit"] is False
 
 
+def test_device_sessions_keep_the_mode_they_started_in(env):
+    # The search before talking (observe) verifies with the OpenVINO match alone; a dose session never does.
+    search = env.registry.sessions[_start(env, mode="observe").json()["session_id"]]
+    assert search.started_mode == "observe" and monitor_service.openvino_only(search) is True
+    dose = env.registry.sessions[_start(env, mode="dose", intk_id=101, task_id=TASK_ID).json()["session_id"]]
+    assert dose.started_mode == "dose" and monitor_service.openvino_only(dose) is False
+
+
 def test_device_start_returns_503_when_models_not_ready(env, monkeypatch):
     monkeypatch.setattr(api_device.FaceRecognitionService, "_available", False)
     assert _start(env, mode="observe").status_code == 503
