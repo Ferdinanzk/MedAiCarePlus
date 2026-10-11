@@ -727,15 +727,21 @@ def test_the_stream_notices_a_dead_camera_and_gets_it_back(caplog):
         clock.t = 52.25
         await stream.step()                       # the reopened camera hands over a frame again
         await stream.drain()
-        return states
+        first = stream.camera.state, [frame[2] for frame in app.frames], list(caplog.records)
+        for i in range(1, 21):                    # steady frames for 5 s more: the stall is over
+            clock.t = 52.25 + i * 0.25
+            await stream.step()
+        return states, first
 
     with caplog.at_level("INFO", logger="medcare_reachy.bridge.camera_watch"):
-        states = asyncio.run(scenario())
+        states, (state_at_first_frame, sent_at_first_frame, records_at_first_frame) = asyncio.run(scenario())
     assert states == ["ok"] * 7 + ["recovering"] and camera.reopened == 1
-    assert stream.camera.state == "ok" and [frame[2] for frame in app.frames] == [1, 2]
+    assert state_at_first_frame == "ok" and sent_at_first_frame == [1, 2] and stream.camera.state == "ok"
     messages = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("camera stalled: no new frame for 2.0 s") and "'released': True" in m for m in messages)
-    assert any(m.startswith("camera recovered: a new frame 2.2 s after the last one") for m in messages)
+    assert not any(r.getMessage().startswith("camera recovered") for r in records_at_first_frame)   # not yet
+    assert any(m.startswith("camera recovered: new frames for 5.0 s without a gap; the stall began 5.2 s ago")
+               for m in messages)
 
 
 def test_a_camera_that_stays_dead_is_unavailable_after_15_s_of_stall():
