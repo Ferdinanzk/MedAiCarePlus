@@ -1,9 +1,10 @@
-"""The search before talking verifies the patient with the OpenVINO match alone; identity is logged.
+"""The search before a check-in verifies the patient with the OpenVINO match alone; identity is logged.
 
-A robot session that started in observe mode (the search before a check-in or a dose prompt) no longer needs
-MediaPipe's short-range face detector to see the face too: it misses faces under about 50 px wide (beyond about
-1.35 m from the robot). Every other session keeps the MediaPipe gate. Robot sessions log each identity outcome,
-rate-limited, with numbers only (spec 2026-10-11, B1 and B2).
+A robot session that started in observe mode for a check-in task no longer needs MediaPipe's short-range face
+detector to see the face too: it misses faces under about 50 px wide (beyond about 1.35 m from the robot). Every other
+session keeps the MediaPipe gate, the search before a dose prompt included (narrowed after the final review of
+11 Oct: the strict dose session that follows would not see a patient verified that far away). Robot sessions log each
+identity outcome, rate-limited, with numbers only (spec 2026-10-11, B1 and B2).
 """
 
 import asyncio
@@ -77,19 +78,37 @@ def _identity_lines(caplog):
 
 # ── B1: which sessions use the OpenVINO-only rule ────────────────────────────
 
-@pytest.mark.parametrize("client_type,mode,expected", [
-    ("reachy", "observe", True), ("reachy", "dose", False), ("browser", "observe", False), ("browser", "dose", False)])
-def test_only_a_robot_session_that_started_in_observe_uses_the_openvino_only_rule(client_type, mode, expected):
+@pytest.mark.parametrize("client_type,mode,checkin_search,expected", [
+    ("reachy", "observe", True, True),
+    ("reachy", "observe", False, False),     # the search of a dose task (and the watch after a dose)
+    ("reachy", "dose", True, False), ("reachy", "dose", False, False),
+    ("browser", "observe", True, False), ("browser", "observe", False, False), ("browser", "dose", False, False)])
+def test_only_a_robot_check_in_search_uses_the_openvino_only_rule(client_type, mode, checkin_search, expected):
     state = MonitorRegistry().start(7, 11 if mode == "dose" else None, "Pearl", "Pearl",
-                                    mode=mode, client_type=client_type)
-    assert state.started_mode == mode
+                                    mode=mode, client_type=client_type, checkin_search=checkin_search)
+    assert state.started_mode == mode and state.checkin_search is checkin_search
     assert service.openvino_only(state) is expected
 
 
-def test_a_search_session_verifies_the_patient_without_a_mediapipe_face(faces):
+def test_the_search_of_a_dose_task_still_needs_the_mediapipe_face(faces):
+    # Final review of 11 Oct: a patient verified 1.35-3 m away by a dose task's search was then 'ambiguous' to the
+    # strict dose session, and the robot asked the right patient for the person whose medicine it was.
     async def scenario():
         registry = MonitorRegistry()
         state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy")
+        result = await _identity_checks(registry, state, [_far(1), _far(2), _far(3)])
+        assert result["identity_status"] == "ambiguous"
+        assert state.identity_hits == 0 and result["target_box"] is None
+        result = await _identity_checks(registry, state, [_packet(4), _packet(5)])
+        assert result["identity_status"] == "verified"
+    asyncio.run(scenario())
+
+
+def test_a_check_in_search_verifies_the_patient_without_a_mediapipe_face(faces):
+    async def scenario():
+        registry = MonitorRegistry()
+        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy",
+                               checkin_search=True)
         first = await _identity_checks(registry, state, [_far(1)])
         assert first["identity_status"] == "verifying" and state.identity_hits == 1
         result = await _identity_checks(registry, state, [_far(2)])
@@ -110,7 +129,8 @@ def test_a_search_session_still_needs_exactly_one_patient_face_among_fewer_than_
 
     async def scenario():
         registry = MonitorRegistry()
-        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy")
+        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy",
+                               checkin_search=True)
         result = await _identity_checks(registry, state, [_far(1), _far(2), _far(3)])
         assert result["identity_status"] == status
         assert state.identity_hits == 0 and result["target_box"] is None
@@ -120,7 +140,8 @@ def test_a_search_session_still_needs_exactly_one_patient_face_among_fewer_than_
 def test_a_search_session_needs_two_hits_in_a_row_on_overlapping_boxes(faces):
     async def scenario():
         registry = MonitorRegistry()
-        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy")
+        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy",
+                               checkin_search=True)
         await _identity_checks(registry, state, [_far(1)])
         faces.faces = [{**PATIENT, "box": [60, 60, 30, 30]}]      # the match jumped across the frame: start again
         result = await _identity_checks(registry, state, [_far(2)])
@@ -139,7 +160,8 @@ def test_a_search_session_needs_a_patient_face_at_least_6_5_percent_of_the_frame
 
     async def scenario():
         registry = MonitorRegistry()
-        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy")
+        state = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy",
+                               checkin_search=True)
         result = await _identity_checks(registry, state, [_far(1), _far(2)], _robot_frame())
         return state, result
 
@@ -198,7 +220,8 @@ def test_identity_log_lines_carry_numbers_and_no_names(faces, caplog):
 
     async def scenario():
         registry = MonitorRegistry()
-        state = registry.start(7, None, "Pearl", "Pearl Chen", mode="observe", client_type="reachy")
+        state = registry.start(7, None, "Pearl", "Pearl Chen", mode="observe", client_type="reachy",
+                               checkin_search=True)
         await _identity_checks(registry, state, [_far(1), _far(2)])
         return state
 

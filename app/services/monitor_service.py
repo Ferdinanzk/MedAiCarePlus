@@ -146,6 +146,9 @@ class MonitorSession:
     # The mode the session started in (set in __post_init__), never changed: `mode` becomes 'observe' after a record,
     # so only this tells the search before talking (a robot session started in 'observe') apart (openvino_only).
     started_mode: str = ""
+    # The robot started this session for a check-in task (reachy_task.reason 'checkin', read at
+    # /api/device/monitor/start): its search verifies with the OpenVINO match alone (openvino_only).
+    checkin_search: bool = False
     client_type: str = "browser"
     auto_commit: bool = True
     detector_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -328,13 +331,16 @@ def vision_interval(state: MonitorSession) -> float:
 
 
 def openvino_only(state: MonitorSession) -> bool:
-    """The identity rule of the search before talking: a robot session that started in observe mode verifies the
-    patient with the OpenVINO match alone. MediaPipe's short-range face detector misses faces under about 50 px wide
-    (beyond about 1.35 m from the robot), where dashboard login, which uses OpenVINO alone, still works. Under this
-    rule a hit needs a patient face at least OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is
-    ever recorded from such a session. Every other session (dose sessions, also once a record switched them to
-    observe, and browser sessions) also needs a MediaPipe face on the same box."""
-    return state.client_type == "reachy" and state.started_mode == "observe"
+    """The identity rule of the search before a check-in: a robot session that started in observe mode for a
+    check-in task (checkin_search) verifies the patient with the OpenVINO match alone. MediaPipe's short-range face
+    detector misses faces under about 50 px wide (beyond about 1.35 m from the robot), where dashboard login, which
+    uses OpenVINO alone, still works. Under this rule a hit needs a patient face at least
+    OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is ever recorded from such a session.
+    Every other session also needs a MediaPipe face on the same box: dose sessions (also once a record switched them
+    to observe), browser sessions, and the search and the watch of a dose task. Narrowed to check-in searches after
+    the final review of 11 Oct: a dose task's search could verify a patient the strict dose session after it then
+    found 'ambiguous', and the robot asked that patient for the person whose medicine it was."""
+    return state.client_type == "reachy" and state.started_mode == "observe" and state.checkin_search
 
 
 def _log_identity(state: MonitorSession, rule: str, distance: float | None, box_px: int | None,
@@ -365,7 +371,8 @@ class MonitorRegistry:
             raise BusyOtherClient(old.client_type)
 
     def start(self, u_id: int, intk_id: int | None, face_label: str, display_name: str, *,
-              mode: str = "dose", client_type: str = "browser", auto_commit: bool = True) -> MonitorSession:
+              mode: str = "dose", client_type: str = "browser", auto_commit: bool = True,
+              checkin_search: bool = False) -> MonitorSession:
         if mode not in MODES:
             raise ValueError("Unknown monitor mode")
         if client_type not in CLIENT_TYPES:
@@ -389,13 +396,15 @@ class MonitorRegistry:
                 if self.by_user.get(session.u_id) == session_id:
                     self.by_user.pop(session.u_id, None)
         state = MonitorSession(str(uuid.uuid4()), str(uuid.uuid4()), u_id, intk_id, face_label.lower(), display_name,
-                               mode=mode, client_type=client_type, auto_commit=bool(auto_commit))
+                               mode=mode, client_type=client_type, auto_commit=bool(auto_commit),
+                               checkin_search=bool(checkin_search))
         self.sessions[state.session_id] = state
         self.by_user[u_id] = state.session_id
         return state
 
     async def replace(self, u_id: int, intk_id: int | None, face_label: str, display_name: str, *,
-                      mode: str = "dose", client_type: str = "browser", auto_commit: bool = True) -> MonitorSession:
+                      mode: str = "dose", client_type: str = "browser", auto_commit: bool = True,
+                      checkin_search: bool = False) -> MonitorSession:
         """Close an existing detector session before replacing its registry entry.
 
         First holder wins across client types: a live session (activity within
@@ -411,7 +420,7 @@ class MonitorRegistry:
                 old.ended = True
                 await IntakeDetectionService.get_instance().end_session(old.u_id, old.detector_session_id)
         return self.start(u_id, intk_id, face_label, display_name,
-                          mode=mode, client_type=client_type, auto_commit=auto_commit)
+                          mode=mode, client_type=client_type, auto_commit=auto_commit, checkin_search=checkin_search)
 
     async def end(self, state: MonitorSession) -> None:
         async with state.lock:

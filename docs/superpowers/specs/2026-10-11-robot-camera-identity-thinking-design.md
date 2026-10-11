@@ -103,6 +103,15 @@ older SenseVoice `voice.py` with the repo's Whisper Base version (F15); the depl
   can't tell, because it changes after a record.
 - A dose is still never recorded from a search session. The dose prompt is spoken only after verification in that
   session, as today.
+- **2026-10-11, after the final review: narrowed to check-in searches**, because a dose task's search verified a
+  patient 1.35-3 m away whom the strict dose session after it then found `ambiguous`: after 20 s the robot told that
+  very patient 「我在等要吃藥的人，請他到我面前來。」 and stopped searching for up to 10 minutes. The user's complaint
+  was the check-in search. The OpenVINO-only rule now applies only to a robot session that started in `observe` for a
+  **check-in task** (`reachy_task.reason = 'checkin'`, looked up at `/api/device/monitor/start`; the session field
+  `checkin_search`). The search before prompting a dose and the watch after a dose keep the strict rule. Under the
+  OpenVINO-only rule a hit also needs a patient face at least 6.5% of the frame's width wide
+  (`OPENVINO_ONLY_MIN_FACE_FRACTION`, about 32 px of the 480x360 frame), else the status is `searching`: the MediaPipe
+  gate had set a floor of about 50 px by itself, and faces of about 24 px matched close to the 0.3 threshold.
 
 **B2. Identity log** (`app/services/monitor_service.py`).
 For robot sessions, every change of `identity_status`, and at most one line per 5 s otherwise, logs one INFO line:

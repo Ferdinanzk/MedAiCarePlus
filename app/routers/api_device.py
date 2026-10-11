@@ -106,7 +106,7 @@ def _uuid(value: str | None) -> str | None:
 
 async def _leased_task(conn, device: dict, task_id: str):
     task = await conn.fetchrow(
-        "SELECT task_id, u_id, slot_time, intk_ids, status FROM reachy_task "
+        "SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
         "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid",
         _uuid(task_id), device["u_id"], device["device_id"])
     if not task:
@@ -563,6 +563,7 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
     if payload.mode == "dose" and (payload.intk_id is None or payload.task_id is None):
         raise HTTPException(422, "A dose session needs intk_id and task_id")
     auto_commit = False
+    checkin_search = False
     intk_id = payload.intk_id if payload.mode == "dose" else None
     async with get_pool().acquire() as conn:
         if payload.task_id is not None:
@@ -571,6 +572,8 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
                 raise HTTPException(409, "Task is no longer active")
             if intk_id is not None and intk_id not in list(task["intk_ids"]):
                 raise HTTPException(409, "Dose does not belong to this task")
+            # Only a check-in task's search verifies with the OpenVINO match alone (monitor_service.openvino_only).
+            checkin_search = task["reason"] == "checkin"
         if intk_id is not None:
             row = await conn.fetchrow(
                 "SELECT m.dose_form, m.units_per_dose, i.intake_time_stamp FROM intake i "
@@ -586,7 +589,8 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
             auto_commit = device["auto_record"] and reachy_tasks.is_supported(row["dose_form"], row["units_per_dose"])
     try:
         state = await registry.replace(device["u_id"], intk_id, device["face_label"], device["name"],
-                                       mode=payload.mode, client_type=CLIENT_TYPE, auto_commit=auto_commit)
+                                       mode=payload.mode, client_type=CLIENT_TYPE, auto_commit=auto_commit,
+                                       checkin_search=checkin_search)
     except BusyOtherClient as exc:
         raise HTTPException(409, "busy_other_client") from exc
     state.clip_enabled = await dose_video.enabled(device["u_id"])
