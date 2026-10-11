@@ -3,12 +3,32 @@ const STATE_TEXT = {
   not_configured: "Not connected yet",
   starting: "Starting…",
   running: "Connected",
+  stopping: "Stopping…",
   stopped: "Stopped",
   error: "Error",
 };
 
 const form = document.getElementById("config");
 const formError = document.getElementById("form-error");
+const saveButton = form.querySelector('button[type="submit"]');
+const restartButton = document.getElementById("restart");
+
+// Save and Restart both restart the robot's connection, so they send one request at a time: two at once
+// (a double click) once left two connections driving the robot. Both buttons wait for the answer.
+function oneAtATime(send) {
+  return async (event) => {
+    event.preventDefault();
+    if (saveButton.disabled) return;
+    saveButton.disabled = true;
+    restartButton.disabled = true;
+    try {
+      await send();
+    } finally {
+      saveButton.disabled = false;
+      restartButton.disabled = false;
+    }
+  };
+}
 
 function show(status) {
   const state = document.getElementById("state");
@@ -57,8 +77,7 @@ async function loadConfig() {
     : "Shown once when you pair the robot in the web app.";
 }
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+form.addEventListener("submit", oneAtATime(async () => {
   formError.textContent = "";
   const body = {
     app_url: form.app_url.value.trim(),
@@ -81,12 +100,12 @@ form.addEventListener("submit", async (event) => {
   form.device_token.value = "";
   show(data.status);
   await loadConfig();
-});
+}));
 
-document.getElementById("restart").addEventListener("click", async () => {
+restartButton.addEventListener("click", oneAtATime(async () => {
   const response = await fetch("/api/restart", { method: "POST" });
   show(await response.json());
-});
+}));
 
 loadConfig().catch(() => { formError.textContent = "Could not load settings."; });
 refreshStatus();
