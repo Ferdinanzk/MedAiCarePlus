@@ -255,9 +255,11 @@ def test_the_test_button_saves_what_the_model_accepted(api, monkeypatch):
         return Reply(200, {"choices": [{"finish_reason": "stop", "message": {"content": "您好！"}}]})
 
     monkeypatch.setattr(api_ai.requests, "post", post)
+    monkeypatch.setattr(api_ai.requests, "get", lambda url, timeout: Reply(200, {"data": [{"id": "other/model"}]}))
     response = api.client.post("/api/ai/models/13/test")
     body = response.json()
     assert body["ok"] is True and body["profile"]["temperature"] is False and body["sample"] == "您好！"
+    assert body["profile"]["thinking"] == ai_profile.CANT_THINK   # not in OpenRouter's list: it can't think
     assert "routerSECRET" not in response.text and "connections" in body["settings"]
     assert sent[0]["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert sent[0]["headers"]["Authorization"] == f"Bearer {OPENROUTER_KEY}"
@@ -401,3 +403,121 @@ def test_a_voice_only_model_gets_a_clear_code_saved_as_its_last_error(api, monke
     assert (response.json()["ok"], response.json()["error"]) == (False, "not_chat_model")
     assert api.store.saved_tests[-1]["error"] == "not_chat_model"   # last_error stores the same code
     assert sent == ["https://api.openai.com/v1/chat/completions"]
+
+
+# Thinking levels found by Test (spec 2026-10-11 D2)
+
+LUNA_REFUSES_MAX = ("Unsupported value: 'reasoning_effort' does not support 'max' with this model. "
+                    "Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.")
+ASTRA_REFUSES_NONE = ("Unsupported value: 'reasoning_effort' does not support 'none' with this model. "
+                      "Supported values are: 'low', 'medium', 'high', and 'xhigh'.")
+HELLO = {"choices": [{"finish_reason": "stop", "message": {"content": "您好！"}}]}
+
+
+def _openai_model(monkeypatch, model_id="gpt-6-luna"):
+    snapshot = _snapshot()
+    openai = ai_settings.Connection(2, "OpenAI", "openai", ai_profile.BASE_URLS["openai"], NEW_KEY, "9876", True,
+                                    "OpenAI")
+    model = ai_settings.Model(21, 2, model_id, "OpenAI", "USA", "30 days", None)
+    monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+        snapshot, connections={**snapshot.connections, 2: openai}, models={**snapshot.models, 21: model}))
+
+
+def test_the_test_button_saves_the_thinking_levels_the_model_accepts(api, monkeypatch):
+    _openai_model(monkeypatch)
+    sent = []
+
+    def post(url, json, timeout, headers):
+        sent.append(json)
+        if json.get("reasoning_effort") == "max":
+            return Reply(400, {"error": {"message": LUNA_REFUSES_MAX}})
+        return Reply(200, HELLO)
+
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    response = api.client.post("/api/ai/models/21/test")
+    body = response.json()
+    thinking = body["profile"]["thinking"]
+    assert body["ok"] is True and body["profile"]["reasoning_off"] == {"reasoning_effort": "none"}
+    assert (thinking["param"], thinking["levels"], thinking["always"], thinking["temperature"]) == (
+        "reasoning_effort", ["low", "medium", "high"], False, False)
+    assert sorted(thinking["ms"]) == ["high", "low", "medium"]
+    assert [b.get("reasoning_effort") for b in sent] == ["none", "max", "low", "medium", "high"]
+    assert [b["max_completion_tokens"] for b in sent] == [200, 200, 1000, 1800, 3200]
+    assert "temperature" in sent[0] and not any("temperature" in b for b in sent[1:])
+    assert api.store.calls[-1] == ("save_test", 21, True, body["profile"]) and "newSECRET" not in response.text
+
+
+def test_a_model_that_refuses_none_is_saved_as_always_thinking(api, monkeypatch):
+    """The Astra/Sol bug (spec F14): its "off" becomes low with low's allowance, never "no setting"."""
+    _openai_model(monkeypatch, "gpt-6-astra")
+    sent = []
+
+    def post(url, json, timeout, headers):   # like GPT-6 Astra: no setting is its default level (medium)
+        sent.append(json)
+        effort = json.get("reasoning_effort")
+        if effort is not None and effort not in ("low", "medium", "high", "xhigh"):
+            return Reply(400, {"error": {"message": ASTRA_REFUSES_NONE.replace("'none'", f"'{effort}'", 1)}})
+        return Reply(200, HELLO)
+
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    profile = api.client.post("/api/ai/models/21/test").json()["profile"]
+    assert profile["reasoning_off"] == {"reasoning_effort": "low"} and profile["temperature"] is False
+    assert (profile["thinking"]["levels"], profile["thinking"]["always"]) == (["low", "medium", "high"], True)
+    assert [(b.get("reasoning_effort"), b["max_completion_tokens"]) for b in sent] == [
+        ("none", 200), ("low", 1000), ("max", 200), ("low", 1000), ("medium", 1800), ("high", 3200)]
+
+
+def test_a_level_that_times_out_is_not_offered_and_the_base_profile_is_saved(api, monkeypatch):
+    """Spec review focus 4: a slow level costs only that level."""
+    _openai_model(monkeypatch)
+
+    def post(url, json, timeout, headers):
+        if json.get("reasoning_effort") in ("max", "high"):
+            raise api_ai.requests.Timeout("slow")
+        return Reply(200, HELLO)
+
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    body = api.client.post("/api/ai/models/21/test").json()
+    assert body["ok"] is True and body["profile"]["thinking"]["levels"] == ["low", "medium"]
+    assert api.store.calls[-1] == ("save_test", 21, True, body["profile"])
+
+
+def test_an_openrouter_model_gets_its_levels_from_the_public_list_without_the_key(api, monkeypatch):
+    asked, sent = [], []
+
+    def get(url, timeout):   # no headers argument: the public list is asked without the key
+        asked.append(url)
+        return Reply(200, {"data": [{"id": "other/model"}, {
+            "id": "meta/llama-4", "supported_parameters": ["max_tokens", "reasoning", "temperature"],
+            "reasoning": {"mandatory": False, "supported_efforts": ["high", "medium", "low"]}}]})
+
+    def post(url, json, timeout, headers):
+        sent.append(json)
+        return Reply(200, HELLO)
+
+    monkeypatch.setattr(api_ai.requests, "get", get)
+    monkeypatch.setattr(api_ai.requests, "post", post)
+    thinking = api.client.post("/api/ai/models/13/test").json()["profile"]["thinking"]
+    assert asked == ["https://openrouter.ai/api/v1/models"]
+    assert {**thinking, "ms": None} == {"param": "openrouter_effort", "levels": ["low", "medium", "high"], "ms": None,
+                                        "always": False, "temperature": True}
+    assert sorted(thinking["ms"]) == ["high", "low", "medium"]
+    assert [b.get("reasoning") for b in sent] == [{"enabled": False}, {"effort": "low", "exclude": True},
+                                                  {"effort": "medium", "exclude": True},
+                                                  {"effort": "high", "exclude": True}]
+
+
+def test_a_failed_thinking_step_still_saves_the_base_profile(api, monkeypatch, caplog):
+    """OpenRouter's model list down, or anything else failing in the thinking step, never costs the profile the base
+    test found."""
+    def get(url, timeout):
+        raise api_ai.requests.ConnectionError("down")
+
+    monkeypatch.setattr(api_ai.requests, "get", get)
+    monkeypatch.setattr(api_ai.requests, "post", lambda url, json, timeout, headers: Reply(200, HELLO))
+    with caplog.at_level("WARNING", logger=api_ai.log.name):
+        body = api.client.post("/api/ai/models/13/test").json()
+    assert body["ok"] is True and body["profile"] == ai_profile.starting_profile("openrouter")
+    assert api.store.calls[-1] == ("save_test", 13, True, ai_profile.starting_profile("openrouter"))
+    assert "thinking levels of AI model 13 not found: ConnectionError" in caplog.text
+    assert "routerSECRET" not in caplog.text

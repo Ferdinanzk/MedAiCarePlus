@@ -234,9 +234,9 @@ async def delete_model(model_ref: int, user: dict = Depends(get_consented_user))
 
 @router.post("/models/{model_ref}/test")
 async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
-    """Find the request settings this model accepts (ai_profile.detect) and save them, or why it failed. A model that
-    is not a chat model (a voice-only one such as gpt-live-1) fails with the code ai_profile.NOT_CHAT_MODEL, which the
-    card explains and last_error keeps."""
+    """Find the request settings this model accepts (ai_profile.detect), then the thinking levels it accepts
+    (ai_profile.detect_thinking), and save them, or why it failed. A failed base test (the service's words, or
+    ai_profile.NOT_CHAT_MODEL for a voice-only model) saves only its reason and starts no thinking probe."""
     model = _model(model_ref)
     connection = ai_settings.current().connections[model.connection_id]
     if not connection.key_readable:
@@ -246,9 +246,8 @@ async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
     target = ai_settings.Target(connection, model)
     provider = conversation._provider() if connection.kind == "openrouter" else None   # as real calls are routed
 
-    def send(profile: dict):
-        body = ai_profile.request_body(profile, model.model_id, ai_profile.TEST_MESSAGES, ai_profile.TEST_MAX_TOKENS,
-                                       0.7, {"provider": provider} if provider else None)
+    def send(profile: dict, level: str = "off"):
+        body = ai_profile.probe_body(profile, model.model_id, level, {"provider": provider} if provider else None)
         started = time.monotonic()
         try:
             response = requests.post(target.url, json=body, timeout=ai_profile.TEST_TIMEOUT,
@@ -262,8 +261,29 @@ async def test_model(model_ref: int, user: dict = Depends(get_consented_user)):
             parsed = response.text   # cut by detect, after the key is removed (a cut key would escape the match)
         return response.status_code, parsed, ms
 
+    def openrouter_entry() -> dict | None:
+        """The model's entry in OpenRouter's public model list (asked without the key), or None when it isn't listed."""
+        response = requests.get(f"{connection.base_url}/models", timeout=REMOTE_MODELS_TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            raise RuntimeError("unexpected body")
+        return next((item for item in data if isinstance(item, dict) and item.get("id") == model.model_id), None)
+
     # The exact key too: a service may echo a key of any shape in its error, which is saved and shown on the card.
     result = await asyncio.to_thread(ai_profile.detect, send, connection.kind, connection.api_key)
+    if result["ok"]:
+        # Apart from the base test (spec review focus 4): nothing here may cost the model the profile detect found.
+        try:
+            thinking = await asyncio.to_thread(ai_profile.detect_thinking, send, connection.kind, result["profile"],
+                                               openrouter_entry)
+        except Exception as exc:
+            log.warning("thinking levels of AI model %s not found: %s", model_ref,
+                        exc if isinstance(exc, RuntimeError) else type(exc).__name__)
+        else:
+            result = {**result, "profile": {**result["profile"], "thinking": thinking}}
     async with get_pool().acquire() as conn:
         async with ai_store.change(conn):
             await ai_store.save_test(conn, model_ref, result)
