@@ -51,11 +51,13 @@ class FakeConn:
             for row in self.devices:
                 if row["u_id"] == args[0] and row["revoked_at"] is None:
                     return {"device_id": row["device_id"], "label": "Reachy Mini", "auto_record": row["auto_record"],
-                            "last_seen_at": None, "robot_reachable": None, "landmark_fps": None,
-                            "status_detail": None}
+                            "live_voice": False, "last_seen_at": None, "robot_reachable": None,
+                            "landmark_fps": None, "status_detail": None}
             return None
         if "FROM reachy_task WHERE u_id = $1" in query:
             return None
+        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
+            return {"reachy_call_name": None, "name": "Pearl"}
         raise AssertionError(query)
 
     async def fetchval(self, query, *args):

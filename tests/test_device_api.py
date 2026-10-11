@@ -96,10 +96,12 @@ class FakeConn:
         if "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL" in query:
             assert "status_detail" in query   # api_reachy._status reads the robot's camera from it
             return {"device_id": uuid.UUID(DEVICE_ID), "label": "Reachy Mini", "auto_record": False,
-                    "last_seen_at": datetime.now(timezone.utc), "robot_reachable": True, "landmark_fps": 9.9,
-                    "status_detail": self.status_detail}
+                    "live_voice": False, "last_seen_at": datetime.now(timezone.utc), "robot_reachable": True,
+                    "landmark_fps": 9.9, "status_detail": self.status_detail}
         if "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1" in query:
             return None
+        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
+            return {"reachy_call_name": None, "name": "Pearl"}
         raise AssertionError(query)
 
     def _stamp(self, intk_id):
