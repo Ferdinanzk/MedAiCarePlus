@@ -49,6 +49,10 @@ DOSE_VISION_INTERVAL = 0.25
 # A robot session's identity log (_log_identity): a line on every change of identity_status, otherwise at most one
 # per IDENTITY_LOG_SECONDS (identity runs up to 2 Hz).
 IDENTITY_LOG_SECONDS = 5.0
+# The OpenVINO-only rule (openvino_only) counts a hit only for a patient face at least this share of the frame's
+# width wide: about 32 px of the robot's 480x360 frame. The MediaPipe gate set a floor of about 50 px by itself;
+# without one, faces of about 24 px matched at distances of 0.20-0.27, close to the 0.3 threshold (review of 11 Oct).
+OPENVINO_ONLY_MIN_FACE_FRACTION = 0.065
 
 log = logging.getLogger(__name__)
 
@@ -326,7 +330,8 @@ def vision_interval(state: MonitorSession) -> float:
 def openvino_only(state: MonitorSession) -> bool:
     """The identity rule of the search before talking: a robot session that started in observe mode verifies the
     patient with the OpenVINO match alone. MediaPipe's short-range face detector misses faces under about 50 px wide
-    (beyond about 1.35 m from the robot), where dashboard login, which uses OpenVINO alone, still works. No dose is
+    (beyond about 1.35 m from the robot), where dashboard login, which uses OpenVINO alone, still works. Under this
+    rule a hit needs a patient face at least OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is
     ever recorded from such a session. Every other session (dose sessions, also once a record switched them to
     observe, and browser sessions) also needs a MediaPipe face on the same box."""
     return state.client_type == "reachy" and state.started_mode == "observe"
@@ -564,16 +569,19 @@ class MonitorRegistry:
                     target = targets[0]
                     h, w = frame.shape[:2]
                     box = [target["box"][0] / w, target["box"][1] / h, target["box"][2] / w, target["box"][3] / h]
-                    ambiguous = False
+                    failed = None   # the status of a check that is not a hit
                     if rule == "with_mediapipe":
                         # The MediaPipe gate: a MediaPipe face on the same box, in a frame of fewer than 4 faces.
                         geometric_matches = sorted(((overlap(face["box"], box), i) for i, face in enumerate(faces)),
                                                    reverse=True)
-                        ambiguous = not geometric_matches or geometric_matches[0][0] < .20 or len(faces) >= 4
-                    if ambiguous:
+                        if not geometric_matches or geometric_matches[0][0] < .20 or len(faces) >= 4:
+                            failed = "ambiguous"
+                    elif target["box"][2] < OPENVINO_ONLY_MIN_FACE_FRACTION * w:
+                        failed = "searching"   # too small to trust the OpenVINO match alone
+                    if failed:
                         state.identity_hits = 0
                         state.target_box = None
-                        state.identity_status = "ambiguous"
+                        state.identity_status = failed
                     else:
                         if state.last_identity_box and overlap(box, state.last_identity_box) < .20:
                             state.identity_hits = 0
