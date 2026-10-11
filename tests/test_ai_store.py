@@ -3,6 +3,7 @@ transaction together with the re-worded notices, and refusing to drop what a job
 
 import asyncio
 import json
+import os
 import sys
 import types
 
@@ -77,7 +78,7 @@ def test_load_reads_keys_and_profiles():
                       "region": "USA", "retention": "30 days", "tested_at": None, "test_ms": None, "last_error": None,
                       "profile": json.dumps({"token_param": "max_completion_tokens", "temperature": True,
                                              "reasoning_off": None})}],
-        "ai_job": [{"job": "reply", "primary_ref": 11, "fallback_ref": None}]}
+        "ai_job": [{"job": "reply", "primary_ref": 11, "fallback_ref": None, "thinking": "medium"}]}
     snapshot = asyncio.run(ai_store.load(Conn(rows)))
     assert snapshot.connections[1].api_key == "sk-proj-k-1234" and snapshot.connections[1].key_readable
     # SECRET_KEY changed since this key was saved: kept, unreadable, and startup goes on (review focus 5)
@@ -85,6 +86,8 @@ def test_load_reads_keys_and_profiles():
     assert snapshot.connections[3].api_key == "" and snapshot.connections[3].key_readable is True
     assert snapshot.models[11].profile["token_param"] == "max_completion_tokens"
     assert snapshot.jobs == {"reply": (11, None)}
+    # each job's thinking level; a job without a row is "off"
+    assert snapshot.thinking == {"reply": "medium", "safety": "off", "after_chat": "off"}
 
 
 def test_the_first_start_copies_the_env_setup(monkeypatch):
@@ -330,3 +333,20 @@ def test_when_every_openrouter_connection_has_a_key_the_start_changes_nothing(mo
     with caplog.at_level("INFO", logger=ai_store.log.name):
         assert asyncio.run(ai_store.fill_openrouter_keys_from_env("sk-or-v1-envFILL-2468")) == 0
     assert conn.statements("UPDATE") == [] and "BEGIN" not in conn.sql and "filled" not in caplog.text
+
+
+def test_set_jobs_saves_each_jobs_thinking_level():
+    conn = Conn()
+    asyncio.run(ai_store.set_jobs(conn, {"reply": (11, 12), "safety": (11, None)}, {"reply": "medium"}))
+    # a job left out of the levels is set to off
+    assert conn.statements("INSERT INTO ai_job") == [("reply", 11, 12, "medium"), ("safety", 11, None, "off")]
+    assert all("thinking = EXCLUDED.thinking" in query for query, _ in conn.sql)
+
+
+def test_the_schema_adds_the_thinking_level_with_its_check():
+    with open(os.path.join(os.path.dirname(__file__), "..", "sql", "init.sql"), encoding="utf-8") as handle:
+        sql = handle.read()
+    assert "ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS thinking VARCHAR(10) NOT NULL DEFAULT 'off';" in sql
+    assert "ALTER TABLE ai_job DROP CONSTRAINT IF EXISTS ai_job_thinking_check;" in sql
+    assert ("ALTER TABLE ai_job ADD CONSTRAINT ai_job_thinking_check CHECK (thinking IN ('off','low','medium','high'));"
+            in sql)

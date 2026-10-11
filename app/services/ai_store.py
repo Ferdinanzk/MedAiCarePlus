@@ -36,10 +36,12 @@ async def load(conn) -> ai_settings.Snapshot:
                   row["retention"], _json(row["profile"]), row["tested_at"], row["test_ms"], row["last_error"])
               for row in await conn.fetch("SELECT model_ref, connection_id, model_id, company, region, retention, "
                                           "profile, tested_at, test_ms, last_error FROM ai_model ORDER BY model_ref")}
-    jobs = {row["job"]: (row["primary_ref"], row["fallback_ref"])
-            for row in await conn.fetch("SELECT job, primary_ref, fallback_ref FROM ai_job")}
+    jobs, thinking = {}, {job: "off" for job in ai_settings.JOBS}
+    for row in await conn.fetch("SELECT job, primary_ref, fallback_ref, thinking FROM ai_job"):
+        jobs[row["job"]] = (row["primary_ref"], row["fallback_ref"])
+        thinking[row["job"]] = row["thinking"]
     seeded_at = await conn.fetchval("SELECT updated_at FROM ops_state WHERE key = 'ai_seeded_from_env'")
-    return ai_settings.Snapshot(connections, models, jobs, seeded_at)
+    return ai_settings.Snapshot(connections, models, jobs, seeded_at, thinking)
 
 
 async def seed_from_env(conn) -> bool:
@@ -167,12 +169,15 @@ async def save_test(conn, model_ref: int, result: dict) -> None:
         await conn.execute("UPDATE ai_model SET last_error = $2 WHERE model_ref = $1", model_ref, result["error"])
 
 
-async def set_jobs(conn, jobs: dict[str, tuple[int, int | None]]) -> None:
+async def set_jobs(conn, jobs: dict[str, tuple[int, int | None]], thinking: dict[str, str] | None = None) -> None:
+    """Each job's main and backup model and its thinking level; a job missing from `thinking` is set to "off"."""
+    thinking = thinking or {}
     for job, (primary_ref, fallback_ref) in jobs.items():
         await conn.execute(
-            "INSERT INTO ai_job (job, primary_ref, fallback_ref) VALUES ($1, $2, $3) ON CONFLICT (job) DO UPDATE "
-            "SET primary_ref = EXCLUDED.primary_ref, fallback_ref = EXCLUDED.fallback_ref, updated_at = NOW()",
-            job, primary_ref, fallback_ref)
+            "INSERT INTO ai_job (job, primary_ref, fallback_ref, thinking) VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (job) DO UPDATE SET primary_ref = EXCLUDED.primary_ref, "
+            "fallback_ref = EXCLUDED.fallback_ref, thinking = EXCLUDED.thinking, updated_at = NOW()",
+            job, primary_ref, fallback_ref, thinking.get(job, "off"))
 
 
 async def note_call(model_ref: int, error: str | None) -> None:
