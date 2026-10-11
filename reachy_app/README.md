@@ -88,11 +88,15 @@ From 0.7.0 the app watches its camera while it looks for the patient or watches 
 - **Still no steady frames 15 seconds after the stall began:** the app ends the search with the reason
   `camera_unavailable` and puts the robot to sleep. The server then handles the reminder as for a patient it could not
   find; the camera alone never records or skips a dose.
+- **The speaker and microphone share the camera's link.** When the daemon refuses to give the camera back, they are
+  off too. The app then asks for them back every 10 seconds (with each heartbeat) and before each reminder or
+  check-in, and when it gives up on the camera while they are still off, it logs an error saying so.
 - The heartbeat tells the server the camera state, and the web app's Reachy card shows "Robot camera not working".
 
 **Don't run TCU's Reachy AI Companion at the same time.** It connects to the robot without media
 (`media_backend="no_media"`), and Reachy Mini's SDK 1.11.0 then makes the daemon release the camera and audio. This
-app's camera feed stops, and nothing asks for the camera back. Disable the companion at boot over SSH
+app's camera feed stops. From 0.7.0 the app asks for it back when it notices, during a search or a dose watch (see
+above), but the companion can take it again at any time. Disable the companion at boot over SSH
 (`sudo systemctl disable --now reachy-ai-companion`); it also uses this app's port, 8042. To check the camera over
 SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when another program took it, and
 `curl -s -X POST localhost:8000/api/media/acquire` gives it back.
