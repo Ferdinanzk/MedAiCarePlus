@@ -5,14 +5,15 @@ import { ApiError } from '../lib/reachy-api';
 import {
   AI_JOBS, AI_KINDS, addConnection, addModel, deleteConnection, deleteModel, fetchAiSettings, fetchRemoteModels,
   mergeJobs, saveJobs, testModel, updateConnection, updateModel,
-  type AiJob, type AiJobChoice, type AiKind, type AiModel, type AiSettings, type AiTestResult,
+  type AiJob, type AiJobChoice, type AiKind, type AiModel, type AiSettings, type AiTestResult, type AiThinkingLevel,
 } from '../lib/ai-connections-api';
+import { acceptedLevels, nearestLevel, offeredLevels, sentLevel, thinkingMs, tooSlow } from '../lib/ai-thinking';
 
 /** Codes api_ai.py answers with; anything else shows the general message. */
 const KNOWN_ERRORS = ['in_use', 'untested_model', 'not_found', 'invalid_base_url', 'invalid_name', 'invalid_kind',
   'key_unreadable', 'no_key', 'already_exists', 'notice_incomplete', 'remote_models_unavailable', 'invalid_request'];
 /** Codes a model's Test result or last call can carry instead of the service's own words (ai_profile.py). */
-const MODEL_ERRORS = ['not_chat_model'];
+const MODEL_ERRORS = ['not_chat_model', 'thinking_budget'];
 const field = 'w-full px-3 py-2 border border-gray-200 rounded-xl text-sm';
 const primary = 'px-3 py-2 rounded-xl text-sm font-medium bg-[#0057B8] text-white disabled:opacity-50';
 const secondary = 'px-3 py-2 rounded-xl text-sm font-medium border border-gray-200 text-gray-700 disabled:opacity-50';
@@ -135,6 +136,7 @@ export default function AiConnectionsCard() {
     (error && MODEL_ERRORS.includes(error) ? t(`aiConnections.modelErrors.${error}`) : error);
 
   const status = (model: AiModel) => {
+    if (testing === model.model_ref) return <span className="text-gray-500">{t('aiConnections.testingThinking')}</span>;
     const result = results[model.model_ref];
     if (result && !result.ok) return <span className="text-red-700"><XCircle className="inline w-4 h-4" /> {modelError(result.error)}</span>;
     if (model.last_error) return <span className="text-red-700">{t('aiConnections.lastCallFailed', { error: modelError(model.last_error) })}</span>;
@@ -146,6 +148,52 @@ export default function AiConnectionsCard() {
     }
     if (model.copied_from_env) return <span className="text-gray-500">{t('aiConnections.copiedFromEnv')}</span>;
     return <span className="text-gray-500">{t('aiConnections.notTested')}</span>;
+  };
+
+  /** "Can think: low · medium · high" or "Can't think", from what the model's Test found. */
+  const canThink = (model: AiModel) => {
+    const levels = acceptedLevels(model);
+    return levels.length
+      ? t('aiConnections.canThink', { levels: levels.map(level => t(`aiConnections.levelShort.${level}`)).join(t('aiConnections.levelSeparator')) })
+      : t('aiConnections.cantThink');
+  };
+
+  /** The job's choice with another main model. Its thinking level stays if the new model accepts it, else it becomes
+   *  the nearest lower level that model accepts, else off. */
+  const withMainModel = (job: AiJob, primary_ref: number): AiJobChoice => {
+    const main = settings.models.find(model => model.model_ref === primary_ref);
+    return { ...jobs[job], primary_ref, thinking: nearestLevel(main, jobs[job].thinking) };
+  };
+
+  /** A job's Thinking list (off, and the levels its main model accepts), the level that model really gets when it
+   *  differs, its time at that level in Test, and a warning when that time is over what one call of the job may take. */
+  const thinkingControls = (job: AiJob) => {
+    const choice = jobs[job];
+    const main = settings.models.find(model => model.model_ref === choice.primary_ref);
+    const sent = sentLevel(main, choice.thinking);
+    const ms = thinkingMs(main, choice.thinking);
+    const notes: string[] = [];
+    if (sent !== choice.thinking) notes.push(t('aiConnections.thinkingSent', { level: t(`aiConnections.levelNames.${sent}`) }));
+    if (ms !== null) notes.push(t('aiConnections.thinkingTime', { seconds: (ms / 1000).toFixed(1) }));
+    return (
+      <>
+        <label className="block text-xs text-gray-600 sm:col-start-2">{t('aiConnections.thinking')}
+          <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.thinking')}`} value={choice.thinking}
+            onChange={event => {
+              setJobsSaved(false);
+              setJobs({ ...jobs, [job]: { ...choice, thinking: event.target.value as AiThinkingLevel } });
+            }}>
+            {offeredLevels(main, choice.thinking).map(level => <option key={level} value={level}>{t(`aiConnections.levelNames.${level}`)}</option>)}
+          </select>
+        </label>
+        {notes.length > 0 && (
+          <p className="text-xs text-gray-500 sm:pb-2">{notes.map(note => <span key={note} className="block">{note}</span>)}</p>
+        )}
+        {tooSlow(job, main, choice.thinking) && (
+          <p role="alert" className={`${warning} sm:col-span-3`}><TriangleAlert className="inline w-4 h-4" /> {t('aiConnections.thinkingTooSlow')}</p>
+        )}
+      </>
+    );
   };
 
   return (
@@ -256,6 +304,7 @@ export default function AiConnectionsCard() {
               <div className="text-sm min-w-0">
                 <div className="font-medium text-gray-900 break-words">{label(model)}</div>
                 <div className="text-xs break-words">{status(model)}</div>
+                {model.profile && <div className="text-xs text-gray-500">{canThink(model)}</div>}
                 <div className="text-xs text-gray-500 break-words">{[model.company, model.region, model.retention].map(value => value || '—').join(' · ')}</div>
               </div>
               <div className="flex flex-wrap gap-2 sm:justify-end sm:shrink-0">
@@ -350,7 +399,7 @@ export default function AiConnectionsCard() {
                 <select className={field} aria-label={`${t(`aiConnections.jobNames.${job}`)}: ${t('aiConnections.main')}`} value={jobs[job].primary_ref}
                   onChange={event => {
                     setJobsSaved(false);
-                    setJobs({ ...jobs, [job]: { ...jobs[job], primary_ref: Number(event.target.value) } });
+                    setJobs({ ...jobs, [job]: withMainModel(job, Number(event.target.value)) });
                   }}>
                   {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
                 </select>
@@ -365,6 +414,7 @@ export default function AiConnectionsCard() {
                   {tested.map(model => <option key={model.model_ref} value={model.model_ref}>{label(model)}</option>)}
                 </select>
               </label>
+              {thinkingControls(job)}
             </div>
             {/* The saved setup, as the server judged it; `?.`: change answers are not shape-checked like the first load. */}
             {settings.jobs_usable?.[job] === false && (
