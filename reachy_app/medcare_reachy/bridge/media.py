@@ -37,6 +37,7 @@ NEUTRAL_TOLERANCE = {"head_deg": 4.5, "head_mm": 6.0, "body_deg": 1.5, "antenna_
 RECENTER_LIMIT = {"head_deg": 15.0, "head_mm": 20.0, "body_deg": 8.0, "antenna_deg": 30.0}
 DAEMON_PORT = 8000
 MEDIA_STATUS_TIMEOUT = 2.0   # seconds: the camera watchdog logs the daemon's media status with every stall
+RESTORE_RETRY_SECONDS = 60.0   # restore_media(): while the daemon refuses, ask again at most this often
 
 
 class Robot(Protocol):
@@ -138,6 +139,8 @@ class ReachyRobot:
         self._lock = threading.Lock()   # audio: the SDK is driven from worker threads
         self._quiet_at = 0.0            # when the last clip handed to the speaker has finished playing
         self._restore_failing = False   # restore_media(): the daemon refused, already logged for this streak
+        self._restore_retry_at = 0.0    # restore_media(): when a refused streak may ask the daemon again
+        self._now = time.monotonic      # clock for restore_media()'s retry pace (tests replace it)
         # Gestures start only after hold_head() and stop for every other move (wake, sleep, look_around, close).
         self._gestures = Gestures(self._send_gesture, ready=self._motors_on, start_from=self._start_pose,
                                   move=thinking_move())
@@ -312,6 +315,9 @@ class ReachyRobot:
         before a task wakes the robot. It only ever calls the SDK's acquire_media(), never release_media(), so media
         this app has is never touched; it holds the playback lock, as the recovery does, and starts the fresh
         manager's microphone. Never raises: a refusal or an SDK error logs one WARNING per streak of failures.
+        While the daemon keeps refusing it asks again at most once every RESTORE_RETRY_SECONDS: the SDK logs a WARNING
+        and an ERROR for each refused acquire and its request can take 10 s, so asking at every heartbeat filled the
+        robot's log and delayed the heartbeat.
         """
         mini = self._mini
         if mini is None:
@@ -319,6 +325,8 @@ class ReachyRobot:
         if not getattr(mini, "media_released", False):
             self._restore_failing = False
             return True
+        if self._restore_failing and self._now() < self._restore_retry_at:
+            return False   # refused a moment ago: wait before asking the daemon again
         failure, restored = None, False
         try:
             with self._lock:
@@ -337,8 +345,9 @@ class ReachyRobot:
         if failure is not None:
             if not self._restore_failing:
                 log.warning("this app's media is still released (%s): the speaker and microphone stay off; asking "
-                            "again at every heartbeat", failure)
+                            "again about once a minute", failure)
             self._restore_failing = True
+            self._restore_retry_at = self._now() + RESTORE_RETRY_SECONDS
             return False
         self._restore_failing = False
         if restored:
