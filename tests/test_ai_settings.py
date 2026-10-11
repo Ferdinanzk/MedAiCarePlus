@@ -92,7 +92,7 @@ def test_the_public_view_never_carries_a_key():
     view = ai_settings.public(_card_snapshot())
     assert "sk-proj-secret-abcd" not in json.dumps(view)
     assert view["connections"][0]["key_last4"] == "abcd" and view["connections"][1]["has_key"] is False
-    assert view["jobs"]["safety"] == {"primary_ref": 21, "fallback_ref": None}
+    assert view["jobs"]["safety"] == {"primary_ref": 21, "fallback_ref": None, "thinking": "off"}
     assert view["no_key_in_use"] is False
     assert view["models"][1]["copied_from_env"] is True and view["models"][1]["tested"] is True
 
@@ -141,3 +141,57 @@ def test_before_loading_the_jobs_are_usable_only_with_the_env_key(monkeypatch):
     assert all(ai_settings.job_usable(ai_settings.current(), job) for job in ai_settings.JOBS)
     monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
     assert not any(ai_settings.job_usable(ai_settings.current(), job) for job in ai_settings.JOBS)
+
+
+# ── Thinking levels (spec 2026-10-11 D3) ──
+
+THINKING_PART = {"param": "reasoning_effort", "levels": ["low", "medium", "high"],
+                 "ms": {"low": 1900, "medium": 2700, "high": 4100}, "always": False, "temperature": False}
+
+
+def _thinking_snapshot(thinking, backup_levels=("low",)):
+    """_card_snapshot with the jobs' levels: the main model (11) thinks at every level, the backup (21) only at
+    backup_levels."""
+    snapshot = _card_snapshot()
+    main = dataclasses.replace(snapshot.models[11],
+                               profile={**snapshot.models[11].profile, "thinking": THINKING_PART})
+    backup = dataclasses.replace(snapshot.models[21], profile={
+        **snapshot.models[21].profile,
+        "thinking": {**THINKING_PART, "param": "openrouter_effort", "levels": list(backup_levels)}})
+    return dataclasses.replace(snapshot, models={11: main, 21: backup}, thinking=thinking)
+
+
+def test_thinking_is_off_by_default_everywhere():
+    assert ai_settings.env_snapshot().thinking == {"reply": "off", "safety": "off", "after_chat": "off"}
+    assert _card_snapshot().thinking == {"reply": "off", "safety": "off", "after_chat": "off"}
+    assert {target.thinking for job in ai_settings.JOBS for target in ai_settings.job_targets(job)} == {"off"}
+    assert ai_settings.env_target("x/model").thinking == "off"
+
+
+def test_main_and_backup_each_get_a_level_they_accept():   # spec review focus 5
+    snapshot = _thinking_snapshot({"reply": "high", "safety": "medium", "after_chat": "off"})
+    assert [target.thinking for target in ai_settings.job_targets("reply", snapshot)] == ["high", "low"]
+    assert [target.thinking for target in ai_settings.job_targets("safety", snapshot)] == ["low"]
+    assert [target.thinking for target in ai_settings.job_targets("after_chat", snapshot)] == ["off"]
+
+
+def test_a_backup_that_cannot_think_gets_off():
+    snapshot = _thinking_snapshot({"reply": "medium", "safety": "off", "after_chat": "off"}, backup_levels=())
+    assert [target.thinking for target in ai_settings.job_targets("reply", snapshot)] == ["medium", "off"]
+
+
+def test_a_model_that_always_thinks_gets_its_lowest_level_when_the_job_is_off():
+    snapshot = _card_snapshot()
+    astra = dataclasses.replace(snapshot.models[11], model_id="gpt-6-astra", profile={
+        "token_param": "max_completion_tokens", "temperature": False, "reasoning_off": {"reasoning_effort": "low"},
+        "thinking": {**THINKING_PART, "always": True}})
+    snapshot = ai_settings.with_model(snapshot, astra)
+    assert [target.thinking for target in ai_settings.job_targets("reply", snapshot)] == ["low", "off"]
+
+
+def test_the_public_view_shows_each_jobs_thinking_level():
+    view = ai_settings.public(_thinking_snapshot({"reply": "high", "safety": "off", "after_chat": "low"}))
+    assert view["jobs"] == {"reply": {"primary_ref": 11, "fallback_ref": 21, "thinking": "high"},
+                            "safety": {"primary_ref": 21, "fallback_ref": None, "thinking": "off"},
+                            "after_chat": {"primary_ref": 21, "fallback_ref": None, "thinking": "low"}}
+    assert view["models"][0]["profile"]["thinking"]["levels"] == ["low", "medium", "high"]

@@ -45,9 +45,11 @@ class Model:
 
 @dataclass(frozen=True)
 class Target:
-    """One model to call, with the connection it goes through."""
+    """One model to call, with the connection it goes through and the thinking level to send it: the job's level,
+    or the nearest lower one this model accepts (ai_profile.effective_level); "off" outside a job."""
     connection: Connection
     model: Model
+    thinking: str = "off"
 
     @property
     def model_id(self) -> str:
@@ -70,12 +72,17 @@ class Target:
         return self.model.profile or ai_profile.starting_profile(self.kind)
 
 
+def _thinking_off() -> dict[str, str]:
+    return {job: "off" for job in JOBS}
+
+
 @dataclass(frozen=True)
 class Snapshot:
     connections: dict[int, Connection]
     models: dict[int, Model]
     jobs: dict[str, tuple[int, int | None]]     # job -> (main model_ref, backup model_ref or None)
     seeded_at: datetime | None = None
+    thinking: dict[str, str] = dataclasses.field(default_factory=_thinking_off)   # job -> level chosen on the card
 
 
 _snapshot: Snapshot | None = None
@@ -121,13 +128,16 @@ def env_target(model_id: str) -> Target:
 
 
 def job_targets(job: str, snapshot: Snapshot | None = None) -> list[Target]:
-    """The job's main model, then its backup (none when unset); the same model twice is tried twice."""
+    """The job's main model, then its backup (none when unset); the same model twice is tried twice. Each gets the
+    job's thinking level, or the nearest lower level that model accepts, so main and backup can differ (spec D3)."""
     snapshot = snapshot or current()
+    level = snapshot.thinking.get(job, "off")
     targets = []
     for ref in snapshot.jobs.get(job, ()):
         model = snapshot.models.get(ref) if ref is not None else None
         if model is not None:
-            targets.append(Target(snapshot.connections[model.connection_id], model))
+            target = Target(snapshot.connections[model.connection_id], model)
+            targets.append(dataclasses.replace(target, thinking=ai_profile.effective_level(target.profile, level)))
     return targets
 
 
@@ -196,7 +206,8 @@ def public(snapshot: Snapshot) -> dict:
                     "tested": m.profile is not None, "copied_from_env": m.profile is not None and m.tested_at is None,
                     "tested_at": m.tested_at.isoformat() if m.tested_at else None, "test_ms": m.test_ms,
                     "last_error": m.last_error} for m in snapshot.models.values()],
-        "jobs": {job: {"primary_ref": refs[0], "fallback_ref": refs[1]} for job, refs in snapshot.jobs.items()},
+        "jobs": {job: {"primary_ref": refs[0], "fallback_ref": refs[1], "thinking": snapshot.thinking.get(job, "off")}
+                 for job, refs in snapshot.jobs.items()},
         "seeded_at": snapshot.seeded_at.isoformat() if snapshot.seeded_at else None,
         "no_key_in_use": not any(target.api_key for target in in_use),
         "jobs_usable": {job: job_usable(snapshot, job) for job in JOBS},

@@ -207,7 +207,8 @@ def test_only_tested_models_can_be_given_a_job(api):
     assert api.client.put("/api/ai/jobs", json=jobs).json() == {"detail": "not_found"}
     jobs["reply"] = {"primary_ref": 12, "fallback_ref": None}
     response = api.client.put("/api/ai/jobs", json=jobs)
-    assert response.status_code == 200 and response.json()["jobs"]["reply"] == {"primary_ref": 12, "fallback_ref": None}
+    assert response.status_code == 200
+    assert response.json()["jobs"]["reply"] == {"primary_ref": 12, "fallback_ref": None, "thinking": "off"}
     assert api.store.calls[-1] == ("set_jobs", {"reply": (12, None), "safety": (11, None), "after_chat": (11, None)})
 
 
