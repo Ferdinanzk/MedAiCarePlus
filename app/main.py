@@ -32,6 +32,11 @@ from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
 from app.services.schedule import DoseRefused
 
+# Nothing else configures logging, and Python drops INFO by default: the server's own INFO lines (robot identity
+# checks, the .env key fill) never reached `docker compose logs`. Give the root logger a handler and let "app.*" log INFO.
+logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s")
+logging.getLogger("app").setLevel(logging.INFO)
+
 log = logging.getLogger(__name__)
 
 

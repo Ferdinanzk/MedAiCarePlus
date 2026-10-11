@@ -94,3 +94,13 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
                 if record.levelname == "WARNING" and "no usable model" in record.getMessage()]
     assert len(unusable) == 2 and "AI job safety" in unusable[0] and "AI job after_chat" in unusable[1]
     assert "envSTART" not in caplog.text
+
+
+def test_the_apps_own_info_lines_reach_the_container_log():
+    # Nothing configured logging, so Python dropped every INFO line: the robot identity log and the .env key-fill note
+    # never reached `docker compose logs` (seen live on 12 Oct). The server's own loggers ("app.*") log INFO.
+    import logging
+    import app.main  # noqa: F401  (importing the app sets the levels)
+    assert logging.getLogger("app.services.monitor_service").isEnabledFor(logging.INFO)
+    assert logging.getLogger("app.services.ai_store").isEnabledFor(logging.INFO)
+    assert logging.getLogger().handlers, "the root logger needs a handler for the app's lines to be printed"
