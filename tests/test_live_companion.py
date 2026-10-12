@@ -12,6 +12,7 @@ reaches the network."""
 
 import asyncio
 import json
+import logging
 import sys
 import time
 import types
@@ -294,6 +295,42 @@ def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kep
         await relay._starting
         (client,) = companion.clients
         assert client.audio == kept
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(companion, caplog):
+    """A robot that sends at twice real time or faster would never let the kept audio run out: the stretch would stay
+    starting, where no pause rule applies, with GPT-Live billed. Sending it ends once a real-time robot would have
+    caught up, plus CATCH_UP_MARGIN_SECONDS; the rest is dropped and logged once, and the live microphone takes over."""
+    async def scenario():
+        frames = iter([_pcm(level % 3000 + 1, 100) for level in range(2000)])
+        due = [float("inf")]
+
+        async def sleep(seconds):   # the robot sends a 100 ms frame every 50 ms: twice real time
+            companion.clock.now += seconds
+            while companion.clock.now >= due[0] - 1e-9:
+                companion.robot.inbox.put_nowait(next(frames))
+                due[0] += 0.05
+            await _settle()
+
+        companion.sleep = sleep
+        relay, running = await _start(companion)
+        companion.start_gate = asyncio.Event()                # GPT-Live takes its time to start
+        await _speak(companion)
+        for _ in range(30):                                   # 3 s of audio kept meanwhile
+            companion.robot.inbox.put_nowait(next(frames))
+        await _settle()
+        started = due[0] = companion.clock.now
+        with caplog.at_level(logging.WARNING, logger="app.services.live_session"):
+            companion.start_gate.set()
+            await asyncio.wait_for(relay._starting, 5)
+        assert relay._phase == "running" and not relay._pre_roll and relay._pre_roll_bytes == 0
+        catch_up = 3.0 / (live_session.PRE_ROLL_SEND_SPEED - 1) + live_session.CATCH_UP_MARGIN_SECONDS
+        assert catch_up <= companion.clock.now - started <= catch_up + 0.2
+        assert sum("faster than GPT-Live may take it" in record.getMessage() for record in caplog.records) == 1
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
 
