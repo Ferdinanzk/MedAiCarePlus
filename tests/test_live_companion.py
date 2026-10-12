@@ -276,7 +276,8 @@ def test_a_stretch_sends_the_kept_audio_at_no_more_than_twice_real_time(companio
 def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kept_max_seconds(companion):
     """While GPT-Live starts, the relay keeps the robot's audio in memory and sends it at up to twice real time. A
     robot that sends faster than real time (broken or hostile) must not grow that memory without bound: at most
-    KEPT_MAX_SECONDS stay, the newest, and the stretch still gets them in order."""
+    KEPT_MAX_SECONDS stay, the newest; and once GPT-Live has started, 20 s of audio in no time is seen for what it is
+    (CATCH_UP_MARGIN_SECONDS): none of it goes out, and the live microphone takes over."""
     async def scenario():
         relay, running = await _start(companion)
         companion.start_gate = asyncio.Event()                # GPT-Live takes its time to start
@@ -294,7 +295,7 @@ def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kep
         companion.start_gate.set()
         await relay._starting
         (client,) = companion.clients
-        assert client.audio == kept
+        assert client.audio == [] and relay._phase == "running" and relay._pre_roll_bytes == 0
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
 
@@ -303,7 +304,7 @@ def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kep
 
 def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(companion, caplog):
     """A robot that sends at twice real time or faster would never let the kept audio run out: the stretch would stay
-    starting, where no pause rule applies, with GPT-Live billed. Once the audio that came since GPT-Live started runs
+    starting, where no pause rule applies, with GPT-Live billed. Once the audio that came since the speech signal runs
     CATCH_UP_MARGIN_SECONDS ahead of the clock, the rest is dropped and logged once, and the live microphone takes
     over."""
     async def scenario():
@@ -321,10 +322,8 @@ def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(compa
         relay, running = await _start(companion)
         companion.start_gate = asyncio.Event()                # GPT-Live takes its time to start
         await _speak(companion)
-        for _ in range(30):                                   # 3 s of audio kept meanwhile
-            companion.robot.inbox.put_nowait(next(frames))
-        await _settle()
         started = due[0] = companion.clock.now
+        await sleep(1.5)                                      # GPT-Live starts in 1.5 s: 3 s of audio meanwhile
         with caplog.at_level(logging.WARNING, logger="app.services.live_session"):
             companion.start_gate.set()
             await asyncio.wait_for(relay._starting, 5)
@@ -339,8 +338,9 @@ def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(compa
 
 
 def test_a_real_time_robot_loses_nothing_when_a_send_to_gpt_live_stalls(companion, caplog):
-    """The rule above judges the audio that came, never how long the sending took: a send that stalls 1.5 s (the
-    network, a busy server) only delays the kept audio; every word of a real-time robot still reaches GPT-Live."""
+    """The rule above judges the audio that came since the speech signal, never how long the sending took: a send
+    that stalls 1.5 s (the network, a busy server) only delays the kept audio; every word of a real-time robot still
+    reaches GPT-Live."""
     async def scenario():
         frames = iter([_pcm(level, 100) for level in range(1, 300)])
         due = [float("inf")]
@@ -358,10 +358,8 @@ def test_a_real_time_robot_loses_nothing_when_a_send_to_gpt_live_stalls(companio
         relay, running = await _start(companion)
         companion.start_gate = asyncio.Event()
         await _speak(companion)
-        kept = [next(frames) for _ in range(30)]               # 3 s of audio kept meanwhile
-        for frame in kept:
-            companion.robot.inbox.put_nowait(frame)
-        await _settle()
+        due[0] = companion.clock.now + 0.1
+        await sleep(3.0)                                      # GPT-Live starts in 3 s: 3 s of audio meanwhile
         (client,) = companion.clients
         send, stalled = client.send_audio, []
 
@@ -372,11 +370,10 @@ def test_a_real_time_robot_loses_nothing_when_a_send_to_gpt_live_stalls(companio
             await send(pcm)
 
         client.send_audio = send_audio
-        due[0] = companion.clock.now + 0.1
         with caplog.at_level(logging.WARNING, logger="app.services.live_session"):
             companion.start_gate.set()
             await asyncio.wait_for(relay._starting, 5)
-        assert relay._phase == "running" and client.audio == kept + arrived   # every frame, in order
+        assert len(arrived) > 45 and relay._phase == "running" and client.audio == arrived   # every frame, in order
         assert not [record for record in caplog.records if "dropped" in record.getMessage()]
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
