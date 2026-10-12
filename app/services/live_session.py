@@ -115,6 +115,11 @@ PRE_ROLL_SECONDS = 2.0         # the microphone audio kept while paused; a new s
 # drops or refuses input audio sent much faster (measured 12 Oct 2026 on gpt-live-1: a burst lost the start of the
 # sentence, 2x kept every word)
 PRE_ROLL_SEND_SPEED = 2.0
+PACE_SLACK_SECONDS = 0.1       # the paced audio may fall this far behind its schedule and catch up (a coarse timer);
+                               # never more, so a send that stalled is never followed by a burst
+# The most audio kept while a stretch starts: a robot sending in real time keeps at most the pre-roll and what came
+# during the start; a faster one (broken or hostile) loses its oldest audio instead of growing the relay's memory
+KEPT_MAX_SECONDS = PRE_ROLL_SECONDS + CONNECT_TIMEOUT + 2.0
 HISTORY_TURNS = 20             # the stored turns a new stretch gets, quoted as transcript data
 COMPANION_VERSION = (0, 9, 0)  # robot app from which a live start is a companion session; older ones get today's chat
 # The reasons the robot's `end` may give (patient_left: the companion's rest; medicine: a dose fell due); anything else
@@ -429,6 +434,7 @@ class LiveRelay:
         self._live_args: tuple | None = None         # (target, name, block): what each stretch's GPT-Live gets
         self._pre_roll: collections.deque = collections.deque()   # microphone PCM while no stretch runs (_keep)
         self._pre_roll_bytes = 0
+        self._kept_overflow = False                  # this start dropped kept audio over KEPT_MAX_SECONDS (logged once)
         self._starting: asyncio.Task | None = None   # the stretch being started (_start_stretch)
         self._listener: asyncio.Task | None = None   # the running stretch's GPT-Live events (_downlink)
         self._in_hand = None                         # the event _downlink took and waits for _handler_lock with
@@ -894,18 +900,26 @@ class LiveRelay:
                          self.conversation_id, SEEN_RECENT_SECONDS)
                 await self._to_robot({"type": "not_seen"})
                 return
-            self._phase = "starting"
+            self._phase, self._kept_overflow = "starting", False
             self._starting = asyncio.create_task(self._start_stretch())
 
     def _keep(self, pcm: bytes) -> None:
         """Microphone audio while no stretch runs. Paused (or pausing), only the last PRE_ROLL_SECONDS are kept; while
-        a stretch starts, everything, so the patient's words after the pre-roll follow it in order (_start_stretch)."""
+        a stretch starts, everything, so the patient's words after the pre-roll follow it in order (_start_stretch),
+        up to KEPT_MAX_SECONDS: more than that comes only from a robot that sends faster than real time, and its oldest
+        audio is dropped (logged once a start)."""
         self._pre_roll.append(pcm)
         self._pre_roll_bytes += len(pcm)
-        if self._phase != "starting":
-            limit = int(PRE_ROLL_SECONDS * RATE) * 2   # PCM16: two bytes a sample
-            while self._pre_roll_bytes > limit:
-                self._pre_roll_bytes -= len(self._pre_roll.popleft())
+        starting = self._phase == "starting"
+        limit = int((KEPT_MAX_SECONDS if starting else PRE_ROLL_SECONDS) * RATE) * 2   # PCM16: two bytes a sample
+        dropped = False
+        while self._pre_roll_bytes > limit:
+            self._pre_roll_bytes -= len(self._pre_roll.popleft())
+            dropped = True
+        if dropped and starting and not self._kept_overflow:
+            self._kept_overflow = True
+            log.warning("live chat %s: the robot sent audio faster than real time while GPT-Live started; its oldest "
+                        "kept audio was dropped", self.conversation_id)
 
     async def _start_stretch(self) -> None:
         """Start GPT-Live for a new stretch, outside _handler_lock: the timers and the access re-check go on during the
@@ -950,13 +964,17 @@ class LiveRelay:
         if self.outcome is not None:
             return
         self._listener = asyncio.create_task(self._downlink(client))
+        due = None
         try:
             while self._pre_roll and self.outcome is None and not self._cut_off:
                 pcm = self._pre_roll.popleft()
                 self._pre_roll_bytes -= len(pcm)
-                sent_at = self.clock()
                 await client.send_audio(pcm)
-                due = sent_at + len(pcm) / 2 / RATE / PRE_ROLL_SEND_SPEED   # PCM16: 2 bytes a sample
+                # One schedule for the whole backlog: a wait that ends late (Windows' 15.6 ms timer) is made up on the
+                # next chunks, at most PACE_SLACK_SECONDS of it, so a stalled send is never followed by a burst
+                now = self.clock()
+                due = max(now - PACE_SLACK_SECONDS, now if due is None else due) \
+                    + len(pcm) / 2 / RATE / PRE_ROLL_SEND_SPEED   # PCM16: 2 bytes a sample
                 while self.clock() < due:   # a timer that fires early (a coarse clock) never sends the next one sooner
                     await self.sleep(due - self.clock())
         except LiveError:

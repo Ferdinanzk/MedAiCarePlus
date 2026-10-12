@@ -208,6 +208,7 @@ ended the live chat (its help line playing), the robot asks for no companion end
 | `SEEN_RECENT_SECONDS` | 15 | live_session.py |
 | `PRE_ROLL_SECONDS` | 2 | live_session.py |
 | `PRE_ROLL_SEND_SPEED` | 2 (times real time; added after the live test) | live_session.py |
+| `KEPT_MAX_SECONDS` | 12 (the most audio kept while a stretch starts; added after a security review) | live_session.py |
 | `HISTORY_TURNS` | 20 | live_session.py |
 | `REST_AFTER_SECONDS` | 600 | robot session.py |
 | `COMPANION_CAPTURE_FPS` | 2 | robot session.py / runner.py |
