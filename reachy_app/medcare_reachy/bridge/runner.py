@@ -114,6 +114,7 @@ class MonitorStream:
         self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
         self.max_in_flight = max_in_flight
         self._frames_in_flight = 0
+        self.fps = fps
         self.interval = 1.0 / fps
         self.vision_interval = vision_interval
         self.session: dict | None = None
@@ -161,6 +162,12 @@ class MonitorStream:
     def take_error(self) -> Exception | None:
         error, self._error = self._error, None
         return error
+
+    def set_max_fps(self, fps: float | None) -> None:
+        """At most `fps` frames a second from the next frame on (a companion session's COMPANION_CAPTURE_FPS: its
+        camera only tells who is there, at less CPU for the robot and the server), or None: back to the rate this
+        stream was made with."""
+        self.interval = 1.0 / (self.fps if fps is None else min(self.fps, fps))
 
     # ── rates for the heartbeat ──────────────────────────────────────────
     def _rate(self, times: deque) -> float:
@@ -287,14 +294,15 @@ class MonitorStream:
         """
         gap = 0.0 if self._last_streamed is None else captured - self._last_streamed
         self._last_streamed = captured
-        if gap > STALL_SECONDS:
+        limit = max(STALL_SECONDS, 2 * self.interval)   # a slowed stream (set_max_fps) has long gaps by design
+        if gap > limit:
             self._stalls += 1
             if captured - self._last_stall_log >= STALL_LOG_SECONDS:
                 self._last_stall_log = captured
                 log.warning("server stream: %.2f s between frames before frame %d (%d gap(s) over %.2f s since the "
                             "last report); longest wait for a camera frame %.2f s, event loop up to %.2f s late, "
                             "frames dropped for want of a free request slot: %d (oldest unanswered request %.2f s)",
-                            gap, self.frame_seq, self._stalls, STALL_SECONDS, self._camera_wait, self._loop_late,
+                            gap, self.frame_seq, self._stalls, limit, self._camera_wait, self._loop_late,
                             self._no_slot, self._oldest_request)
                 self._stalls = 0
         self._clear_stall_notes()
@@ -513,6 +521,9 @@ class Runner:
         if self.slot and "microphone" in response:
             # Withdrawn microphone consent takes effect within one heartbeat, not only at the next task.
             self.slot.task["microphone"] = bool(response["microphone"])
+        if response.get("task_due") and self.slot:
+            # Medicine first (spec 2026-10-12 companion 4.5): a companion session ends for a medicine task now due.
+            self.slot.medicine_due()
         return response
 
     async def _heartbeat_loop(self) -> None:
