@@ -29,15 +29,17 @@ message: never to the risk check or the summary.
 """
 
 import asyncio
+import json
 import logging
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 
 import requests
 
 from app import config
-from app.services import context_info, outbox
+from app.services import context_info, dose_status, outbox
 
 log = logging.getLogger(__name__)
 
@@ -120,18 +122,61 @@ RISK_PATTERNS = {
     ),
 }
 
-SYSTEM_PROMPT = {
+# The praise line the patient must hear once today's medicine is taken (spec 2026-10-12, medication status handling).
+PRAISE = {"zh-TW": "您越來越健康了！", "en": "You are getting healthier and healthier!"}
+# Medication status (tool get_today_dose_status, services/dose_status.py) and the warm companion mode. The tool's
+# statuses are named as the model sees them in its answer. Overdose protection decides what may be encouraged: a
+# refused dose is never encouraged, and saying "I finished" is praised but never called recorded (it is a claim).
+MEDICATION_RULES = {
     "zh-TW": (
-        "你是 Reachy，一個陪伴長者的小機器人。剛才長者吃完藥，你正在和他聊天關心他。"
-        "請一律用繁體中文回答，每次只說一到兩個短句，總共不超過 30 個字，溫暖、口語化，適合大聲唸出來。"
-        "不要使用表情符號、列表或括號。可以問一個簡單的問題讓對方多說一點。"
-        "不要給醫療建議，不要評論藥物或劑量；如果對方問醫療問題，請建議他問醫師或藥師。"
+        "關於今天的藥：對話一開始已經用 get_today_dose_status 查過今天的服藥狀態，結果就在對話裡；"
+        "長者說他剛吃了藥、或你不確定時，可以再查一次。照查到的 status 回應："
+        "taken 表示長者已經吃過藥了，請熱情地稱讚他、為他拍拍手，例如「拍拍手！好棒！」，而且一定要說「"
+        + PRAISE["zh-TW"] + "」。"
+        "pending_confirmation 也表示長者已經吃過藥了，只是還在等家人確認；一樣熱情稱讚、拍拍手，並說「"
+        + PRAISE["zh-TW"] + "」，但不要說已經記錄好了。"
+        "長者自己說吃完藥了，也照這樣稱讚他。可是他說吃了兩次、多吃了或吃太多時，不要稱讚。"
+        "pending_allowed 表示藥還沒吃、現在可以吃：溫柔、有耐心地鼓勵他去吃，暖暖地提醒按時吃藥是在照顧自己的身體；"
+        "不要命令、催促或說教，同一次聊天最多提兩次。"
+        "refused_too_soon、refused_max_reached、refused_not_due 表示現在不能吃，refused_expired 表示這次錯過了、不要補吃："
+        "這些時候絕對不要鼓勵他吃藥，可以溫和地說現在先不用吃。"
+        "skipped、none，或查不到狀態時，不要主動提起藥物。"
+        "不要給醫療建議，不要評論是哪種藥或劑量；如果對方問醫療問題，請建議他問醫師或藥師。"
+        "如果長者心情不好、難過、有壓力或沒精神，立刻改用特別溫暖、溫柔、體貼的語氣："
+        "先接住並肯定他的感受，告訴他你在這裡陪著他，不要講大道理，也不要主動給建議。"
     ),
     "en": (
-        "You are Reachy, a small companion robot for an older adult who has just taken their medicine. "
+        "About today's medicine: at the start of the conversation get_today_dose_status was already called, and "
+        "its answer is in the conversation. Call it again when the patient says they just took their medicine or "
+        "you are unsure. Answer by its status. taken means the patient has already taken their medicine: praise "
+        "them with real enthusiasm and applaud them, for example \"A big round of applause for you!\", and you must "
+        "say \"" + PRAISE["en"] + "\" pending_confirmation also means the patient has already taken it and family "
+        "is still confirming: praise and applaud the same way and say \"" + PRAISE["en"] + "\", but never say it "
+        "was recorded. When the patient says they finished their medicine, praise them the same way, but never "
+        "when they say they took it twice, took extra or took too much. pending_allowed means it is not taken yet "
+        "and may be taken now: gently and patiently encourage them, warmly reminding them that taking it looks "
+        "after their health; never bossy, demanding or preachy, and at most twice in one chat. refused_too_soon, "
+        "refused_max_reached and refused_not_due mean it must not be taken now, and refused_expired means this "
+        "dose was missed and must not be made up: then never encourage taking medicine; you may gently say there "
+        "is no need to take it now. With skipped, none, or no status, do not bring medicine up yourself. "
+        "Never give medical advice or comment on which medicine or dose; suggest asking a doctor or pharmacist. "
+        "When the patient sounds sad, stressed, low or in a bad mood, switch at once to an especially warm, gentle "
+        "and caring tone: acknowledge and validate their feelings, reassure them you are here with them, and give "
+        "no cold logic or unsolicited advice."
+    ),
+}
+SYSTEM_PROMPT = {
+    "zh-TW": (
+        "你是 Reachy，一個陪伴長者的小機器人，在吃藥時間陪他聊天、關心他。"
+        "請一律用繁體中文回答，每次只說一到兩個短句，總共不超過 30 個字，溫暖、口語化，適合大聲唸出來。"
+        "不要使用表情符號、列表或括號。可以問一個簡單的問題讓對方多說一點。"
+        + MEDICATION_RULES["zh-TW"]
+    ),
+    "en": (
+        "You are Reachy, a small companion robot that keeps an older adult company at medicine time. "
         "Reply in English in one or two short, warm, spoken sentences (under 25 words), suitable for reading aloud. "
         "No emoji, lists or brackets. You may ask one simple question. "
-        "Never give medical advice or comment on medicines or doses; suggest asking a doctor or pharmacist."
+        + MEDICATION_RULES["en"]
     ),
 }
 # Examples for conversational tone. Weather details in the example are illustrative: the live answer must follow
@@ -336,13 +381,21 @@ def _http_session(clock=time.monotonic) -> requests.Session:
 
 
 def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeout: float = CALL_TIMEOUT,
-          info: dict | None = None, temperature: float = 0.7) -> str | None:
+          info: dict | None = None, temperature: float = 0.7, tools: list | None = None,
+          tool_choice=None) -> str | dict | None:
     """One OpenRouter call. `info`, when given, receives status, model_served, finish_reason and tokens.
-    temperature: 0 for extraction (memory facts), 0.7 for everything else."""
+    temperature: 0 for extraction (memory facts), 0.7 for everything else.
+
+    With `tools` (and optionally `tool_choice`) the answer is the whole message, {"content", "tool_calls"}, so a
+    tool call (no text) is not taken for an empty answer; without them, the text as before."""
     info = {} if info is None else info
     # Reasoning off: free reasoning models otherwise spend every token thinking and send back nothing.
     payload = {"model": model or config.LLM_FALLBACK_MODEL, "messages": messages, "max_tokens": max_tokens,
                "temperature": temperature, "reasoning": {"enabled": False}}
+    if tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
     provider = _provider()
     if provider:
         payload["provider"] = provider
@@ -361,8 +414,12 @@ def _post(messages: list[dict], max_tokens: int, model: str | None = None, timeo
                 finish_reason=choices[0].get("finish_reason") if choices else None)
     if not choices or choices[0].get("finish_reason") == "length":
         return None   # cut off mid-sentence (often a reasoning model that ran out of tokens): never speak half a reply
-    content = (choices[0].get("message") or {}).get("content")
-    return content.strip() if isinstance(content, str) and content.strip() else None
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    text = content.strip() if isinstance(content, str) and content.strip() else None
+    if tools:
+        return {"content": text, "tool_calls": message.get("tool_calls") or None}
+    return text
 
 
 def _ms_since(started: float) -> int:
@@ -370,7 +427,8 @@ def _ms_since(started: float) -> int:
 
 
 async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: float, call_timeout: float,
-                    accept, temperature: float = 0.7) -> tuple[object | None, dict]:
+                    accept, temperature: float = 0.7, tools: list | None = None,
+                    tool_choice=None) -> tuple[object | None, dict]:
     """The primary model, then the fallback model, never past `deadline_seconds` in total.
 
     accept(answer) turns an answer into the result, or returns None when it is unusable (the next model is tried).
@@ -394,8 +452,10 @@ async def _complete(messages: list[dict], max_tokens: int, deadline_seconds: flo
             call_started = time.monotonic()
             try:
                 # requests' timeout bounds each socket wait, not the whole call; wait_for holds the deadline.
+                extra = {"tools": tools, "tool_choice": tool_choice} if tools else {}
                 answer = await asyncio.wait_for(
-                    loop.run_in_executor(None, _post, messages, max_tokens, model, timeout, info, temperature),
+                    loop.run_in_executor(None, lambda: _post(messages, max_tokens, model, timeout, info,
+                                                             temperature, **extra)),
                     timeout)
                 result = accept(answer)
                 status = info.get("status")
@@ -479,26 +539,138 @@ def reply_prompt(language: str) -> str:
             f"{CONVERSATION_EXAMPLES[language]}")
 
 
-async def reply_with_metrics(history: list[dict], language: str, memory: str = "") -> tuple[str, dict]:
-    """Reachy's next line, plus {"llm_ms", "fallback_used", "attempts"} (fallback_used: the fixed FALLBACK line).
+@dataclass
+class DoseTool:
+    """What a reply knows about today's medicine (services/dose_status.py).
+
+    exchange: the conversation's opening tool call and its answer (dose_exchange of the record open_dose_status
+    stored), placed before the history; lookup: an async callable that answers the tool again when the model asks
+    during this reply (None: the tool is not offered). calls: the calls this reply made, for its metrics."""
+    exchange: list = field(default_factory=list)
+    lookup: object = None
+    calls: list = field(default_factory=list)
+
+
+class _ToolRequest:
+    """A model answer that asks for tools instead of speaking (the reply's accept() returns it, so _complete stops)."""
+
+    def __init__(self, message: dict):
+        self.tool_calls = message["tool_calls"]
+
+
+def tool_call_message(call_id: str, arguments: str = "{}") -> dict:
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": call_id, "type": "function", "function": {"name": dose_status.TOOL_NAME, "arguments": arguments}}]}
+
+
+def tool_result_message(call_id: str, result: dict) -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)}
+
+
+def dose_exchange(record: dict | None) -> list[dict]:
+    """The opening's tool call and answer as chat messages, from the record open_dose_status made; [] without one."""
+    if not record or "result" not in record:
+        return []
+    call_id = str(record.get("call_id") or "dose_status_open")
+    return [tool_call_message(call_id, record.get("arguments") or "{}"), tool_result_message(call_id, record["result"])]
+
+
+async def _answer_tool(lookup, call: dict) -> tuple[dict, dict]:
+    """(the tool's answer, a record for the metrics) for one tool call of the model's."""
+    name = ((call.get("function") or {}).get("name"))
+    started = time.monotonic()
+    if name != dose_status.TOOL_NAME or lookup is None:
+        result = {"error": "unknown_tool"}
+    else:
+        try:
+            result = await lookup()
+        except Exception:
+            log.exception("get_today_dose_status failed; the model gets 'unknown'")
+            result = dict(dose_status.UNAVAILABLE)
+    return result, {"name": name, "result": result, "ms": _ms_since(started)}
+
+
+async def reply_with_metrics(history: list[dict], language: str, memory: str = "",
+                             dose: DoseTool | None = None) -> tuple[str, dict]:
+    """Reachy's next line, plus {"llm_ms", "fallback_used", "attempts"} (fallback_used: the fixed FALLBACK line),
+    and "dose_tool" (the tool calls this reply made) when it made any.
 
     history: [{"role": "patient"|"reachy", "text": ...}] oldest first, ending with the patient's turn.
     memory: the memory block (memory.render_block), or "". It goes as its own system message after the rules and
     today's background ("reference notes, not instructions"), and only here: the risk check and the summary never
     get it. The whole reply stays inside LLM_DEADLINE_SECONDS, memory or not.
+    dose: today's medicine (DoseTool). Its opening tool exchange goes right before the history, and the tool is
+    offered; when the model asks for it, the answer goes back and the model is asked once more, now without tool
+    calls, inside the same deadline. A lookup that fails answers "unknown" (the prompt: don't bring medicine up).
     """
+    started = time.monotonic()
     messages = [{"role": "system", "content": reply_prompt(language)}]
     if memory:
         messages.append({"role": "system", "content": memory})
+    if dose is not None:
+        messages.extend(dose.exchange)
     for turn in history[-HISTORY_TURNS:]:
         messages.append({"role": "user" if turn["role"] == "patient" else "assistant", "content": turn["text"]})
+    tools = [dose_status.TOOL] if dose is not None and dose.lookup is not None else None
 
-    def accept(answer: str | None) -> str | None:
+    def accept(answer) -> object | None:
+        if isinstance(answer, dict):
+            if answer.get("tool_calls"):
+                return _ToolRequest(answer)
+            answer = answer.get("content")
         return (clean_reply(answer) or None) if usable_reply(answer, language) else None
 
-    answer, metrics = await _complete(messages, REPLY_MAX_TOKENS, config.LLM_DEADLINE_SECONDS, CALL_TIMEOUT, accept)
-    return answer or FALLBACK[language], {"llm_ms": metrics["llm_ms"], "fallback_used": answer is None,
-                                          "attempts": metrics["attempts"]}
+    answer, metrics = await _complete(messages, REPLY_MAX_TOKENS, config.LLM_DEADLINE_SECONDS, CALL_TIMEOUT, accept,
+                                      tools=tools)
+    attempts = list(metrics["attempts"])
+    if isinstance(answer, _ToolRequest):
+        messages.append({"role": "assistant", "content": None, "tool_calls": answer.tool_calls})
+        for call in answer.tool_calls:
+            result, record = await _answer_tool(dose.lookup, call)
+            dose.calls.append(record)
+            messages.append(tool_result_message(str(call.get("id") or "call"), result))
+
+        def accept_text(text) -> str | None:
+            if isinstance(text, dict):
+                text = None if text.get("tool_calls") else text.get("content")
+            return (clean_reply(text) or None) if usable_reply(text, language) else None
+
+        left = config.LLM_DEADLINE_SECONDS - (time.monotonic() - started)
+        answer, second = await _complete(messages, REPLY_MAX_TOKENS, left, CALL_TIMEOUT, accept_text, tools=tools,
+                                         tool_choice="none")
+        attempts += second["attempts"]
+    result = {"llm_ms": _ms_since(started), "fallback_used": answer is None, "attempts": attempts}
+    if dose is not None and dose.calls:
+        result["dose_tool"] = dose.calls
+    return answer or FALLBACK[language], result
+
+
+OPEN_MAX_TOKENS = 64   # the forced call only names the tool
+
+
+async def open_dose_status(language: str, opening: str, lookup) -> dict:
+    """The conversation's first model call (spec: tool calling at the beginning): the reply model, given Reachy's
+    opening, is made to call get_today_dose_status (tool_choice forced), and the tool answers. Runs while the robot
+    says the opening, so the patient's first reply waits for no extra call.
+
+    Returns the record the opening turn keeps (server.dose_tool): call_id and arguments of the model's call, the
+    tool's result, forced_by ("model", or "server" when no model made the call: no key, an error, a timeout; the
+    lookup then runs anyway, so the replies still know), llm_ms and attempts."""
+    messages = [{"role": "system", "content": reply_prompt(language)}, {"role": "assistant", "content": opening}]
+
+    def accept(answer) -> object | None:
+        if isinstance(answer, dict) and answer.get("tool_calls"):
+            return _ToolRequest(answer)
+        return None
+
+    call, metrics = await _complete(messages, OPEN_MAX_TOKENS, config.LLM_DEADLINE_SECONDS, CALL_TIMEOUT, accept,
+                                    tools=[dose_status.TOOL], tool_choice=dose_status.FORCE)
+    first = call.tool_calls[0] if isinstance(call, _ToolRequest) else {}
+    result, record = await _answer_tool(lookup, {"function": {"name": dose_status.TOOL_NAME}})
+    return {"call_id": str(first.get("id") or "dose_status_open"),
+            "arguments": (first.get("function") or {}).get("arguments") or "{}",
+            "result": result, "forced_by": "model" if first else "server", "lookup_ms": record["ms"],
+            "llm_ms": metrics["llm_ms"], "attempts": metrics["attempts"]}
 
 
 async def reply(history: list[dict], language: str, memory: str = "") -> str:

@@ -23,7 +23,8 @@ from app import config
 from app.config import DEVICE_PORT
 from app.dependencies import get_current_user
 from app.routers import api_conversations, api_device, api_reachy
-from app.services import after_chat, consent_service, context_info, conversation, deletion_ledger, memory, outbox
+from app.services import (after_chat, consent_service, context_info, conversation, deletion_ledger, dose_status,
+                          memory, outbox)
 from app.services.device_auth import get_device
 
 DEVICE_ID = str(uuid.uuid4())
@@ -243,7 +244,9 @@ def test_a_broken_background_never_costs_the_reply(monkeypatch):
     monkeypatch.setattr(context_info, "background", broken)
     calls = _model_answers(monkeypatch, "好的呀。")
     assert asyncio.run(conversation.reply([{"role": "patient", "text": "嗨"}], "zh-TW")) == "好的呀。"
-    assert calls[0]["messages"][0]["content"] == conversation.SYSTEM_PROMPT["zh-TW"]
+    # without the background, the rules and the tone examples (reply_prompt's fallback)
+    assert calls[0]["messages"][0]["content"] == (conversation.SYSTEM_PROMPT["zh-TW"] + "\n\n"
+                                                  + conversation.CONVERSATION_EXAMPLES["zh-TW"])
 
 
 def test_the_risk_check_and_the_summary_get_no_background(monkeypatch):
@@ -411,7 +414,7 @@ def test_summary_alerts_say_they_come_from_the_summary():
 class FakeDB:
     def __init__(self):
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": None, "intk_ids": [],
-                     "status": "in_progress", "lease_owner": DEVICE_ID}
+                     "status": "in_progress", "lease_owner": DEVICE_ID, "reason": "manual"}
         self.conversations, self.turns, self.notifications = {}, [], []
 
     def transaction(self):
@@ -462,6 +465,14 @@ class FakeDB:
             return args[0]
         if 'SELECT name FROM "user"' in query:
             return "Pearl"
+        if query == api_device.OPENING_DOSE_TOOL_SQL:
+            opening = next((t for t in self.turns if t["conversation_id"] == args[0] and t["role"] == "reachy"), None)
+            record = ((opening or {}).get("metrics") or {}).get("server", {}).get("dose_tool")
+            return None if record is None else json.dumps(record)   # JSONB comes back as text
+        if query == dose_status.CONVERSATION_TASK_SQL:
+            return TASK_ID if args[0] in self.conversations else None
+        if query == dose_status.TASK_SQL:
+            return list(self.task["intk_ids"]) if args[0] == str(self.task["task_id"]) else None
         if "RETURNING after_chat_state" in query:   # after_chat: a last attempt that never finished
             row = self.conversations[args[0]]
             if row["after_chat_state"] != "pending" or row["after_chat_attempts"] < args[2]:
@@ -475,6 +486,8 @@ class FakeDB:
     async def fetch(self, query, *args):
         if "SELECT role, text FROM conversation_turn" in query:
             return [{"role": t["role"], "text": t["text"]} for t in self.turns if t["conversation_id"] == args[0]]
+        if query in (dose_status.TODAY_SQL, dose_status.DOSES_SQL):
+            return []   # no doses today
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -542,7 +555,7 @@ def robot(monkeypatch):
         alerts.append({"u_id": u_id, **kwargs})
         return state["family_contacts"]
 
-    async def reply_with_metrics(history, language, memory=""):
+    async def reply_with_metrics(history, language, memory="", dose=None):
         prompts.append(list(history))
         memories.append(memory)
         return "真好，您走了多久呢？", {"llm_ms": 1234, "fallback_used": False, "attempts": [ATTEMPT]}
@@ -601,17 +614,25 @@ def _openrouter(monkeypatch, robot, **answers):
     for name, function in robot.real.items():
         monkeypatch.setattr(conversation, name, function)
     answers = {"risk": ["NONE"], "reply": ["真好，您走了多久呢？"], "summary": ["MOOD: calm\nSUMMARY: 談到散步。\nRISK: none"],
-               "after_chat": ['MOOD: calm\nSUMMARY: 談到散步。\nRISK: none\n{"facts": []}'], **answers}
-    sent = []
+               "after_chat": ['MOOD: calm\nSUMMARY: 談到散步。\nRISK: none\n{"facts": []}'], "dose_open": [None],
+               **answers}
+    class Sent(list):
+        """The requests; the opening's forced tool calls go to .opens instead (no test counts them as replies)."""
 
-    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7):
+    sent = Sent()
+    sent.opens = []
+
+    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7,
+             tools=None, tool_choice=None):
         system = messages[0]["content"]
         kind = ("risk" if system == conversation.RISK_PROMPT else
                 "summary" if system in conversation.SUMMARY_PROMPT.values() else
-                "after_chat" if system in memory.AFTER_CHAT_PROMPT.values() else "reply")
-        sent.append({"kind": kind, "messages": messages, "max_tokens": max_tokens, "model": model,
-                     "temperature": temperature, "at": time.monotonic()})
-        calls = sum(1 for request in sent if request["kind"] == kind)
+                "after_chat" if system in memory.AFTER_CHAT_PROMPT.values() else
+                "dose_open" if tool_choice == dose_status.FORCE else "reply")
+        request = {"kind": kind, "messages": messages, "max_tokens": max_tokens, "model": model,
+                   "temperature": temperature, "tools": tools, "tool_choice": tool_choice, "at": time.monotonic()}
+        (sent.opens if kind == "dose_open" else sent).append(request)
+        calls = sum(1 for request in (sent.opens if kind == "dose_open" else sent) if request["kind"] == kind)
         answer = answers[kind][min(calls, len(answers[kind])) - 1]
         info = {} if info is None else info
         info.update(status=200, model_served=model, finish_reason="stop")
@@ -908,7 +929,7 @@ def test_no_summary_alert_when_a_turn_already_raised_one(robot):
 
 
 def _slow_models(monkeypatch, reply_seconds, risk_seconds, risk="none"):
-    async def reply_with_metrics(history, language, memory=""):
+    async def reply_with_metrics(history, language, memory="", dose=None):
         await asyncio.sleep(reply_seconds)
         return "好呀。", {"llm_ms": int(reply_seconds * 1000), "fallback_used": False, "attempts": [ATTEMPT]}
 
@@ -986,7 +1007,7 @@ def test_malformed_timings_are_refused(robot, metrics):
     turn = robot.client.post(f"/api/device/conversations/{cid}/turn", json={"text": "嗯", "metrics": metrics})
     assert turn.status_code == 422
     assert _turn_metrics(robot, cid, 1, metrics).status_code == 422
-    assert [t["role"] for t in robot.db.turns] == ["reachy"] and robot.db.turns[0]["metrics"] is None
+    assert [t["role"] for t in robot.db.turns] == ["reachy"] and "robot" not in (robot.db.turns[0]["metrics"] or {})
 
 
 def test_timing_limits_are_inclusive(robot):
@@ -1010,7 +1031,8 @@ def test_playback_timings_merge_into_reachys_turn(robot):
     assert metrics["robot"] == {"round_trip_ms": 2100, "tts_first_audio_ms": 1450, "tts_total_ms": 3900}
     assert metrics["server"]["llm_ms"] == 1234
     assert _turn_metrics(robot, cid, 1, {"tts_total_ms": 2500}).status_code == 200   # the opening line
-    assert robot.db.turns[0]["metrics"] == {"robot": {"tts_total_ms": 2500}}
+    assert robot.db.turns[0]["metrics"]["robot"] == {"tts_total_ms": 2500}
+    assert set(robot.db.turns[0]["metrics"]) <= {"robot", "server"}   # server: the opening's dose status
 
 
 def test_playback_timings_only_for_this_robots_reachy_turns(robot):
@@ -1022,7 +1044,7 @@ def test_playback_timings_only_for_this_robots_reachy_turns(robot):
         assert _turn_metrics(robot, conversation_id, turn_id, {"tts_total_ms": 1}).status_code == 404
     robot.db.conversations[other]["u_id"] = 8   # another patient's conversation
     assert _turn_metrics(robot, other, 4, {"tts_total_ms": 1}).status_code == 404
-    assert robot.db.turns[1]["metrics"] is None and robot.db.turns[3]["metrics"] is None
+    assert robot.db.turns[1]["metrics"] is None and "robot" not in (robot.db.turns[3]["metrics"] or {})
 
 
 def test_numbers_up_to_a_billion_either_way_are_kept(robot):

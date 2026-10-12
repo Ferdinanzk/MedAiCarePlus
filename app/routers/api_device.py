@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import (after_chat, consent_service, conversation, dose_safety, dose_video, memory, outbox,
+from app.services import (after_chat, consent_service, conversation, dose_safety, dose_status, dose_video, memory,
+                          outbox,
                           reachy_tasks, schedule)
 from app.services.device_auth import get_device, get_device_for_heartbeat
 from app.services.face_recognition_service import FaceRecognitionService
@@ -272,6 +273,53 @@ def _ms_since(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+# ── Today's medicine for the check-in replies (get_today_dose_status, services/dose_status.py) ──
+# The conversation's opening runs the forced tool call in the background (conversation.open_dose_status) and keeps
+# its record on Reachy's opening turn, server.dose_tool. A patient's turn that comes while it still runs waits for
+# it up to DOSE_OPEN_WAIT; each reply gets that record as a tool exchange, and the tool itself for a fresh look.
+DOSE_OPEN_WAIT = 3.0
+DOSE_LOOKUP_TIMEOUT = 2.0
+MERGE_SERVER_METRICS_SQL = (
+    "UPDATE conversation_turn SET metrics = COALESCE(metrics, '{}'::jsonb) || jsonb_build_object("
+    "'server', COALESCE(metrics->'server', '{}'::jsonb) || $2::jsonb) WHERE turn_id = $1")
+OPENING_DOSE_TOOL_SQL = ("SELECT metrics->'server'->'dose_tool' AS dose_tool FROM conversation_turn "
+                         "WHERE conversation_id = $1::uuid AND role = 'reachy' ORDER BY turn_id LIMIT 1")
+_dose_openings: dict = {}   # conversation_id -> its open_dose_status task, while it runs
+
+
+def _dose_lookup(u_id: int, conversation_id: str):
+    """The tool's answer for this conversation, on a connection of its own and within DOSE_LOOKUP_TIMEOUT."""
+    async def lookup() -> dict:
+        async def run():
+            async with get_pool().acquire() as conn:
+                return await dose_status.for_conversation(conn, u_id, conversation_id)
+        return await asyncio.wait_for(run(), DOSE_LOOKUP_TIMEOUT)
+    return lookup
+
+
+async def _open_dose_status(u_id: int, conversation_id: str, turn_id: int, language: str, opening: str) -> None:
+    """Background, from the conversation's start: the forced tool call, kept on the opening turn. Never raises: a
+    failure leaves the replies without an opening record (they can still call the tool)."""
+    try:
+        record = await conversation.open_dose_status(language, opening, _dose_lookup(u_id, conversation_id))
+        async with get_pool().acquire() as conn:
+            await conn.execute(MERGE_SERVER_METRICS_SQL, turn_id, json.dumps({"dose_tool": record}))
+        log.info("conversation %s: today's dose status %s (tool call by the %s)", conversation_id,
+                 record["result"].get("status"), record["forced_by"])
+    except Exception:
+        log.exception("conversation %s: the opening dose status failed; replies call the tool themselves",
+                      conversation_id)
+    finally:
+        _dose_openings.pop(conversation_id, None)
+
+
+async def _opening_dose_record(conn, conversation_id: str) -> dict | None:
+    stored = await conn.fetchval(OPENING_DOSE_TOOL_SQL, str(conversation_id))
+    if isinstance(stored, str):   # JSONB comes back as text
+        stored = json.loads(stored)
+    return stored if isinstance(stored, dict) else None
+
+
 async def _checkin_consent(device: dict) -> None:
     if not reachy_tasks.checkin_allowed(await consent_service.get_state(device["u_id"])):
         raise HTTPException(403, "checkin_consent_required")
@@ -341,6 +389,9 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
             conversation_id, device["u_id"], str(task["task_id"]), language,
             config.LLM_MODEL or config.LLM_FALLBACK_MODEL, str(followup["memory_id"]) if followup else None)
         turn_id = await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
+    # The forced get_today_dose_status call runs while the robot says the opening.
+    _dose_openings[conversation_id] = _in_background(
+        _open_dose_status(device["u_id"], conversation_id, turn_id, language, opening))
     return _spoken(opening, language, end=False, reply_turn_id=turn_id, conversation_id=conversation_id)
 
 
@@ -373,6 +424,12 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
     started = time.monotonic()
     keyword = conversation.screen(text)
     screen_ms = _ms_since(started)
+    opening = _dose_openings.get(conversation_id)
+    if opening is not None:   # the opening's tool call is still running: the first reply should have its answer
+        try:
+            await asyncio.wait_for(asyncio.shield(opening), DOSE_OPEN_WAIT)
+        except (asyncio.TimeoutError, Exception):
+            pass
     started = time.monotonic()
     async with get_pool().acquire() as conn, conn.transaction():
         row = await _own_conversation(conn, device, conversation_id)
@@ -398,6 +455,16 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
             except Exception:
                 log.exception("conversation %s: the memory block failed; replying without it", cid)
                 block = ""
+        dose = None
+        if not (keyword or row["risk_flag"] or closing):
+            record = None
+            try:
+                async with conn.transaction():   # a savepoint, as for the memory block
+                    record = await _opening_dose_record(conn, cid)
+            except Exception:
+                log.exception("conversation %s: the opening dose status could not be read", cid)
+            dose = conversation.DoseTool(exchange=conversation.dose_exchange(record),
+                                         lookup=_dose_lookup(device["u_id"], cid))
         if keyword:   # the words never go to the model
             await conversation.alert_family(conn, device["u_id"], cid,
                                             conversation.safety_alert_text(device["name"], text, keyword),
@@ -413,7 +480,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         # the memory block.
         classifying = asyncio.create_task(conversation.classify_risk(history, language))
         replying = (None if closing
-                    else asyncio.create_task(conversation.reply_with_metrics(history, language, block)))
+                    else asyncio.create_task(conversation.reply_with_metrics(history, language, block, dose=dose)))
         kind, check = await classifying
         risk, end, source = kind is not None, True, "model" if kind else "none"
         if kind:
@@ -432,6 +499,8 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
     server = {"received_to_reply_ms": _ms_since(received), "consent_ms": consent_ms, "screen_ms": screen_ms,
               "db_ms": db_ms, "llm_ms": llm["llm_ms"], "fallback_used": llm["fallback_used"], "risk": risk,
               "attempts": llm["attempts"], "risk_source": source, **check}
+    if llm.get("dose_tool"):
+        server["dose_tool"] = llm["dose_tool"]   # the tool calls this reply made, with what they answered
     async with get_pool().acquire() as conn:
         reply_turn_id = await _add_turn(conn, cid, device["u_id"], "reachy", reply, metrics={"server": server})
     if check["risk_result"] == "unknown":
