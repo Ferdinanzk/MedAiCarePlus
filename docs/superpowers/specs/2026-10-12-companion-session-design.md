@@ -210,7 +210,7 @@ ended the live chat (its help line playing), the robot asks for no companion end
 | `PRE_ROLL_SEND_SPEED` | 2 (times real time; added after the live test) | live_session.py |
 | `PACE_SLACK_SECONDS` | 0.1 (how far the paced kept audio may catch up at once) | live_session.py |
 | `KEPT_MAX_SECONDS` | 17 (the most audio kept while a stretch starts: pre-roll + DB + start + 2 s; added after a security review) | live_session.py |
-| `CATCH_UP_MARGIN_SECONDS` | 2 (sending the kept audio ends this long after a real-time robot would have caught up) | live_session.py |
+| `CATCH_UP_MARGIN_SECONDS` | 2 (audio this far ahead of the clock while the kept audio goes out marks a robot sending faster than real time: the rest is dropped) | live_session.py |
 | `HISTORY_TURNS` | 20 | live_session.py |
 | `REST_AFTER_SECONDS` | 600 | robot session.py |
 | `COMPANION_CAPTURE_FPS` | 2 | robot session.py / runner.py |

@@ -121,9 +121,10 @@ PACE_SLACK_SECONDS = 0.1       # the paced audio may fall this far behind its sc
 # during the start (the history read, then GPT-Live's start); beyond it the oldest audio is dropped, so a robot that
 # sends faster than real time (broken or hostile) never grows the relay's memory
 KEPT_MAX_SECONDS = PRE_ROLL_SECONDS + DB_TIMEOUT_SECONDS + CONNECT_TIMEOUT + 2.0
-# Sending the kept audio ends at the latest this long after the time a real-time robot needs to catch up (the backlog
-# divided by PRE_ROLL_SEND_SPEED - 1): a robot sending at twice real time or faster would keep a stretch starting
-# for ever, where no pause rule applies and GPT-Live stays billed; what is left then is dropped
+# While the kept audio goes out, a robot whose audio since GPT-Live started runs more than this ahead of the clock
+# sends faster than real time (broken or hostile): at twice real time or faster it would keep a stretch starting for
+# ever, where no pause rule applies and GPT-Live stays billed, so what is left is dropped. A real-time robot never
+# gets there, even when a send stalls (judged by the audio that came, never by how long the sending took)
 CATCH_UP_MARGIN_SECONDS = 2.0
 HISTORY_TURNS = 20             # the stored turns a new stretch gets, quoted as transcript data
 COMPANION_VERSION = (0, 9, 0)  # robot app from which a live start is a companion session; older ones get today's chat
@@ -440,6 +441,7 @@ class LiveRelay:
         self._pre_roll: collections.deque = collections.deque()   # microphone PCM while no stretch runs (_keep)
         self._pre_roll_bytes = 0
         self._kept_overflow = False                  # this start dropped kept audio over KEPT_MAX_SECONDS (logged once)
+        self._kept_total = 0                         # bytes _keep ever took (what came while the kept audio went out)
         self._starting: asyncio.Task | None = None   # the stretch being started (_start_stretch)
         self._listener: asyncio.Task | None = None   # the running stretch's GPT-Live events (_downlink)
         self._in_hand = None                         # the event _downlink took and waits for _handler_lock with
@@ -915,7 +917,8 @@ class LiveRelay:
         stalled past its timeouts), and its oldest audio is dropped (logged once a start)."""
         self._pre_roll.append(pcm)
         self._pre_roll_bytes += len(pcm)
-        starting = self._phase == "starting"
+        self._kept_total += len(pcm)
+        starting =self._phase == "starting"
         limit = int((KEPT_MAX_SECONDS if starting else PRE_ROLL_SECONDS) * RATE) * 2   # PCM16: two bytes a sample
         dropped = False
         while self._pre_roll_bytes > limit:
@@ -938,8 +941,9 @@ class LiveRelay:
         due that long divided by PRE_ROLL_SEND_SPEED after the one before it was due, a late one catching up by at most
         PACE_SLACK_SECONDS. The phase stays starting meanwhile, so the microphone frames that come in the meantime join
         that backlog in order (_keep), and the live microphone goes straight to GPT-Live only once the backlog is
-        empty (_microphone), or once the time a real-time robot needs to catch up, plus CATCH_UP_MARGIN_SECONDS, has
-        passed: what is left then is dropped (logged). GPT-Live's first sound answers the patient, so it is held (B2).
+        empty (_microphone), or once the audio that came since GPT-Live started runs more than CATCH_UP_MARGIN_SECONDS
+        ahead of the clock (a robot sending faster than real time): what is left then is dropped (logged). GPT-Live's
+        first sound answers the patient, so it is held (B2).
         The usage of the stretch before is added up here. A session that started once the outcome was decided is left
         to the wrap-up, which closes it."""
         target, name, block = self._live_args
@@ -973,13 +977,14 @@ class LiveRelay:
             return
         self._listener = asyncio.create_task(self._downlink(client))
         due = None
-        backlog = self._pre_roll_bytes / 2 / RATE   # seconds of audio (PCM16: 2 bytes a sample)
-        deadline = self.clock() + backlog / (PRE_ROLL_SEND_SPEED - 1) + CATCH_UP_MARGIN_SECONDS
+        since, came_before = self.clock(), self._kept_total
         try:
             while self._pre_roll and self.outcome is None and not self._cut_off:
-                if self.clock() > deadline:
-                    log.warning("live chat %s: the robot's audio kept coming faster than GPT-Live may take it; %.1f s "
-                                "of kept audio dropped", self.conversation_id, self._pre_roll_bytes / 2 / RATE)
+                came = (self._kept_total - came_before) / 2 / RATE   # seconds of audio (PCM16: 2 bytes a sample)
+                if came > self.clock() - since + CATCH_UP_MARGIN_SECONDS:
+                    log.warning("live chat %s: the robot sends audio faster than real time (%.1f s in %.1f s); %.2f s "
+                                "of kept audio dropped", self.conversation_id, came, self.clock() - since,
+                                self._pre_roll_bytes / 2 / RATE)
                     break
                 pcm = self._pre_roll.popleft()
                 self._pre_roll_bytes -= len(pcm)

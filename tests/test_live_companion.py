@@ -303,8 +303,9 @@ def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kep
 
 def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(companion, caplog):
     """A robot that sends at twice real time or faster would never let the kept audio run out: the stretch would stay
-    starting, where no pause rule applies, with GPT-Live billed. Sending it ends once a real-time robot would have
-    caught up, plus CATCH_UP_MARGIN_SECONDS; the rest is dropped and logged once, and the live microphone takes over."""
+    starting, where no pause rule applies, with GPT-Live billed. Once the audio that came since GPT-Live started runs
+    CATCH_UP_MARGIN_SECONDS ahead of the clock, the rest is dropped and logged once, and the live microphone takes
+    over."""
     async def scenario():
         frames = iter([_pcm(level % 3000 + 1, 100) for level in range(2000)])
         due = [float("inf")]
@@ -328,9 +329,55 @@ def test_a_robot_sending_at_twice_real_time_cannot_keep_a_stretch_starting(compa
             companion.start_gate.set()
             await asyncio.wait_for(relay._starting, 5)
         assert relay._phase == "running" and not relay._pre_roll and relay._pre_roll_bytes == 0
-        catch_up = 3.0 / (live_session.PRE_ROLL_SEND_SPEED - 1) + live_session.CATCH_UP_MARGIN_SECONDS
-        assert catch_up <= companion.clock.now - started <= catch_up + 0.2
-        assert sum("faster than GPT-Live may take it" in record.getMessage() for record in caplog.records) == 1
+        margin = live_session.CATCH_UP_MARGIN_SECONDS        # 2 s of audio ahead of the clock at twice real time
+        assert margin - 0.2 <= companion.clock.now - started <= margin + 0.2   # give or take a frame
+        assert sum("faster than real time" in record.getMessage() for record in caplog.records) == 1
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_real_time_robot_loses_nothing_when_a_send_to_gpt_live_stalls(companion, caplog):
+    """The rule above judges the audio that came, never how long the sending took: a send that stalls 1.5 s (the
+    network, a busy server) only delays the kept audio; every word of a real-time robot still reaches GPT-Live."""
+    async def scenario():
+        frames = iter([_pcm(level, 100) for level in range(1, 300)])
+        due = [float("inf")]
+        arrived = []
+
+        async def sleep(seconds):   # a real-time robot: a 100 ms frame every 100 ms
+            companion.clock.now += seconds
+            while companion.clock.now >= due[0] - 1e-9:
+                arrived.append(next(frames))
+                companion.robot.inbox.put_nowait(arrived[-1])
+                due[0] += 0.1
+            await _settle()
+
+        companion.sleep = sleep
+        relay, running = await _start(companion)
+        companion.start_gate = asyncio.Event()
+        await _speak(companion)
+        kept = [next(frames) for _ in range(30)]               # 3 s of audio kept meanwhile
+        for frame in kept:
+            companion.robot.inbox.put_nowait(frame)
+        await _settle()
+        (client,) = companion.clients
+        send, stalled = client.send_audio, []
+
+        async def send_audio(pcm):
+            if not stalled:
+                stalled.append(True)
+                await sleep(1.5)                              # the first send hangs 1.5 s
+            await send(pcm)
+
+        client.send_audio = send_audio
+        due[0] = companion.clock.now + 0.1
+        with caplog.at_level(logging.WARNING, logger="app.services.live_session"):
+            companion.start_gate.set()
+            await asyncio.wait_for(relay._starting, 5)
+        assert relay._phase == "running" and client.audio == kept + arrived   # every frame, in order
+        assert not [record for record in caplog.records if "dropped" in record.getMessage()]
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
 
