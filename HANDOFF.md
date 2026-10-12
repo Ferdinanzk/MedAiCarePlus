@@ -224,9 +224,53 @@ Known failures that are not caused by this branch: `test_a_broken_background_nev
    (`reachy_tasks._lease_once`; the robot's retry worked), and a 500 instead of a 409 for a camera frame that arrives
    just after its session ended (`intake_detection.process_frame` raises `SessionEnded`).
 9. The check-ins switch records consent to the robot notice without showing it (only pairing shows it).
-10. **Next: Phase 2, live voice with GPT-Live** for check-ins (patients opt in), with the camera kept on during the chat
-   to keep checking the face. The measurements are done (they live outside the repo); the spec is next. A smaller first
-   step reuses the TCU companion's GPT-Live code.
+10. **Phase 2, live voice with GPT-Live.** Phase 2a, live check-ins for testing, is on branch `live-voice-2a` (section
+   6). Phase 2b comes before any real patient uses it: the patient notice and opt-in, the camera kept on during the
+   chat to keep checking the face, reconnecting, a daily budget, and a second transcript for the safety check.
+
+## 6. Phase 2a: live voice check-ins (test only)
+
+Branch `live-voice-2a` (from `reachy-integration-0.1`), robot app **0.8.0**. Design:
+`docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`. How it works: CLAUDE.md, section "Live voice check-ins
+(Phase 2a, test)". The branch also carries robot app 0.7.1 (today's check-in chat no longer ends on silence); the
+robot has run 0.7.1 since 12 Oct.
+
+**What it is.** A check-in can be a live voice chat with OpenAI's GPT-Live (gpt-live-1) instead of the turn-by-turn
+text chat, which takes 12-14 s a turn. The robot streams its microphone to the server; the server talks with GPT-Live
+and sends its voice back to the robot. The OpenAI key stays on the server. The server holds the start of every reply
+for 0.5 s so the safety check can stop it, has the robot say the help line in its own voice, and falls back to the
+text chat whenever something fails. While the chat runs, the server checks every 10 s that the robot is still paired
+and the consents and the live switch are still on. Reachy also greets the patient by name now, in both chat types
+("What should Reachy call you?" on the Reachy card). GPT-Live costs about US$0.05 per minute of chat.
+
+**Turn it on for testing:**
+
+1. In `.env`, set `LIVE_VOICE_TEST=1`. Rebuild and start the app: `docker compose up -d --build app`.
+2. Settings → **AI connections** → **Live voice (test)**: pick the OpenAI connection (step 4.6), keep the model
+   `gpt-live-1` and the voice `marin` (or pick another), press **Save live voice**, then **Check**. Check must show a
+   time; while it shows an error, live check-ins stay off.
+3. Install robot app 0.8.0 as in step 4.7 (`python tools/deploy_to_robot.py --host <robot-ip>`), then restart it on
+   the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app`. Heartbeats then report `bridge_version`
+   0.8.0.
+4. Settings → **Reachy robot**: **Daily check-ins** on, **Live voice (test)** on. Optionally fill in **What should
+   Reachy call you?** and save it.
+5. Press **Talk to Reachy now**. Reachy greets the patient by name in GPT-Live's voice; say 「再見」 to end. The chat
+   is on the Conversations page like any check-in.
+
+To turn it off: switch **Live voice (test)** off on the Reachy card (one robot), or set `LIVE_VOICE_TEST=0` and run
+`docker compose up -d app` (everyone). Check-ins are then text chats again.
+
+**Still to check on the robot** (the spec's robot tests, not done yet): the time to each reply, the name greeting,
+that Reachy's own voice never comes back as a patient turn (echo), one goodbye, and one fallback (break the connection
+briefly during a chat, e.g. the PC's internet: the check-in must go on as a text chat).
+
+**Open question.** Today's text chat no longer ends on silence (0.7.1), but the live chat still ends after 45 s
+without patient speech, because an open GPT-Live session is billed per second. Decide whether to keep that.
+
+**Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
+daily cost limit, no reconnect, and no face check during the chat; its safety check reads only GPT-Live's own
+transcript (no second transcript and no echo guard on the server). Keep `LIVE_VOICE_TEST=0` on any installation a
+patient uses.
 
 ---
 
