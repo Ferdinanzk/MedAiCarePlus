@@ -154,18 +154,59 @@ def test_held_audio_of_a_reply_that_ended_during_the_hold_is_dropped(safe):
         await _step(safe, relay, 0.3)
         await _live(safe, _said("了"))                             # still a hit
         await _step(safe, relay, 0.35)                             # 0.65 s after its sound: that reply ended, unheard
-        await _live(safe, _said("我孫子"), _sound())                # cleared; GPT-Live's sound starts again
-        await _step(safe, relay, 0.3)                              # the words have not settled yet
+        await _live(safe, _said("我孫子"), _sound())                # cleared; a new reply starts
+        await _step(safe, relay, 0.45)                             # settled: released, behind its own 0.5 s hold
         assert safe.robot.audio() == []
-        # Settled and cleared: released at once. GPT-Live already began answering this turn, so its sound is not held
-        # a second 0.5 s (C1). Only the new sound goes, none of the dropped reply's.
-        await _step(safe, relay, 0.15)
-        assert safe.robot.audio() == [_pcm(LOUD)]
         await _step(safe, relay, 0.1)
-        assert safe.robot.audio() == [_pcm(LOUD)]
+        assert safe.robot.audio() == [_pcm(LOUD)]                  # only the new reply's sound
         safe.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(safe, running)
         assert safe.alerts == [] and _flagged(safe) == []
+
+    asyncio.run(scenario())
+
+
+async def _reply_dropped_unheard(safe):
+    """A hit holds; GPT-Live's first sound starts and ends during the hold (dropped, unheard); the patient's turn
+    goes on (他, before that sound ended) and the hit clears on 想死他. Nobody has heard a reply yet."""
+    relay, running = await _begin(safe)
+    await _live(safe, _said("真是想死"), _sound())             # a hit; GPT-Live's first sound starts during the hold
+    await _step(safe, relay, 0.375)
+    await _live(safe, _said("他"))                             # the same turn goes on while that sound plays
+    await _step(safe, relay, 0.375)                            # 0.75 s after its onset: it ended, unheard
+    await _step(safe, relay, 0.125)                            # the words settled: the hit cleared
+    assert safe.robot.audio() == [] and safe.robot.json()[1:] == [FLUSH] and relay._hit_at is None
+    return relay, running
+
+
+def test_a_reply_whose_first_sound_was_dropped_unheard_is_held_when_it_is_heard(safe):
+    async def scenario():
+        relay, running = await _reply_dropped_unheard(safe)
+        await _live(safe, _reachy("會想他是很自然的。"), _sound())   # the first sound the patient can hear: held
+        await _step(safe, relay, 0.375)
+        assert safe.robot.audio() == []
+        await _step(safe, relay, 0.125)                        # 0.5 s after its onset: released
+        assert safe.robot.audio() == [_pcm(LOUD)]
+        safe.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(safe, running)
+        assert safe.db.rows() == [("reachy", OPENING), ("patient", "真是想死他"), ("reachy", "會想他是很自然的。")]
+        assert safe.db.turns[2]["metrics"] == {"live": {"first_audio_ms": 1000, "hold_ms": 500, "cut": False,
+                                                        "robot_playing_ms": None}}   # from 他, the last words
+        assert safe.alerts == [] and _flagged(safe) == []
+
+    asyncio.run(scenario())
+
+
+def test_a_late_hit_stops_a_reply_whose_first_sound_was_dropped_before_it_is_heard(safe):
+    async def scenario():
+        relay, running = await _reply_dropped_unheard(safe)
+        await _live(safe, _sound(), _said("我也想死"))          # GPT-Live's reply, then a lagging fragment: a hit
+        await _step(safe, relay, 0.5)                          # confirmed while the reply was still held
+        await _over(safe, running)
+        assert safe.robot.audio() == []                        # nothing of GPT-Live's reply was heard
+        assert safe.robot.json()[1:] == [FLUSH, FLUSH, SAY, END_RISK]
+        assert _flagged(safe) == [2] and safe.db.rows("patient") == [("patient", "真是想死他我也想死")]
+        assert safe.alerts == [_alert(safe, "真是想死他我也想死", 2)]
 
     asyncio.run(scenario())
 

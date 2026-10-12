@@ -21,7 +21,8 @@ The chat (spec B2, C1-C3), once the robot has `ready`: the robot's microphone go
 GPT-Live's voice goes to the robot, but the start of every reply to the patient is held HOLD_SECONDS first (B2), so
 the safety checks on the patient's words can stop it before anything is heard. A reply starts when GPT-Live's audio
 turns non-silent (a sample above ONSET_LEVEL) after the patient spoke; after that onset the audio flows through, more
-words of the same patient turn hold nothing more, and silence between replies never goes to the robot. GPT-Live's
+words of the same patient turn hold nothing more, and silence between replies never goes to the robot. A sound the
+screening hold (B1) dropped before any of it went to the robot started no reply: the next sound is held. GPT-Live's
 transcripts become conversation turns (C1, amended after the Task 7 review): fragments are grouped per role. GPT-Live
 can answer before its transcript of the patient is complete, so its words never close the patient's turn: a pause
 over TURN_GAP_SECONDS, MAX_GROUP_CHARS or the end does. The patient's next turn closes Reachy's (the spoken opening
@@ -207,7 +208,9 @@ class _Group:
     text: str = ""
     fragments: int = 0
     opening: bool = False              # Reachy's: GPT-Live's spoken opening, decided when the group is created
-    reply_onset: float | None = None   # the patient's: when GPT-Live's first sound since the group began started
+    # The patient's: when GPT-Live's first sound since the group began started; cleared again when that sound was
+    # dropped unheard by a screening hold (_tick), so the next one is still the reply's start
+    reply_onset: float | None = None
 
     def add(self, text: str, now: float) -> None:
         self.text += text
@@ -504,6 +507,12 @@ class LiveRelay:
             if self._segment is segment and (now - segment.last_signal > TAIL_SECONDS
                                              or now - segment.last_audio > QUIET_SECONDS):
                 self._segment = None
+                patient = self._patient
+                if segment.released_at is None and patient is not None and patient.reply_onset == segment.onset:
+                    # dropped unheard during a screening hold (B1): the patient heard no reply yet, so GPT-Live's
+                    # next sound is still the reply's start: held (B2), its timings from the turn's latest words
+                    patient.reply_onset = None
+                    self._armed, self._reply_due_at = True, patient.last
                 await self._sound_ended(now)
         if self._patient is not None and now - self._patient.last > TURN_GAP_SECONDS:
             await self._close_patient()
@@ -679,7 +688,8 @@ class LiveRelay:
         even after GPT-Live began answering it (its transcript can lag its answer). A fragment that starts a new turn
         closes Reachy's open group, except the spoken opening while its sound plays (_sound_ended closes that). Until
         GPT-Live's next sound starts, the turn's words hold that sound (_armed) and its timings count from them
-        (_reply_due_at); once it started, more words of the same turn change neither."""
+        (_reply_due_at); once it started, more words of the same turn change neither, unless a screening hold dropped
+        that sound unheard (_tick)."""
         if not text.strip():
             if self._patient is not None:
                 self._patient.text += text
@@ -810,7 +820,8 @@ class LiveRelay:
     async def _confirm(self) -> None:
         """B1, step 2: screen() again on the settled words. Still a hit: block(). Cleared (NOT_RISK removes 想死他了
         once 他 has arrived): GPT-Live's voice flows again with the audio held meanwhile (a reply that ended during
-        the hold was dropped with its audio, _tick), and the turns stored during the hold go to layer 2."""
+        the hold was dropped with its audio, and GPT-Live's next sound is held as the reply's start, _tick), and the
+        turns stored during the hold go to layer 2."""
         kind = conversation.screen(self._heard)
         if kind is not None:
             await self.block("keyword", kind=kind, quote=self._heard.strip())

@@ -141,7 +141,9 @@ missed a goodbye split by GPT-Live's early answer. The rule:
 - A fragment that **continues** the patient's group never closes Reachy's group, and re-arms the hold (B2) and moves
   `_reply_due_at` only while GPT-Live has not started a reply since that patient group began. Once a reply's onset
   came after the group began, continuing fragments leave `_armed`, `_reply_due_at` and the reply's metrics alone: the
-  same reply's next sound after a pause is not held again.
+  same reply's next sound after a pause is not held again. A sound that a screening hold (B1) dropped before any of
+  it went to the robot started no reply: the patient heard nothing, so GPT-Live's next sound is still the reply's
+  start, held 500 ms (B2), with its timings from the turn's latest fragment.
 - Turns are stored in the order their groups began: before Reachy's group is stored, a patient group that began
   earlier and is still open is stored first.
 - The spoken opening: Reachy's group created before the patient's first turn began and before the opening was spoken
