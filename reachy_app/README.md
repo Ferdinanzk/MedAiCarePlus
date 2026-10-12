@@ -128,7 +128,7 @@ voice (test)" switch is on in the web app's Reachy card. Otherwise check-ins wor
 - **0.8.0** (for testing; not on this space yet): live voice check-ins (above). Without the server's live voice
   switch, check-ins are unchanged.
 - **0.7.1**: today's check-in chat no longer ends when the patient is quiet (`CHECKIN_SILENCE = None`); it ends on a
-  goodbye, a risk, a stop, or after 5 minutes. On this space since 12 Oct 2026.
+  goodbye, a risk, a stop, or after 5 minutes. Runs on the robot since 12 Oct 2026; not on this space yet.
 - **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
   Two quick restarts from the settings page no longer start two copies of the app's worker.
