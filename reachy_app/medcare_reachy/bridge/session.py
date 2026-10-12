@@ -780,6 +780,7 @@ class SlotSession:
 
     def _after_checkin(self) -> None:
         self._end_chat_events()
+        self.companion_since = None   # the companion session is over: observing on is not companion time
         self._gesture(None)
         self.stream.set_max_fps(None)   # the camera's own rate again (POST_SLOT_OBSERVE looks for an extra dose)
         rest = self._is_checkin_task() or self.outcomes.get("checkin") in COMPANION_ENDINGS
@@ -1017,7 +1018,8 @@ class SlotSession:
         if self.monitor is not None and self.monitor_key == (mode, intk_id):
             return
         await self._end_session()
-        self.monitor = await self.app.monitor_start(mode, intk_id, self.task_id)
+        self.monitor = await self.app.monitor_start(
+            mode, intk_id, self.task_id, companion=self.companion_since is not None and mode == "observe")
         self.monitor_key = (mode, intk_id)
         self.stream.attach(self.monitor)
 

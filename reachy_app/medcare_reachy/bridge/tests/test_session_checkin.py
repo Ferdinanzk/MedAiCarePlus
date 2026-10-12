@@ -50,6 +50,22 @@ def test_after_the_last_dose_reachy_chats_then_observes():
     assert h.stream.attached["session_id"] == "s3" and h.stream.max_fps is None   # observing on, at the full rate
 
 
+def test_the_observe_session_of_a_companion_session_says_companion_and_one_outside_it_does_not():
+    h = Harness(make_task([dose(1)], microphone=True, checkin=True), voice=True, speaker=True)
+    h.find_patient()   # the search before the dose
+    assert h.app.named("monitor_start") == [("monitor_start", "observe", None)] and h.app.monitor_companion == [False]
+    h.verify_and_prompt()
+    h.see(identity_status="verified", recorded=RECORDED)
+    h.tick()
+    h.tick()   # the companion session begins; its camera session is opened for it
+    assert h.app.named("monitor_start")[-1] == ("monitor_start", "observe", None) and h.app.monitor_companion[-1] is True
+    h.app.replies = [{"reply": "再見", "speech_text": "再见", "end": True}]
+    h.voice.speak("好，拜拜")
+    h.tick(1)
+    assert h.slot.state == "POST_SLOT_OBSERVE" and h.slot.companion_since is None
+    assert h.app.monitor_companion[-1] is True   # the same camera session goes on, it is not reopened
+
+
 def test_without_checkin_consent_there_is_no_conversation():
     h = after_one_dose(checkin=False)
     assert h.slot.state == "POST_SLOT_OBSERVE"

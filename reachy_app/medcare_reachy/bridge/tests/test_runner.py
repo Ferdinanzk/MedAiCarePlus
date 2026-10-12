@@ -507,9 +507,22 @@ def test_heartbeat_payload_and_stop_all():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert app.payloads == [{"robot_reachable": True, "landmark_fps": 14.8, "vision_fps": 4.9,
-                             "bridge_version": __version__, "missing_clips": 2}]
+                             "bridge_version": __version__, "missing_clips": 2, "companion": False}]
     assert app.cameras == [StubCamera.SNAPSHOT]
     assert runner.slot.stopped == ("stop_all", True)
+
+
+def test_the_heartbeat_says_companion_while_the_slot_is_in_a_companion_session():
+    app = HeartbeatApp({"stop_all": False})
+    runner = heartbeat_runner(app)
+    runner.slot = StubSlot()
+    runner.slot.companion_since = 12.5
+    asyncio.run(runner.heartbeat_once())
+    runner.slot.companion_since = None
+    asyncio.run(runner.heartbeat_once())
+    runner.slot = None
+    asyncio.run(runner.heartbeat_once())
+    assert [payload["companion"] for payload in app.payloads] == [True, False, False]
 
 
 def test_every_heartbeat_asks_for_media_a_refused_recovery_left_released():

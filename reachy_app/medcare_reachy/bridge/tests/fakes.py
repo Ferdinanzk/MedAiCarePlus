@@ -289,6 +289,7 @@ class FakeApp:
         self.unreachable_since = None
         self.sessions = []
         self.companion_starts = []   # conversation_start's `companion`, per call
+        self.monitor_companion = []   # monitor_start's `companion`, per call
 
     def _maybe_fail(self, name):
         queue = self.fail.get(name)
@@ -322,8 +323,9 @@ class FakeApp:
         self._maybe_fail("extra_event")
         return {"ok": True}
 
-    async def monitor_start(self, mode, intk_id, task_id):
+    async def monitor_start(self, mode, intk_id, task_id, companion=False):
         self.calls.append(("monitor_start", mode, intk_id))
+        self.monitor_companion.append(companion)
         self._maybe_fail("monitor_start")
         n = len(self.sessions) + 1
         session = {"session_id": f"s{n}", "generation": f"g{n}", "mode": mode, "intk_id": intk_id,
