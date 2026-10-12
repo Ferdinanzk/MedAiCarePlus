@@ -256,6 +256,7 @@ class FakeStream:
         self.history = []
         self.camera = FakeCamera()
         self.max_fps = None     # set_max_fps(): the companion session's camera rate, None for the stream's own
+        self.frame_seq = 0      # the attached session's last streamed frame (MonitorStream's; tests set it)
 
     def set_max_fps(self, fps):
         self.max_fps = fps
@@ -263,6 +264,7 @@ class FakeStream:
     def attach(self, monitor):
         self.attached = monitor
         self.latest = None
+        self.frame_seq = 0
         self.history.append(("attach", monitor["session_id"]))
 
     def detach(self):
