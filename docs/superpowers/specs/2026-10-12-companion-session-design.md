@@ -41,6 +41,9 @@ Decisions the user made on 12 Oct (each asked as a question):
    - for 10 minutes there is no patient voice and nobody seen: Reachy says 「我先休息一下，有需要再叫我喔。」 and sleeps;
    - a medicine task falls due: Reachy says 「該吃藥囉，我們等一下再聊。」, ends the session and starts the medicine task;
    - someone stops the robot from the app (`stop_all`), or the microphone consent is withdrawn (as today).
+
+   *(Amended after the final review: today's text chat also ends at once when the microphone consent is withdrawn;
+   the medicine ending first lets the patient's words reach the server, MEDICINE_WAIT_SECONDS (30 s) at most, 4.5.)*
 6. When live voice is off or GPT-Live is not available, **today's text chat follows the same rules** (stays until
    goodbye, the same rest and medicine rules). Only the "brain" differs.
 
@@ -63,6 +66,9 @@ Decisions the user made on 12 Oct (each asked as a question):
   should answer what the patient says now. Then it sends the kept pre-roll audio, then the live microphone. A start
   that fails falls back to today's text chat in the same conversation (`fallback` with the conversation id), as a
   mid-chat GPT-Live failure does today.
+  *(Amended after the final review: when the patient's words that started it were kept, nothing has transcribed or
+  screened them, so the robot first gets a `say` with reason `repeat`, `REPEAT_LINES`: 「不好意思，我剛剛沒聽清楚，可以再說一次嗎？」
+  / "Sorry, I didn't catch that. Could you say it again?", and the patient says it again to the text chat.)*
 - **Pause.** When no patient speech has been heard for `QUIET_PAUSE_SECONDS` (30 s) and GPT-Live's sound has ended,
   the relay stores the open turns and closes GPT-Live (session usage added up), then is paused again. A talking
   stretch also pauses at `STRETCH_MAX_SECONDS` (600 s); the patient's next words restart it.
@@ -71,6 +77,10 @@ Decisions the user made on 12 Oct (each asked as a question):
   speaking. Every pause first handles the closed stretch's queued events: the patient's words are screened and stored,
   and OpenAI's cut-offs are judged. After a pause at the hard limit with recent speech, the next stretch starts at
   once.)*
+  *(Amended after the final review: the order is close GPT-Live, handle its queued events, store the open turns, send
+  `paused`; a robot `end` during that handling lets it finish. The turn-gap pause also waits while GPT-Live owes the
+  patient an answer. After a pause at the hard limit with recent speech the next stretch is asked for at once, still
+  camera first.)*
 - **Not used for robot app 0.9.0:** `SILENCE_END_SECONDS` (the 45 s ending) and the whole-chat `LIVE_MAX_SECONDS`
   limit. The robot's rest rule and the goodbye end a session. (Both stay in the code for older robots, below.)
 - **Unchanged while a stretch runs:** the 0.5 s hold of each reply, screening of every transcript fragment, `block()`
@@ -79,6 +89,10 @@ Decisions the user made on 12 Oct (each asked as a question):
   GPT-Live's answer), the bounded database calls.
 - **Unchanged while paused too:** the 10 s access re-check (robot, live switch, robot consent, check-in consent,
   memory consent) runs whether a stretch is open or not. After a risk (`self._risk`), nothing restarts.
+  *(Amended after the final review: the re-check also reads the conversation's `ended_at`; when another writer, the
+  after-chat sweep, ended it, the chat ends as `stopped`. An ending or a fallback while a stretch runs (the robot's
+  medicine, rest or stop, a dropped robot) first closes GPT-Live and handles its queued events as a pause does, before
+  the open turns are stored, so a risk in the patient's last words is stored, judged and alerted.)*
 - **Cost record:** `conversation.live` keeps `usage_seconds` as the sum over all stretches and adds `stretches` (how
   many times GPT-Live was started).
 - **Old robots:** a `start` whose `bridge_version` is below 0.9.0 gets today's behaviour (GPT-Live starts at once and
@@ -87,8 +101,9 @@ Decisions the user made on 12 Oct (each asked as a question):
 ### 3.2 Camera first (the server enforces it)
 
 The relay restarts GPT-Live on `speech` only when the patient's robot monitor session in the in-memory
-`MonitorRegistry` shows the patient verified within `SEEN_RECENT_SECONDS` (15 s) (`MonitorSession.verified_at`, the
-same check-in search session the robot keeps open, 4.2). Otherwise it stays paused and answers
+`MonitorRegistry` shows the patient verified within `SEEN_RECENT_SECONDS` (15 s) (`MonitorSession.confirmed_at`, set
+only by a hit that makes the status verified, two in a row, never by a first hit still "verifying"; the same check-in
+search session the robot keeps open, 4.2). Otherwise it stays paused and answers
 `{"type": "not_seen"}` (the robot logs it; Reachy keeps listening). A stretch already running is not cut when the
 patient steps out of view. So only the identified patient's voice starts a cloud session.
 
@@ -99,7 +114,12 @@ check-in face rule, the OpenVINO match alone, so the patient is recognised from 
 
 - The patient-turn limit (`conversation.MAX_PATIENT_TURNS`, 6) no longer ends a check-in chat from robot app 0.9.0;
   only a goodbye or a risk does (the robot ends it for rest, medicine or a stop). An older robot keeps the limit
-  (the robot's version is known from its heartbeat's `bridge_version`).
+  (a 0.9.0 robot says so with the `companion` flag on `POST /conversations`, which the server keeps as
+  `conversation.companion`; an older robot sends no flag).
+- *(Added after the final review: the after-chat sweep leaves a companion conversation open, however long it is
+  quiet, while it is the patient's newest conversation, the patient's robot holds its camera session and an
+  in-progress task whose expiry has not passed; `extend_for_companion` keeps that expiry ahead only while heartbeats
+  say companion, so a robot that went away lets it lapse and the 15-minute rule closes the row. There is no ceiling.)*
 - `/conversations/{id}/end` accepts the new reason `medicine` (the 10-minute rest uses the existing `patient_left`).
 
 ### 3.4 Heartbeat: medicine first
@@ -112,6 +132,11 @@ companion session (4.5).
 keeps the held in-progress task from expiring (`reachy_tasks.extend_for_companion`, `COMPANION_TASK_EXTEND_SECONDS` =
 600 s past each heartbeat). `task_due` is read after the heartbeat's write transaction; if that read fails, the answer
 is false.)*
+
+*(Added after the final review: a missed-dose retry that finds the slot's task held in progress (a companion session
+after a dose was left pending) marks it `retry_due`; `task_due` is then also true while a marked dose is open and
+startable, and when that task ends the retry is queued at once for the doses still open. The lease takes every
+medicine task before a queued check-in.)*
 
 ### 3.5 End reasons
 
@@ -130,6 +155,10 @@ the live chat (4.3) or today's text chat. `CHECKIN_MAX` (5 minutes) is removed; 
 The check-in search's monitor session (observe mode, check-in search) is kept open for the whole companion session,
 instead of being ended before the chat. Frames are sent at `COMPANION_CAPTURE_FPS` (2 per second) to save the robot's
 and the server's CPU. The robot tracks when the server last reported the patient verified (`seen_at`, already kept).
+*(Amended after the final review: `seen_at` is when that answer came, `MonitorStream.latest_at`, never a later tick's
+time, so a camera that stopped never keeps Reachy awake. A live chat whose camera has been unusable, no session or its
+state not "ok", for `CAMERA_LOST_SECONDS` (30 s) goes on as today's chat in a new conversation, as when its voice
+detector stops; never merely because the patient is out of view.)*
 
 ### 4.3 Hearing the patient start (`bridge/live.py`)
 
@@ -147,6 +176,10 @@ The controller ends the session as `patient_left`, after Reachy says its rest li
 
 When a heartbeat answer has `task_due` true, the controller waits for Reachy to finish its current sentence, says its
 medicine line, ends the session as `medicine` (live: `end`; text chat: `/end`), and the runner leases the next task.
+*(Amended after the final review: it also waits for the patient's words, `MEDICINE_WAIT_SECONDS` (30 s) at most: in
+today's chat a turn is sent and answered first and the listener must hold nothing; in the live chat the patient must
+have stopped speaking `MEDICINE_SPEECH_GAP_SECONDS` (2 s) before, by the voice detector's state. Once the server has
+ended the live chat (its help line playing), the robot asks for no companion ending of its own.)*
 
 ### 4.6 Version
 
@@ -156,7 +189,7 @@ medicine line, ends the session as `medicine` (live: `end`; text chat: `/end`), 
 
 - Every layer of the live spec stays (B1-B5) and the text chat's three layers stay.
 - Camera first means a cloud session starts only for the identified patient's voice; the pre-roll makes sure the first
-  words are screened too.
+  words are screened too (a stretch that cannot start asks the patient to say them again, 3.1).
 - The access re-check keeps running while paused; after a risk nothing restarts; the help line is always Reachy's own
   voice.
 - No new data leaves the home: the same audio, name and notes as Phase 2a, only less often (paused while quiet). Live
@@ -176,6 +209,9 @@ medicine line, ends the session as `medicine` (live: `end`; text chat: `/end`), 
 | `COMPANION_CAPTURE_FPS` | 2 | robot session.py / runner.py |
 | `SPEECH_SIGNAL_GAP_SECONDS` | 1 | robot live.py |
 | `SPEECH_ECHO_GUARD_SECONDS` | 0.75 (added after the review) | robot live.py |
+| `MEDICINE_WAIT_SECONDS` | 30 (added after the final review) | robot session.py |
+| `MEDICINE_SPEECH_GAP_SECONDS` | 2 (added after the final review) | robot session.py |
+| `CAMERA_LOST_SECONDS` | 30 (added after the final review) | robot session.py |
 
 ## 7. Testing
 
