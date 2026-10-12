@@ -127,10 +127,34 @@ or `unknown` (no answer) → `block()`. `NONE` → the chat continues as today's
 
 ### C. Turns, endings, fallback
 
-**C1. Turns.** Transcript fragments are grouped per role. A role switch closes the other role's group; a pause over
-1.5 s closes a patient group. Each closed group becomes one `conversation_turn` row (`role` patient or reachy) with
-`metrics.live`: patient turns `transcript_ms` (first to last fragment) and the risk result; Reachy turns
-`first_audio_ms`, `hold_ms`, `cut` (true if blocked or flushed). GPT-Live's text is the transcript of its speech.
+**C1. Turns** (amended after the Task 7 review, see the spike's 3b). Transcript fragments are grouped per role.
+GPT-Live is full duplex: it can start its reply before its transcript of the patient is complete (in the spike the
+last input fragment came 0.84-1.28 s after the patient stopped and the reply became audible 0.00-0.31 s after it; in
+the idiom run 「會想」 arrived with 「他」), and OpenAI's Live guide says input transcript deltas "do not define complete
+turns". The earlier rule, "a role switch closes the other role's group", split one utterance into several turns and
+missed a goodbye split by GPT-Live's early answer. The rule:
+- A patient turn is closed by a pause over `TURN_GAP_SECONDS` (1.5 s) since its last fragment, by `MAX_GROUP_CHARS`, or
+  by the chat's end. **GPT-Live's words never close it.** A patient fragment that arrives while the patient's group is
+  still open (within 1.5 s of its last fragment) continues that turn, even if GPT-Live has started answering.
+- A patient fragment that **starts** a new patient group closes Reachy's open group (the reply it interrupted or
+  followed), except GPT-Live's spoken opening while its sound is still playing (below).
+- A fragment that **continues** the patient's group never closes Reachy's group, and re-arms the hold (B2) and moves
+  `_reply_due_at` only while GPT-Live has not started a reply since that patient group began. Once a reply's onset
+  came after the group began, continuing fragments leave `_armed`, `_reply_due_at` and the reply's metrics alone: the
+  same reply's next sound after a pause is not held again.
+- Turns are stored in the order their groups began: before Reachy's group is stored, a patient group that began
+  earlier and is still open is stored first.
+- The spoken opening: Reachy's group created before the patient's first turn began and before the opening was spoken
+  is the opening group (`_Group.opening`, decided when the group is created, not when it is closed). While
+  GPT-Live's sound is still playing, a new patient group does not close it; it is closed when GPT-Live's sound ends
+  (`_sound_ended`) if the patient talked over it, else at the next new patient group after that, or at the end, and
+  it always replaces turn 1's text. So an opening with a pause between its sentences stays whole while nobody speaks.
+  The patient's words spoken over it are stored as their own turn after it.
+- The goodbye check (`conversation.wants_to_end`, C2) runs on the closed patient turn, which is the whole utterance.
+
+Each closed group becomes one `conversation_turn` row (`role` patient or reachy) with `metrics.live`: patient turns
+`transcript_ms` (first to last fragment) and the risk result; Reachy turns `first_audio_ms`, `hold_ms`, `cut` (true if
+blocked or flushed). GPT-Live's text is the transcript of its speech.
 
 **C2. Endings.** The chat ends on: a goodbye in a closed patient turn (`conversation.is_goodbye`-style check, the
 `GOODBYES` list), after which GPT-Live may answer once and the server ends 3 s after that reply's audio ends; 45 s
