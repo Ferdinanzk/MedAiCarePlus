@@ -66,6 +66,11 @@ Decisions the user made on 12 Oct (each asked as a question):
 - **Pause.** When no patient speech has been heard for `QUIET_PAUSE_SECONDS` (30 s) and GPT-Live's sound has ended,
   the relay stores the open turns and closes GPT-Live (session usage added up), then is paused again. A talking
   stretch also pauses at `STRETCH_MAX_SECONDS` (600 s); the patient's next words restart it.
+  *(Amended after the review: a stretch older than 600 s pauses at the patient's next turn gap, when nobody is talking
+  and GPT-Live is silent; `STRETCH_HARD_MAX_SECONDS` (660 s) pauses it anyway, with a `flush` if GPT-Live was
+  speaking. Every pause first handles the closed stretch's queued events: the patient's words are screened and stored,
+  and OpenAI's cut-offs are judged. After a pause at the hard limit with recent speech, the next stretch starts at
+  once.)*
 - **Not used for robot app 0.9.0:** `SILENCE_END_SECONDS` (the 45 s ending) and the whole-chat `LIVE_MAX_SECONDS`
   limit. The robot's rest rule and the goodbye end a session. (Both stay in the code for older robots, below.)
 - **Unchanged while a stretch runs:** the 0.5 s hold of each reply, screening of every transcript fragment, `block()`
@@ -87,6 +92,9 @@ same check-in search session the robot keeps open, 4.2). Otherwise it stays paus
 `{"type": "not_seen"}` (the robot logs it; Reachy keeps listening). A stretch already running is not cut when the
 patient steps out of view. So only the identified patient's voice starts a cloud session.
 
+*(Added after the review: `/api/device/monitor/start` accepts a `companion` flag. A companion `observe` session uses the
+check-in face rule, the OpenVINO match alone, so the patient is recognised from across the room even after a dose.)*
+
 ### 3.3 Today's text chat (`app/routers/api_device.py`)
 
 - The patient-turn limit (`conversation.MAX_PATIENT_TURNS`, 6) no longer ends a check-in chat from robot app 0.9.0;
@@ -99,6 +107,11 @@ patient steps out of view. So only the identified patient's voice starts a cloud
 The heartbeat answer gains `task_due` (bool): true when this robot could lease a different open task for the patient
 now (the same rule as `reachy_tasks` leasing: a queued task whose doses are startable). The robot then ends the
 companion session (4.5).
+
+*(Added after the review: the heartbeat accepts a `companion` flag while a companion session runs, and the server then
+keeps the held in-progress task from expiring (`reachy_tasks.extend_for_companion`, `COMPANION_TASK_EXTEND_SECONDS` =
+600 s past each heartbeat). `task_due` is read after the heartbeat's write transaction; if that read fails, the answer
+is false.)*
 
 ### 3.5 End reasons
 
@@ -154,7 +167,8 @@ medicine line, ends the session as `medicine` (live: `end`; text chat: `/end`), 
 | Constant | Value | Where |
 |---|---|---|
 | `QUIET_PAUSE_SECONDS` | 30 | live_session.py |
-| `STRETCH_MAX_SECONDS` | 600 | live_session.py |
+| `STRETCH_MAX_SECONDS` | 600 (amended after the review: the next turn gap after it) | live_session.py |
+| `STRETCH_HARD_MAX_SECONDS` | 660 (added after the review) | live_session.py |
 | `SEEN_RECENT_SECONDS` | 15 | live_session.py |
 | `PRE_ROLL_SECONDS` | 2 | live_session.py |
 | `HISTORY_TURNS` | 20 | live_session.py |

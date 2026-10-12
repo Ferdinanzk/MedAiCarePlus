@@ -331,15 +331,16 @@ def vision_interval(state: MonitorSession) -> float:
 
 
 def openvino_only(state: MonitorSession) -> bool:
-    """The identity rule of the search before a check-in: a robot session that started in observe mode for a
-    check-in task (checkin_search) verifies the patient with the OpenVINO match alone. MediaPipe's short-range face
-    detector misses faces under about 50 px wide (beyond about 1.35 m from the robot), where dashboard login, which
-    uses OpenVINO alone, still works. Under this rule a hit needs a patient face at least
-    OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is ever recorded from such a session.
-    Every other session also needs a MediaPipe face on the same box: dose sessions (also once a record switched them
-    to observe), browser sessions, and the search and the watch of a dose task. Narrowed to check-in searches after
-    the final review of 11 Oct: a dose task's search could verify a patient the strict dose session after it then
-    found 'ambiguous', and the robot asked that patient for the person whose medicine it was."""
+    """The identity rule of a check-in's camera: a robot session that started in observe mode for a check-in task
+    (the search before the chat), or that /api/device/monitor/start received with companion true (robot app 0.9.0,
+    which keeps its camera on during the chat and never records), is marked checkin_search and verifies the patient
+    with the OpenVINO match alone. MediaPipe's short-range face detector misses faces under about 50 px wide (beyond
+    about 1.35 m from the robot), where dashboard login, which uses OpenVINO alone, still works. Under this rule a hit
+    needs a patient face at least OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is ever recorded
+    from such a session. Every other session also needs a MediaPipe face on the same box: dose sessions (also once a
+    record switched them to observe), browser sessions, and the search and the watch of a dose task. Narrowed to
+    check-in searches after the final review of 11 Oct: a dose task's search could verify a patient the strict dose
+    session after it then found 'ambiguous', and the robot asked that patient for the person whose medicine it was."""
     return state.client_type == "reachy" and state.started_mode == "observe" and state.checkin_search
 
 

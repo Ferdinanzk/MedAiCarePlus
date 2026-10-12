@@ -231,10 +231,10 @@ Known failures that are not caused by this branch: `test_a_broken_background_nev
 
 ## 6. Phase 2a: live voice check-ins (test only)
 
-Branch `live-voice-2a` (from `reachy-integration-0.1`), robot app **0.8.0**. Design:
-`docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`. How it works: CLAUDE.md, section "Live voice check-ins
-(Phase 2a, test)". The branch also carries robot app 0.7.1 (today's check-in chat no longer ends on silence); the
-robot has run 0.7.1 since 12 Oct.
+Branch `live-voice-2a` (from `reachy-integration-0.1`), robot app **0.8.0**, then **0.9.0** (the companion session,
+below). Design: `docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`. How it works: CLAUDE.md, section "Live
+voice check-ins (Phase 2a, test)". The branch also carries robot app 0.7.1 (today's check-in chat no longer ends on
+silence); the robot has run 0.7.1 since 12 Oct.
 
 **What it is.** A check-in can be a live voice chat with OpenAI's GPT-Live (gpt-live-1) instead of the turn-by-turn
 text chat, which takes 12-14 s a turn. The robot streams its microphone to the server; the server talks with GPT-Live
@@ -250,13 +250,14 @@ and the consents and the live switch are still on. Reachy also greets the patien
 2. Settings → **AI connections** → **Live voice (test)**: pick the OpenAI connection (step 4.6), keep the model
    `gpt-live-1` and the voice `marin` (or pick another), press **Save live voice**, then **Check**. Check must show a
    time; while it shows an error, live check-ins stay off.
-3. Install robot app 0.8.0 as in step 4.7 (`python tools/deploy_to_robot.py --host <robot-ip>`), then restart it on
-   the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app`. Heartbeats then report `bridge_version`
-   0.8.0.
+3. Install the robot app (0.9.0 on this branch) as in step 4.7 (`python tools/deploy_to_robot.py --host <robot-ip>`),
+   then restart it on the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app`. Heartbeats then report
+   `bridge_version` 0.9.0.
 4. Settings → **Reachy robot**: **Daily check-ins** on, **Live voice (test)** on. Optionally fill in **What should
    Reachy call you?** and save it.
-5. Press **Talk to Reachy now**. Reachy greets the patient by name in GPT-Live's voice; say 「再見」 to end. The chat
-   is on the Conversations page like any check-in.
+5. Press **Talk to Reachy now**. Reachy looks for the patient, greets them by name in its own voice and listens.
+   Answer while it can see you: GPT-Live then answers. Say 「再見」 to end. The chat is on the Conversations page like
+   any check-in.
 
 To turn it off: switch **Live voice (test)** off on the Reachy card (one robot), or set `LIVE_VOICE_TEST=0` and run
 `docker compose up -d app` (everyone). Check-ins are then text chats again.
@@ -265,13 +266,20 @@ To turn it off: switch **Live voice (test)** off on the Reachy card (one robot),
 that Reachy's own voice never comes back as a patient turn (echo), one goodbye, and one fallback (break the connection
 briefly during a chat, e.g. the PC's internet: the check-in must go on as a text chat).
 
-**Open question (answered on 12 Oct).** Today's text chat no longer ends on silence (0.7.1), but the live chat still
-ends after 45 s without patient speech, because an open GPT-Live session is billed per second. The user's answer is
-the companion session (section 7): GPT-Live pauses while the patient is quiet instead of ending the chat. Until that is
-built, 0.8.0 keeps the 45 s ending.
+**Companion session (robot app 0.9.0).** Decided with the user on 12 Oct; design:
+`docs/superpowers/specs/2026-10-12-companion-session-design.md`; how it works: CLAUDE.md, "How it ends" in the
+check-in section and "Companion session" in the live voice section. A check-in now stays until the patient says
+goodbye, with either chat. Reachy greets in its own voice and keeps the camera on (2 frames a second). GPT-Live starts
+only when the patient speaks and the camera recognised them in the last 15 s, pauses after 30 s without patient speech
+(billing stops) and starts again with the last 20 turns when the patient speaks. A talking stretch pauses at the next
+gap in the talk after 10 minutes, and at 11 minutes whatever is happening. Reachy rests after 10 minutes with no voice
+and nobody seen, and ends the chat for a medicine that falls due. This settles the old question about the live chat's
+45 s silence ending: only robots older than 0.9.0 keep it. Every timing is one constant (for example
+`QUIET_PAUSE_SECONDS` and `REST_AFTER_SECONDS`), to change after trying. Still to check on the robot with the user:
+greet, talk, stay quiet (pause), speak again (restart), say 拜拜.
 
 **Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
-daily cost limit, no reconnect, and no face check during the chat; its safety check reads only GPT-Live's own
+daily cost limit, no reconnect, and no face check while GPT-Live is talking; its safety check reads only GPT-Live's own
 transcript (no second transcript and no echo guard on the server). Keep `LIVE_VOICE_TEST=0` on any installation a
 patient uses.
 
@@ -307,12 +315,13 @@ patient uses.
      speaking. None of GPT-Live's voice reached the robot; the robot said the help line in its own voice; family were
      alerted once.
    - Cost: 39 billed seconds in all.
-4. **The companion session: designed and approved, not built yet.** Spec:
+4. **The companion session: built and reviewed on this branch (robot app 0.9.0).** Its live tests on the PC and on the
+   robot are still to do (see "Not done yet"). Spec:
    `docs/superpowers/specs/2026-10-12-companion-session-design.md`. Reachy greets the patient in its own voice. GPT-Live
    starts only when the camera recognised the patient in the last 15 s and the patient speaks. It pauses after 30 s of
    quiet (billing stops) and restarts with the conversation so far. The session ends on 拜拜/再見, a risk, a
    withdrawal, a medicine falling due, or 10 minutes with no voice and nobody seen. Today's text chat follows the same
-   rules. It will be robot app 0.9.0; its implementation plan is being written.
+   rules.
 
 **Tests at this commit:** backend 2020 passed plus 1 known failure (BUG-37, older than this work); robot app 624
 passed, 6 skipped; web app 91 Playwright tests passed plus 1 known failure (BUG-38).
@@ -330,7 +339,7 @@ passed, 6 skipped; web app 91 Playwright tests passed plus 1 known failure (BUG-
 
 - The robot tests of Phase 2a (section 6, "Still to check on the robot"). They need the server rebuilt from this branch
   with `LIVE_VOICE_TEST=1` and robot app 0.8.0 on the robot; the user will do them together with the developer.
-- Building the companion session (robot app 0.9.0).
+- The companion session's live test on this PC and its robot test with the user (robot app 0.9.0; section 6).
 - Small points the reviews found and left for Phase 2b: a database insert that times out can slow the chat's later
   writes; a late risk found while the chat is already falling back can end it without the spoken help line (family
   are still alerted); the check-ins help text on the Reachy card still says only text is sent, also while the live
