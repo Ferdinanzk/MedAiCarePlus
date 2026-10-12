@@ -507,7 +507,8 @@ class Runner:
             await self.run_blocking(self.robot.restore_media)
         payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
                    "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
-                   "missing_clips": self.clips.missing_count}
+                   "missing_clips": self.clips.missing_count,
+                   "companion": bool(self.slot is not None and getattr(self.slot, "companion_since", None) is not None)}
         try:
             response = await self.app.heartbeat(payload, camera=self.stream.camera.snapshot())
         except NotAuthorised:

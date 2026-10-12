@@ -177,8 +177,9 @@ class AppClient:
         return await self._request("POST", "/api/device/heartbeat", json=body) or {}
 
     # ── monitor ──────────────────────────────────────────────────────────
-    async def monitor_start(self, mode: str, intk_id: int | None, task_id: str) -> dict:
-        body = {"mode": mode, **({} if intk_id is None else {"intk_id": intk_id}), "task_id": task_id}
+    async def monitor_start(self, mode: str, intk_id: int | None, task_id: str, companion: bool = False) -> dict:
+        body = {"mode": mode, **({} if intk_id is None else {"intk_id": intk_id}), "task_id": task_id,
+                **({"companion": True} if companion else {})}
         return await self._request("POST", "/api/device/monitor/start", json=body)
 
     async def monitor_landmarks(self, packet: dict) -> dict:
