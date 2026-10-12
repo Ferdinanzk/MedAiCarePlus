@@ -136,6 +136,8 @@ class FakeVoice:
         self.pause = None       # chat: when the VAD released what the patient said (heard_pause)
         self.speaking = False   # chat: hears_speech()
         self.acks = []          # chat: (when, seconds) of each note_ack
+        self.suspended = False  # a live chat reads the microphone meanwhile (suspend / resume)
+        self.handovers = []     # "suspend" / "resume", in order
 
     def set_active(self, active, mode="done"):
         if active != self.active:
@@ -149,6 +151,14 @@ class FakeVoice:
     def release(self):
         self.holds -= 1
 
+    def suspend(self):
+        self.suspended = True
+        self.handovers.append("suspend")
+
+    def resume(self):
+        self.suspended = False
+        self.handovers.append("resume")
+
     def say(self, word="吃完"):
         assert self.active and self.holds == 0, "the listener is off"
         self.heard = (self.clock.monotonic(), word)
@@ -157,12 +167,14 @@ class FakeVoice:
         """Chat mode: the patient says something (`metrics`: what the listener measured while hearing it); the VAD
         released it at `ended` (default now), and it is decoded at once."""
         assert self.active and self.mode == "chat" and self.holds == 0, "not listening for a conversation"
+        assert not self.suspended, "the live chat has the microphone"
         self.pauses(ended)
         self.utterances.append((text, metrics or {"handover_ms": 400, "segments": 1, "listen_mode": "chat"}))
 
     def pauses(self, ended=None):
         """Chat mode: the VAD released what the patient said; SenseVoice is still decoding it."""
         assert self.active and self.mode == "chat" and self.holds == 0, "not listening for a conversation"
+        assert not self.suspended, "the live chat has the microphone"
         if self.pause is None:
             self.pause = self.clock.monotonic() if ended is None else ended
 
