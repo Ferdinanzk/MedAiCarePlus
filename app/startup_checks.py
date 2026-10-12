@@ -25,6 +25,9 @@ def run_startup_checks(env: Mapping[str, str] | None = None) -> list[str]:
     for key in required:
         if not str(value(key)).strip():
             problems.append(f"{key} is required")
+    if str(value("LIVE_VOICE_TEST")).strip().lower() in ("1", "true", "yes"):
+        problems.append("LIVE_VOICE_TEST must be off: live voice check-ins are for testing only, and no patient "
+                        "notice or consent covers them before Phase 2b")
     for problem in problems:
         logger.warning("Startup check: %s", problem)
     if problems and str(value("APP_ENV", "dev")).strip().lower() == "prod":

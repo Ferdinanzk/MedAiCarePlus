@@ -106,8 +106,9 @@ SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when ano
 ## Live voice check-ins (0.8.0, test)
 
 From 0.8.0 a check-in can be a live voice chat with OpenAI's GPT-Live, **for testing only**: no patient notice covers
-it yet. It runs only when the server allows it (`LIVE_VOICE_TEST=1` in the server's `.env`) and the robot's "Live
-voice (test)" switch is on in the web app's Reachy card. Otherwise check-ins work as before.
+it yet. It runs only when the server allows it (`LIVE_VOICE_TEST=1` in the server's `.env`), the robot's "Live
+voice (test)" switch is on in the web app's Reachy card, and a live model on the web app's AI connections card has
+passed its Check. Otherwise check-ins work as before.
 
 - The robot sends what its microphone hears to the MedAiCarePlus server as it hears it, and plays the voice the server
   sends back. The server talks with GPT-Live; the OpenAI key stays on the server.
@@ -116,9 +117,13 @@ voice (test)" switch is on in the web app's Reachy card. Otherwise check-ins wor
   talks about harming themselves, Reachy says the help line in its own voice and family are alerted, as in the text
   chat.
 - While the chat runs, the server checks every 10 seconds that the robot is still paired and that the patient's
-  consents and live switch are still on. If not, the chat ends.
-- When anything goes wrong (the server can't reach GPT-Live, the connection drops, OpenAI ends the session), the
-  check-in simply goes on as the text chat.
+  consents and live switch are still on. If not, the chat ends; when only the memory consent was switched off, the
+  check-in goes on as the text chat, without the notes.
+- When the server can't reach GPT-Live, or GPT-Live or the server fails during the chat, the check-in goes on as the
+  text chat. When OpenAI ends the session itself (its moderation), the server first judges the patient's last words:
+  the text chat takes over only when the safety check answers explicitly that there is no risk. Any other answer, or
+  none, counts as a risk: Reachy says the help line, family are alerted and the chat ends. When the robot's own
+  connection to the server drops, the server ends that chat and the robot starts a new text chat.
 - One sound owner: the app's speech listener pauses during the live chat, and Reachy's own lines go through the same
   speaker queue as GPT-Live's voice.
 - It uses the `websockets` package, which the robot's apps environment already has.
