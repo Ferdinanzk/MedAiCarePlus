@@ -420,6 +420,71 @@ def test_stop_ends_the_chat_at_once_and_drops_what_is_queued():
     assert chat.robot.calls[-2:] == ["gesture:None", "stop_live_audio"]
 
 
+def stop_in_the_drain(chat, reason):
+    """Make stop() arrive once the chat has begun draining what is queued."""
+    drain = chat.live._drain
+
+    async def stopping():
+        chat.live.stop(reason)
+        await drain()
+
+    chat.live._drain = stopping
+
+
+@pytest.mark.parametrize("message, expected", [
+    ({"type": "fallback", "reason": "live_ended", "conversation_id": "c9"},
+     LiveOutcome("ended", "stop_all", "c9")),
+    ({"type": "end", "reason": "goodbye", "risk": False}, LiveOutcome("ended", "stop_all", "c9")),
+    ({"type": "end", "reason": "risk", "risk": True}, LiveOutcome("ended", "stop_all", "c9", True)),
+])
+def test_a_stop_during_the_final_drain_still_ends_the_chat(message, expected):
+    async def scenario():
+        chat = Chat()
+        stop_in_the_drain(chat, "stop_all")
+        task = chat.start()
+        await chat.ready()
+        chat.socket.serve(pcm(0.1))
+        chat.socket.serve(message)
+        return chat, await task
+
+    chat, outcome = run(scenario)
+    assert outcome == expected
+    assert chat.robot.calls[-1] == "stop_live_audio" and chat.socket.closed
+
+
+def test_a_speaker_that_cannot_be_cleared_never_breaks_a_flush():
+    async def scenario():
+        chat = Chat()
+        chat.robot.clear_error = RuntimeError("clear_player failed")
+        task = chat.start()
+        await chat.ready()
+        chat.socket.serve(pcm(2.0))
+        await until(lambda: len(chat.robot.pushed) >= 5)
+        chat.socket.serve({"type": "flush"})
+        await until(lambda: {"type": "idle"} in chat.sent())
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        return chat, await task
+
+    chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("ended", "goodbye", "c9")
+    assert chat.live.player.queued == 0 and chat.robot.calls[-1] == "stop_live_audio"
+
+
+def test_a_speaker_that_cannot_be_cleared_never_breaks_a_robot_ending():
+    async def scenario():
+        chat = Chat()
+        task = chat.start()
+        await chat.ready()
+        chat.robot.push_error = RuntimeError("push_buffer failed")
+        chat.robot.clear_error = RuntimeError("clear_player failed")
+        return chat, await task
+
+    chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("fallback", "robot_error", None)
+    assert chat.sent()[-1] == {"type": "end", "reason": "robot_error"}
+    assert "clear_live_audio" in chat.robot.calls and chat.robot.calls[-1] == "stop_live_audio"
+
+
 def test_a_chat_the_server_never_ends_stops_after_max_seconds():
     async def scenario():
         chat = Chat()
