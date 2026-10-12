@@ -54,6 +54,18 @@ def test_robot_enabled_requires_the_risk_key(enabled):
     assert startup_checks.run_startup_checks(env) == []
 
 
+@pytest.mark.parametrize("on", ["1", "true", "yes"])
+def test_live_voice_test_warns_in_dev_and_stops_prod(caplog, on):
+    """Live voice is for testing only: no patient notice or consent covers it before Phase 2b."""
+    env = {**_configured(), "LIVE_VOICE_TEST": on}
+    with pytest.raises(SystemExit) as exc:
+        startup_checks.run_startup_checks(env)
+    assert exc.value.code == 1 and "LIVE_VOICE_TEST" in caplog.text
+    assert [problem.split()[0] for problem in startup_checks.run_startup_checks({**env, "APP_ENV": "dev"})] == [
+        "LIVE_VOICE_TEST"]
+    assert startup_checks.run_startup_checks({**env, "LIVE_VOICE_TEST": "0"}) == []
+
+
 def _ai_snapshot(model_id="google/gemini-2.5-flash", region="global"):
     from app.services import ai_profile, ai_settings
     connection = ai_settings.Connection(1, "OpenRouter", "openrouter", ai_profile.BASE_URLS["openrouter"], "k", "k",

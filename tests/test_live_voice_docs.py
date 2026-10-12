@@ -213,5 +213,6 @@ def test_claude_md_lists_live_voice_test_and_its_port_rule_covers_websockets():
 def test_the_docs_name_the_access_recheck_and_the_endings_it_adds():
     section = _section("CLAUDE.md")
     for name in ("ACCESS_RECHECK_SECONDS = 10.0", "ACCESS_CHECK_TIMEOUT = 5.0", "ACCESS_FAILURES_TO_END = 3",
-                 "access_withdrawn", "access_unverified", "SILENCE_END_SECONDS = 45", "CHECKIN_SILENCE = None"):
+                 "access_withdrawn", "access_unverified", "memory_withdrawn", "DB_TIMEOUT_SECONDS = 5.0",
+                 "SILENCE_END_SECONDS = 45", "CHECKIN_SILENCE = None"):
         assert name in section, f"CLAUDE.md's live voice section doesn't name {name}"
