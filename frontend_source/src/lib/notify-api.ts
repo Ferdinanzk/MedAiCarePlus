@@ -29,6 +29,15 @@ export async function fetchOverdoseProtection(): Promise<boolean> {
 }
 
 export const notifyApi = {
+  async sendManualMedicationReminder(): Promise<{ sent: number; total: number }> {
+    const resp = await aiFetch('/api/notify/manual-reminder', { method: 'POST' });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${resp.status}`);
+    }
+    return resp.json();
+  },
+
   async generateCode(contactId: number): Promise<{ code?: string; error?: string }> {
     const resp = await aiFetch('/api/notify/generate-code', {
       method: 'POST',

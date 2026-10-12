@@ -104,7 +104,7 @@ Settings that matter:
 | `WEB_PORT` | `8080`, so port 8000 stays free for the Reachy daemon |
 | `MEDCARE_FRONTEND_URL` | `http://localhost:8080` |
 | `GEMINI_API_KEY` | Your own Gemini API key (https://aistudio.google.com/apikey). This is the **only** thing prescription scanning (the Scan page) needs; it then works for every account. A secret: `.env` only, never commit it. Leave `OCR_MODEL` and `OCR_GEMINI_FALLBACK_MODEL` as in `.env.example` (or delete them); if an old `.env` says `OCR_MODEL=gemini-3.8-flash`, change it. See [OCR.md](OCR.md). |
-| `OPENROUTER_API_KEY`, `LLM_MODEL` | Optional; only for future conversation features |
+| `OPENROUTER_API_KEY`, `LLM_MODEL`, `LLM_FALLBACK_MODEL` | Needed for Reachy check-in conversations, risk checks, summaries and memory. Set the key in `.env`; defaults are `google/gemini-2.5-flash-lite` and `google/gemini-2.5-flash` through OpenRouter. |
 | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | Leave empty until LINE is set up |
 | `BACKUP_PASSPHRASE` | A strong passphrase for the weekly encrypted backup. Store it somewhere else too. |
 
@@ -206,14 +206,14 @@ It asks for the robot's SSH password (user `pollen`), then:
 1. Backs up the installed app.
 2. Copies 0.4.0 over.
 3. Records the "say when you're done" prompt.
-4. Downloads the voice-activity model.
+4. Installs faster-whisper, downloads Whisper Base from Hugging Face, and fetches the voice-activity model.
 5. Sets 15 fps with vision on the server.
 
-If the robot's speech models were never installed (a brand-new robot), copy them first. They live in `~/.medcare_reachy/models/{tts,stt}` on the robot:
+If the robot's speech models were never installed (a brand-new robot), copy the TTS models first. They live in `~/.medcare_reachy/models/{tts,stt}` on the robot:
 - `tts/matcha-icefall-zh-baker/` and `tts/vocos-22khz-univ.onnx`, from the sherpa-onnx `tts-models` and `vocoder-models` GitHub releases.
-- `stt/model.int8.onnx` and `stt/tokens.txt`, from Hugging Face `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`.
+- `stt/whisper/`, populated by the deploy script with Whisper Base from Hugging Face (`Systran/faster-whisper-base`).
 
-The deploy script fetches `stt/silero_vad.onnx` itself.
+The deploy script fetches `stt/silero_vad.onnx` itself and installs faster-whisper in the robot app environment.
 
 ## 10b. LINE notifications
 

@@ -160,6 +160,22 @@ def test_settings_from_env_and_validation(tmp_path):
     assert video.robot_backend == "video"
 
 
+def test_service_prefers_persistent_rendered_voice_clips_after_reinstall(tmp_path, monkeypatch):
+    from medcare_reachy import service
+
+    home = tmp_path / "robot-home"
+    persistent = home / ".medcare_reachy" / "clips"
+    chinese = persistent / "zh-TW"
+    chinese.mkdir(parents=True)
+    (chinese / "reminder.wav").write_bytes(b"rendered voice clip")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    packaged = tmp_path / "installed-package" / "bridge" / "clips"
+    monkeypatch.setattr(service, "CLIPS_DIR", packaged)
+
+    assert service._clips_root_dir("zh-TW") == persistent
+    assert service._clips_root_dir("en") == packaged
+
+
 class _FakeMini:
     def __init__(self):
         self.exited = False

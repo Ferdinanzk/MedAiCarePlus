@@ -39,9 +39,9 @@ This document lists every model and decision algorithm in MedAiCarePlus: what ea
 | 12a | YOLO segmentation | Prescription page outline | YOLO (ultralytics) | photo | mask | **inert**: not installed | — | `models/segmentation/prescription_best_100_epo.pt` |
 | 12b | Vision LLM OCR | Read the prescription | Gemini `OCR_MODEL` (default `gemini-3.5-flash`, fallback `gemini-3.5-flash-lite`), or an Ollama vision model without a Gemini key | enhanced photo (Ollama: + icon-row crop) | JSON: paper fields + every medicine | HTTPS API / local Ollama | Google or local | `app/services/ocr_service.py` |
 | 13a | Silero VAD | Find speech segments | Silero VAD (ext) | 16 kHz audio, 512-sample windows | speech segments | sherpa-onnx | robot | `~/.medcare_reachy/models/stt/silero_vad.onnx` |
-| 13b | SenseVoice-Small int8 | Speech to text | SenseVoice, 234M params | 16 kHz segments ≤ 8 s | text (Simplified) | sherpa-onnx, 2 threads | robot | `~/.medcare_reachy/models/stt/model.int8.onnx` |
+| 13b | Whisper Base | Speech to text | Whisper Base via faster-whisper / CTranslate2 | 16 kHz segments up to 8 s | text | CPU int8, 2 threads | robot | Hugging Face cache under `~/.medcare_reachy/models/stt/whisper/` |
 | 14 | "I finished" matcher and echo guards | Detect 「我吃完了」, drop Reachy's own voice | word lists, regexes, SequenceMatcher | transcripts | done flag / cleaned text | Python | robot | `reachy_app/medcare_reachy/bridge/voice.py` |
-| 15 | Matcha-TTS zh-baker + Vocos | Speak Mandarin | Matcha acoustic model + Vocos vocoder | Simplified text chunks, cut only at punctuation | waveform | sherpa-onnx, 2 threads | robot | `~/.medcare_reachy/models/tts/` |
+| 15 | ElevenLabs Flash v2.5 | Speak Mandarin | ElevenLabs cloud TTS API | Simplified text chunks, cut only at punctuation | PCM 16-bit mono, 22.05 kHz | HTTPS | robot | Robot-private settings plus ElevenLabs API |
 | 16 | On-robot vision | Landmarks + emotion on the robot | copies of 4a-4f and 2 | 640×480 frame | landmark packet + emotion | ONNX Runtime CPU | robot (`vision_on_server=false` only) | `reachy_app/medcare_reachy/vision_models/` |
 | 17 | inquiring3 move + gestures | "Thinking" and "speaking" motion | recorded motion data + sine patterns | — | head/antenna targets at 25-50 Hz | Python | robot | `reachy_app/medcare_reachy/bridge/moves/inquiring3.json`, `bridge/gestures.py` |
 
@@ -484,8 +484,8 @@ Layer 1 of three safety layers (`conversation.screen`, `app/services/conversatio
 - Header `X-Title: MedAiCarePlus Reachy check-in`.
 
 **Models**
-- On this laptop `.env` pins `LLM_MODEL=inclusionai/ling-3.0-flash-sante:free` with fallback `LLM_FALLBACK_MODEL=apodex/apodex-1.1-mini:free`, and `LLM_DEADLINE_SECONDS=8`.
-- Code defaults: `LLM_MODEL` "", fallback `openrouter/free`, deadline 8 (`app/config.py:83-85`).
+- Check-in replies, risk checks, summaries and memory extraction use Google Gemini through OpenRouter. On this laptop `.env` pins `LLM_MODEL=google/gemini-2.5-flash-lite` with fallback `LLM_FALLBACK_MODEL=google/gemini-2.5-flash`, and `LLM_DEADLINE_SECONDS=8`.
+- Code defaults: primary `google/gemini-2.5-flash-lite`, fallback `google/gemini-2.5-flash`, deadline 8 (`app/config.py`). The request endpoint is OpenRouter's OpenAI-compatible chat-completions API, not Google's Gemini API directly. OpenRouter currently lists Flash Lite as going away on 2026-10-20; replace the primary model before then.
 - **Architecture, size and licence of both models: unverified.** They are remote APIs, and nothing in the repo describes them.
 
 **Fallback chain** (`_complete`, lines 324-367)
@@ -570,31 +570,30 @@ OCR therefore runs without the page warp (`ocr_service.py:57-63,166-177`). When 
 
 **Limitations:** the photo, including the patient name, physician and hospital, goes to Google when Gemini is used. Accuracy over many real prescriptions is not measured (one real receipt and one synthetic slip, 4 Oct); on dot-matrix print neither model reads every letter right, so the user checks each medicine. The Scan page asks the camera for up to 1920×1080; a real photo through it has not been tested yet.
 
-## 13. Robot speech-to-text: Silero VAD and SenseVoice
+## 13. Robot speech-to-text: Silero VAD and Whisper Base
 
 All of this runs on the robot, in `reachy_app/medcare_reachy/bridge/voice.py`. Audio stays in memory and is never stored, logged or sent (lines 1-8).
 
-| | Silero VAD | SenseVoice-Small int8 |
+| | Silero VAD | Whisper Base |
 |---|---|---|
-| Files | `~/.medcare_reachy/models/stt/silero_vad.onnx` | `model.int8.onnx`, `tokens.txt` (same folder) |
-| Source | sherpa-onnx `asr-models` release; fetched by the deploy tool when missing (`reachy_app/tools/deploy_to_robot.py:37,339-341`) | HF `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` (`HANDOFF.md:36`) |
-| Architecture | Silero VAD (ext) | 234M params, multilingual zh/yue/en/ja/ko (`docs/ASR_COMPARISON_2026-10-02.md:45`); non-autoregressive encoder (ext, not stated in the repo) |
-| Runtime | `sherpa_onnx.VoiceActivityDetector` | `OfflineRecognizer.from_sense_voice(…, language="zh" or "en", use_itn=True, num_threads=2)`, cached per process, about 10 s to load (lines 212-222) |
-| Input | 16 kHz mono, 512-sample windows | VAD segments, ≤ 8 s |
-| Settings | min silence 0.5 s, min speech 0.25 s, max speech 8 s, buffer 30 s (lines 37-40, 225-243) | — |
-| Output | speech segments | text, **Simplified** for zh, with punctuation |
-| Measured | not measured (unverified) | RTF 0.48 on the CM4 with 2 threads (4.8 s of speech in 2.34 s), 363 MB peak RAM, sherpa-onnx 1.13.8 (`docs/ASR_COMPARISON_2026-10-02.md:45`) |
+| Files | `~/.medcare_reachy/models/stt/silero_vad.onnx` | HF model cache in `~/.medcare_reachy/models/stt/whisper/` |
+| Source | sherpa-onnx `asr-models` release; fetched by the deploy tool when missing (`reachy_app/tools/deploy_to_robot.py`) | Hugging Face `Systran/faster-whisper-base`, fetched and cached by the deploy tool |
+| Runtime | `sherpa_onnx.VoiceActivityDetector` | `faster_whisper.WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2)`, cached per process |
+| Input | 16 kHz mono, 512-sample windows | VAD segments, up to 8 s; language `zh` for `zh-TW`, `en` for English |
+| Settings | min silence 0.5 s, min speech 0.25 s, max speech 8 s, buffer 30 s | beam size 1, no internal VAD |
+| Output | speech segments | transcript text; Whisper chooses script and punctuation |
+| Measured | model quality and runtime not benchmarked on the CM4 yet | not measured on the CM4 yet |
 
 **Audio path** (lines 195-205, 457-540)
-- `robot.get_audio()` → downmix to mono. At 48 kHz each 3 samples are averaged to 16 kHz; other rates are linearly resampled. The exact robot rate is unverified.
+- `robot.get_audio()` then downmixes to mono. At 48 kHz each three samples are averaged to 16 kHz; other rates are linearly resampled. The exact robot rate is unverified.
 - At most 8 segments are queued.
-- The listener thread runs at nice 5 so that camera streaming wins when the Pi is busy (lines 97-101). On 2 Oct, decoding 「我吃完了」 coincided with the stream falling from 10 to 6-7 fps (`CLAUDE.md:88`).
+- The listener thread runs at nice 5 so that camera streaming wins when the Pi is busy (lines 97-101).
 
-**Licence:** sherpa-onnx and Silero are open source (ext). The SenseVoice model licence is unverified in the repo.
+**Model source and privacy:** faster-whisper downloads Whisper Base weights from Hugging Face during deployment and keeps them in the robot user's model cache. Audio is transcribed locally; neither raw audio nor requests to Hugging Face leave the robot during recognition. The deploy tool uses the same Whisper model to validate newly rendered audio prompts.
 
 **Limitations**
-- Output is Simplified, so the server converts it before keyword screening.
-- The CM4 lacks the dotprod instruction. That this slows int8 kernels is a hypothesis (`docs/ASR_COMPARISON_2026-10-02.md:166-167`).
+- Whisper Base latency and memory use on the CM4 have not been measured. The 2-thread int8 setting is the initial deployment choice.
+- Chinese script and punctuation are model output and have not been verified on Taiwan-accented patient speech.
 
 ## 14. Robot "I finished" matcher and echo guards (`bridge/voice.py`)
 
@@ -617,33 +616,27 @@ All of this runs on the robot, in `reachy_app/medcare_reachy/bridge/voice.py`. A
 - The thinking phrase is armed only when the 「嗯」 ack played for this turn (lines 428-429). It then plays 0.5 s after hand-over (`THINK_AFTER_SECONDS`), unless the patient speaks again. It waits up to 2.0 s when speech may be an echo (lines 50-51, 373-396).
 - The reason: a version that played the phrase at once lost 活 from 「我不想…活了」 (`CLAUDE.md:130`).
 
-## 15. Robot text-to-speech: Matcha-TTS and Vocos (`bridge/speech.py`)
+## 15. Robot text-to-speech: ElevenLabs
 
 | Fact | Value | Source |
 |---|---|---|
-| Files | `~/.medcare_reachy/models/tts/matcha-icefall-zh-baker/{model-steps-3.onnx, lexicon.txt, tokens.txt}`, `vocos-22khz-univ.onnx`, optional `phone.fst`, `date.fst`, `number.fst` | `speech.py:21-34` |
-| Source | sherpa-onnx `tts-models` and `vocoder-models` releases | `HANDOFF.md:36` |
-| Architecture | Matcha-TTS acoustic model ("steps-3", flow matching with about 3 ODE steps, trained on the Baker corpus: ext) + Vocos 22 kHz universal vocoder | — |
-| Runtime | `sherpa_onnx.OfflineTts` with `OfflineTtsMatchaModelConfig`, `num_threads=2`, `max_num_sentences=2`; one engine per process, about 12 s to load, preloaded on thread `medcare-tts-load` | `speech.py:30-42,91-108` |
-| Voice settings | `SPEED` 0.85 ("a little slower for older listeners"), `sid` 0 | `speech.py:24,133` |
-| Input | **Simplified** Chinese. The server sends `speech_text` converted with `zhconv` | `app/services/conversation.py:266-273` |
-| Chunking (app 0.5.4) | Sentences end at 。！？!?；; (a run such as ！！ and a closing quote or bracket stay with it) and at a full stop followed by a space or the end, so 25.5 and ... stay whole. Long sentences are cut again after ，、 and commas, but not inside 1,000, and comma clauses are joined up to `MAX_CHUNK` (16) characters. An opening comma clause with ≥ 6 Chinese characters is a chunk of its own, so speech starts sooner. **A clause without a comma is never cut**, however long: a cut splits words and numbers (明天早\|上6点, 吃满 4\|次了, 要\|不要) and each chunk gets its own falling tone | `speech.py:chunks`, `_sentences` |
-| Pipeline | Producer thread `medcare-tts` synthesises chunk N+1 (queue size 2) while chunk N plays. Each chunk is written to a temporary 16-bit mono WAV, played, then deleted | `speech.py:121-160` |
-| Speed | "roughly real time" on the Pi | `speech.py:113` |
-| Output rate | from the engine; 22.05 kHz implied by the vocoder name (unverified) | — |
-| Metrics | `tts_first_audio_ms`, `tts_total_ms`, `tts_chunks`, `tts_synth_ms` | `speech.py:161-165` |
+| Provider | ElevenLabs `eleven_flash_v2_5`, text-to-speech endpoint, `pcm_22050` output | `reachy_app/medcare_reachy/bridge/speech.py` |
+| Credentials | API key and voice ID are saved in `~/.medcare_reachy/settings.json` (mode 0600); the key is write-only in the settings API | `reachy_app/medcare_reachy/settings_store.py`, `web.py` |
+| Input | Simplified Chinese (`speech_text` converted by `zhconv`); request language code `zh` | `app/services/conversation.py`, `speech.py` |
+| Voice | Default voice ID `JBFqnCBsd6RMkjVDRZzb`; configurable on the robot settings page. Choose an account voice that supports Mandarin Chinese | `settings_store.py` |
+| Voice setting | Speed 0.85 for live replies; prerecorded prompts try 0.85, 0.8 and 0.9, thinking phrases try 1.0, 1.1 and 0.9 | `speech.py`, `reachy_app/tools/deploy_to_robot.py` |
+| Chunking | Sentences and comma clauses are split only at punctuation; long clauses without punctuation remain intact. First comma clause of at least six CJK characters is sent on its own | `speech.py:chunks` |
+| Pipeline | Producer thread submits each chunk while the previous WAV plays. PCM responses are wrapped in temporary WAVs, played, then deleted | `speech.py` |
+| Metrics | `tts_first_audio_ms`, `tts_total_ms`, `tts_chunks`, `tts_synth_ms` | `speech.py` |
 
-**Prerecorded clips** (`bridge/clips/manifest.json`)
-- 16 clips: 12 prompts plus `ack` (「嗯」) and `thinking_1..3` (「我再想一下喔。」「讓我想一想喔。」「我想想看喔。」). Every clip is `pending_clinician_review`.
-- Optional per-medicine prompts `med_<med_id>.wav` (manifest `per_medication`, `bridge/clips/manifest.json:89-90`; `bridge/clips.py:97`). Without one, `med_prompt_generic` plays (manifest note, line 3).
-- They are rendered on the robot by the deploy tool with Matcha at speeds (0.85, 0.8, 0.9), or (1.0, 1.1, 0.9) for the thinking phrases.
-- Each render is read back with SenseVoice, and the best match is kept. A filler is kept only if SenseVoice hears it as a removable echo.
-- Leading silence is trimmed to 10 ms at threshold 0.003, about −50 dBFS (`reachy_app/tools/deploy_to_robot.py:72-157`).
-- English has no clips.
+**Prerequisites and prerecorded clips**
+- Enter the ElevenLabs API key and a Mandarin-capable voice ID in the robot's settings page. The key is stored on the robot and is not returned by the settings API.
+- Each changed or missing Chinese prompt WAV is synthesized by ElevenLabs during deployment and read back with Whisper Base. The render record tracks the provider and voice ID, so switching from Matcha or changing voices refreshes the cached clips.
+- The English language currently has no prerecorded clips.
 
 **Limitations**
-- Without the TTS files, check-ins cannot run and dose refusals stay silent (`speech.py:86-89`).
-- The zh-baker voice reads Simplified only.
+- Speech requires robot internet access and an ElevenLabs account with available API quota; without a key, check-in replies and dose refusal speech are silent.
+- Each live punctuation-delimited chunk is a separate provider request. Provider latency and connection failures can delay or interrupt a reply.
 
 ## 16. On-robot vision mode (`vision_on_server=false`)
 
@@ -693,8 +686,8 @@ This is not the default since app 0.4.0. It is kept for the robot app and the le
 | Intake detector accuracy on real doses (browser or robot) | not measured; `HANDOFF.md:137-141` lists it as open |
 | OCR accuracy on real prescriptions; a real photo through the Scan page camera | not measured (a synthetic image took 2-3 s end to end) |
 | Silero VAD cost on the robot; on-robot per-model timings | not measured |
-| Matcha output sample rate | implied 22.05 kHz, unverified |
+| ElevenLabs PCM sample rate | requested at 22.05 kHz; not yet verified on the robot speaker |
 | OpenRouter models' architecture, size, licence and data handling | remote; `LLM_PROVIDER*` and `LLM_RETENTION` are empty in `.env` (`HANDOFF.md:152`) |
 | Robot microphone sample rate | code assumes 48 kHz (`voice.py:201-204`) |
-| Which robot app version runs on the robot | the code is 0.5.4 (speech chunking); 0.5.4 is not deployed. Heartbeats report it as `bridge_version` |
+| Which robot app version runs on the robot | the working tree is 0.6.0 (ElevenLabs speech); 0.6.0 is not deployed or published. Heartbeats report it as `bridge_version` |
 | Effect of the OpenRouter keep-alive on `server.llm_ms` | not measured; compare `/api/conversations/metrics/summary` before and after deploying it |

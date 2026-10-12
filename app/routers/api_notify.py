@@ -231,6 +231,50 @@ async def notify_status(user: dict = Depends(get_consented_user)):
     }
 
 
+@router.post("/manual-reminder")
+async def send_manual_medication_reminder(user: dict = Depends(get_consented_user)):
+    """Send an immediate medication reminder to the patient and opted-in, verified family LINE contacts."""
+    u_id = user.get("u_id")
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        patient = await conn.fetchrow('SELECT name, line_id FROM "user" WHERE u_id = $1', u_id)
+        contacts = await conn.fetch(
+            "SELECT name, line_id FROM family_contacts WHERE u_id = $1 AND verified = TRUE "
+            "AND notify_missed = TRUE AND relationship <> 'user' AND line_id IS NOT NULL",
+            u_id,
+        )
+    if not patient:
+        return JSONResponse({"detail": "User not found"}, status_code=404)
+
+    recipients: dict[str, str] = {}
+    if patient["line_id"]:
+        recipients[patient["line_id"]] = "patient"
+    for contact in contacts:
+        recipients.setdefault(contact["line_id"], "family")
+    if not recipients:
+        return JSONResponse({"detail": "no_linked_line"}, status_code=400)
+
+    svc = LineService.get_instance()
+    patient_name = patient["name"] or "the patient"
+    results = []
+    for line_id, role in recipients.items():
+        if role == "family":
+            message = (f"💊 服藥提醒 / Medication reminder\n"
+                       f"請提醒 {patient_name} 依照排定時間服藥。若已服用，請勿重複給藥。\n"
+                       f"Please remind {patient_name} to take the scheduled medicine. "
+                       "Do not give an extra dose if it was already taken.")
+        else:
+            message = ("💊 服藥提醒 / Medication reminder\n"
+                       "請依照處方與排定時間服藥；若已服用，請勿重複服用。\n"
+                       "Please follow your prescription and scheduled time. "
+                       "Do not take an extra dose if you already took it.")
+        results.append(svc.send_text(line_id, message))
+    sent = sum(bool(result.get("sent")) for result in results)
+    if not sent:
+        return JSONResponse({"detail": "LINE could not send the reminder"}, status_code=502)
+    return {"sent": sent, "total": len(results)}
+
+
 @router.get("/settings")
 async def get_notification_settings(user: dict = Depends(get_consented_user)):
     pool = get_pool()

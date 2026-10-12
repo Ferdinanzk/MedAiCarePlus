@@ -1,6 +1,8 @@
-# Voxtral vs. our current ASR (SenseVoice-Small): comparison for the Reachy Mini medication robot
+# Voxtral vs. the SenseVoice-Small baseline: comparison for the Reachy Mini medication robot
 
 *Research date: 2026-10-02. Every number below was checked against its source. Numbers we measured ourselves are labelled "measured". Our own calculations are labelled "estimate".*
+
+*At the time of this comparison, Reachy used SenseVoice-Small. The current robot speech pipeline uses Whisper Base via faster-whisper; see [MODELS.md](MODELS.md#13-robot-speech-to-text-silero-vad-and-whisper-base).*
 
 *Units: file sizes use GB = 10^9 bytes. GPU memory (VRAM) is given in MiB, as the sources publish it (1 MiB = 1.048576 MB). For comparison, the laptop GPU has 8,151 MiB in total and 7,899 MiB free.*
 
@@ -42,7 +44,7 @@
 
 | Option | Params | Download | Chinese? | Streaming? | Runtime | RAM needed | GPU / VRAM needed | Runs on robot (CM4, 4 GB)? | Runs on laptop (RTX 5060, 8 GB)? | Expected speed (see the note on speed figures below) | License |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **SenseVoice-Small int8 (current)** | 234M | [239 MB](https://huggingface.co/api/models/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tree/main) + silero VAD | Yes: zh, yue, en, ja, ko; explicit `language` option | No (VAD cuts, then decodes) | sherpa-onnx 1.13.8 | **363 MB peak (measured)** | None | **Yes (measured)** | Yes, easily | **RTF 0.48 on 2 threads (measured)**: 4.8 s of speech in 2.34 s | [FunASR Model License v1.1](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE) |
+| **SenseVoice-Small int8 (Oct 2 baseline)** | 234M | [239 MB](https://huggingface.co/api/models/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tree/main) + silero VAD | Yes: zh, yue, en, ja, ko; explicit `language` option | No (VAD cuts, then decodes) | sherpa-onnx 1.13.8 | **363 MB peak (measured)** | None | **Yes (measured)** | Yes, easily | **RTF 0.48 on 2 threads (measured)**: 4.8 s of speech in 2.34 s | [FunASR Model License v1.1](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE) |
 | **Voxtral Mini 4B Realtime 2602, BF16** | 4.43B | [8.86 GB (only one copy needed; the full repo is 17.7 GB)](https://huggingface.co/api/models/mistralai/Voxtral-Mini-4B-Realtime-2602/tree/main) | Yes (13 languages incl. zh); no language hint; script not documented | **Yes**, delay 80–1200 ms in 80 ms steps, or 2400 ms | vLLM ≥0.20 (Linux/WSL2), Transformers ≥5.2 | Not published | **≥16 GB GPU** ([card](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602/raw/main/README.md)) | No | **No** (the weights alone exceed 8 GB) | n/a on our hardware | Apache-2.0 |
 | Voxtral Mini 3B 2507 (offline) | 4.68B | 9.35 GB | **No** (8 languages, no zh) | No | vLLM, Transformers, llama.cpp | — | ~9.5 GB | No | No (and no Chinese) | — | Apache-2.0 |
 | Voxtral Small 24B 2507 (offline) | 24.26B | 48.5 GB | **No** | No | vLLM, Transformers | — | ~55 GB | No | No | — | Apache-2.0 |

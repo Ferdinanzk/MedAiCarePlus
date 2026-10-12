@@ -98,7 +98,7 @@ def _uuid(value: str | None) -> str | None:
 
 async def _leased_task(conn, device: dict, task_id: str):
     task = await conn.fetchrow(
-        "SELECT task_id, u_id, slot_time, intk_ids, status FROM reachy_task "
+        "SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
         "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid",
         _uuid(task_id), device["u_id"], device["device_id"])
     if not task:
@@ -328,7 +328,13 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
         if memory_on:
             name = memory.preferred_name(await memory.current_facts(conn, device["u_id"]))
             followup = await memory.pick_followup(conn, device["u_id"], memory.local_today())
-        opening = memory.opening_line(language, name)
+        if task["reason"] == "checkin":
+            opening = {
+                "zh-TW": "我來提醒您查看用藥時間表，並依照處方在排定時間服藥。若現在還沒到時間，請不要提前服用。需要我陪您確認嗎？",
+                "en": "I'm here to remind you to check your medication schedule and follow your prescription. If it isn't due yet, please don't take it early. Would you like me to help you check?",
+            }[language]
+        else:
+            opening = memory.opening_line(language, name)
         await conn.execute(
             "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
             "VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid)",

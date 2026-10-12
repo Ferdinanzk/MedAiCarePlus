@@ -29,7 +29,9 @@ Anything it can't verify goes to a family member to confirm on LINE.
 2. On the server, let the robot reach the device port: set `DEVICE_BIND` in `.env` to the server's home-network IP
    and restart (`docker compose up -d app`). Never expose this port to the internet.
 3. Install **MedCare Reachy** from the robot's dashboard and open its settings page. Enter the server address
-   (e.g. `http://192.168.1.20:8001`) and the robot key, then **Save and connect**.
+   (e.g. `http://192.168.1.20:8001`), the robot key, and your ElevenLabs API key. Select a voice ID that supports
+   Mandarin Chinese, then **Save and connect**. The API key is stored in the robot's private settings file and is
+   never sent back to the settings page.
 
 The vision and emotion models ship inside the app (about 55 MB) and are checked against pinned SHA-256s at every start; nothing
 is downloaded at run time.
@@ -42,10 +44,14 @@ is downloaded at run time.
 - Follows the server's overdose protection: when the server refuses a dose (not due yet, too soon after the last one,
   the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
   on to the next medicine. It never retries that dose in the same reminder.
+- During check-in chats, Reachy keeps recent turns in context and uses the server's current weather. If rain spoils an
+  outing the patient was looking forward to, it acknowledges the disappointment and offers gentle company; the
+  after-chat summary can classify clearly expressed disappointment as sad.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
 - No microphone in this version.
-- **Not a medical device.** Prototype software. Prompt wording is pending clinician review, and no voice clips are
-  included yet, so the robot is silent until they're added.
+- **Not a medical device.** Prototype software. Prompt wording is pending clinician review. Prerecorded prompt clips
+  are rendered on the robot during deployment; live replies and refusal speech require the ElevenLabs API key and
+  internet access.
 
 ## How vision runs on the robot
 
@@ -78,6 +84,8 @@ While a reminder runs, the settings page also shows the live **Camera landmarks*
 
 ## Status
 
+- **0.6.0**: ElevenLabs Flash v2.5 handles live Mandarin speech; the deploy tool renders and verifies prompt clips
+  with the configured voice. The API key stays in the robot's private settings file.
 - **0.3.0**: emotion is scored on the robot too; snapshots to the server are identity-only, 2 a second (was 5).
 - **0.2.0**: vision runs on the robot (above). Tested against MediaPipe and the Reachy Mini simulator; frame rate on
   a real robot is not measured yet; run the bench above.
