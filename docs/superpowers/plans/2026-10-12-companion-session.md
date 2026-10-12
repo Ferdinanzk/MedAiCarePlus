@@ -66,10 +66,45 @@ Tasks run in order 1, 2, 2b, 3, 4, 4b, 5, then 6 (controller, with the user). Se
 3, 4 and 4b must be deployed together (new messages and fields both ways). Cumulative counts measured in the drafts'
 rehearsal (each task applied in order to one worktree): backend 2064 after Task 1, 2078 after Task 2, 2087 after Task
 5 (plus Task 2b's new tests); robot app 635 after Task 3, 657 after Task 4 (plus Task 4b's new tests), 6 skipped; the
-docs test 25 after Task 5. Always plus the one known BUG-37 failure.
+docs test 25 after Task 5. Always plus the one known BUG-37 failure. These counts are from before the test trim (each task's
+"Controller ruling: fewer new tests"): with about 55 new tests instead of about 105, every count is lower;
+each task reports what it measures.
 
 ---
 ### Task 1: Companion mode in the live relay (server)
+
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_a_companion_start_is_paused_and_the_robot_says_the_opening`
+>   - `test_speech_starts_nothing_until_the_camera_saw_the_patient_recently`
+>   - `test_the_pre_roll_reaches_gpt_live_first_then_the_live_microphone`
+>   - `test_each_stretch_gets_the_note_and_the_last_20_turns_quoted_as_data`
+>   - `test_a_stretchs_first_sound_is_held_and_its_words_never_replace_the_opening`
+>   - `test_30_s_without_patient_speech_pauses_gpt_live_and_the_next_words_restart_it`
+>   - `test_a_stretch_never_pauses_while_gpt_live_is_still_speaking`
+>   - `test_a_talking_stretch_pauses_at_stretch_max_seconds_and_the_chat_goes_on`
+>   - `test_the_robot_ends_a_companion_session_for_medicine_or_rest`
+>   - `test_a_stretch_that_cannot_start_goes_on_as_todays_text_chat`
+>   - `test_the_patients_first_words_in_a_stretch_are_screened`
+>   - `test_nothing_restarts_after_a_risk_found_while_paused`
+>   - `test_the_access_re_check_runs_while_paused`
+>   - `test_an_older_robot_gets_todays_live_chat`
+>   - `test_patient_seen_recently_asks_the_robots_monitor_session`
+>
+> SKIP:
+>   - `test_a_companion_start_runs_todays_checks_first`
+>   - `test_the_companion_note_quotes_the_greeting_and_the_transcript_as_data`
+>   - `test_the_robots_speech_signal_is_patient_speech_and_never_cuts_a_running_stretch`
+>   - `test_speech_while_a_stretch_is_being_paused_starts_the_next_once_it_is_paused`
+>   - `test_a_chat_that_ends_while_a_stretch_starts_stops_the_start`
+>   - `test_audio_a_stretch_refuses_never_stops_the_robots_messages`
+>   - `test_gpt_live_failing_mid_stretch_falls_back_as_today`
+>   - `test_companion_robot_reads_the_robot_apps_version`
 
 Spec: `docs/superpowers/specs/2026-10-12-companion-session-design.md` sections 3.1, 3.2, 3.5 and 5 (it builds on
 `docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`). A live start from robot app 0.9.0 or later becomes a
@@ -1720,6 +1755,29 @@ applied from this document by exact replacement):
 
 ### Task 2: Server: text chat for companions, the medicine end reason, and task_due in the heartbeat
 
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_the_companion_flag_is_stored_and_an_older_robot_gets_false`
+>   - `test_a_companion_chat_has_no_turn_limit_and_ends_on_a_goodbye`
+>   - `test_a_companion_chat_still_ends_on_a_risk`
+>   - `test_end_accepts_the_companion_reasons`
+>   - `test_heartbeat_says_whether_a_medicine_task_waits`
+>   - `test_task_due_when_a_medicine_task_waits_during_a_chat`
+>   - `test_a_queued_checkin_or_a_task_with_nothing_left_to_take_is_no_medicine`
+>   - `test_the_sweep_leaves_a_companion_chat_open_while_its_robot_holds_a_camera_session`
+>
+> SKIP:
+>   - `test_a_live_companion_chat_that_fell_back_keeps_no_turn_limit`
+>   - `test_end_refuses_a_reason_it_does_not_know_in_a_companion_chat`
+>   - `test_task_due_follows_the_lease_rules`
+>   - `test_task_due_asks_the_lease_question_word_for_word`
+>   - `test_the_schema_adds_the_companion_column`
+
 Spec: `docs/superpowers/specs/2026-10-12-companion-session-design.md` 3.3, 3.4 and 3.5 (the text chat part). A
 check-in from robot app 0.9.0 is a *companion* session: today's text chat no longer closes it at
 `conversation.MAX_PATIENT_TURNS` (6); only a goodbye or a risk closes it on the server, and the robot ends it itself
@@ -2626,6 +2684,21 @@ semgrep 290 rules on 9 files, 0 findings.
 
 ### Task 2b: Server: the companion's camera rule and keeping its task alive (controller ruling)
 
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_a_companion_observe_session_of_a_dose_task_uses_the_checkin_face_rule`
+>   - `test_a_companion_flag_never_loosens_a_dose_session`
+>   - `test_a_companion_heartbeat_keeps_the_held_task_alive`
+>
+> SKIP:
+>   - `test_an_observe_session_without_the_flag_keeps_the_strict_rule`
+>   - `test_extend_for_companion_pushes_expiry_of_in_progress_tasks_only`
+
 Added by the controller after the plan cross-check, which left two risks open. Spec 3.2 says the camera-first check
 reads "the same check-in search session the robot keeps open", but:
 
@@ -2751,6 +2824,28 @@ git commit -m "Companion session (server): the companion's observe session uses 
 ---
 
 ### Task 3: Robot app: speech signals, the spoken opening and a stop with a last line (LiveChat)
+
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_a_listener_that_never_started_suspends_at_once`
+>   - `test_the_voice_detector_is_the_listeners_vad_and_says_where_speech_begins`
+>   - `test_the_opening_is_said_in_reachys_own_voice_before_anything_else`
+>   - `test_speech_goes_to_the_server_when_the_patient_begins_to_speak_never_on_reachys_own_sound`
+>   - `test_speech_goes_to_the_server_at_most_once_a_second`
+>   - `test_a_companion_chat_has_no_length_limit_on_the_robot`
+>   - `test_stop_with_a_last_line_lets_reachy_finish_its_sentence_then_says_the_line`
+>
+> SKIP:
+>   - `test_the_listener_builds_its_vad_with_make_vad`
+>   - `test_the_voice_detector_fails_only_when_built_without_its_model_or_sherpa_onnx`
+>   - `test_without_a_voice_detector_no_speech_goes_to_the_server`
+>   - `test_paused_and_not_seen_are_logged_and_reachy_keeps_listening`
+>   - `test_a_last_line_that_comes_after_the_servers_end_is_not_said`
 
 Spec 4.3 and the robot side of 3.1 (`docs/superpowers/specs/2026-10-12-companion-session-design.md`). In the robot
 app's `bridge/live.py`, `LiveChat` learns the companion relay's protocol (Task 1 produces the server side):
@@ -4059,6 +4154,43 @@ which imports `medcare_reachy` from the worktree)
 ---
 
 ### Task 4: Robot app 0.9.0: the companion session (camera on, rest, medicine first)
+
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_reachy_rests_after_ten_minutes_with_no_voice_and_nobody_seen`
+>   - `test_the_patient_in_view_keeps_reachy_awake`
+>   - `test_the_patients_voice_keeps_reachy_awake`
+>   - `test_a_due_medicine_ends_the_chat_with_reachys_line`
+>   - `test_a_medicine_due_while_reachy_answers_waits_for_the_answer`
+>   - `test_a_due_medicine_never_cuts_a_dose_short`
+>   - `test_hand_to_mouth_moments_while_chatting_are_no_news_for_family`
+>   - `test_a_live_companion_chat_has_no_time_limit`
+>   - `test_a_live_companion_rests_when_nobody_is_heard_or_seen`
+>   - `test_a_due_medicine_ends_the_live_chat_with_reachys_line`
+>   - `test_no_live_chat_without_the_listeners_voice_detector`
+>   - `test_a_companion_session_slows_the_stream_and_gives_the_rate_back`
+>   - `test_a_due_medicine_task_reaches_the_running_slot`
+>   - `test_a_companion_check_in_says_so_and_a_plain_one_sends_what_it_always_did`
+>   - `test_robot_app_0_9_0_in_its_code`
+>
+> SKIP:
+>   - `test_the_rest_line_is_in_the_patients_language`
+>   - `test_a_lost_camera_session_is_opened_again_during_the_chat`
+>   - `test_a_camera_that_does_not_open_never_stops_the_chat`
+>   - `test_the_rest_line_is_not_acknowledged`
+>   - `test_the_patients_voice_keeps_a_live_companion_awake`
+>   - `test_a_live_chat_that_does_not_end_after_reachys_line_is_stopped`
+>   - `test_a_lost_camera_session_is_opened_again_during_a_live_chat`
+>   - `test_hand_to_mouth_moments_during_a_live_chat_are_no_news_for_family`
+>   - `test_no_live_chat_without_the_companions_camera`
+>   - `test_a_voice_detector_that_does_not_load_means_todays_chat`
+>   - `test_the_voice_detector_is_the_listeners_silero_model`
+>   - `test_a_lower_stream_rate_keeps_its_schedule_on_a_15_fps_camera`
 
 Spec `docs/superpowers/specs/2026-10-12-companion-session-design.md` sections 2, 4.1, 4.2, 4.4, 4.5 and 4.6. One
 controller in `bridge/session.py` (state `CHECKIN`) now runs the check-in as a companion session for both chats, the
@@ -6012,6 +6144,19 @@ above holds for both; removed afterwards)
 
 ### Task 4b: Robot app: say "companion" to the server (controller ruling)
 
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - the session test: the observe session opened during a companion session carries the companion flag, and one opened outside it does not
+>   - the runner test: the heartbeat's companion flag
+>
+> SKIP:
+>   - a separate app_client body test (the session test covers the flag)
+
 The robot side of Task 2b. Two small additions on top of Task 4.
 
 **Files:**
@@ -6068,6 +6213,21 @@ git commit -m "Robot app 0.9.0: the companion session tells the server (its came
 ---
 
 ### Task 5: Docs
+
+> **Controller ruling: fewer new tests** (the user, 12 Oct: keep the important ones; about 55 new tests in all).
+> Write ONLY the new tests listed under KEEP; do not write the ones under SKIP, even where a step below shows
+> their code. Every code change of this task stays exactly as written. An EXISTING test that this task rewrites
+> because its behaviour changes on purpose always stays (it is not a new test). The expected test counts in the
+> steps below are therefore higher than what you will see: report the counts you measure.
+>
+> KEEP:
+>   - `test_every_code_name_in_the_companion_text_is_in_the_code`
+>   - `test_robot_app_0_9_0_in_its_code_and_its_readme`
+>
+> SKIP:
+>   - `test_the_docs_give_the_companion_timings_with_their_values`
+>   - `test_the_docs_name_each_live_message_and_both_ends_use_it`
+>   - the parametrized test of sentences that are no longer true
 
 Spec: `docs/superpowers/specs/2026-10-12-companion-session-design.md` (all of it; this task writes no code). After
 Tasks 1-4 the companion session is built. This task writes it down, in plain words:
