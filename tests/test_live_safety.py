@@ -501,3 +501,60 @@ def test_a_model_block_landing_while_a_hit_settles_flags_its_turns_while_they_st
         assert safe.db.rows("patient")[1] == ("patient", "".join(words))
 
     asyncio.run(scenario())
+
+
+# ── final review: the risk wrap-up survives a database error, and an ending never waits for ever ───────────────────
+
+
+def _fails_once(world, part: str) -> None:
+    """The database fails once, with OSError: storing the patient's turn (patient_turn) or ending the conversation
+    (ending)."""
+    fetchval, failed = world.db.fetchval, []
+
+    async def flaky(query, *args):
+        hit = (("INSERT INTO conversation_turn" in query and args[2] == "patient") if part == "patient_turn"
+               else "SET ended_at = NOW()" in query)
+        if hit and not failed:
+            failed.append(query)
+            raise OSError("connection reset by the database")
+        return await fetchval(query, *args)
+
+    world.db.fetchval = flaky
+
+
+@pytest.mark.parametrize("part", ["patient_turn", "ending"])
+def test_a_database_error_in_the_risk_wrap_up_still_alerts_family_once_and_ends_with_risk(safe, part):
+    async def scenario():
+        relay, running = await _begin(safe)
+        await _live(safe, _said("我想自殺"))                    # a screening hit; the patient's turn is still open
+        _fails_once(safe, part)
+        await _step(safe, relay, 0.45)                         # confirmed: block()
+        await _over(safe, running)
+        chat = safe.db.chat()
+        assert safe.robot.json()[1:] == [FLUSH, SAY, END_RISK] and safe.robot.closed == 1000
+        assert chat.get("risk_flag") is True and (safe.clients[0].mutes, safe.clients[0].closes) == (1, 1)
+        if part == "patient_turn":                             # the words were never stored: the alert quotes them
+            assert safe.alerts == [_alert(safe, "我想自殺", "keyword")] and _flagged(safe) == []
+            assert safe.db.rows() == [("reachy", OPENING), ("reachy", HELPLINE)]
+            assert chat["end_reason"] == "risk" and safe.after_chat == [(chat["conversation_id"], 7)]
+        else:                                                  # run() still tells the robot it was a risk
+            assert safe.alerts == [_alert(safe, "我想自殺", 2)] and _flagged(safe) == [2]
+            assert safe.db.rows()[-1] == ("reachy", HELPLINE)
+            assert chat["ended_at"] is None and safe.after_chat == []   # the after-chat sweep closes it later
+
+    asyncio.run(scenario())
+
+
+def test_an_ending_waits_for_openais_cut_off_check_only_so_long_and_a_check_cut_short_blocks(safe, monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(live_session, "DB_TIMEOUT_SECONDS", 0.05)   # real seconds: the wait is 0.1 s
+        safe.gates[UNHEARD] = asyncio.Event()                  # the check never answers
+        relay, running = await _begin(safe)
+        await _live(safe, _said(UNHEARD), LiveEvent(type="error", code="content_filter"))
+        safe.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})   # the robot ends meanwhile
+        await _over(safe, running)                             # the wrap-up did not wait for the check for ever
+        # no answer is never a clear (B4): the check that was stopped blocks, as a check that fails does
+        _blocked(safe, flagged=[], quote="", source="content", dedupe="content")
+        assert relay.outcome.reason == "stopped" and safe.checks[0][0] == UNHEARD
+
+    asyncio.run(scenario())

@@ -23,6 +23,7 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
+from app import config  # noqa: E402
 from app.services import consent_service, live_session  # noqa: E402
 from tests.test_live_relay_chat import (_begin, _ended, _live, _over, _pcm, _said, _settle, _step,  # noqa: E402
                                         world)  # noqa: F401 (world is a fixture)
@@ -98,6 +99,43 @@ def test_access_withdrawn_during_the_chat_ends_it_at_the_next_re_check(world, ca
         assert world.clients[0].audio == [heard]               # nothing reached GPT-Live after the outcome
         (warning,) = _warnings(caplog)
         assert warning.args == (relay.conversation_id, 7)      # the conversation and the patient, nothing else
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("started_with_memory", [True, False])
+def test_memory_consent_withdrawn_during_the_chat_falls_back_at_the_next_re_check(world, caplog, started_with_memory):
+    """The memory block and the memory name went into GPT-Live's instructions at the start. Memory consent withdrawn
+    meanwhile: the chat goes on as today's text chat, which checks memory consent at every turn, in the same
+    conversation, and GPT-Live (holding the notes) is closed. A chat that started without memory has nothing to drop."""
+    async def scenario():
+        if started_with_memory:
+            world.consent["conversation_memory"] = {"granted": True, "terms_version": config.TERMS_VERSION}
+        relay, running = await _begin(world)
+        heard = _pcm(200, 20)
+        world.robot.inbox.put_nowait(heard)
+        await _step(world, relay, 9.5)
+        await _live(world, _said("我等一下要去散步"))
+        world.consent = {scope: value for scope, value in world.consent.items() if scope != "conversation_memory"}
+        await _step(world, relay, 0.5)                         # 10 s: the re-check
+        if not started_with_memory:
+            assert relay.outcome is None and world.clients[0].closes == 0   # the chat goes on
+            world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+            await _over(world, running)
+            _ended(world, "stopped")
+            return
+        world.robot.inbox.put_nowait(_pcm(200, 20))            # the microphone after the outcome
+        await _settle()
+        await _over(world, running)
+        chat = world.db.chat()
+        assert world.robot.json()[1:] == [{"type": "fallback", "reason": "memory_withdrawn",
+                                           "conversation_id": chat["conversation_id"]}]
+        assert world.robot.closed == 1000 and world.clients[0].closes == 1   # GPT-Live closed once
+        assert chat["ended_at"] is None and chat["live"]["fallback_reason"] == "memory_withdrawn"
+        assert world.after_chat == [] and world.db.rows("patient") == [("patient", "我等一下要去散步")]
+        assert world.clients[0].audio == [heard]               # nothing reached GPT-Live after the outcome
+        assert _warnings(caplog)[0].args == (relay.conversation_id,)   # the conversation id, nothing else
 
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         asyncio.run(scenario())
