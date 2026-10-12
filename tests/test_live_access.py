@@ -3,14 +3,16 @@ the relay re-reads what the text chat checks at every call: the robot not unpair
 robot consent and check-in consent current. When one is gone the chat ends with reason access_withdrawn, as any other
 ending, so the patient's voice stops going to OpenAI. A failed read is logged and tried again, a slow one never holds
 up the timers or runs twice at once, and a risk found at the same moment is still carried out as a block. A read that
-hangs gives up after ACCESS_CHECK_TIMEOUT and counts as a failed one; ACCESS_FAILURES_TO_END failed checks in a row
-end the chat with reason access_unverified (it fails closed), and a check that completes its reads resets the count.
+hangs is given up on after ACCESS_CHECK_TIMEOUT, even one that does not let go when cancelled, and counts as a failed
+one; ACCESS_FAILURES_TO_END failed checks in a row end the chat with reason access_unverified (it fails closed), and a
+check that completes its reads resets the count.
 
 It drives Task 7's relay with Task 7's fakes (tests/test_live_relay_chat.py: the world fixture with its consent state
 and live switch, FakeRobot, FakeLive, LiveDB and the fake clock) and, for the blocks, Task 8's safe fixture
 (tests/test_live_safety.py). Nothing reaches the network."""
 
 import asyncio
+import gc
 import logging
 import sys
 import types
@@ -208,6 +210,52 @@ def test_three_failed_access_checks_in_a_row_end_the_chat_as_access_unverified(w
             (relay.conversation_id, "ConnectionError"), (relay.conversation_id, "TimeoutError"),
             (relay.conversation_id, "ConnectionError"),
             (relay.conversation_id,)]                          # the ending: the conversation id, nothing else
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("unwinds_with", ["cancelled", "error"])
+def test_a_read_that_does_not_let_go_when_cancelled_never_holds_up_the_access_checks(world, caplog, monkeypatch,
+                                                                                     unwinds_with):
+    """asyncpg: a cancelled read lets go only once the server confirms the cancel (the pool's shielded release waits
+    for it with no time limit), so on a server that stopped answering it never lets go. Each check still gives up by
+    its own time limit, and the third ends the chat."""
+    async def scenario():
+        monkeypatch.setattr(live_session, "ACCESS_CHECK_TIMEOUT", 0.01)
+        unhandled = []
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: unhandled.append(context))
+        answered = asyncio.Event()                             # the server confirms the cancels at last
+
+        async def stuck(u_id):
+            try:
+                await asyncio.Event().wait()                   # the consent read never answers
+            except asyncio.CancelledError:
+                await answered.wait()                          # and its cancel waits for the server
+                if unwinds_with == "error":
+                    raise ConnectionError("the connection was terminated") from None
+                raise
+
+        monkeypatch.setattr(consent_service, "get_state", stuck)
+        relay, running = await _begin(world)
+        heard = _pcm(200, 20)
+        world.robot.inbox.put_nowait(heard)
+        for _ in range(3):
+            await _step(world, relay, 10)
+            await _given_up(relay)                             # by its time limit, its read still letting go
+        assert relay.outcome.reason == "access_unverified" and world.db.access_reads == 3   # a new read each time
+        world.robot.inbox.put_nowait(_pcm(200, 20))            # the microphone after the outcome
+        await _settle()
+        answered.set()
+        await _over(world, running)
+        _ended(world, "access_unverified")
+        assert world.robot.json()[-1] == END_UNVERIFIED
+        assert world.clients[0].audio == [heard]               # nothing reached GPT-Live after the outcome
+        assert [warning.args for warning in _warnings(caplog)] == [(relay.conversation_id, "TimeoutError")] * 3 + [
+            (relay.conversation_id,)]
+        await _settle()
+        gc.collect()
+        assert not live_session._letting_go and unhandled == []   # every read let go, no late error left unread
 
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         asyncio.run(scenario())
