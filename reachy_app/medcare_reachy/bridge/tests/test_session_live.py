@@ -46,6 +46,7 @@ class FakeLiveChat:
         self.during, self.block = during, block
         self.made, self.models_dirs, self.runs, self.stops, self.cancelled = [], [], [], [], False
         self.last_speech_at = None        # LiveChat's: when the robot last heard the patient begin to speak
+        self.speech_start = "detector"    # LiveChat's voice detector; None once it failed
         self.stopped = None               # set by stop() while run() waits
 
     def factory(self, app, robot, speaker, models_dir):
@@ -288,6 +289,44 @@ def test_a_due_medicine_ends_the_live_chat_with_reachys_line():
     assert h.slot.outcomes == {"live": "ended", "checkin": "medicine"} and h.slot.state == "WIND_DOWN"
     h.run_until(lambda: h.slot.done)
     assert h.slot.result == "completed" and "wind_down" not in h.clips.played
+
+
+def test_a_hand_to_mouth_moment_during_reachys_closing_line_is_no_news_for_family():
+    chat = FakeLiveChat(block=True)
+    h = checkin_live(chat)
+    stop = chat.stop
+    sip = {"event_id": "e1", "decision": "uncertain", "confidence": 0.3, "frame_seq": 7}
+
+    def closing_line(reason, say=None):
+        h.stream.frame_seq = 8
+        h.see(identity_status="verified", extra_events=[sip])   # a sip while Reachy says its line
+        asyncio.get_running_loop().call_later(0.05, stop, reason, say)   # the line takes a moment
+
+    chat.stop = closing_line
+    chat.during = h.slot.medicine_due
+    h.tick()
+    assert chat.stops == [("medicine", MEDICINE_LINE["zh-TW"])] and h.slot.state == "WIND_DOWN"
+    in_flight = {"event_id": "e2", "decision": "uncertain", "confidence": 0.4, "frame_seq": 8}   # answered late
+    h.see(identity_status="verified", extra_events=[sip, in_flight])
+    h.run_until(lambda: h.slot.done)
+    assert not h.app.named("extra_event") and h.slot.result == "completed"
+
+
+def test_a_live_chat_whose_voice_detector_stops_goes_on_as_todays_chat(caplog):
+    """Without speech signals GPT-Live could never start again (LiveChat._listen drops a failed voice detector)."""
+    chat = FakeLiveChat(block=True)
+    h = checkin_live(chat)
+    chat.during = lambda: setattr(chat, "speech_start", None)
+    with caplog.at_level(logging.WARNING, logger="medcare_reachy.bridge.session"):
+        h.tick()
+    assert chat.stops == [("detector_failed", None)] and not chat.cancelled   # stopped without a line
+    assert [record.levelname for record in caplog.records if record.name == "medcare_reachy.bridge.session"] == [
+        "WARNING"]
+    assert h.voice.handovers == ["suspend", "resume"]
+    # Today's chat in a new conversation, as after a fallback the robot decides itself.
+    assert ("conversation_start", "task-1", "zh-TW") in h.app.calls and h.slot.chat_id == "c1"
+    assert h.speaker.said[-1] == OPENING and h.slot.state == "CHECKIN"
+    assert h.slot.outcomes == {"live": "detector_failed"}
 
 
 def test_no_live_chat_without_the_listeners_voice_detector(monkeypatch):

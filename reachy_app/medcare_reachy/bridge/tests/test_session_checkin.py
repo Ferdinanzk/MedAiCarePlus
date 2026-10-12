@@ -179,6 +179,30 @@ def test_hand_to_mouth_moments_while_chatting_are_no_news_for_family():
     assert h.app.named("extra_event") == [("extra_event", "e2", "uncertain", 0.4)]
 
 
+def test_a_hand_to_mouth_moment_during_reachys_last_line_is_no_news_either():
+    h = after_one_dose()
+    h.tick()
+    say = h.speaker.say
+    sip = {"event_id": "e1", "decision": "uncertain", "confidence": 0.3, "frame_seq": 40}
+
+    def sip_during_goodbye(text, stats=None, on_audio=None):
+        h.stream.frame_seq = 41                                   # frames streamed while Reachy says goodbye
+        h.see(identity_status="verified", extra_events=[sip])
+        return say(text, stats, on_audio)
+
+    h.speaker.say = sip_during_goodbye
+    h.app.replies = [{"reply": "再見", "speech_text": "再见", "end": True}]
+    h.voice.speak("好，拜拜")
+    h.tick(1)
+    assert h.slot.state == "POST_SLOT_OBSERVE" and not h.app.named("extra_event")
+    h.speaker.say = say
+    in_flight = {"event_id": "e2", "decision": "uncertain", "confidence": 0.3, "frame_seq": 41}   # answered late
+    later = {"event_id": "e3", "decision": "uncertain", "confidence": 0.4, "frame_seq": 42}
+    h.see(identity_status="verified", extra_events=[sip, in_flight, later])
+    h.tick(1)
+    assert h.app.named("extra_event") == [("extra_event", "e3", "uncertain", 0.4)]
+
+
 def test_a_silence_limit_can_still_be_set(monkeypatch):
     monkeypatch.setattr(session_module, "CHECKIN_SILENCE", 25.0)
     h = after_one_dose()

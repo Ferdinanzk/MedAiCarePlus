@@ -57,6 +57,7 @@ COMPANION_STOP_SECONDS = 45.0   # live companion: time for Reachy's closing line
 COMPANION_ENDINGS = ("patient_left", "medicine")   # Reachy said why it stops: it sleeps at once, no wind_down clip
 LIVE_POLL_SECONDS = 0.2         # live check-in: how often the session looks for a reason to stop it at once
 LIVE_STOP_SECONDS = 5.0         # live check-in: how long a stopped live chat may take to close
+DETECTOR_FAILED = "detector_failed"   # live companion chat: its voice detector stopped; today's chat goes on
 LIVE_AUDIO = ("start_live_audio", "push_audio", "clear_live_audio", "stop_live_audio")   # media.py's live calls
 SPEECH_MODEL = "silero_vad.onnx"   # the listener's voice detector (voice.py STT_FILES); live.SpeechStart uses it too
 # Spoken (not prerecorded) lines, already in the voice's Simplified characters (喔 written 哦, as in the clips).
@@ -163,6 +164,7 @@ class SlotSession:
         self.monitor: dict | None = None
         self.monitor_key: tuple | None = None
         self.sent_extra: set[str] = set()
+        self.chat_end: tuple[str, int] | None = None   # at the chat's end: (camera session id, its last frame_seq)
         self.stop_reason: str | None = None
         self.stop_abort = True
         self.needs_recovery = False
@@ -592,7 +594,12 @@ class SlotSession:
         Meanwhile the companion session goes on around it (spec 2026-10-12 companion 4.2-4.5): its camera
         (`_keep_watching`), the patient's voice (LiveChat.last_speech_at) and the medicine and rest rules
         (`_companion_ending`). Those ask the chat to end with Reachy's line (LiveChat.stop with `say`); a chat that has
-        not ended COMPANION_STOP_SECONDS later is cancelled: ("cut", that reason)."""
+        not ended COMPANION_STOP_SECONDS later is cancelled: ("cut", that reason). What the camera reports until the
+        chat has ended (Reachy's closing line included) is chat-time (`_forward_extra_events`).
+
+        A voice detector that stopped (LiveChat.speech_start None after a failure) would leave GPT-Live unable to start
+        again: the chat is stopped without a line and today's chat goes on in a new conversation, as after a fallback
+        the robot decides itself: ("fallback", DETECTOR_FAILED)."""
         run = asyncio.ensure_future(chat.run(self.task_id, self.language))
         ending, asked = None, 0.0
         try:
@@ -608,9 +615,10 @@ class SlotSession:
                 now = self.clock.monotonic()
                 if ending is not None:
                     if now - asked >= COMPANION_STOP_SECONDS:
-                        log.error("slot %s: the live chat did not end within %.0f s of Reachy's closing line; the "
-                                  "robot stops it", self.task_id, COMPANION_STOP_SECONDS)
-                        return "cut", ending, None
+                        log.error("slot %s: the live chat did not end within %.0f s of the robot's stop (%s); the "
+                                  "robot stops it", self.task_id, COMPANION_STOP_SECONDS, ending)
+                        return ("fallback" if ending == DETECTOR_FAILED else "cut"), ending, None
+                    await self._forward_extra_events()   # still chat-time: never to family
                     continue
                 await self._keep_watching()
                 if chat.last_speech_at is not None and (self.heard_at is None or chat.last_speech_at > self.heard_at):
@@ -620,6 +628,11 @@ class SlotSession:
                     asked = now
                     log.info("slot %s: the companion session ends (%s)", self.task_id, ending)
                     chat.stop(ending, say=self._line(MEDICINE_LINE if ending == "medicine" else REST_LINE))
+                elif chat.speech_start is None:
+                    log.warning("slot %s: the live chat's voice detector stopped, so GPT-Live could not start again; "
+                                "today's chat goes on in a new conversation", self.task_id)
+                    ending, asked = DETECTOR_FAILED, now
+                    chat.stop(ending)
         finally:
             if not run.done():
                 run.cancel()
@@ -631,6 +644,8 @@ class SlotSession:
         except Exception:
             log.exception("slot %s: the live chat failed", self.task_id)
             return "fallback", "error", None
+        if ending == DETECTOR_FAILED and outcome.kind == "ended" and not outcome.risk:
+            return "fallback", DETECTOR_FAILED, None
         return outcome.kind, outcome.reason, outcome.conversation_id
 
     # ── the companion session around either chat ─────────────────────────
@@ -638,7 +653,7 @@ class SlotSession:
         """The companion's camera (spec 2026-10-12 companion 4.2): the observe session stays attached for the whole
         session (a check-in task's search session goes on; after a dose, a new one starts). One the server lost is
         opened again at once; one that did not open is tried again every CAMERA_RETRY_SECONDS. A camera that won't
-        open never ends the chat."""
+        open never ends the chat; a device no longer authorised (NotAuthorised) fails closed, as everywhere."""
         if self.monitor is not None and self.monitor_key == ("observe", None):
             return
         now = self.clock.monotonic()
@@ -646,15 +661,19 @@ class SlotSession:
             return
         try:
             await self._ensure_session("observe")
+        except NotAuthorised:
+            raise
         except BridgeError as exc:
             self.camera_retry_at = now + CAMERA_RETRY_SECONDS
             log.warning("slot %s: the companion's camera did not open (%s); Reachy chats on", self.task_id, exc)
 
     async def _keep_watching(self) -> None:
         """While the live chat holds this session's tick: the frame stream's errors (tick() takes them otherwise; a
-        lost session is opened again by `_watch`), and the latest answer, which updates seen_at (hand-to-mouth events
-        are only marked as seen: `_forward_extra_events`)."""
+        lost session is opened again by `_watch`; NotAuthorised fails closed in tick()), and the latest answer, which
+        updates seen_at (hand-to-mouth events are only marked as seen: `_forward_extra_events`)."""
         error = self.stream.take_error()
+        if isinstance(error, NotAuthorised):
+            raise error
         if isinstance(error, SessionLost):
             log.warning("slot %s: the companion's camera session was lost (%s)", self.task_id, error.detail)
             self._drop_session()
@@ -760,6 +779,7 @@ class SlotSession:
         self._after_checkin()
 
     def _after_checkin(self) -> None:
+        self._end_chat_events()
         self._gesture(None)
         self.stream.set_max_fps(None)   # the camera's own rate again (POST_SLOT_OBSERVE looks for an extra dose)
         rest = self._is_checkin_task() or self.outcomes.get("checkin") in COMPANION_ENDINGS
@@ -1015,12 +1035,25 @@ class SlotSession:
             except (SessionLost, AppUnreachable):
                 pass   # already gone, or the server evicts it once landmarks stop
 
-    async def _forward_extra_events(self) -> None:
+    def _end_chat_events(self) -> None:
+        """The chat is over: every hand-to-mouth event its camera session has reported so far happened during it
+        (Reachy's last line included), and so did one the server reports later for a frame already streamed (an
+        answer still on its way). `_forward_extra_events` sends none of them to family."""
         for event in self._latest().get("extra_events") or []:
+            if event.get("event_id"):
+                self.sent_extra.add(event["event_id"])
+        if self.monitor is not None:
+            self.chat_end = (self.monitor["session_id"], self.stream.frame_seq)
+
+    async def _forward_extra_events(self) -> None:
+        latest = self._latest()
+        chat_end = self.chat_end if self.chat_end and self.chat_end[0] == latest.get("session_id") else None
+        for event in latest.get("extra_events") or []:
             event_id = event.get("event_id")
             if not event_id or event_id in self.sent_extra:
                 continue
-            if self.state == CHECKIN:
+            seq = event.get("frame_seq")
+            if self.state == CHECKIN or (chat_end and seq is not None and int(seq) <= chat_end[1]):
                 # The companion's camera only tells who is there: a hand at the mouth while chatting (a drink, a
                 # snack) is no news for family, and at COMPANION_CAPTURE_FPS the detector isn't calibrated.
                 self.sent_extra.add(event_id)
