@@ -64,6 +64,8 @@ class FakeConn:
         self.device_row = {"device_id": uuid.UUID(DEVICE_ID)}
         self.source = self.doses   # monitor starts read `doses`, manual tasks `intakes`
         self.status_detail = None  # what the heartbeat stored (asyncpg hands JSONB back as text)
+        self.task_due = False      # what reachy_tasks.task_due finds: a medicine task waiting (companion spec 3.4)
+        self.task_due_asked = []   # (arguments, transaction depth) of each task_due read
 
     def transaction(self):
         return _Transaction(self)
@@ -142,6 +144,9 @@ class FakeConn:
             return None      # no alert for this dose within the hour
         if "FROM family_contacts" in query:
             return 1         # contacts that can receive family alerts (the Reachy card's status)
+        if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # reachy_tasks.task_due
+            self.task_due_asked.append((args, self.depth))
+            return self.task_due
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -346,6 +351,15 @@ def test_heartbeat_reports_microphone_consent(env, monkeypatch):
     monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
     monkeypatch.setattr(consent_service, "get_state", get_state)
     assert env.robot.post("/api/device/heartbeat", json={}).json()["microphone"] is True
+
+
+def test_heartbeat_says_whether_a_medicine_task_waits(env, monkeypatch):
+    # Companion spec 3.4: a robot in a companion session ends it, with its medicine line, when task_due is true.
+    _no_leases(monkeypatch)
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is False
+    env.conn.task_due = True
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is True
+    assert env.conn.task_due_asked == [((7,), 1), ((7,), 1)]   # this patient, inside the heartbeat's transaction
 
 
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──

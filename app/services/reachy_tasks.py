@@ -135,6 +135,14 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
     return str(task_id) if task_id is not None else None
 
 
+def _leasable_sql() -> str:
+    """When the robot may lease a queued task t of patient $1 now (the rules in _lease_once's comment). task_due asks
+    the same question, so the robot is never told of a task it could not lease."""
+    return ("t.u_id = $1 AND t.status = 'queued' AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i "
+            "WHERE i.intk_id = ANY(t.intk_ids) "
+            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')}))")
+
+
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
     # A task holding an open dose that is not due yet stays queued until it is, and one holding an open dose that has
     # expired is not handed out (enqueue refuses such tasks; this also covers any queued before the rules, or that
@@ -145,9 +153,7 @@ async def _lease_once(u_id: int, device_id: str) -> dict | None:
         task = await conn.fetchrow(
             "UPDATE reachy_task SET status = 'leased', lease_owner = $2::uuid, "
             f"lease_until = NOW() + INTERVAL '{LEASE_SECONDS} seconds' "
-            "WHERE task_id = (SELECT t.task_id FROM reachy_task t WHERE t.u_id = $1 AND t.status = 'queued' "
-            "AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i WHERE i.intk_id = ANY(t.intk_ids) "
-            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')})) "
+            f"WHERE task_id = (SELECT t.task_id FROM reachy_task t WHERE {_leasable_sql()} "
             "ORDER BY t.slot_time, t.created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
             "RETURNING *",
             u_id, device_id)
@@ -163,6 +169,18 @@ async def lease_next(u_id: int, device_id: str, wait: float) -> dict | None:
         if task is not None or remaining <= 0:
             return task
         await asyncio.sleep(min(1.0, remaining))
+
+
+async def task_due(conn, u_id: int) -> bool:
+    """Medicine first (companion spec 3.4), for the heartbeat: would the robot lease a task of this patient now (the
+    lease's own rule, _leasable_sql) that holds a dose still to take? The task the robot is busy with is never
+    queued, so it never counts. A queued check-in ('Talk to Reachy now' pressed during a chat), or a task whose doses
+    were all taken, skipped or sent to family meanwhile, is no medicine: it never interrupts a chat, and the robot
+    leases it afterwards as today."""
+    return bool(await conn.fetchval(
+        f"SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE {_leasable_sql()} AND EXISTS (SELECT 1 FROM intake "
+        "open_dose WHERE open_dose.intk_id = ANY(t.intk_ids) AND open_dose.intake_stats IN ('pending','missed')))",
+        u_id))
 
 
 async def current_task(u_id: int, device_id: str) -> dict | None:
