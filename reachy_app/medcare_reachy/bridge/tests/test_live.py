@@ -560,6 +560,10 @@ class FakeSpeechStart:
         self.fed = []
         self._speech = False
 
+    @property
+    def speaking(self):
+        return self._speech
+
     def accept(self, samples):
         assert samples.dtype == np.float32 and len(samples) == FRAME_SAMPLES
         level = round(float(np.max(np.abs(samples))), 2)

@@ -251,7 +251,8 @@ class SpeechStart:
     (voice.make_vad: its model file and timings), telling where the patient begins to speak.
 
     accept() takes float32 samples at 16 kHz, any number at a time, and is True for the call in which speech began
-    (the VAD says so after voice.MIN_SPEECH_SECONDS of it, and speech ends after voice.MIN_SILENCE_SECONDS of quiet).
+    (the VAD says so after voice.MIN_SPEECH_SECONDS of it, and speech ends after voice.MIN_SILENCE_SECONDS of quiet);
+    `speaking` is the VAD's state after the last call: it hears speech now.
     sherpa_onnx (on the robot; not in this repo's test environment) is imported only when one is built: building one
     raises ImportError without it, and FileNotFoundError without the model file (voice.STT_FILES in `models_dir`)."""
 
@@ -277,6 +278,10 @@ class SpeechStart:
             self._vad.pop()
         return began
 
+    @property
+    def speaking(self) -> bool:
+        return self._speech
+
 
 class LiveChat:
     """One live check-in: run() opens the WebSocket, streams the microphone, plays what comes back, and returns how it
@@ -288,7 +293,9 @@ class LiveChat:
     `gestures`: the settings page's check-in gestures switch (Reachy's "speak" gesture while it makes sound, still
     during the help line); `speech_start`: a companion chat's voice detector (a SpeechStart; None: no 'speech' to the
     server). `last_speech_at` (on `clock`) is when that detector last heard the patient begin to speak while Reachy
-    made no sound; None until then.
+    made no sound, and `last_voice_at` the last frame on which it heard the patient speaking (its speech state, not
+    an onset) while Reachy made no sound; None until then. `closing` is True once the chat's ending is decided (the
+    server's end or fallback, a dropped connection, the robot's own ending) and what is queued plays out.
     """
 
     def __init__(self, app, robot, speaker, *, connect=None, clock=time.monotonic, sleep=asyncio.sleep,
@@ -303,6 +310,8 @@ class LiveChat:
         self.frames_sent = 0          # microphone frames sent
         self.dropped_audio = 0        # frames of GPT-Live's voice that came while Reachy said its own line
         self.last_speech_at: float | None = None
+        self.last_voice_at: float | None = None
+        self.closing = False
         self._socket = None
         self._inbox: asyncio.Queue = asyncio.Queue()   # the server's messages; None once the connection closed
         self._ready = False
@@ -328,8 +337,10 @@ class LiveChat:
         Without `say`, what is queued is dropped at once. With `say` (Reachy's last line, in the voice's Simplified
         characters), what is queued still plays (Reachy finishes its sentence), then Reachy says the line through the
         same queue; `end` goes to the server at once, so GPT-Live says nothing more, and run() returns once the line
-        has played (DRAIN_LIMIT_SECONDS at most). A stop that comes after the server ended the chat (during its final
-        drain) cuts that drain, with or without a line, and its line is not said."""
+        has played (DRAIN_LIMIT_SECONDS at most). Once `closing` is set (the server ended the chat or fell back: its
+        final drain plays its help line) the session asks for no companion ending (medicine, rest, a lost voice
+        detector or camera); a stop that still comes then (stop_all, the app shutting down) cuts that drain, with or
+        without a line, and its line is not said."""
         if self._stop_reason is None:
             self._stop_reason, self._last_line = reason, say
             self._inbox.put_nowait(_STOP)
@@ -358,6 +369,7 @@ class LiveChat:
                              asyncio.create_task(self._mic_loop(), name="live-microphone"),
                              asyncio.create_task(self._play_loop(), name="live-speaker")]
             outcome, drain = await self._converse()
+            self.closing = True
             if drain:
                 await self._drain()
             if self._stop_reason is not None and not (outcome.kind == "ended" and outcome.reason == self._stop_reason):
@@ -550,11 +562,13 @@ class LiveChat:
                         self.conversation_id, type(error).__name__)
             self.speech_start = None
             return
-        if not onset:
-            return
         if not self._hearing():
             return
         now = self.clock()
+        if self.speech_start.speaking:
+            self.last_voice_at = now   # the patient speaks (the medicine ending waits for their words)
+        if not onset:
+            return
         self.last_speech_at = now
         if self._signal_at is not None and now - self._signal_at < SPEECH_SIGNAL_GAP_SECONDS:
             return

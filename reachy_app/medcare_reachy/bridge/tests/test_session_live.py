@@ -13,8 +13,10 @@ from medcare_reachy.bridge import live as live_module
 from medcare_reachy.bridge import session as session_module
 from medcare_reachy.bridge.live import LiveChat, LiveOutcome
 from medcare_reachy.bridge.session import (
-    CHECKIN_GREETING, COMPANION_CAPTURE_FPS, MEDICINE_LINE, REST_AFTER_SECONDS, REST_LINE, open_live_chat)
-from medcare_reachy.bridge.tests.fakes import FakeSpeaker, Harness, dose, make_task
+    CAMERA_LOST_SECONDS, CHECKIN_GREETING, COMPANION_CAPTURE_FPS, MEDICINE_LINE, REST_AFTER_SECONDS, REST_LINE,
+    open_live_chat)
+from medcare_reachy.bridge.tests.fakes import FakeSocket, FakeSpeaker, Harness, dose, make_task
+from medcare_reachy.bridge.tests.test_live import HELP, inline, no_wait, said, until
 
 RECORDED = {"event_id": "ev1", "status": "taken"}
 OPENING = "今天感觉怎么样？"   # FakeApp.conversation_start's speech_text: today's chat opened
@@ -46,6 +48,8 @@ class FakeLiveChat:
         self.during, self.block = during, block
         self.made, self.models_dirs, self.runs, self.stops, self.cancelled = [], [], [], [], False
         self.last_speech_at = None        # LiveChat's: when the robot last heard the patient begin to speak
+        self.last_voice_at = None         # LiveChat's: when it last heard the patient speaking
+        self.closing = False              # LiveChat's: the ending is decided and what is queued plays out
         self.speech_start = "detector"    # LiveChat's voice detector; None once it failed
         self.stopped = None               # set by stop() while run() waits
 
@@ -255,7 +259,8 @@ def test_a_live_companion_chat_has_no_time_limit():
     h = checkin_live(chat)
 
     def an_hour():
-        h.clock.t += 3600.0                             # an hour of chatting, the patient in view
+        h.clock.t += 3600.0                             # an hour of chatting, the patient in view:
+        h.see(identity_status="verified")               # the camera's answers keep coming
 
     chat.during = an_hour
     h.tick()
@@ -327,6 +332,72 @@ def test_a_live_chat_whose_voice_detector_stops_goes_on_as_todays_chat(caplog):
     assert ("conversation_start", "task-1", "zh-TW") in h.app.calls and h.slot.chat_id == "c1"
     assert h.speaker.said[-1] == OPENING and h.slot.state == "CHECKIN"
     assert h.slot.outcomes == {"live": "detector_failed"}
+
+
+def test_a_live_companion_chat_without_a_camera_goes_on_as_todays_chat(caplog):
+    """Camera first: without a working camera the server could never start GPT-Live again."""
+    chat = FakeLiveChat(block=True)
+    h = checkin_live(chat)
+
+    def camera_dies():
+        h.stream.camera.state = "unavailable"           # the watchdog gave up on the camera (the patient may be there)
+        asyncio.get_running_loop().call_later(0.05, setattr, h.clock, "t", h.clock.t + CAMERA_LOST_SECONDS)
+
+    chat.during = camera_dies
+    with caplog.at_level(logging.WARNING, logger="medcare_reachy.bridge.session"):
+        h.tick()
+    assert chat.stops == [("camera_failed", None)] and not chat.cancelled   # stopped without a line
+    assert "the companion's camera has not worked for 30 s" in caplog.text
+    # Today's chat in a new conversation, as after a fallback the robot decides itself.
+    assert ("conversation_start", "task-1", "zh-TW") in h.app.calls and h.slot.chat_id == "c1"
+    assert h.slot.outcomes == {"live": "camera_failed"} and h.slot.state == "CHECKIN"
+
+
+def test_a_companion_ending_never_cuts_the_servers_help_line():
+    """The server ended the chat for a risk and its help line plays (LiveChat's final drain) when a heartbeat says a
+    medicine is due: the whole help line is heard, and no medicine ending is asked for."""
+    socket, made = FakeSocket(), []
+
+    async def connect(url, headers):
+        return socket
+
+    def real_chat(app, robot, speaker, models_dir):
+        made.append(LiveChat(LIVE_APP, robot, speaker, connect=connect, clock=h.clock.monotonic, sleep=no_wait,
+                             run_blocking=inline, speech_start=object()))
+        return made[-1]
+
+    h = Harness(live_task(reason="checkin"), voice=True, speaker=True, live_chat=real_chat)
+    h.find_patient()
+    looks = []                                          # each time the session looks at the running chat
+    take_error = h.stream.take_error
+    h.stream.take_error = lambda: looks.append(1) or take_error()
+    opening = "王奶奶，今天感觉怎么样？"
+
+    async def scenario():
+        tick = asyncio.ensure_future(h.slot.tick())
+        await until(lambda: made and socket.json_sent())   # the chat said start
+        chat = made[0]
+        drain = chat._drain
+
+        async def medicine_during_the_help_line():
+            async with chat._speaker_lock:              # the help line has not played yet ...
+                h.slot.medicine_due()                   # ... when the heartbeat's task_due lands
+                seen = len(looks)
+                await until(lambda: len(looks) > seen)  # the session looks at the chat meanwhile
+            await drain()
+
+        chat._drain = medicine_during_the_help_line
+        socket.serve({"type": "ready", "conversation_id": "c9", "speech_text": opening})
+        socket.serve({"type": "say", "speech_text": HELP, "reason": "risk"})
+        socket.serve({"type": "end", "reason": "risk", "risk": True})
+        await tick
+
+    asyncio.run(scenario())
+    heard = h.robot.heard()
+    assert list(heard[heard != 0]) == [8192] * (said(opening) + said(HELP))   # the opening, then the whole help line
+    assert {"type": "end", "reason": "medicine"} not in socket.json_sent()
+    assert not any(MEDICINE_LINE["zh-TW"] in text for text in h.speaker.synthesised)
+    assert h.slot.outcomes == {"live": "ended", "checkin": "risk"} and h.slot.state == "WIND_DOWN"
 
 
 def test_no_live_chat_without_the_listeners_voice_detector(monkeypatch):
