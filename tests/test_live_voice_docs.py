@@ -1,8 +1,9 @@
-"""Docs for live voice check-ins, Phase 2a (docs/superpowers/specs/2026-10-12-live-voice-2a-design.md).
+"""Docs for live voice check-ins, Phase 2a (docs/superpowers/specs/2026-10-12-live-voice-2a-design.md), and the
+companion session of robot app 0.9.0 (docs/superpowers/specs/2026-10-12-companion-session-design.md).
 
-The live voice sections of CLAUDE.md, reachy_app/README.md and HANDOFF.md may name only what the code has. Every span
-in backticks there is checked against the code (app/, sql/init.sql, the robot app, frontend_source/src and
-.env.example; files under a tests folder don't count):
+The live voice sections of CLAUDE.md, reachy_app/README.md and HANDOFF.md, CLAUDE.md's "How it ends" bullet and the
+README's companion section may name only what the code has. Every span in backticks there is checked against the code
+(app/, sql/init.sql, the robot app, frontend_source/src and .env.example; files under a tests folder don't count):
 - `NAME = value`, or `module.NAME = value`: every definition of NAME (in module.py) has exactly that value;
 - a URL appears in the code as written; a route /api/<group>/... is declared in app/routers/api_<group>.py;
 - a file path exists;
@@ -25,6 +26,10 @@ SECTIONS = {   # doc -> (its live voice heading, line starts that end the sectio
     "reachy_app/README.md": ("## Live voice check-ins (0.8.0, test)", ("## ",)),
     "HANDOFF.md": ("## 6. Phase 2a: live voice check-ins (test only)", ("# ", "## ", "---")),
 }
+COMPANION_PARTS = {   # doc -> (the first line of its companion text, line starts that end it outside code blocks)
+    "CLAUDE.md": ("- **How it ends (robot app 0.9.0, the companion session):**", ("- ", "#")),
+    "reachy_app/README.md": ("## Companion session (0.9.0)", ("## ",)),
+}
 CODE_GLOBS = ("app/**/*.py", "sql/init.sql", "reachy_app/medcare_reachy/**/*.py", "reachy_app/tools/*.py",
               "reachy_app/pyproject.toml", "frontend_source/src/**/*.ts", "frontend_source/src/**/*.tsx",
               ".env.example")
@@ -42,19 +47,30 @@ PATH = re.compile(r"[\w./-]*\w\.(?:py|tsx?|sql|md|toml|json)\b")
 TOKEN = re.compile(r'(?:"user"|[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)*')
 
 
-def _section(doc: str) -> str:
-    heading, stops = SECTIONS[doc]
+def _lines_from(doc: str, first: str, stops: tuple) -> list:
+    """doc's lines from the first one that starts with `first` up to the next line outside code blocks that starts
+    with one of `stops`."""
     lines = (REPO / doc).read_text(encoding="utf-8").splitlines()
-    if heading not in lines:
-        pytest.fail(f"{doc} has no line {heading!r}")
-    body, fenced = [], False
-    for line in lines[lines.index(heading) + 1:]:
+    start = next((index for index, line in enumerate(lines) if line.startswith(first)), None)
+    if start is None:
+        pytest.fail(f"{doc} has no line starting {first!r}")
+    body, fenced = [lines[start]], False
+    for line in lines[start + 1:]:
         if line.startswith("```"):
             fenced = not fenced
         elif not fenced and line.startswith(stops):
             break
         body.append(line)
-    return "\n".join(body)
+    return body
+
+
+def _section(doc: str) -> str:
+    heading, stops = SECTIONS[doc]
+    return "\n".join(_lines_from(doc, heading, stops)[1:])
+
+
+def _companion_part(doc: str) -> str:
+    return "\n".join(_lines_from(doc, *COMPANION_PARTS[doc]))
 
 
 @functools.lru_cache(maxsize=None)
@@ -155,6 +171,12 @@ def test_every_code_name_in_the_section_is_in_the_code(doc):
     assert problems == [], f"{doc}: its live voice section names what the code lacks: {problems}"
 
 
+@pytest.mark.parametrize("doc", COMPANION_PARTS)
+def test_every_code_name_in_the_companion_text_is_in_the_code(doc):
+    problems = sorted({problem for span in SPAN.findall(_companion_part(doc)) for problem in _problems(span)})
+    assert problems == [], f"{doc}: its companion session text names what the code lacks: {problems}"
+
+
 def test_the_docs_name_each_live_message_and_both_ends_use_it():
     section = _section("CLAUDE.md")
     relay = (REPO / "app" / "services" / "live_session.py").read_text(encoding="utf-8")
@@ -173,13 +195,13 @@ def test_the_docs_quote_the_cards_words_as_the_web_app_says_them():
         assert words in web, f"frontend_source/src has no {words}"
 
 
-def test_robot_app_0_9_0_in_its_code():
+def test_robot_app_0_9_0_in_its_code_and_its_readme():
     pyproject = (REPO / "reachy_app" / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'^version = "0\.9\.0"$', pyproject, re.M)
     init = (REPO / "reachy_app" / "medcare_reachy" / "bridge" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "0.9.0"' in init
-    # The README's 0.9.0 entry comes with the companion session's docs (the docs task replaces this test).
-    assert "- **0.8.0**" in (REPO / "reachy_app" / "README.md").read_text(encoding="utf-8")
+    readme = (REPO / "reachy_app" / "README.md").read_text(encoding="utf-8")
+    assert "- **0.9.0**" in readme and "- **0.8.0**" in readme
 
 
 def test_env_example_says_how_to_test_live_voice_and_that_patients_wait_for_2b():
