@@ -69,6 +69,9 @@ Decisions the user made on 12 Oct (each asked as a question):
   *(Amended after the final review: when the patient's words that started it were kept, nothing has transcribed or
   screened them, so the robot first gets a `say` with reason `repeat`, `REPEAT_LINES`: 「不好意思，我剛剛沒聽清楚，可以再說一次嗎？」
   / "Sorry, I didn't catch that. Could you say it again?", and the patient says it again to the text chat.)*
+  *(Amended after the live test on the PC, 12 Oct: the kept audio, the pre-roll and what came while GPT-Live started,
+  goes at up to twice real time, `PRE_ROLL_SEND_SPEED` (2), because GPT-Live drops a faster burst: sent at once, the
+  patient's first 1-2 s of each stretch were lost.)*
 - **Pause.** When no patient speech has been heard for `QUIET_PAUSE_SECONDS` (30 s) and GPT-Live's sound has ended,
   the relay stores the open turns and closes GPT-Live (session usage added up), then is paused again. A talking
   stretch also pauses at `STRETCH_MAX_SECONDS` (600 s); the patient's next words restart it.
@@ -204,6 +207,7 @@ ended the live chat (its help line playing), the robot asks for no companion end
 | `STRETCH_HARD_MAX_SECONDS` | 660 (added after the review) | live_session.py |
 | `SEEN_RECENT_SECONDS` | 15 | live_session.py |
 | `PRE_ROLL_SECONDS` | 2 | live_session.py |
+| `PRE_ROLL_SEND_SPEED` | 2 (times real time; added after the live test) | live_session.py |
 | `HISTORY_TURNS` | 20 | live_session.py |
 | `REST_AFTER_SECONDS` | 600 | robot session.py |
 | `COMPANION_CAPTURE_FPS` | 2 | robot session.py / runner.py |

@@ -84,7 +84,8 @@ def companion(safe, monkeypatch):
     """Task 7's world with Task 8's safety fakes, for a start through the real LiveRelay._open: LIVE_VOICE_TEST on,
     the task leased by this robot (CompanionDB), a usable live model, the call name 王奶奶 and, with memory consent,
     the memory block MEMORY BLOCK. Each stretch's GPT-Live is a CompanionLive. `seen` answers the camera-first check
-    (each question recorded in `seen_asked`); `fail` and `start_gate` steer CompanionLive."""
+    (each question recorded in `seen_asked`); `fail` and `start_gate` steer CompanionLive. `sleep` is the relay's wait
+    (it paces the kept audio): the fake clock moves on at once."""
     w = safe
     w.db = CompanionDB()
     w.seen, w.seen_asked, w.fail, w.start_gate = True, [], None, None
@@ -92,6 +93,10 @@ def companion(safe, monkeypatch):
     def factory(*args, **kwargs):
         w.clients.append(CompanionLive(w, *args, **kwargs))
         return w.clients[-1]
+
+    async def sleep(seconds):
+        w.clock.now += seconds
+        await asyncio.sleep(0)
 
     async def call_name(conn, u_id, memory_on):
         return "王奶奶"
@@ -102,7 +107,7 @@ def companion(safe, monkeypatch):
     async def build_block(conn, u_id, language, followup_memory_id, today):
         return "MEMORY BLOCK"
 
-    w.factory = factory
+    w.factory, w.sleep = factory, sleep
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
     monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: TARGET)
     monkeypatch.setattr(memory, "call_name", call_name)
@@ -118,7 +123,8 @@ async def _start(w, version="0.9.0"):
         w.seen_asked.append(u_id)
         return w.seen
 
-    relay = live_session.LiveRelay(w.robot, dict(DEVICE), client_factory=w.factory, clock=w.clock, seen=seen)
+    relay = live_session.LiveRelay(w.robot, dict(DEVICE), client_factory=w.factory, clock=w.clock, seen=seen,
+                                   sleep=w.sleep)
     running = asyncio.create_task(relay.run())
     w.robot.inbox.put_nowait({**START, "bridge_version": version})
     await _settle()
@@ -204,6 +210,62 @@ def test_the_pre_roll_reaches_gpt_live_first_then_the_live_microphone(companion)
         await _settle()
         # the last PRE_ROLL_SECONDS before the speech, all that came during the start, then the live microphone
         assert client.audio == kept[-20:] + meanwhile + [live]
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_stretch_sends_the_kept_audio_at_no_more_than_twice_real_time(companion):
+    """GPT-Live drops input audio sent much faster than real time (measured 12 Oct 2026: sent at once, the patient's
+    first words were lost in every stretch). So the kept audio goes at up to PRE_ROLL_SEND_SPEED times real time, the
+    microphone frames that come meanwhile join it in order, and the live microphone takes over once it is all sent."""
+    async def scenario():
+        frames = iter([_pcm(level, 100) for level in range(1, 200)])   # the robot's microphone, 100 ms a frame
+        arrived, due = [], [float("inf")]
+
+        async def sleep(seconds):   # the relay's pacing wait: time passes, and the microphone goes on meanwhile
+            companion.clock.now += seconds
+            while companion.clock.now >= due[0] - 1e-9:
+                arrived.append(next(frames))
+                companion.robot.inbox.put_nowait(arrived[-1])
+                due[0] += 0.1
+            await _settle()
+
+        companion.sleep = sleep
+        relay, running = await _start(companion)
+        kept = [next(frames) for _ in range(30)]              # 3 s while paused: the last 2 s are kept
+        starting = [next(frames) for _ in range(15)]          # 1.5 s while GPT-Live starts
+        for frame in kept:
+            companion.robot.inbox.put_nowait(frame)
+        await _settle()
+        companion.start_gate = asyncio.Event()
+        await _speak(companion)
+        for frame in starting:
+            companion.robot.inbox.put_nowait(frame)
+        await _settle()
+        (client,) = companion.clients
+        sent, send = [], client.send_audio
+
+        async def send_audio(pcm):
+            sent.append((companion.clock.now, pcm))
+            await send(pcm)
+
+        client.send_audio = send_audio
+        due[0] = companion.clock.now + 0.1                    # GPT-Live started: the next frame in 100 ms
+        companion.start_gate.set()
+        await relay._starting                                 # the start is over once the kept audio is sent
+        assert relay._phase == "running" and not relay._pre_roll and relay._pre_roll_bytes == 0
+        backlog = kept[-20:] + starting + arrived
+        assert len(arrived) >= 30 and [pcm for _, pcm in sent] == backlog   # 3.5 s kept, 3.5 s more meanwhile
+        live = next(frames)
+        companion.robot.inbox.put_nowait(live)                # the live microphone, now the backlog is sent
+        await _settle()
+        assert client.audio == backlog + [live] and sent[-1][1] == live
+        # a 100 ms frame every 50 ms (twice real time), the live microphone's first frame included: never faster
+        gaps = [later - earlier for (earlier, _), (later, _) in zip(sent, sent[1:])]
+        assert gaps == pytest.approx([0.1 / live_session.PRE_ROLL_SEND_SPEED] * len(gaps))
+        assert live_session.PRE_ROLL_SEND_SPEED == 2.0
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
 

@@ -276,7 +276,9 @@ briefly during a chat, e.g. the PC's internet: the check-in must go on as a text
 check-in section and "Companion session" in the live voice section. A check-in now stays until the patient says
 goodbye, with either chat. Reachy greets in its own voice and keeps the camera on (2 frames a second). GPT-Live starts
 only when the patient speaks and the camera recognised them in the last 15 s, pauses after 30 s without patient speech
-(billing stops) and starts again with the last 20 turns when the patient speaks. A talking stretch pauses at the next
+(billing stops) and starts again with the last 20 turns when the patient speaks. The patient's first words (the last
+2 s kept while paused, and what they said while GPT-Live started) go to GPT-Live at up to twice real time
+(`PRE_ROLL_SEND_SPEED`), because GPT-Live drops a faster burst. A talking stretch pauses at the next
 gap in the talk after 10 minutes, and at 11 minutes whatever is happening. Reachy rests after 10 minutes with no voice
 and nobody seen, and ends the chat for a medicine that falls due. This settles the old question about the live chat's
 45 s silence ending: only robots older than 0.9.0 keep it. Every timing is one constant (for example

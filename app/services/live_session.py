@@ -46,7 +46,8 @@ nothing to OpenAI. The robot's {"type": "speech"} (its voice detector heard the 
 camera first: only when seen(u_id) says the robot's camera verified the patient within SEEN_RECENT_SECONDS (else the
 robot gets {"type": "not_seen"}). A stretch is a new GPT-Live session, started within CONNECT_TIMEOUT with the live
 instructions plus companion_note (Reachy already greeted; the last HISTORY_TURNS stored turns quoted as transcript
-data); the pre-roll goes first, then the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
+data); the pre-roll goes first (at up to PRE_ROLL_SEND_SPEED times real time: GPT-Live drops a faster burst), then
+the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
 transcript of it, or the robot's speech signals) once GPT-Live's sound has ended, or, once the stretch is
 STRETCH_MAX_SECONDS old, the patient's next turn gap (STRETCH_HARD_MAX_SECONDS at the latest, a reply cut with a
 flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient's words screened and grouped,
@@ -110,6 +111,10 @@ PAUSE_DRAIN_SECONDS = 2.0      # a paused stretch's queued events: the longest w
                                # already waited up to 2 s for them, so its closed event is queued last)
 SEEN_RECENT_SECONDS = 15.0     # GPT-Live (re)starts only for a patient the robot's camera verified this recently
 PRE_ROLL_SECONDS = 2.0         # the microphone audio kept while paused; a new stretch hears it first
+# ... and goes to GPT-Live, with what came while the stretch started, at up to this many times real time: GPT-Live
+# drops or refuses input audio sent much faster (measured 12 Oct 2026 on gpt-live-1: a burst lost the start of the
+# sentence, 2x kept every word)
+PRE_ROLL_SEND_SPEED = 2.0
 HISTORY_TURNS = 20             # the stored turns a new stretch gets, quoted as transcript data
 COMPANION_VERSION = (0, 9, 0)  # robot app from which a live start is a companion session; older ones get today's chat
 # The reasons the robot's `end` may give (patient_left: the companion's rest; medicine: a dose fell due); anything else
@@ -362,19 +367,21 @@ class LiveRelay:
     robot: an adapter with async receive() -> dict | bytes | None, send_json(dict), send_bytes(bytes) and
     close(code=1000) (WebSocketRobot; tests pass a fake). device: get_device_ws's dict. client_factory builds the
     GPT-Live client (live_client.LiveClient's signature); clock is the monotonic clock the relay reads; seen(u_id) ->
-    bool is companion mode's camera-first check (patient_seen_recently).
+    bool is companion mode's camera-first check (patient_seen_recently); sleep(seconds) is how the relay waits while
+    it paces a stretch's kept audio (_start_stretch).
     After a successful start: client is the running GPT-Live session (companion mode: the latest stretch's, None
     before the first), conversation_id the conversation row, opening and opening_turn_id Reachy's opening line and
     its stored turn, companion whether this is a companion session."""
 
     def __init__(self, robot, device: dict, *, client_factory=LiveClient, clock=time.monotonic,
-                 seen=patient_seen_recently):
+                 seen=patient_seen_recently, sleep=asyncio.sleep):
         self.robot = robot
         self.device = device
         self.u_id = device["u_id"]
         self.client_factory = client_factory
         self.clock = clock
         self.seen = seen
+        self.sleep = sleep
         self.companion = False                  # set by _open (companion_robot)
         self.language = "zh-TW"
         self.client = None
@@ -906,9 +913,13 @@ class LiveRelay:
         companion_note with the last HISTORY_TURNS stored turns. It must start within CONNECT_TIMEOUT, else the chat
         goes on as today's text chat (fallback live_unavailable with the conversation id; a failed read of the turns:
         error), and when the patient's words that started it were kept (the pre-roll), the robot first asks for them
-        again (_ask_again). Then the kept microphone audio goes first and the live microphone after it (_microphone);
-        GPT-Live's first sound answers the patient, so it is held (B2). The usage of the stretch before is added up
-        here. A session that started once the outcome was decided is left to the wrap-up, which closes it."""
+        again (_ask_again). Then the kept microphone audio goes first, at up to PRE_ROLL_SEND_SPEED times real time
+        (GPT-Live drops a faster burst): a chunk of n bytes is n / 2 / RATE seconds of audio, and the next one waits
+        that long divided by PRE_ROLL_SEND_SPEED after it. The phase stays starting meanwhile, so the microphone frames
+        that come in the meantime join that backlog in order (_keep), and the live microphone goes straight to
+        GPT-Live only once the backlog is empty (_microphone). GPT-Live's first sound answers the patient, so it is
+        held (B2). The usage of the stretch before is added up here. A session that started once the outcome was
+        decided is left to the wrap-up, which closes it."""
         target, name, block = self._live_args
         began = self.clock()
         try:
@@ -943,7 +954,11 @@ class LiveRelay:
             while self._pre_roll and self.outcome is None and not self._cut_off:
                 pcm = self._pre_roll.popleft()
                 self._pre_roll_bytes -= len(pcm)
+                sent_at = self.clock()
                 await client.send_audio(pcm)
+                due = sent_at + len(pcm) / 2 / RATE / PRE_ROLL_SEND_SPEED   # PCM16: 2 bytes a sample
+                while self.clock() < due:   # a timer that fires early (a coarse clock) never sends the next one sooner
+                    await self.sleep(due - self.clock())
         except LiveError:
             pass   # GPT-Live closed the session: its closed event (_downlink) decides what happens
         self._pre_roll.clear()
