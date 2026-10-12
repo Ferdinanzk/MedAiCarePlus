@@ -116,9 +116,11 @@ class MonitorStream:
         self._frames_in_flight = 0
         self.fps = fps
         self.interval = 1.0 / fps
+        self._max_fps: float | None = None   # set_max_fps's cap, None without one
         self.vision_interval = vision_interval
         self.session: dict | None = None
         self.latest: dict | None = None
+        self.latest_at: float | None = None   # when `latest` came from the server (clock); None for attach's answer
         self.frame_seq = 0
         self._latest_seq = 0
         self._error: Exception | None = None
@@ -144,6 +146,7 @@ class MonitorStream:
     def attach(self, monitor: dict) -> None:
         self.session = {"session_id": monitor["session_id"], "generation": monitor["generation"]}
         self.latest = dict(monitor)
+        self.latest_at = None
         self.frame_seq = 0
         self._latest_seq = 0
         self._error = None
@@ -157,6 +160,7 @@ class MonitorStream:
     def detach(self) -> None:
         self.session = None
         self.latest = None
+        self.latest_at = None
         self.camera.detach()
 
     def take_error(self) -> Exception | None:
@@ -166,7 +170,8 @@ class MonitorStream:
     def set_max_fps(self, fps: float | None) -> None:
         """At most `fps` frames a second from the next frame on (a companion session's COMPANION_CAPTURE_FPS: its
         camera only tells who is there, at less CPU for the robot and the server), or None: back to the rate this
-        stream was made with."""
+        stream was made with. Below SERVER_FPS_MIN the slow-camera warning is off: slow on purpose."""
+        self._max_fps = fps
         self.interval = 1.0 / (self.fps if fps is None else min(self.fps, fps))
 
     # ── rates for the heartbeat ──────────────────────────────────────────
@@ -317,12 +322,15 @@ class MonitorStream:
             self._streaming_since = None
 
     def _note_camera_frame(self, captured: float) -> None:
-        """Count camera frames, and say once in the log when the camera alone keeps the server from recording."""
+        """Count camera frames, and say once in the log when the camera alone keeps the server from recording; not
+        while this stream's own cap (set_max_fps, a companion session) reads the camera that slowly on purpose."""
         self._camera_times.append(captured)
         fps = self.camera_fps()   # also forgets frames older than the window
         if self._streaming_since is None:
             self._streaming_since = captured
-        if not self._slow_camera_logged and captured - self._streaming_since >= FPS_WINDOW and fps < SERVER_FPS_MIN:
+        capped = self._max_fps is not None and self._max_fps < SERVER_FPS_MIN
+        if (not self._slow_camera_logged and not capped and captured - self._streaming_since >= FPS_WINDOW
+                and fps < SERVER_FPS_MIN):
             self._slow_camera_logged = True
             # Reachy Mini daemon 1.11 caps the camera feed it shares with apps at 10 fps (IPC_FPS in
             # reachy_mini/media/media_server.py); tools/deploy_to_robot.py --camera-ipc-fps 15 lifts it.
@@ -399,6 +407,7 @@ class MonitorStream:
             return
         self._latest_seq = seq
         self.latest = response
+        self.latest_at = self.clock()
 
     def _fail(self, session, exc: Exception) -> None:
         if self.session is session:

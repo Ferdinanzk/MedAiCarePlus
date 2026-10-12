@@ -86,9 +86,9 @@ def test_silence_alone_never_ends_the_conversation():
     patient is in view (0.9.0: the 5-minute CHECKIN_MAX is gone)."""
     h = after_one_dose()
     h.tick()
-    h.see(identity_status="verified")
-    for _ in range(6):
-        h.tick(REST_AFTER_SECONDS - 1)                    # an hour
+    for _ in range(6):                                    # an hour, in view: the camera's answers keep coming
+        h.see(identity_status="verified")
+        h.tick(REST_AFTER_SECONDS - 1)
     assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
 
 
@@ -112,13 +112,27 @@ def test_reachy_rests_after_ten_minutes_with_no_voice_and_nobody_seen():
 def test_the_patient_in_view_keeps_reachy_awake():
     h = after_one_dose()
     h.tick()
-    h.see(identity_status="verified")
-    h.tick(REST_AFTER_SECONDS + 1)
+    for _ in range(3):                                    # in view for 15 minutes: the camera's answers keep coming
+        h.see(identity_status="verified")
+        h.tick(REST_AFTER_SECONDS / 2)
+    assert h.slot.state == "CHECKIN"
     h.see(identity_status="searching")                    # then they step away
-    h.tick(REST_AFTER_SECONDS - 1)
+    h.tick(REST_AFTER_SECONDS / 2 - 1)
     assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")   # counted from the last sighting
     h.tick(2)
     assert ("conversation_end", "c1", "patient_left") in h.app.calls
+
+
+def test_a_stale_sighting_never_keeps_reachy_awake():
+    """The camera stops after one verified answer (MonitorStream keeps that answer): it counts as a sighting when it
+    came, not on every tick after."""
+    h = after_one_dose()
+    h.tick()
+    h.see(identity_status="verified")                     # the last answer before the camera stopped
+    h.tick(REST_AFTER_SECONDS - 1)
+    assert h.slot.state == "CHECKIN"
+    h.tick(2)
+    assert h.speaker.said[-1] == REST_LINE["zh-TW"] and ("conversation_end", "c1", "patient_left") in h.app.calls
 
 
 def test_the_patients_voice_keeps_reachy_awake():
@@ -149,6 +163,21 @@ def test_a_due_medicine_ends_the_chat_with_reachys_line():
     h.run_until(lambda: h.slot.done)
     assert "wind_down" not in h.clips.played and h.slot.result == "completed"
     assert h.app.named("task_status")[-1][2] == {"outcomes": {"1": "recorded", "checkin": "medicine"}}
+
+
+def test_words_the_patient_just_said_go_to_the_server_before_the_medicine_line():
+    h = after_one_dose()
+    h.tick()
+    h.voice.pauses()                                      # the patient said something; Whisper is decoding it
+    h.slot.medicine_due()                                 # a heartbeat's task_due lands meanwhile
+    h.tick(0.2)
+    assert not h.app.named("conversation_end") and MEDICINE_LINE["zh-TW"] not in h.speaker.said   # it waits
+    h.voice.speak("我剛剛頭有點暈")                         # the words are decoded
+    h.tick(1)
+    assert h.app.named("conversation_turn")[-1][1:3] == ("c1", "我剛剛頭有點暈") and h.speaker.said[-1] == "真好"
+    assert not h.app.named("conversation_end")
+    h.tick(0.2)                                           # nothing more held: now the medicine
+    assert h.speaker.said[-1] == MEDICINE_LINE["zh-TW"] and ("conversation_end", "c1", "medicine") in h.app.calls
 
 
 def test_a_medicine_due_while_reachy_answers_waits_for_the_answer():
@@ -265,6 +294,16 @@ def test_conversation_only_task_greets_finds_the_patient_and_chats():
     h.run_until(lambda: h.slot.done)
     assert h.slot.result == "completed" and ("monitor_end", "s1") in h.app.calls
     assert h.app.named("task_status")[-1][2] == {"outcomes": {"checkin": "patient_left"}}
+
+
+def test_a_withdrawn_microphone_ends_todays_companion_chat():
+    h = after_one_dose()
+    h.tick()
+    assert h.voice.active and h.voice.mode == "chat"
+    h.slot.task["microphone"] = False                     # the heartbeat's "microphone": false
+    h.tick(0.2)
+    assert ("conversation_end", "c1", "stopped") in h.app.calls and h.voice.active is False
+    assert h.slot.outcomes["checkin"] == "microphone_withdrawn"
 
 
 def test_stopping_mid_conversation_closes_it():
