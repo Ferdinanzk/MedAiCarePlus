@@ -136,7 +136,7 @@ and the server's CPU. The robot tracks when the server last reported the patient
 During a live companion session, `LiveChat` runs its own silero voice detector (the model the listener already uses,
 `silero_vad.onnx`) on the microphone frames it already reads. It sends `{"type": "speech"}` when speech begins outside
 Reachy's own playback and its `MUTE_TAIL_SECONDS` tail (the robot's echo canceller also helps), at most once per
-`SPEECH_SIGNAL_GAP_SECONDS` (1 s). In today's text chat the listener (`voice.py`) already hears the patient.
+`SPEECH_SIGNAL_GAP_SECONDS` (1 s). (Amended after the review: a signal is also held back while Reachy says its own line and for `SAY_TAIL_SECONDS` after it, and within `SPEECH_ECHO_GUARD_SECONDS` (0.75 s, measured from the push) of the last block with sound pushed to the speaker. `MUTE_TAIL_SECONDS` is no longer used as a gate here.) In today's text chat the listener (`voice.py`) already hears the patient.
 
 ### 4.4 Rest
 
@@ -175,6 +175,7 @@ medicine line, ends the session as `medicine` (live: `end`; text chat: `/end`), 
 | `REST_AFTER_SECONDS` | 600 | robot session.py |
 | `COMPANION_CAPTURE_FPS` | 2 | robot session.py / runner.py |
 | `SPEECH_SIGNAL_GAP_SECONDS` | 1 | robot live.py |
+| `SPEECH_ECHO_GUARD_SECONDS` | 0.75 (added after the review) | robot live.py |
 
 ## 7. Testing
 
