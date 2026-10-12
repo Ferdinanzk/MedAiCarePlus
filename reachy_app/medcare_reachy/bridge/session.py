@@ -23,12 +23,18 @@ When the task says `live` (spec 2026-10-12 F2), the check-in is a live chat inst
 the robot streams its microphone to the server's GPT-Live relay and plays the voice that comes back.
 The speech listener is suspended meanwhile (the microphone has one reader), and when the server
 falls back, today's chat goes on.
+
+From 0.9.0 a check-in is a companion session, whichever chat runs (spec 2026-10-12 companion, section 4): the
+camera stays on (the observe session, at COMPANION_CAPTURE_FPS), there is no time limit, and it ends on a goodbye, a
+risk, a stop, a medicine task falling due (medicine_due: MEDICINE_LINE) or the rest rule (no patient voice and nobody
+seen for REST_AFTER_SECONDS: REST_LINE).
 """
 
 import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from medcare_reachy.bridge.app_client import (
     AppUnreachable, BridgeError, BusyOtherClient, DoseRefused, NotAuthorised, RequestRejected, ServiceUnavailable,
@@ -44,13 +50,19 @@ DONE_GRACE = 8.0                # after "I finished": time for the camera to res
 AWAY_TIMEOUT = 90.0             # patient out of sight this long while watched -> leave the dose pending
 CHECKIN_SILENCE: float | None = None   # check-in: off (0.7.1): a companion stays while the patient is quiet;
                                        # seconds here end the chat that long after Reachy last spoke, unanswered
-CHECKIN_MAX = 300.0             # check-in: at most 5 minutes, then it ends as "finished"
+REST_AFTER_SECONDS = 600.0      # companion: no patient voice and nobody seen this long -> REST_LINE, then sleep
+COMPANION_CAPTURE_FPS = 2.0     # companion: the camera stays on at this rate (it only tells who is there)
+CAMERA_RETRY_SECONDS = 5.0      # companion: a camera session that did not open is tried again this often
+COMPANION_STOP_SECONDS = 45.0   # live companion: time for Reachy's closing line and the chat's end (its drain: 30 s)
+COMPANION_ENDINGS = ("patient_left", "medicine")   # Reachy said why it stops: it sleeps at once, no wind_down clip
 LIVE_POLL_SECONDS = 0.2         # live check-in: how often the session looks for a reason to stop it at once
 LIVE_STOP_SECONDS = 5.0         # live check-in: how long a stopped live chat may take to close
-LIVE_CHECKIN_MAX = 660.0        # live check-in: the robot's backstop (the server ends it after 600 s)
 LIVE_AUDIO = ("start_live_audio", "push_audio", "clear_live_audio", "stop_live_audio")   # media.py's live calls
-# Spoken (not prerecorded) greeting for a conversation-only task, already in the voice's Simplified characters.
+SPEECH_MODEL = "silero_vad.onnx"   # the listener's voice detector (voice.py STT_FILES); live.SpeechStart uses it too
+# Spoken (not prerecorded) lines, already in the voice's Simplified characters (喔 written 哦, as in the clips).
 CHECKIN_GREETING = {"zh-TW": "您好！我来找您聊聊天。", "en": "Hello! I came to have a chat with you."}
+REST_LINE = {"zh-TW": "我先休息一下，有需要再叫我哦。", "en": "I'll rest for now. Call me when you need me."}
+MEDICINE_LINE = {"zh-TW": "该吃药啰，我们等一下再聊。", "en": "It's time for your medicine. Let's talk again later."}
 ACK_CLIP = "ack"                # check-in: the prerecorded 「嗯」 said the moment the patient pauses
 POST_SLOT_SECONDS = 120.0
 WRONG_PERSON_SECONDS = 20.0
@@ -94,18 +106,33 @@ def _parse_time(value) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def open_live_chat(app, robot, speaker):
+def speech_models_dir(voice) -> Path | None:
+    """The speech listener's models folder (voice.DoneListener.models_dir) when its voice detector, SPEECH_MODEL, is
+    there, else None. A live companion chat hears the patient begin to speak with it (live.SpeechStart)."""
+    models_dir = getattr(voice, "models_dir", None)
+    if models_dir is None or not (Path(models_dir) / SPEECH_MODEL).is_file():
+        return None
+    return Path(models_dir)
+
+
+def open_live_chat(app, robot, speaker, models_dir: Path | None):
     """A LiveChat (bridge/live.py) when this robot app can hold one, else None (today's chat runs instead): the robot
-    has the live audio calls (media.py's ReachyRobot; not the video-file robot) and the live module loads (it needs
-    `websockets`, which the robot's apps_venv has)."""
-    if not all(callable(getattr(robot, name, None)) for name in LIVE_AUDIO):
+    has the live audio calls (media.py's ReachyRobot; not the video-file robot), the live module loads (it needs
+    `websockets`, which the robot's apps_venv has), and the voice detector loads from `models_dir`
+    (speech_models_dir): the server starts GPT-Live only when the robot tells it the patient began to speak."""
+    if models_dir is None or not all(callable(getattr(robot, name, None)) for name in LIVE_AUDIO):
         return None
     try:
-        from medcare_reachy.bridge.live import LiveChat
+        from medcare_reachy.bridge.live import LiveChat, SpeechStart
     except ImportError as exc:
         log.warning("live voice is off in this robot app: %s", exc)
         return None
-    return LiveChat(app, robot, speaker)
+    try:
+        speech_start = SpeechStart(Path(models_dir))
+    except Exception:
+        log.exception("live voice is off: the voice detector did not load from %s", models_dir)
+        return None
+    return LiveChat(app, robot, speaker, speech_start=speech_start)
 
 
 class SlotSession:
@@ -118,7 +145,7 @@ class SlotSession:
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
         self.speaker, self.language = speaker, language
         self.ack, self.gestures = ack, gestures
-        self.live_chat = live_chat               # (app, robot, speaker) -> a LiveChat, or None (open_live_chat)
+        self.live_chat = live_chat   # (app, robot, speaker, models_dir) -> a LiveChat, or None (open_live_chat)
         self.chat_id: str | None = None
         self.last_spoke = 0.0
         self.acked: float | None = None          # the patient's pause Reachy last said 「嗯」 to
@@ -153,6 +180,10 @@ class SlotSession:
         self.away_since: float | None = None
         self.seen_at: float | None = None         # when the patient was last seen verified, in any session
         self.explained: set[int] = set()          # doses whose refusal Reachy has already (tried to) explain
+        self.companion_since: float | None = None   # when the companion session (CHECKIN) began
+        self.heard_at: float | None = None          # when the patient's voice was last heard in it
+        self.medicine_wanted = False                # medicine_due(): it ends for a medicine task
+        self.camera_retry_at = 0.0                  # when its camera may be tried again (_watch)
         self.handlers = {
             WAKE: self._wake, ANNOUNCE: self._announce, SEARCHING: self._searching,
             MED_PROMPT: self._med_prompt, WATCHING: self._watching, POST_SLOT_OBSERVE: self._post_slot,
@@ -165,6 +196,15 @@ class SlotSession:
         """Finish at the next tick. `abort=False` (process shutdown) leaves the task leased for recovery."""
         if not self.stop_reason:
             self.stop_reason, self.stop_abort = reason, abort
+
+    def medicine_due(self) -> None:
+        """A heartbeat says a medicine task is due (spec 2026-10-12 companion 4.5). A companion session (CHECKIN) ends
+        for it: once Reachy's current line is over it says MEDICINE_LINE and ends as "medicine", and the runner then
+        leases the medicine task. In any other state nothing changes (a dose task finishes first; every heartbeat
+        says it again)."""
+        if self.state == CHECKIN and not self.done and not self.medicine_wanted:
+            log.info("slot %s: a medicine task is due; the companion session ends for it", self.task_id)
+            self.medicine_wanted = True
 
     async def tick(self) -> None:
         if self.done:
@@ -428,25 +468,37 @@ class SlotSession:
             log.exception("slot %s: could not say why dose %s was refused", self.task_id, intk_id)
 
     async def _checkin(self):
-        """A short conversation: the patient's words become text on the robot; the server answers.
+        """The companion session (spec 2026-10-12 companion 4.1), one controller for both chats. On entering it the
+        camera stays on (`_watch`: the observe session, at COMPANION_CAPTURE_FPS), then the live chat runs
+        (`_live_checkin`; Reachy says the server's opening line in its own voice) or today's chat: the patient's
+        words become text on the robot; the server answers.
 
         Each turn carries how long hearing it took, and each of Reachy's lines is followed by how long it took to
         arrive and to speak (milliseconds, for the patient's conversation history).
 
-        With `live` in the task it is a live chat instead (`_live_checkin`); today's chat runs when that falls back.
+        There is no time limit. Today's chat ends on a goodbye or a risk (the server's answer says so), a stop, a
+        medicine task falling due (medicine_due: Reachy says MEDICINE_LINE, reason "medicine") or the rest rule
+        (`_resting`: REST_LINE, reason "patient_left").
         """
         if not self.entered:
             self.entered = True
-            await self._end_session()   # the camera isn't needed to chat
+            self.companion_since = self.clock.monotonic()
+            self.stream.set_max_fps(COMPANION_CAPTURE_FPS)
+            await self._watch()
             if not (self._may_go_live() and await self._live_checkin()):
                 await self._open_chat()
             return
         if self.chat_id is None:
             self._after_checkin()
             return
+        await self._watch()   # a camera session the server lost is opened again
+        if self.medicine_wanted:
+            await self._end_companion("medicine", MEDICINE_LINE)
+            return
         heard = None
         if self.voice is not None:
             await self._answer_pause()
+            self._note_heard()
             heard = self.voice.take_utterance_with_metrics()
         if heard:
             text, metrics = heard
@@ -466,13 +518,13 @@ class SlotSession:
         now = self.clock.monotonic()
         if CHECKIN_SILENCE is not None and now - self.last_spoke >= CHECKIN_SILENCE:
             await self._close_chat("silence")
-        elif now - self.since >= CHECKIN_MAX:
-            await self._close_chat("finished")
+        elif self._resting(now):
+            await self._end_companion("patient_left", REST_LINE)
 
     async def _open_chat(self) -> None:
         """Today's chat: POST /conversations, then Reachy's opening line."""
         try:
-            opened = await self.app.conversation_start(self.task_id, self.language)
+            opened = await self.app.conversation_start(self.task_id, self.language, companion=True)
         except (NotAuthorised, RequestRejected, SessionLost) as exc:
             log.warning("slot %s: check-in unavailable (%s)", self.task_id, exc)
             self.outcomes["checkin"] = "unavailable"
@@ -491,13 +543,15 @@ class SlotSession:
         One microphone reader: the speech listener is suspended for the whole chat and resumed after it, also when the
         chat fails or is stopped. The server stores the conversation and ends it. On its `fallback`, today's chat goes
         on: in the same conversation when the server already made one (Reachy says nothing new, it simply listens),
-        else in a new one; the silence and length limits then count from the fallback. A stop() wins over all of it.
+        else in a new one; the silence limit (CHECKIN_SILENCE) then counts from the fallback. A stop() wins over all
+        of it.
 
-        outcomes["live"] says how the live chat went: "ended" (the server ended it; outcomes["checkin"] has its
-        reason), the fallback's reason, the robot's own reason to cut it short ("stopped", "microphone_withdrawn",
-        "too_long"), or "unsupported".
+        outcomes["live"] says how the live chat went: "ended" (it ended; outcomes["checkin"] has its reason), the
+        fallback's reason, the robot's own reason to cut it short ("stopped", "microphone_withdrawn", or the
+        companion's "patient_left" / "medicine" when the chat did not end after Reachy's closing line), or
+        "unsupported".
         """
-        chat = self.live_chat(self.app, self.robot, self.speaker)
+        chat = self.live_chat(self.app, self.robot, self.speaker, speech_models_dir(self.voice))
         if chat is None:
             self.outcomes["live"] = "unsupported"
             return False
@@ -532,10 +586,15 @@ class SlotSession:
     async def _run_live(self, chat) -> tuple[str, str, str | None]:
         """Run the live chat to its end: (kind, reason, conversation_id), kind "ended" or "fallback" as its LiveOutcome
         says. Every LIVE_POLL_SECONDS the session looks for a reason to stop it at once: stop() (the heartbeat's
-        stop_all, the app shutting down), the patient's microphone consent withdrawn (heartbeat), or the chat lasting
-        LIVE_CHECKIN_MAX. It is then cancelled: ("cut", that reason). A chat that fails: ("fallback", "error")."""
-        started = self.clock.monotonic()
+        stop_all, the app shutting down) or the patient's microphone consent withdrawn (heartbeat). It is then
+        cancelled: ("cut", that reason). A chat that fails: ("fallback", "error").
+
+        Meanwhile the companion session goes on around it (spec 2026-10-12 companion 4.2-4.5): its camera
+        (`_keep_watching`), the patient's voice (LiveChat.last_speech_at) and the medicine and rest rules
+        (`_companion_ending`). Those ask the chat to end with Reachy's line (LiveChat.stop with `say`); a chat that has
+        not ended COMPANION_STOP_SECONDS later is cancelled: ("cut", that reason)."""
         run = asyncio.ensure_future(chat.run(self.task_id, self.language))
+        ending, asked = None, 0.0
         try:
             while True:
                 done, _ = await asyncio.wait({run}, timeout=LIVE_POLL_SECONDS)
@@ -546,10 +605,21 @@ class SlotSession:
                 if not self.task.get("microphone"):
                     log.warning("slot %s: microphone consent withdrawn; the live chat stops", self.task_id)
                     return "cut", "microphone_withdrawn", None
-                if self.clock.monotonic() - started >= LIVE_CHECKIN_MAX:
-                    log.error("slot %s: the live chat outlasted %.0f s; the robot stops it", self.task_id,
-                              LIVE_CHECKIN_MAX)
-                    return "cut", "too_long", None
+                now = self.clock.monotonic()
+                if ending is not None:
+                    if now - asked >= COMPANION_STOP_SECONDS:
+                        log.error("slot %s: the live chat did not end within %.0f s of Reachy's closing line; the "
+                                  "robot stops it", self.task_id, COMPANION_STOP_SECONDS)
+                        return "cut", ending, None
+                    continue
+                await self._keep_watching()
+                if chat.last_speech_at is not None and (self.heard_at is None or chat.last_speech_at > self.heard_at):
+                    self.heard_at = chat.last_speech_at
+                ending = self._companion_ending(now)
+                if ending is not None:
+                    asked = now
+                    log.info("slot %s: the companion session ends (%s)", self.task_id, ending)
+                    chat.stop(ending, say=self._line(MEDICINE_LINE if ending == "medicine" else REST_LINE))
         finally:
             if not run.done():
                 run.cancel()
@@ -562,6 +632,67 @@ class SlotSession:
             log.exception("slot %s: the live chat failed", self.task_id)
             return "fallback", "error", None
         return outcome.kind, outcome.reason, outcome.conversation_id
+
+    # ── the companion session around either chat ─────────────────────────
+    async def _watch(self) -> None:
+        """The companion's camera (spec 2026-10-12 companion 4.2): the observe session stays attached for the whole
+        session (a check-in task's search session goes on; after a dose, a new one starts). One the server lost is
+        opened again at once; one that did not open is tried again every CAMERA_RETRY_SECONDS. A camera that won't
+        open never ends the chat."""
+        if self.monitor is not None and self.monitor_key == ("observe", None):
+            return
+        now = self.clock.monotonic()
+        if now < self.camera_retry_at:
+            return
+        try:
+            await self._ensure_session("observe")
+        except BridgeError as exc:
+            self.camera_retry_at = now + CAMERA_RETRY_SECONDS
+            log.warning("slot %s: the companion's camera did not open (%s); Reachy chats on", self.task_id, exc)
+
+    async def _keep_watching(self) -> None:
+        """While the live chat holds this session's tick: the frame stream's errors (tick() takes them otherwise; a
+        lost session is opened again by `_watch`), and the latest answer, which updates seen_at (hand-to-mouth events
+        are only marked as seen: `_forward_extra_events`)."""
+        error = self.stream.take_error()
+        if isinstance(error, SessionLost):
+            log.warning("slot %s: the companion's camera session was lost (%s)", self.task_id, error.detail)
+            self._drop_session()
+        elif error is not None:
+            log.warning("slot %s: a companion camera frame failed (%s)", self.task_id, error)
+        await self._watch()
+        await self._forward_extra_events()
+
+    def _note_heard(self) -> None:
+        """Today's chat: the patient's voice for the rest rule, while the listener hears them speak or holds words
+        they said that are not handed over yet."""
+        if self.voice.hears_speech() or self.voice.heard_pause() is not None:
+            self.heard_at = self.clock.monotonic()
+
+    def _resting(self, now: float) -> bool:
+        """The rest rule (spec 2026-10-12 companion 4.4): neither the patient's voice nor a verified sighting for
+        REST_AFTER_SECONDS, counted from the latest of the companion session's start, the patient's last speech and
+        the last sighting (seen_at)."""
+        marks = [mark for mark in (self.companion_since, self.heard_at, self.seen_at) if mark is not None]
+        return bool(marks) and now - max(marks) >= REST_AFTER_SECONDS
+
+    def _companion_ending(self, now: float) -> str | None:
+        """Why the robot ends the companion session now, if it does: a due medicine first, then the rest rule."""
+        if self.medicine_wanted:
+            return "medicine"
+        return "patient_left" if self._resting(now) else None
+
+    async def _end_companion(self, reason: str, lines: dict) -> None:
+        """Today's chat: Reachy says why the companion session ends (REST_LINE, MEDICINE_LINE), then the conversation
+        ends with `reason` and Reachy goes to sleep (spec 2026-10-12 companion 4.4, 4.5). The live chat does the same
+        through LiveChat.stop (`_run_live`)."""
+        log.info("slot %s: the companion session ends (%s)", self.task_id, reason)
+        self._gesture(None)
+        await self._say(self._line(lines))
+        await self._close_chat(reason)
+
+    def _line(self, lines: dict) -> str:
+        return lines.get(self.language, lines["zh-TW"])
 
     async def _answer_pause(self) -> None:
         """The moment the VAD hears the patient pause, while SenseVoice is still decoding their words, Reachy says
@@ -630,7 +761,9 @@ class SlotSession:
 
     def _after_checkin(self) -> None:
         self._gesture(None)
-        self._go(WIND_DOWN if self._is_checkin_task() else POST_SLOT_OBSERVE)
+        self.stream.set_max_fps(None)   # the camera's own rate again (POST_SLOT_OBSERVE looks for an extra dose)
+        rest = self._is_checkin_task() or self.outcomes.get("checkin") in COMPANION_ENDINGS
+        self._go(WIND_DOWN if rest else POST_SLOT_OBSERVE)
 
     async def _post_slot(self):
         await self._ensure_session("observe")
@@ -648,7 +781,8 @@ class SlotSession:
     async def _wind_down(self):
         if not self.entered:
             await self._end_session()
-            await self._play("wind_down")
+            if self.outcomes.get("checkin") not in COMPANION_ENDINGS:   # else Reachy has just said why it rests
+                await self._play("wind_down")
             self.entered = True
         await self._advance("completed", {"outcomes": self._outcome_detail()})
         await self._robot("sleep")
@@ -693,6 +827,7 @@ class SlotSession:
         self.done = True
         self.state = SLEEP
         self.gesture_mode = None   # robot.sleep() stops any gesture before it moves
+        self.stream.set_max_fps(None)   # a companion session cut short leaves no slow camera for the next task
         self._sync_voice()
 
     def _enter_waiting_other_client(self) -> None:
@@ -758,9 +893,12 @@ class SlotSession:
     def _may_go_live(self) -> bool:
         """A live chat needs the server's go-ahead (task["live"]: its test switch, the robot's live voice switch,
         check-in consent and a usable live model), the patient's microphone consent, and Reachy's own voice: the
-        server has Reachy say the help line itself, never GPT-Live."""
+        server has Reachy say the help line itself, never GPT-Live. The server starts GPT-Live only when the robot
+        hears the patient begin to speak while its camera recognises them (camera first), so it also needs the
+        listener's voice detector (speech_models_dir) and the companion's camera session: without either the patient
+        would talk to a Reachy that never answers, and today's chat runs instead."""
         return (bool(self.task.get("live")) and bool(self.task.get("microphone")) and self.speaker is not None
-                and self.speaker.available)
+                and self.speaker.available and speech_models_dir(self.voice) is not None and self.monitor is not None)
 
     async def _say(self, text: str | None, stats: dict | None = None, lively: bool = True) -> bool:
         """Speak a check-in line; `stats` receives the speaker's timings. In the conversation Reachy's antennas
@@ -881,6 +1019,11 @@ class SlotSession:
         for event in self._latest().get("extra_events") or []:
             event_id = event.get("event_id")
             if not event_id or event_id in self.sent_extra:
+                continue
+            if self.state == CHECKIN:
+                # The companion's camera only tells who is there: a hand at the mouth while chatting (a drink, a
+                # snack) is no news for family, and at COMPANION_CAPTURE_FPS the detector isn't calibrated.
+                self.sent_extra.add(event_id)
                 continue
             try:
                 await self.app.extra_event(self.task_id, event_id, event.get("decision"),

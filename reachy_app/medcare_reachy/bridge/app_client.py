@@ -200,9 +200,11 @@ class AppClient:
             files={"file": ("frame.jpg", jpeg, "image/jpeg")})
 
     # ── check-in conversation (text only: speech is turned into text on the robot) ──
-    async def conversation_start(self, task_id: str, language: str) -> dict:
-        return await self._request("POST", "/api/device/conversations",
-                                   json={"task_id": task_id, "language": language})
+    async def conversation_start(self, task_id: str, language: str, companion: bool = False) -> dict:
+        """`companion`: a companion session (robot app 0.9.0), which the server ends only on a goodbye or a risk,
+        never at its patient-turn limit. Sent only when true: an older server gets the same request as before."""
+        body = {"task_id": task_id, "language": language, **({"companion": True} if companion else {})}
+        return await self._request("POST", "/api/device/conversations", json=body)
 
     async def conversation_turn(self, conversation_id: str, text: str, metrics: dict | None = None) -> dict:
         """One thing the patient said, with how long hearing it took (`metrics`: milliseconds, no audio).

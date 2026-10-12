@@ -255,6 +255,10 @@ class FakeStream:
         self.errors = []
         self.history = []
         self.camera = FakeCamera()
+        self.max_fps = None     # set_max_fps(): the companion session's camera rate, None for the stream's own
+
+    def set_max_fps(self, fps):
+        self.max_fps = fps
 
     def attach(self, monitor):
         self.attached = monitor
@@ -282,6 +286,7 @@ class FakeApp:
         self.fail = {}
         self.unreachable_since = None
         self.sessions = []
+        self.companion_starts = []   # conversation_start's `companion`, per call
 
     def _maybe_fail(self, name):
         queue = self.fail.get(name)
@@ -324,8 +329,9 @@ class FakeApp:
         self.sessions.append(session)
         return dict(session)
 
-    async def conversation_start(self, task_id, language):
+    async def conversation_start(self, task_id, language, companion=False):
         self.calls.append(("conversation_start", task_id, language))
+        self.companion_starts.append(companion)
         self._maybe_fail("conversation_start")
         self.turn_ids = 1
         return {"conversation_id": "c1", "reply": "今天感覺怎麼樣？", "speech_text": "今天感觉怎么样？", "end": False,

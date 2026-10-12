@@ -173,11 +173,12 @@ def test_the_docs_quote_the_cards_words_as_the_web_app_says_them():
         assert words in web, f"frontend_source/src has no {words}"
 
 
-def test_robot_app_0_8_0_in_its_code_and_its_readme():
+def test_robot_app_0_9_0_in_its_code():
     pyproject = (REPO / "reachy_app" / "pyproject.toml").read_text(encoding="utf-8")
-    assert re.search(r'^version = "0\.8\.0"$', pyproject, re.M)
+    assert re.search(r'^version = "0\.9\.0"$', pyproject, re.M)
     init = (REPO / "reachy_app" / "medcare_reachy" / "bridge" / "__init__.py").read_text(encoding="utf-8")
-    assert '__version__ = "0.8.0"' in init
+    assert '__version__ = "0.9.0"' in init
+    # The README's 0.9.0 entry comes with the companion session's docs (the docs task replaces this test).
     assert "- **0.8.0**" in (REPO / "reachy_app" / "README.md").read_text(encoding="utf-8")
 
 
