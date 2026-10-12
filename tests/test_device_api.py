@@ -364,17 +364,18 @@ def test_heartbeat_says_whether_a_medicine_task_waits(env, monkeypatch):
 
 def test_a_companion_heartbeat_keeps_the_held_task_alive(env, monkeypatch):
     _no_leases(monkeypatch)
-    extended = []
 
-    async def extend_for_companion(conn, device_id):
-        extended.append((device_id, conn.depth))
+    def extensions():
+        return [entry for entry in env.conn.executed
+                if "SET expires_at = GREATEST(expires_at" in entry[0] and "status = 'in_progress'" in entry[0]]
 
-    monkeypatch.setattr(reachy_tasks, "extend_for_companion", extend_for_companion)
     assert env.robot.post("/api/device/heartbeat", json={"companion": False}).status_code == 200
     assert env.robot.post("/api/device/heartbeat", json={}).status_code == 200
-    assert extended == []
+    assert extensions() == []
     assert env.robot.post("/api/device/heartbeat", json={"companion": True}).status_code == 200
-    assert extended == [(DEVICE_ID, 1)]   # inside the write transaction, with the lease extension
+    found = extensions()
+    assert len(found) == 1
+    assert found[0][1] == (DEVICE_ID,) and found[0][2] == 1   # inside the write transaction, with the lease extension
 
 
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
