@@ -1,7 +1,8 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **12 October 2026**, GitHub branch **`reachy-integration-0.2`** (sections 6 and 7 are new in it;
-sections 1-5 describe `reachy-integration-0.1`, which 0.2 builds on). No passwords, keys or tokens are written here;
+Status as of **12 October 2026, evening**, GitHub branch **`reachy-integration-0.3`** (section 8 is new in it;
+sections 6 and 7 came with `reachy-integration-0.2`; sections 1-5 describe `reachy-integration-0.1`, which both build
+on). **Start with [section 8](#8-what-was-finished-on-12-october-2026-evening) for what to do next.** No passwords, keys or tokens are written here;
 [step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
 
 The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
@@ -361,6 +362,86 @@ passed, 6 skipped; web app 91 Playwright tests passed plus 1 known failure (BUG-
   writes; a late risk found while the chat is already falling back can end it without the spoken help line (family
   are still alerted); the check-ins help text on the Reachy card still says only text is sent, also while the live
   voice test switch is on.
+
+## 8. What was finished on 12 October 2026, evening
+
+`reachy-integration-0.3` is `reachy-integration-0.2` plus the companion session (robot app **0.9.0**), the fixes from
+its final review and from its live tests, and this section. It was built on the local branch `live-voice-2a`.
+
+**Finished and tested**
+
+1. **The companion session (robot app 0.9.0)**, as in section 6: Reachy stays with the patient until goodbye, in both
+   chat types. Built in 7 reviewed tasks. A final review of the whole work (4 reviewers, 2 more checking each finding)
+   found 14 problems, all fixed. The most important ones:
+   - a medicine or rest ending could drop the patient's last words before the safety check saw them;
+   - a medicine ending could cut the server's help line;
+   - after the camera stopped, its last answer kept Reachy awake for ever;
+   - the text chat ignored a withdrawn microphone switch;
+   - a dose left untaken was never brought up again during a long chat.
+2. **A live test on this PC with the real gpt-live-1 found one more problem, now fixed.** After each pause, GPT-Live
+   lost the patient's first 1-2 s, because the server sent the saved audio all at once and GPT-Live limits how fast
+   audio may arrive (`input_audio_rate_limit_exceeded`; no OpenAI document states the limit). The server now sends it
+   at up to twice real time (`PRE_ROLL_SEND_SPEED`; measured: every word kept). A security review then added a memory
+   cap (`KEPT_MAX_SECONDS`) and a rule against a robot that sends audio too fast (`CATCH_UP_MARGIN_SECONDS`). The
+   final PC test heard every word, and after the pause GPT-Live remembered what was said before
+   (「因為你說天氣有點冷，不太想出門散步。」).
+3. **Two robot tests with the user** (22:18 and 22:25, "Talk to Reachy now"). Both worked from start to end: Reachy
+   found the patient, greeted him by name in its own voice, GPT-Live started 1.2-2.1 s after he spoke, replies began
+   0.65-3 s after he finished, every patient turn went through the safety check (no risk), and 「拜拜」 / 「先這樣」 ended
+   the chat cleanly. GPT-Live cost about US$0.18 for both. **Not reached on the robot:** the pause and restart (it
+   needs 30 s of quiet; the longest gap was about 20 s), the rest ending and the medicine ending. The pause and restart
+   passed the PC test.
+
+**Tests at this commit:** backend 2068 passed plus 1 known failure (BUG-37); robot app 650 passed, 6 skipped, plus the
+known flaky tests (`test_speech` first sound, a `test_gestures` clip timing); web app type check and build pass.
+
+**Repeat the robot test on another computer** (section 6, "Turn it on for testing", in short): set
+`LIVE_VOICE_TEST=1` in `.env` and run `docker compose up -d --build app`; on the AI connections card save the live
+voice model (`gpt-live-1`, voice `marin`) on the OpenAI connection and press **Check**; on the Reachy card switch
+**Live voice (test)** on; install robot app 0.9.0 with `python tools/deploy_to_robot.py --host <robot-ip>` and start it
+(`curl -s -X POST http://<robot-ip>:8000/api/apps/start-app/medcare_reachy`); press **Talk to Reachy now**.
+
+**Where everything is**
+
+| What | Where |
+|---|---|
+| Code | GitHub `Ferdinanzk/MedAiCarePlus`, branch `reachy-integration-0.3` |
+| Robot app 0.9.0 | Hugging Face space `pearlyjam21/medcare_reachy`, branch `reachy-integration-0.3`. The space's `main` (what the robot's app store installs) is still 0.7.0. |
+| The robot | Runs 0.9.0 (deployed by SSH; the old app is backed up in `~/.medcare_reachy/backup-20261012-221715.tgz`) |
+| The server on this PC | This branch, with `LIVE_VOICE_TEST=1` in `.env` and the robot's live voice switch on |
+
+**Seen in the robot tests (not fixed yet)**
+
+- **GPT-Live makes up facts it cannot know.** Asked about the weather it said 「今晚是晴天」 and 「現在22度，晴天」; it has
+  no weather source.
+- **GPT-Live cannot see.** Asked 「你會看得到我的臉嗎」 and 「你知道我穿什麼衣服嗎」 it said it could not; it only hears.
+- One reply was stored split across two Reachy turns (text only: the patient's words, which the safety check reads,
+  are not affected). GPT-Live writes the patient's words in Simplified characters at times (the keyword check reads
+  both scripts), and its own transcript sometimes holds a broken character 「�」.
+- The robot's camera reaches the app at about 10 frames a second; recording a dose needs 12 (see step 4.7,
+  `--camera-ipc-fps 15`).
+- **Release gate (section 5 item 11):** before 0.9.0 reaches patients beyond the user's own test, a new robot notice
+  version must say that the camera stays on during a check-in and that the chat lasts until goodbye.
+
+**Next (asked by the user on 12 Oct)**
+
+1. **Face tracking.** Once Reachy finds the patient, it should keep its head turned to the patient's face (lock on)
+   for the whole session. The server's camera answers already give the face's box (see the `box_px` in the identity
+   log lines); during a companion session the robot sends 2 frames a second, so smooth following may need a face
+   detector on the robot itself. Head moves must not fight Reachy's speaking gestures.
+2. **Let GPT-Live see.** The patient asks what he is wearing or how he looks, and GPT-Live cannot answer because it
+   gets only sound. A way to build it: GPT-Live's "delegation" (below) with a tool such as `look()` that the server
+   answers from the latest camera frame. This sends a camera image (or a description of it) to OpenAI, which today's
+   notice does not allow ("analysed in memory, never saved"): it needs a new notice and consent first, and a design.
+3. **Tool calling for GPT-Live.** GPT-Live can hand questions that need facts or tools to a backend model, which can
+   use OpenAI's web search or call functions our server runs ("Responses delegation"; the TCU companion's
+   `companion/ai/openai_live.py` already does this). A weather tool (for example Taiwan's Central Weather
+   Administration open data) or web search would stop the made-up weather; a tool could also read the patient's
+   medicine schedule. Backend calls are billed on top of the $0.05 per minute. Until then, one line in GPT-Live's
+   instructions ("never claim to know the weather or news you cannot check") is the cheap fix.
+4. **Still to test on the robot:** the pause and restart (stay quiet 40 s, then ask about what was said), the rest
+   ending (step away for 10 minutes), a medicine falling due during a chat, and a fallback (cut the PC's internet
+   during a chat).
 
 ---
 
