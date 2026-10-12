@@ -590,7 +590,7 @@ def test_abandoned_conversations_are_closed_by_their_last_turn_and_summarised_in
     close, args = world.calls[0]
     assert "ended_at IS NULL" in close and "'abandoned'" in close and "after_chat_state = 'pending'" in close
     # Counted from the last turn (or the start), so a live conversation is never closed under the patient.
-    assert "GREATEST(c.started_at" in close and "MAX(t.created_at)" in close and args == (job.ABANDON_MINUTES,)
+    assert "GREATEST(c.started_at" in close and "MAX(t.created_at)" in close and args[0] == job.ABANDON_MINUTES
     assert world.summarised == [SPOKEN]
     assert (world.chat["summary"], world.chat["mood"], world.chat["after_chat_state"]) == ("散步", "happy", "done")
     assert world.alerts == [] and world.notes == []

@@ -489,11 +489,11 @@ class FakeDB:
 
     async def execute(self, query, *args):
         if "INSERT INTO conversation " in query:
-            cid, u_id, task_id, language, model, followup = args
+            cid, u_id, task_id, language, model, followup, companion = args
             self.conversations[cid] = {"conversation_id": cid, "u_id": u_id, "language": language,
                                        "ended_at": None, "risk_flag": False, "summary": None, "mood": None,
                                        "after_chat_state": "done", "after_chat_attempts": 0,
-                                       "followup_memory_id": followup}
+                                       "followup_memory_id": followup, "companion": companion}
         elif "SET ended_at = NOW()" in query:
             self.conversations[args[0]].update(ended_at="now", end_reason=args[1], after_chat_state="pending")
         elif "SET after_chat_state" in query:
@@ -1450,3 +1450,49 @@ def test_after_a_live_chat_falls_back_the_turn_limit_counts_from_the_fallback(ro
     last = _turn(robot, cid, "嗯").json()
     assert last["end"] is True and last["reply"] == conversation.CLOSING["zh-TW"]
     assert len(robot.prompts[0]) == 10   # the replies still read the live chat's turns
+
+
+# ── Companion sessions (spec 2026-10-12-companion-session-design.md 3.3, 3.5): robot app 0.9.0 ──
+
+def _start_companion(robot):
+    response = robot.client.post("/api/device/conversations",
+                                 json={"task_id": TASK_ID, "language": "zh-TW", "companion": True})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_the_companion_flag_is_stored_and_an_older_robot_gets_false(robot):
+    older = _start(robot)["conversation_id"]   # a robot app before 0.9.0 sends no companion field
+    companion = _start_companion(robot)["conversation_id"]
+    assert robot.db.conversations[older]["companion"] is False
+    assert robot.db.conversations[companion]["companion"] is True
+
+
+def test_a_companion_chat_has_no_turn_limit_and_ends_on_a_goodbye(robot):
+    cid = _start_companion(robot)["conversation_id"]
+    for _ in range(conversation.MAX_PATIENT_TURNS + 4):
+        body = _turn(robot, cid, "嗯").json()
+        assert body["end"] is False and body["reply"] == "真好，您走了多久呢？"
+    bye = _turn(robot, cid, "好，拜拜").json()
+    assert bye["end"] is True and bye["risk"] is False and bye["reply"] == conversation.CLOSING["zh-TW"]
+    assert len(robot.prompts) == conversation.MAX_PATIENT_TURNS + 4   # the goodbye got the fixed line
+    assert robot.alerts == []
+
+
+def test_a_companion_chat_still_ends_on_a_risk(robot):
+    cid = _start_companion(robot)["conversation_id"]
+    for _ in range(conversation.MAX_PATIENT_TURNS):
+        assert _turn(robot, cid, "嗯").json()["end"] is False
+    body = _turn(robot, cid, "我覺得活不下去了").json()
+    assert body["end"] is True and body["risk"] is True and body["reply"] == conversation.HELPLINE["zh-TW"]
+    assert len(robot.alerts) == 1 and robot.db.conversations[cid]["risk_flag"] is True
+
+
+@pytest.mark.parametrize("reason", ["medicine", "patient_left"])
+def test_end_accepts_the_companion_reasons(robot, reason):
+    cid = _start_companion(robot)["conversation_id"]
+    _turn(robot, cid, "我早上去散步了")
+    response = robot.client.post(f"/api/device/conversations/{cid}/end", json={"reason": reason})
+    assert response.status_code == 200 and response.json() == {"ended": True}
+    assert robot.db.conversations[cid]["end_reason"] == reason
+    assert _eventually(lambda: robot.db.conversations[cid]["summary"] == "談到散步，心情愉快。")

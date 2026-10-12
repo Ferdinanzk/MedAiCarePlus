@@ -103,6 +103,13 @@ class FakeDB:
         return not row["protection"] or (schedule.is_due(row["intake_time_stamp"], self.now, row["previous_time"])
                                          and (expiry is None or self.now < expiry))
 
+    def leasable(self, task, u_id):
+        """reachy_tasks._leasable_sql: patient u_id's queued task, not expired, whose open doses may all start now.
+        Only open doses hold a task back: a taken one past its halfway point does not."""
+        return (task["u_id"] == u_id and task["status"] == "queued" and task["expires_at"] > self.now
+                and all(self.startable(i) for i in task["intk_ids"]
+                        if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")))
+
     # asyncpg surface
     async def fetchval(self, query, *args):
         if "SELECT device_id FROM reachy_device" in query:
@@ -132,6 +139,11 @@ class FakeDB:
         if "FROM notification_outbox" in query and "kind = 'robot_offline'" in query:
             self.outbox_now = args[1] + timedelta(hours=6)
             return 1 if any(n["u_id"] == args[0] and n["at"] > args[1] for n in self.notices) else None
+        if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # task_due
+            assert reachy_tasks._leasable_sql() in query and len(args) == 1
+            return any(self.leasable(t, args[0]) and any(
+                i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed") for i in t["intk_ids"])
+                for t in self.tasks)
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):
@@ -141,13 +153,7 @@ class FakeDB:
             assert (f"AND i.intake_stats IN ('pending','missed') "
                     f"AND NOT ({dose_safety.startable_sql('i', 'NOW()')})") in query and len(args) == 2
 
-            def due(task):
-                # Only open doses hold a task back: a taken one past its halfway point does not.
-                return all(self.startable(i) for i in task["intk_ids"]
-                           if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed"))
-
-            queued = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["status"] == "queued"
-                             and t["expires_at"] > self.now and due(t)),
+            queued = sorted((t for t in self.tasks if self.leasable(t, args[0])),
                             key=lambda t: (t["slot_time"], t["created_at"]))
             if not queued:
                 return None
@@ -821,6 +827,29 @@ def test_with_protection_off_a_task_for_a_later_dose_is_leased_at_once(db):
     assert enqueue(db, reason="manual", slot=T0 + timedelta(hours=12), intk_ids=(104,),
                    expires=T0 + timedelta(hours=13))
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["doses"][0]["intk_id"] == 104
+
+
+# ── Medicine first: task_due for the heartbeat (companion spec 3.4) ─────────
+
+def test_task_due_when_a_medicine_task_waits_during_a_chat(db):
+    # The robot is chatting in a check-in task it leased; that task is not queued, so it never counts.
+    db.tasks.append({"task_id": "chat", "u_id": 7, "slot_time": T0 - timedelta(minutes=30), "intk_ids": [],
+                     "reason": "checkin", "attempt": 1, "status": "in_progress", "lease_owner": DEVICE,
+                     "lease_until": T0 + timedelta(seconds=60), "created_at": T0 - timedelta(minutes=30),
+                     "finished_at": None, "expires_at": T0 + timedelta(minutes=15), "detail": None})
+    assert run(reachy_tasks.task_due(db, 7)) is False
+    enqueue(db)                                         # the 08:00 doses, due now
+    assert run(reachy_tasks.task_due(db, 7)) is True
+    assert run(reachy_tasks.task_due(db, 8)) is False   # another patient's robot is told nothing of it
+
+
+def test_a_queued_checkin_or_a_task_with_nothing_left_to_take_is_no_medicine(db):
+    enqueue(db, reason="checkin", slot=T0 + timedelta(minutes=5), intk_ids=())   # 'Talk to Reachy now' again
+    db.tasks.append({"task_id": "done", "u_id": 7, "slot_time": T0, "intk_ids": [103], "reason": "manual",
+                     "attempt": 1, "status": "queued", "lease_owner": None, "lease_until": None, "created_at": T0,
+                     "finished_at": None, "expires_at": T0 + timedelta(hours=1), "detail": None})   # 103 is taken
+    assert run(reachy_tasks.task_due(db, 7)) is False
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == "done"   # leased after the chat, as today
 
 
 # ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────

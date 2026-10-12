@@ -292,10 +292,54 @@ def test_sweep_closes_abandoned_chats_and_reprocesses_pending(monkeypatch):
     monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
     monkeypatch.setattr(after_chat, "process", process)
     asyncio.run(after_chat_job.run_after_chat_sweep())
-    assert "end_reason = 'abandoned'" in sql[0][0] and sql[0][1] == (after_chat_job.ABANDON_MINUTES,)
+    assert "end_reason = 'abandoned'" in sql[0][0] and sql[0][1][0] == after_chat_job.ABANDON_MINUTES
     assert "after_chat_state = CASE" in sql[1][0]   # end_stale, before the chats it ends could be picked
     assert "make_interval(days => $3)" in sql[2][0] and sql[2][1][2] == after_chat.RETRY_DAYS
     assert processed == [(CID, 7)]
+
+
+def test_the_sweep_leaves_a_companion_chat_open_while_its_robot_holds_a_camera_session(monkeypatch):
+    """Companion spec 2 and 4.2 (robot app 0.9.0): a patient may stay in view and quiet for longer than
+    ABANDON_MINUTES (no turns; a live companion's GPT-Live is paused). The robot keeps its camera session open until
+    the session ends, so the sweep leaves that patient's companion conversation open; any other one closes as before."""
+    from app.jobs import after_chat_job
+    from app.services import monitor_service
+
+    registry = monitor_service.MonitorRegistry()
+    for sid, u_id, client_type, ended in (("s1", 7, "reachy", False), ("s2", 8, "browser", False),
+                                          ("s3", 9, "reachy", True)):
+        registry.sessions[sid] = monitor_service.MonitorSession(sid, "g1", u_id, None, "pearl", "Pearl",
+                                                                mode="observe", client_type=client_type)
+        registry.sessions[sid].ended = ended
+    monkeypatch.setattr(monitor_service, "registry", registry)
+    sql = []
+
+    class C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def transaction(self):
+            return self
+
+        async def execute(self, query, *args):
+            sql.append((query, args))
+
+        async def fetch(self, query, *args):
+            sql.append((query, args))
+            return []
+
+    class P:
+        def acquire(self):
+            return C()
+
+    monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
+    asyncio.run(after_chat_job.run_after_chat_sweep())
+    close, args = sql[0]
+    assert "end_reason = 'abandoned'" in close and "AND NOT (c.companion AND c.u_id = ANY($2::int[]))" in close
+    assert args == (after_chat_job.ABANDON_MINUTES, [7])   # an open robot session only: no browser, no ended one
 
 
 def test_retention_purges_transcripts_events_and_tombstones():

@@ -207,6 +207,7 @@ async def extra_event(task_id: str, payload: ExtraEventPayload, device: dict = D
 class ConversationStartPayload(BaseModel):
     task_id: str
     language: Literal["zh-TW", "en"] = "zh-TW"
+    companion: bool = False   # robot app 0.9.0's companion session: no turn limit (companion spec 3.3)
 
 
 MAX_METRIC_KEYS = 30
@@ -260,7 +261,9 @@ class TurnMetricsPayload(BaseModel):
 
 
 class ConversationEndPayload(BaseModel):
-    reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error"] = "finished"
+    # Robot app 0.9.0 (companion spec 3.5): patient_left after its rest rule, medicine when a medicine task fell due.
+    reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error",
+                    "medicine"] = "finished"
 
 
 def _ms_since(started: float) -> int:
@@ -278,7 +281,7 @@ async def _own_conversation(conn, device: dict, conversation_id: str):
     except ValueError as exc:
         raise HTTPException(404, "Conversation not found") from exc
     row = await conn.fetchrow(
-        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id, live FROM conversation "
+        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id, live, companion FROM conversation "
         "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
     if not row:
         raise HTTPException(404, "Conversation not found")
@@ -319,7 +322,8 @@ def _spoken(reply: str, language: str, end: bool, reply_turn_id: int, risk: bool
 
 @router.post("/conversations")
 async def conversation_start(payload: ConversationStartPayload, device: dict = Depends(get_device)):
-    """Open a check-in conversation for a task leased by this robot; returns the opening line."""
+    """Open a check-in conversation for a task leased by this robot; returns the opening line. A companion session
+    (robot app 0.9.0 sends companion: true) is stored as such: its chat has no turn limit (companion spec 3.3)."""
     await _checkin_consent(device)
     language = conversation.language_of(payload.language)
     conversation_id = str(uuid.uuid4())
@@ -331,10 +335,10 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
         followup = await memory.pick_followup(conn, device["u_id"], memory.local_today()) if memory_on else None
         opening = memory.opening_line(language, name)
         await conn.execute(
-            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
-            "VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid)",
+            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id, "
+            "companion) VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid, $7)",
             conversation_id, device["u_id"], str(task["task_id"]), language,
-            ai_settings.main_model_id("reply"), str(followup["memory_id"]) if followup else None)
+            ai_settings.main_model_id("reply"), str(followup["memory_id"]) if followup else None, payload.companion)
         turn_id = await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
     return _spoken(opening, language, end=False, reply_turn_id=turn_id, conversation_id=conversation_id)
 
@@ -378,7 +382,10 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
                                   metrics=None if payload.metrics is None else {"robot": payload.metrics})
         history = await _history(conn, cid)
         patient_turns = sum(1 for turn in history if turn["role"] == "patient") - _live_patient_turns(row)
-        closing = conversation.wants_to_end(text) or patient_turns >= conversation.MAX_PATIENT_TURNS
+        # A companion chat (robot app 0.9.0, companion spec 3.3) has no turn limit: a goodbye or a risk ends it, or
+        # the robot does (rest, medicine, a stop).
+        closing = conversation.wants_to_end(text) or (
+            not row["companion"] and patient_turns >= conversation.MAX_PATIENT_TURNS)
         block = ""
         # The memory block (facts only) goes to the reply alone, so it is built only when the model will write
         # one: never for a risk turn, a flagged conversation or a fixed closing line.
@@ -568,8 +575,10 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",
             device["device_id"], payload.robot_reachable, payload.landmark_fps, json.dumps(detail))
         await reachy_tasks.extend_leases(conn, device["device_id"])
+        # Medicine first (companion spec 3.4): a robot in a companion session ends it when a medicine task waits.
+        task_due = await reachy_tasks.task_due(conn, device["u_id"])
     microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
-    return {"stop_all": False, "microphone": microphone, "server_time": server_time}
+    return {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}
 
 
 # ── Monitor (same payloads as /api/intake/monitor/*) ─────────────────────────
