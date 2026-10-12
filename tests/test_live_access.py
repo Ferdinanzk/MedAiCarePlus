@@ -2,7 +2,9 @@
 the relay re-reads what the text chat checks at every call: the robot not unpaired, the patient's live switch on,
 robot consent and check-in consent current. When one is gone the chat ends with reason access_withdrawn, as any other
 ending, so the patient's voice stops going to OpenAI. A failed read is logged and tried again, a slow one never holds
-up the timers or runs twice at once, and a risk found at the same moment is still carried out as a block.
+up the timers or runs twice at once, and a risk found at the same moment is still carried out as a block. A read that
+hangs gives up after ACCESS_CHECK_TIMEOUT and counts as a failed one; ACCESS_FAILURES_TO_END failed checks in a row
+end the chat with reason access_unverified (it fails closed), and a check that completes its reads resets the count.
 
 It drives Task 7's relay with Task 7's fakes (tests/test_live_relay_chat.py: the world fixture with its consent state
 and live switch, FakeRobot, FakeLive, LiveDB and the fake clock) and, for the blocks, Task 8's safe fixture
@@ -19,13 +21,15 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app.services import consent_service  # noqa: E402
+from app.services import consent_service, live_session  # noqa: E402
 from tests.test_live_relay_chat import (_begin, _ended, _live, _over, _pcm, _said, _settle, _step,  # noqa: E402
                                         world)  # noqa: F401 (world is a fixture)
 from tests.test_live_safety import QUIET_RISK, _blocked, safe  # noqa: E402,F401 (safe is a fixture)
 
 LOGGER = "app.services.live_session"
 END_WITHDRAWN = {"type": "end", "reason": "access_withdrawn", "risk": False}
+END_UNVERIFIED = {"type": "end", "reason": "access_unverified", "risk": False}
+LOST = ConnectionError("lost the connection to 10.0.0.5")
 
 
 def _revoked(w):
@@ -111,7 +115,7 @@ def test_a_failed_access_read_is_logged_and_tried_again_10_s_later(world, caplog
         else:
             monkeypatch.setattr(consent_service, "get_state", broken)
         await _step(world, relay, 10)
-        assert relay.outcome is None and world.clients[0].closes == 0   # a failed read never ends the chat
+        assert relay.outcome is None and world.clients[0].closes == 0   # one failed read does not end the chat
         (warning,) = _warnings(caplog)
         assert warning.args == (relay.conversation_id, "ConnectionError")   # the class name, not the message
         assert "10.0.0.5" not in warning.getMessage()
@@ -128,8 +132,9 @@ def test_a_failed_access_read_is_logged_and_tried_again_10_s_later(world, caplog
         asyncio.run(scenario())
 
 
-def test_a_slow_access_check_never_holds_up_the_timers_and_never_runs_twice_at_once(world):
+def test_a_slow_access_check_never_holds_up_the_timers_and_never_runs_twice_at_once(world, monkeypatch):
     async def scenario():
+        monkeypatch.setattr(live_session, "ACCESS_CHECK_TIMEOUT", 3600)   # slow, yet inside its time limit
         world.consent_gate = asyncio.Event()                   # the consent read never answers
         relay, running = await _begin(world)
         await _step(world, relay, 10)
@@ -145,6 +150,87 @@ def test_a_slow_access_check_never_holds_up_the_timers_and_never_runs_twice_at_o
         assert world.db.access_reads == 1 and relay._access_check.cancelled()   # it did not outlive the chat
 
     asyncio.run(scenario())
+
+
+async def _given_up(relay):
+    """Real time: wait (at most 1 s) for the running access check to end by its own time limit."""
+    await asyncio.wait({relay._access_check}, timeout=1)
+    assert relay._access_check.done() and not relay._access_check.cancelled()
+
+
+def test_an_access_check_whose_read_hangs_times_out_and_the_next_interval_starts_a_new_one(world, caplog,
+                                                                                            monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(live_session, "ACCESS_CHECK_TIMEOUT", 0.01)   # real seconds, so the test is quick
+        world.consent_gate = asyncio.Event()                   # the consent read hangs
+        relay, running = await _begin(world)
+        await _step(world, relay, 10)
+        assert world.db.access_reads == 1
+        await _given_up(relay)                                 # it did not wait for the read for ever
+        (warning,) = _warnings(caplog)
+        assert warning.args == (relay.conversation_id, "TimeoutError")   # a timeout is a failed read
+        assert relay.outcome is None and world.clients[0].closes == 0   # one failed check does not end the chat
+        world.consent_gate.set()                               # the consent read answers again: allowed
+        await _step(world, relay, 10)
+        assert world.db.access_reads == 2 and relay._access_check.done()   # the next interval starts a new check
+        assert relay.outcome is None and len(_warnings(caplog)) == 1
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        _ended(world, "stopped")
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
+
+
+def test_three_failed_access_checks_in_a_row_end_the_chat_as_access_unverified(world, caplog, monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(live_session, "ACCESS_CHECK_TIMEOUT", 0.01)
+        relay, running = await _begin(world)
+        heard = _pcm(200, 20)
+        world.robot.inbox.put_nowait(heard)
+        world.db.access_error = LOST
+        await _step(world, relay, 10)                          # 1: the database read fails
+        world.db.access_error = None
+        world.consent_gate = asyncio.Event()
+        await _step(world, relay, 10)                          # 2: the consent read hangs and times out
+        await _given_up(relay)
+        assert relay.outcome is None and world.clients[0].closes == 0
+        world.db.access_error = LOST
+        await _step(world, relay, 10)                          # 3: the database read fails again: the chat ends
+        world.robot.inbox.put_nowait(_pcm(200, 20))            # the microphone after the outcome
+        await _settle()
+        await _over(world, running)
+        assert relay.outcome.reason == "access_unverified" and world.db.access_reads == 3
+        _ended(world, "access_unverified")                     # GPT-Live closed once, the after-chat work once
+        assert world.robot.json()[-1] == END_UNVERIFIED
+        assert world.clients[0].audio == [heard]               # nothing reached GPT-Live after the outcome
+        assert [warning.args for warning in _warnings(caplog)] == [
+            (relay.conversation_id, "ConnectionError"), (relay.conversation_id, "TimeoutError"),
+            (relay.conversation_id, "ConnectionError"),
+            (relay.conversation_id,)]                          # the ending: the conversation id, nothing else
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
+
+
+def test_a_check_that_completes_its_reads_resets_the_count_of_failed_ones(world, caplog):
+    async def scenario():
+        relay, running = await _begin(world)
+        world.db.access_error = LOST
+        await _step(world, relay, 10)                          # 1 failed
+        await _step(world, relay, 10)                          # 2 failed
+        world.db.access_error = None
+        await _step(world, relay, 10)                          # the reads complete, access allowed: count reset
+        world.db.access_error = LOST
+        await _step(world, relay, 10)                          # a third failure, but not in a row
+        assert relay.outcome is None and world.clients[0].closes == 0   # the chat goes on
+        assert world.db.access_reads == 4 and len(_warnings(caplog)) == 3
+        world.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(world, running)
+        _ended(world, "stopped")
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("found_by", ["keyword", "model"])

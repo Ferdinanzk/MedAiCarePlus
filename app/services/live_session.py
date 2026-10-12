@@ -24,11 +24,12 @@ turns non-silent (a sample above ONSET_LEVEL) after the patient spoke; after tha
 silence between replies never goes to the robot. GPT-Live's transcripts become conversation turns (C1): fragments
 are grouped per role, a role switch closes the other role's group and a pause over TURN_GAP_SECONDS closes the
 patient's. The chat ends (C2) on a goodbye, SILENCE_END_SECONDS without patient speech, LIVE_MAX_SECONDS, the robot's
-`end`, a dropped robot, or access withdrawn (access_withdrawn: every ACCESS_RECHECK_SECONDS the chat re-checks what
-the text chat checks at every call, A2 and E1: the robot not unpaired, its live switch on, robot and check-in consent
-current); every ending stores conversation.live and runs the post-chat work as /conversations/{id}/end does. When
-GPT-Live fails after the chat started, the robot gets `fallback` with the conversation id and goes on with today's
-text chat (C3).
+`end`, a dropped robot, access withdrawn (access_withdrawn: every ACCESS_RECHECK_SECONDS the chat re-checks what the
+text chat checks at every call, A2 and E1: the robot not unpaired, its live switch on, robot and check-in consent
+current), or access unverified (access_unverified: ACCESS_FAILURES_TO_END re-checks in a row could not read it, by an
+error or by taking over ACCESS_CHECK_TIMEOUT); every ending stores conversation.live and runs the post-chat work as
+/conversations/{id}/end does. When GPT-Live fails after the chat started, the robot gets `fallback` with the
+conversation id and goes on with today's text chat (C3).
 """
 
 import asyncio
@@ -66,6 +67,8 @@ MAX_GROUP_CHARS = 2000        # a transcript group this long is closed, and the 
 TICK_SECONDS = 0.1            # how often the hold, the turn gap and the endings are checked
 MUTE_WAIT_SECONDS = 1.0       # a block waits this long for GPT-Live to acknowledge the mute; it is closed anyway
 ACCESS_RECHECK_SECONDS = 10.0  # the running chat re-checks what the text chat checks at every call (A2, E1)
+ACCESS_CHECK_TIMEOUT = 5.0     # seconds one access re-check's reads may take; a read that hangs counts as a failed one
+ACCESS_FAILURES_TO_END = 3     # this many failed re-checks in a row end the chat (access_unverified): it fails closed
 ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "stopped", "error")   # anything else: stopped
 
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
@@ -257,6 +260,7 @@ class LiveRelay:
         self._started_at = self._last_patient_at = self._reply_due_at = 0.0
         self._access_checked_at = 0.0                # the last access re-check started then (_check_access)
         self._access_check: asyncio.Task | None = None
+        self._access_failures = 0                    # failed access re-checks in a row (_check_access)
         self._goodbye = False
         self._goodbye_replied = False
         self._goodbye_end_at: float | None = None
@@ -464,7 +468,8 @@ class LiveRelay:
     async def _tick(self) -> None:
         """The timers: a screening hit's confirmation (B1), the end of the hold, the end of GPT-Live's sound, the
         patient's turn gap, the access re-check (A2, E1: started here, never awaited, so a slow database never delays
-        the rest), and the endings: goodbye, silence and limit here, access_withdrawn from the re-check."""
+        the rest), and the endings: goodbye, silence and limit here, access_withdrawn and access_unverified from the
+        re-check."""
         now = self.clock()
         if self._hit_at is not None and now - self._heard_at >= CONFIRM_SECONDS:
             await self._confirm()
@@ -495,16 +500,26 @@ class LiveRelay:
         running chat re-checks every ACCESS_RECHECK_SECONDS: the robot not unpaired and the patient's live switch on
         (LIVE_SWITCH_SQL), robot consent and check-in consent current. When one is gone the chat ends at once with
         reason access_withdrawn, as any ending (_end_chat), so the patient's voice stops going to OpenAI; a risk found
-        meanwhile still outranks it (_wrap_up). A read that fails is logged and tried again at the next re-check: it
-        never ends the chat."""
-        try:
+        meanwhile still outranks it (_wrap_up). The two reads together may take ACCESS_CHECK_TIMEOUT. A read that
+        fails or hangs is logged and tried again at the next re-check, but ACCESS_FAILURES_TO_END failed checks in a
+        row end the chat with reason access_unverified: it fails closed, so a database that stopped answering never
+        leaves the chat running unchecked. A check that completes its reads, allowed or not, resets the count."""
+
+        async def read():
             async with get_pool().acquire() as conn:
                 switched_on = await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"])
-            state = await consent_service.get_state(self.u_id)
-        except Exception as exc:
-            log.warning("live chat %s: re-checking access failed (%s); trying again", self.conversation_id,
-                        type(exc).__name__)
+            return switched_on, await consent_service.get_state(self.u_id)
+
+        try:
+            switched_on, state = await asyncio.wait_for(read(), ACCESS_CHECK_TIMEOUT)
+        except Exception as exc:   # a timeout too (TimeoutError): a read that hangs is a failed read
+            self._access_failures += 1
+            log.warning("live chat %s: re-checking access failed (%s)", self.conversation_id, type(exc).__name__)
+            if self._access_failures >= ACCESS_FAILURES_TO_END:
+                log.warning("live chat %s: the access re-checks kept failing; the chat ends", self.conversation_id)
+                self._finish("end", "access_unverified")
             return
+        self._access_failures = 0
         if switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state):
             return
         log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id, self.u_id)
