@@ -767,8 +767,9 @@ class LiveRelay:
         in GPT-Live's instructions) whose memory consent is no longer current goes on as today's text chat, which
         checks memory consent at every turn (fallback memory_withdrawn); the wrap-up closes GPT-Live and its notes.
         The same reads also tell whether another writer (the after-chat sweep) ended the conversation
-        (CONVERSATION_ENDED_SQL): then the chat ends as stopped, as the text chat's next turn gets 409, so no turn is
-        stored into a conversation whose post-chat work already ran."""
+        (CONVERSATION_ENDED_SQL): then the chat ends as stopped, as the text chat's next turn gets 409, so no later
+        stretch stores turns into it. A turn still open at that moment is stored into the ended row without post-chat
+        work (rare: the sweep needs 15 minutes without a turn, so the chat is paused with nothing open)."""
 
         async def read():
             async with get_pool().acquire() as conn:
