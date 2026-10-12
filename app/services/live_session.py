@@ -109,6 +109,24 @@ def _in_background(coro) -> asyncio.Task:
     return task
 
 
+_letting_go: set = set()
+
+
+def _let_go(task: asyncio.Task) -> None:
+    """Cancel an access re-check's reads without waiting for them (LiveRelay._check_access): a cancelled asyncpg read
+    lets go only once the server confirms the cancel, with no time limit. The reference keeps the task from being
+    garbage-collected meanwhile, and a late error is read, so asyncio never logs it as never retrieved."""
+
+    def gone(done: asyncio.Task) -> None:
+        _letting_go.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    task.cancel()
+    _letting_go.add(task)
+    task.add_done_callback(gone)
+
+
 def instructions(language: str, name: str | None, block: str) -> str:
     """GPT-Live's instructions (spec A3): Reachy's reply prompt (its rules and the day's background), the live rules,
     the name to call the patient when there is one, and the memory block ("" without memory consent)."""
@@ -500,18 +518,21 @@ class LiveRelay:
         running chat re-checks every ACCESS_RECHECK_SECONDS: the robot not unpaired and the patient's live switch on
         (LIVE_SWITCH_SQL), robot consent and check-in consent current. When one is gone the chat ends at once with
         reason access_withdrawn, as any ending (_end_chat), so the patient's voice stops going to OpenAI; a risk found
-        meanwhile still outranks it (_wrap_up). The two reads together may take ACCESS_CHECK_TIMEOUT. A read that
-        fails or hangs is logged and tried again at the next re-check, but ACCESS_FAILURES_TO_END failed checks in a
-        row end the chat with reason access_unverified: it fails closed, so a database that stopped answering never
-        leaves the chat running unchecked. A check that completes its reads, allowed or not, resets the count."""
+        meanwhile still outranks it (_wrap_up). The two reads together may take ACCESS_CHECK_TIMEOUT; then they are
+        cancelled and never waited for (_let_go), because a cancelled asyncpg read lets go only once the server
+        confirms the cancel. A read that fails or hangs is logged and tried again at the next re-check, but
+        ACCESS_FAILURES_TO_END failed checks in a row end the chat with reason access_unverified: it fails closed, so a
+        database that stopped answering never leaves the chat running unchecked. A check that completes its reads,
+        allowed or not, resets the count."""
 
         async def read():
             async with get_pool().acquire() as conn:
                 switched_on = await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"])
             return switched_on, await consent_service.get_state(self.u_id)
 
+        reads = asyncio.create_task(read())
         try:
-            switched_on, state = await asyncio.wait_for(read(), ACCESS_CHECK_TIMEOUT)
+            switched_on, state = await asyncio.wait_for(asyncio.shield(reads), ACCESS_CHECK_TIMEOUT)
         except Exception as exc:   # a timeout too (TimeoutError): a read that hangs is a failed read
             self._access_failures += 1
             log.warning("live chat %s: re-checking access failed (%s)", self.conversation_id, type(exc).__name__)
@@ -519,6 +540,9 @@ class LiveRelay:
                 log.warning("live chat %s: the access re-checks kept failing; the chat ends", self.conversation_id)
                 self._finish("end", "access_unverified")
             return
+        finally:
+            if not reads.done():   # past its time limit, or the chat ended
+                _let_go(reads)
         self._access_failures = 0
         if switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state):
             return
