@@ -585,7 +585,7 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         async with get_pool().acquire() as conn:
             task_due = await reachy_tasks.task_due(conn, device["u_id"])
     except Exception:
-        log.warning("heartbeat: the medicine-task check failed; answering task_due false")
+        log.warning("heartbeat: the medicine-task check failed; answering task_due false", exc_info=True)
         task_due = False
     microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
     return {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}

@@ -30,6 +30,8 @@ from tests.test_live_relay_chat import (DEVICE, DEVICE_ID, LOUD, OPENING, TASK_I
                                         _pcm, _reachy, _said, _settle, _sound, _step, world)  # noqa: F401
 from tests.test_live_safety import (END_RISK, FLUSH, HELPLINE, QUIET_RISK, SAY, UNHEARD, SafetyLive,  # noqa: E402
                                     _alert, _blocked, _flagged, safe)  # noqa: F401 (safe is a fixture)
+from tests.test_monitor_backend import _packet  # noqa: E402
+from tests.test_search_identity import _identity_checks, faces  # noqa: E402,F401 (faces is a fixture)
 
 TARGET = ai_settings.LiveTarget("sk-test-live-key-0000", "gpt-live-1", "marin")
 START = {"type": "start", "task_id": TASK_ID, "language": "zh-TW", "rate": 16000, "bridge_version": "0.9.0"}
@@ -328,7 +330,13 @@ def test_a_talking_stretch_pauses_at_stretch_max_seconds_and_the_chat_goes_on(co
         await _step(companion, relay, 0.5)                    # 600 s after the stretch started: their turn is open
         await _step(companion, relay, 1.0)                    # 1.5 s after their words: not yet a turn gap
         assert companion.clients[0].closes == 0 and companion.robot.json()[1:] == []
-        await _step(companion, relay, 0.25)                   # their turn gap: the turn is stored, then paused
+        await _step(companion, relay, 0.25)                   # their turn gap: the turn is stored, but GPT-Live
+        assert companion.clients[0].closes == 0               # still owes them its answer: no pause yet
+        assert companion.db.rows("patient")[-1] == ("patient", "最後")
+        await _live(companion, _sound())                      # GPT-Live answers
+        await _step(companion, relay, 0.5)                    # it plays after its hold
+        assert companion.clients[0].closes == 0
+        await _step(companion, relay, 0.75)                   # its sound ended: paused
         assert companion.clients[0].closes == 1 and companion.robot.json()[1:] == [PAUSED]
         assert relay.outcome is None                          # no LIVE_MAX_SECONDS ending
         assert companion.db.rows("patient")[-1] == ("patient", "最後")
@@ -450,6 +458,49 @@ def test_a_stretch_that_cannot_start_goes_on_as_todays_text_chat(companion, when
     asyncio.run(scenario())
 
 
+def test_a_stretch_that_cannot_start_asks_the_patient_to_say_it_again(companion):
+    async def scenario():
+        relay, running = await _start(companion)
+        companion.robot.inbox.put_nowait(_pcm(200, 20))       # the patient's first words, kept in the pre-roll
+        await _settle()
+        companion.fail = "rate_limit_exceeded"                # GPT-Live does not start: nothing hears those words
+        await _speak(companion)
+        await _over(companion, running)
+        cid = companion.db.chat()["conversation_id"]
+        repeat = {"type": "say", "speech_text": "不好意思，我刚刚没听清楚，可以再说一次吗？", "reason": "repeat"}
+        assert repeat["speech_text"] == conversation.speech_text(live_session.REPEAT_LINES["zh-TW"], "zh-TW")
+        # the robot asks for them again in its own voice, then today's text chat listens in the same conversation
+        assert companion.robot.json()[1:] == [repeat, {"type": "fallback", "reason": "live_unavailable",
+                                                       "conversation_id": cid}]
+
+    asyncio.run(scenario())
+
+
+def test_a_robot_end_mid_stretch_still_screens_the_patients_last_words(companion):
+    async def scenario():
+        relay, running = await _start(companion)
+        await _speak(companion)
+        client = companion.clients[0]
+        await _live(companion, _said("今天"))
+        closing = client.close
+
+        async def close(wait=2.0):   # GPT-Live's transcript of the patient's last words, sent as session.close is answered
+            client.events_in.put_nowait(_said("我想自殺"))
+            return await closing(wait)
+
+        client.close = close
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "medicine"})   # a dose fell due mid-sentence
+        await _over(companion, running)
+        chat = companion.db.chat()
+        assert companion.db.rows("patient") == [("patient", "今天我想自殺")] and _flagged(companion) == [2]
+        assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True)
+        assert companion.alerts == [_alert(companion, "今天我想自殺", 2)]
+        assert companion.robot.json()[1:] == [FLUSH, SAY, END_RISK]   # the help line, if the robot still listens
+        assert companion.db.rows()[-1] == ("reachy", HELPLINE) and client.closes == 1
+
+    asyncio.run(scenario())
+
+
 def test_the_patients_first_words_in_a_stretch_are_screened(companion):
     async def scenario():
         relay, running = await _start(companion)
@@ -513,6 +564,22 @@ def test_the_access_re_check_runs_while_paused(companion, withdrawal):
     asyncio.run(scenario())
 
 
+def test_a_live_chat_whose_conversation_was_closed_elsewhere_ends(companion):
+    async def scenario():
+        relay, running = await _start(companion)
+        await _step(companion, relay, 10)                     # a re-check: the conversation is open, the chat goes on
+        assert relay.outcome is None
+        chat = companion.db.chat()
+        chat.update(ended_at="swept", end_reason="abandoned")   # the after-chat sweep closed it under the paused relay
+        await _step(companion, relay, 10)                     # the next re-check
+        await _over(companion, running)
+        assert companion.robot.json()[1:] == [{"type": "end", "reason": "stopped", "risk": False}]
+        assert companion.robot.closed == 1000 and companion.clients == []
+        assert chat["end_reason"] == "abandoned" and companion.after_chat == []   # its post-chat work already ran
+
+    asyncio.run(scenario())
+
+
 # ── older robots, and the two module helpers ─────────────────────────────────────────────────────────────────────
 
 
@@ -536,20 +603,29 @@ def test_an_older_robot_gets_todays_live_chat(companion, version):
     asyncio.run(scenario())
 
 
-def test_patient_seen_recently_asks_the_robots_monitor_session(monkeypatch):
+def test_patient_seen_recently_asks_the_robots_monitor_session(monkeypatch, faces):
+    """Camera first needs a verified sighting (spec 3.2): the monitor session's first patient hit is only
+    'verifying' and starts nothing; the second in a row verifies the patient (MonitorSession.confirmed_at)."""
     registry = monitor_service.MonitorRegistry()
     monkeypatch.setattr(monitor_service, "registry", registry)
     assert live_session.patient_seen_recently(7) is False     # no session
-    session = monitor_service.MonitorSession("s1", "g1", 7, None, "pearl", "Pearl", mode="observe",
-                                             client_type="reachy", checkin_search=True)
-    registry.sessions["s1"], registry.by_user[7] = session, "s1"
+    session = registry.start(7, None, "Pearl", "Pearl", mode="observe", client_type="reachy", checkin_search=True)
     assert live_session.patient_seen_recently(7) is False     # never verified
-    session.verified_at = time.monotonic() - 14.0
-    assert live_session.patient_seen_recently(7) is True
+
+    async def hits():
+        await _identity_checks(registry, session, [_packet(1)])
+        assert session.identity_status == "verifying" and session.verified_at
+        assert live_session.patient_seen_recently(7) is False     # one hit is not enough
+        await _identity_checks(registry, session, [_packet(2)])
+        assert session.identity_status == "verified" and live_session.patient_seen_recently(7) is True
+
+    asyncio.run(hits())
     assert live_session.patient_seen_recently(8) is False     # another patient
-    session.verified_at = time.monotonic() - 16.0
+    session.confirmed_at = time.monotonic() - 14.0
+    assert live_session.patient_seen_recently(7) is True
+    session.confirmed_at = time.monotonic() - 16.0
     assert live_session.patient_seen_recently(7) is False     # longer ago than SEEN_RECENT_SECONDS
-    session.verified_at = time.monotonic()
+    session.confirmed_at = time.monotonic()
     session.client_type = "browser"
     assert live_session.patient_seen_recently(7) is False     # only the robot's camera counts
     session.client_type, session.ended = "reachy", True

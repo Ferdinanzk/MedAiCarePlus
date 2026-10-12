@@ -53,8 +53,11 @@ flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient
 OpenAI's cut-off judged), the open turns are stored and the robot gets {"type": "paused"}. A
 stretch runs as the chat above, and the access re-check runs while paused too; but SILENCE_END_SECONDS and
 LIVE_MAX_SECONDS end no companion chat (the robot ends it: a goodbye, rest as patient_left, medicine, a stop), a
-stretch that cannot start falls back as live_unavailable with the conversation id, and after a risk nothing restarts.
-conversation.live adds stretches (GPT-Live sessions started), and its usage_seconds is their sum.
+stretch that cannot start falls back as live_unavailable with the conversation id (first asking the patient to say
+it again, REPEAT_LINES, when their words were kept), and after a risk nothing restarts. An ending or a fallback
+while a stretch runs drains it as a pause does before the open turns are stored, and the access re-check also ends
+the chat (stopped) when another writer ended the conversation. conversation.live adds stretches (GPT-Live sessions
+started), and its usage_seconds is their sum.
 """
 
 import asyncio
@@ -116,6 +119,8 @@ ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "medicine
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
                    "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid")   # api_device uses it too
 LIVE_SWITCH_SQL = "SELECT live_voice FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL"
+# The access re-check also reads whether another writer (the after-chat sweep) ended the conversation (_check_access)
+CONVERSATION_ENDED_SQL = "SELECT ended_at FROM conversation WHERE conversation_id = $1::uuid"
 INSERT_TURN_SQL = ("INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
                    "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id")   # api_device uses it too
 FLAG_TURN_SQL = "UPDATE conversation_turn SET flagged = TRUE WHERE turn_id = $1"
@@ -151,6 +156,10 @@ COMPANION_NOTE = {
 }
 COMPANION_SPEAKERS = {"zh-TW": {"reachy": "Reachy", "patient": "長者"},
                       "en": {"reachy": "Reachy", "patient": "older adult"}}
+# Companion mode: a stretch that cannot start lost the patient's words that started it (only the pre-roll had them),
+# so the robot asks for them again in its own voice before the fallback, and the patient says them to today's text chat
+REPEAT_LINES = {"zh-TW": "不好意思，我剛剛沒聽清楚，可以再說一次嗎？",
+                "en": "Sorry, I didn't catch that. Could you say it again?"}
 
 _background: set = set()
 
@@ -232,12 +241,13 @@ def companion_robot(bridge_version: str | None) -> bool:
 def patient_seen_recently(u_id: int) -> bool:
     """Camera first (companion spec 3.2): the patient's robot monitor session in the in-memory registry (the check-in
     search the robot keeps open during a companion session) verified the patient within SEEN_RECENT_SECONDS
-    (MonitorSession.verified_at, time.monotonic). False without one, for a browser session, or for one that ended."""
+    (MonitorSession.confirmed_at, time.monotonic: a hit that made the status "verified", never the first one while it
+    is still "verifying"). False without one, for a browser session, or for one that ended."""
     registry = monitor_service.registry
     session = registry.sessions.get(registry.by_user.get(u_id) or "")
-    if session is None or session.ended or session.client_type != "reachy" or not session.verified_at:
+    if session is None or session.ended or session.client_type != "reachy" or not session.confirmed_at:
         return False
-    return time.monotonic() - session.verified_at <= SEEN_RECENT_SECONDS
+    return time.monotonic() - session.confirmed_at <= SEEN_RECENT_SECONDS
 
 
 class WebSocketRobot:
@@ -699,8 +709,9 @@ class LiveRelay:
         access_withdrawn and access_unverified from the re-check. In companion mode silence and limit end nothing: a
         running stretch pauses instead (_pause), never while a screening hit settles: QUIET_PAUSE_SECONDS after the
         patient's last speech once GPT-Live's sound has ended; once it is STRETCH_MAX_SECONDS old, at the patient's
-        turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended); and once
-        it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and GPT-Live are doing."""
+        turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended and no
+        answer still owed to them: _armed); and once it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and
+        GPT-Live are doing."""
         now = self.clock()
         if self._hit_at is not None and now - self._heard_at >= CONFIRM_SECONDS:
             await self._confirm()
@@ -733,7 +744,7 @@ class LiveRelay:
                 if stretch >= STRETCH_HARD_MAX_SECONDS:
                     await self._pause("stretch_hard_max")
                 elif (stretch >= STRETCH_MAX_SECONDS and self._patient is None and self._segment is None
-                      and now - self._last_patient_at > TURN_GAP_SECONDS):
+                      and not self._armed and now - self._last_patient_at > TURN_GAP_SECONDS):
                     await self._pause("stretch_max")
                 elif now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None:
                     await self._pause("quiet")
@@ -754,16 +765,20 @@ class LiveRelay:
         database that stopped answering never leaves the chat running unchecked. A check that completes its reads,
         allowed or not, resets the count. A chat that started with memory consent (its notes and the memory name are
         in GPT-Live's instructions) whose memory consent is no longer current goes on as today's text chat, which
-        checks memory consent at every turn (fallback memory_withdrawn); the wrap-up closes GPT-Live and its notes."""
+        checks memory consent at every turn (fallback memory_withdrawn); the wrap-up closes GPT-Live and its notes.
+        The same reads also tell whether another writer (the after-chat sweep) ended the conversation
+        (CONVERSATION_ENDED_SQL): then the chat ends as stopped, as the text chat's next turn gets 409, so no turn is
+        stored into a conversation whose post-chat work already ran."""
 
         async def read():
             async with get_pool().acquire() as conn:
                 switched_on = await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"])
-            return switched_on, await consent_service.get_state(self.u_id)
+                ended = await conn.fetchval(CONVERSATION_ENDED_SQL, self.conversation_id) is not None
+            return switched_on, ended, await consent_service.get_state(self.u_id)
 
         reads = asyncio.create_task(read())
         try:
-            switched_on, state = await asyncio.wait_for(asyncio.shield(reads), ACCESS_CHECK_TIMEOUT)
+            switched_on, ended, state = await asyncio.wait_for(asyncio.shield(reads), ACCESS_CHECK_TIMEOUT)
         except Exception as exc:   # a timeout too (TimeoutError): a read that hangs is a failed read
             self._access_failures += 1
             log.warning("live chat %s: re-checking access failed (%s)", self.conversation_id, type(exc).__name__)
@@ -779,6 +794,9 @@ class LiveRelay:
             log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id,
                         self.u_id)
             self._finish("end", "access_withdrawn")
+        elif ended:
+            log.warning("live chat %s: the conversation was ended elsewhere; the chat ends", self.conversation_id)
+            self._finish("end", "stopped")
         elif self._memory_on and not memory.consent_current(state):
             log.warning("live chat %s: memory consent withdrawn; the text chat takes over", self.conversation_id)
             self._finish("fallback", "memory_withdrawn")
@@ -886,9 +904,10 @@ class LiveRelay:
         connect. Its instructions are the live ones (the name and the memory block the chat started with) plus
         companion_note with the last HISTORY_TURNS stored turns. It must start within CONNECT_TIMEOUT, else the chat
         goes on as today's text chat (fallback live_unavailable with the conversation id; a failed read of the turns:
-        error). Then the kept microphone audio goes first and the live microphone after it (_microphone); GPT-Live's
-        first sound answers the patient, so it is held (B2). The usage of the stretch before is added up here. A
-        session that started once the outcome was decided is left to the wrap-up, which closes it."""
+        error), and when the patient's words that started it were kept (the pre-roll), the robot first asks for them
+        again (_ask_again). Then the kept microphone audio goes first and the live microphone after it (_microphone);
+        GPT-Live's first sound answers the patient, so it is held (B2). The usage of the stretch before is added up
+        here. A session that started once the outcome was decided is left to the wrap-up, which closes it."""
         target, name, block = self._live_args
         began = self.clock()
         try:
@@ -899,10 +918,12 @@ class LiveRelay:
             await client.start(timeout=CONNECT_TIMEOUT)
         except LiveError as error:
             log.warning("live chat %s: GPT-Live did not start (%s)", self.conversation_id, error.code)
+            await self._ask_again()
             self._finish("fallback", "live_unavailable")
             return
         except Exception:
             log.exception("live chat %s: starting a GPT-Live stretch failed", self.conversation_id)
+            await self._ask_again()
             self._finish("fallback", "error")
             return
         if self._usage is not None:
@@ -928,6 +949,18 @@ class LiveRelay:
         self._pre_roll_bytes = 0
         self._phase = "running"
 
+    async def _ask_again(self) -> None:
+        """A stretch that could not start (_start_stretch): the patient's words that started it are only in the
+        pre-roll, which nothing transcribes, screens or stores, and the robot's own listener was suspended meanwhile.
+        So while the chat goes on (no outcome decided yet), the robot says REPEAT_LINES in its own voice before the
+        fallback, built as the help line is (the patient's language, the voice's script): the patient says it again
+        into today's text chat. Not when no patient audio was kept."""
+        if not self._pre_roll or self.outcome is not None:
+            return
+        line = REPEAT_LINES[self.language]
+        await self._to_robot({"type": "say", "speech_text": conversation.speech_text(line, self.language),
+                              "reason": "repeat"})
+
     async def _pause(self, why: str) -> None:
         """End the running stretch, as a timer (_handler_lock). why: quiet, stretch_max or stretch_hard_max (_tick).
 
@@ -935,9 +968,9 @@ class LiveRelay:
         failure), keeping the event it held. A reply the hard cap cuts short ends as when its sound stops (cut, the
         goodbye's grace) and the robot's queue is flushed. GPT-Live is closed (session.close, its usage kept,
         _close_live), and what it still sent is handled as the events loop would have (_drain_stretch): the
-        patient's last words are screened and grouped, OpenAI's cut-off is judged. Only then are the open turns
-        stored and the robot sent `paused`; an outcome decided meanwhile is left to the wrap-up, which does both its
-        own way. The patient's next words start a new stretch (_on_speech), at once when they spoke during the pause
+        patient's last words are screened and grouped, OpenAI's cut-off is judged; an ending decided meanwhile (a
+        robot `end`) lets that drain finish. Only then are the open turns stored and the robot sent `paused`; an
+        outcome decided meanwhile is left to the wrap-up, which does both its own way. The patient's next words start a new stretch (_on_speech), at once when they spoke during the pause
         or, at the hard cap, within TURN_GAP_SECONDS of it: the pre-roll then carries their words on."""
         began = self.clock()
         self._phase = "pausing"
@@ -967,19 +1000,20 @@ class LiveRelay:
             await self._on_speech()
 
     async def _drain_stretch(self, client, in_hand) -> None:
-        """A paused stretch's last events (_pause): the one its events loop held (in_hand), then those still queued
-        once GPT-Live was closed, through the events loop's handler (_on_live_event), so none of the patient's words
-        is lost: their transcript is screened and grouped (B1, C1), and OpenAI's cut-off, an error content_filter or a
-        close with reason content, is judged (B4: only an explicit NONE goes on). GPT-Live's audio is dropped (the
-        pause stopped its voice), and the closed event of the close the relay asked for (any other reason) is no
-        failure. It stops once an outcome is decided, as the events loop does, and waits at most PAUSE_DRAIN_SECONDS
-        for each event."""
+        """A closed stretch's last events (_pause, and a companion chat's ending, _drain_ending): the one its events
+        loop held (in_hand), then those still queued once GPT-Live was closed, through the events loop's handler
+        (_on_live_event), so none of the patient's words is lost: their transcript is screened and grouped (B1, C1),
+        and OpenAI's cut-off, an error content_filter or a close with reason content, is judged (B4: only an explicit
+        NONE goes on). GPT-Live's audio is dropped (its voice is over), and the closed event of the close the relay
+        asked for (any other reason) is no failure. It goes on while no risk was found, whatever ending or fallback
+        was decided meanwhile (a robot `end` during a pause no longer cuts it short), and waits at most
+        PAUSE_DRAIN_SECONDS for each event."""
         if client is None:
             return
         events = client.events()
         event = in_hand
         try:
-            while self.outcome is None:
+            while self._risk is None:
                 if event is None:
                     try:
                         event = await asyncio.wait_for(anext(events), PAUSE_DRAIN_SECONDS)
@@ -1390,8 +1424,11 @@ class LiveRelay:
     async def _wrap_up(self) -> None:
         """Carry out the outcome, safety first (spec section 7, point 3): a screening hit still settling is judged on
         the words heard (B1), a check of OpenAI's cut-off that _chat stopped before it answered blocks (B4: no answer
-        is never a clear), and a block outranks the ending or the fallback decided (B3). From here on a block only
-        flags and alerts (block)."""
+        is never a clear), and a block outranks the ending or the fallback decided (B3). In companion mode a stretch
+        still running is closed and drained first (_drain_ending), so a risk in the patient's last words is found
+        before this. From here on a block only flags and alerts (block)."""
+        if self.companion and self._risk is None:
+            await self._drain_ending()
         if self._hit_at is not None and self._risk is None:
             await self._confirm()
         if self._judging_cut_off and self._risk is None:
@@ -1404,6 +1441,24 @@ class LiveRelay:
             await self._fall_back(self.outcome.reason)
         else:
             await self._end_chat(self.outcome.reason, self.outcome.risk)
+
+    async def _drain_ending(self) -> None:
+        """Companion mode: the chat ends or falls back (the robot's `end` for medicine, rest or a stop, a dropped
+        robot, a fallback, the access re-check) while a stretch runs. As a pause does, GPT-Live is closed and what it
+        still sent goes through the events loop's handler (_drain_stretch): the event the stopped events loop held
+        (_in_hand), the ones still queued and those OpenAI sent while the close was answered. So the patient's last
+        words are screened, grouped and judged (layer 2, and B4 for a content close) before the wrap-up stores the
+        open turns, and a risk found here takes the risk path (_end_blocked; the robot gets the help line only if it is
+        still there, never waited for). A failure here costs the drain, never the ending."""
+        in_hand, self._in_hand = self._in_hand, None
+        client = self.client
+        if client is None or self._live_closed:
+            return   # no stretch runs: a pause already drained the last one
+        await self._close_live()
+        try:
+            await self._drain_stretch(client, in_hand)
+        except Exception:
+            log.exception("live chat %s: handling GPT-Live's last events at the ending failed", self.conversation_id)
 
     async def _end_chat(self, reason: str, risk: bool) -> None:
         """Every ending: the open turns stored, session.close, conversation.live stored (in companion mode with the

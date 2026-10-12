@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 import os
 import sys
 import types
@@ -103,6 +104,15 @@ class FakeDB:
         return not row["protection"] or (schedule.is_due(row["intake_time_stamp"], self.now, row["previous_time"])
                                          and (expiry is None or self.now < expiry))
 
+    def retry_due(self, task, u_id):
+        """reachy_tasks._retry_due_sql: patient u_id's in-progress task marked retry_due, not expired, with a marked
+        dose still open and startable."""
+        retry = json.loads(task["detail"] or "{}").get("retry_due")
+        return (task["u_id"] == u_id and task["status"] == "in_progress" and retry is not None
+                and datetime.fromisoformat(retry["expires_at"]) > self.now
+                and any(i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")
+                        and self.startable(i) for i in retry["intk_ids"]))
+
     def leasable(self, task, u_id):
         """reachy_tasks._leasable_sql: patient u_id's queued task, not expired, whose open doses may all start now.
         Only open doses hold a task back: a taken one past its halfway point does not."""
@@ -141,9 +151,10 @@ class FakeDB:
             return 1 if any(n["u_id"] == args[0] and n["at"] > args[1] for n in self.notices) else None
         if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # task_due
             assert reachy_tasks._leasable_sql() in query and len(args) == 1
+            assert f"OR EXISTS ({reachy_tasks._retry_due_sql()})" in query
             return any(self.leasable(t, args[0]) and any(
                 i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed") for i in t["intk_ids"])
-                for t in self.tasks)
+                for t in self.tasks) or any(self.retry_due(t, args[0]) for t in self.tasks)
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):
@@ -153,8 +164,9 @@ class FakeDB:
             assert (f"AND i.intake_stats IN ('pending','missed') "
                     f"AND NOT ({dose_safety.startable_sql('i', 'NOW()')})") in query and len(args) == 2
 
+            assert "ORDER BY (t.reason = 'checkin'), t.slot_time, t.created_at" in query   # medicine first
             queued = sorted((t for t in self.tasks if self.leasable(t, args[0])),
-                            key=lambda t: (t["slot_time"], t["created_at"]))
+                            key=lambda t: (t["reason"] == "checkin", t["slot_time"], t["created_at"]))
             if not queued:
                 return None
             task = queued[0]
@@ -190,6 +202,9 @@ class FakeDB:
             assert args[0] == 7
             self.due_checks.append(list(args[1]))
             return self.facts(args)
+        if "SELECT intk_id FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[])" in query:   # retry_due's open doses
+            return [{"intk_id": i} for i in sorted(args[1])
+                    if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")]
         if "FROM intake i JOIN medication m" in query:
             assert "ORDER BY m.med_name, m.med_id" in query
             rows = [self.doses[i] for i in args[1] if i in self.doses]
@@ -222,6 +237,11 @@ class FakeDB:
             for t in self.tasks:
                 if t["lease_owner"] == args[0] and t["status"] in ("leased", "searching", "in_progress"):
                     t["lease_until"] = self.now + timedelta(seconds=60)
+        elif "jsonb_build_object('retry_due'" in query:   # enqueue_reachy_task: a missed retry for a held task
+            task = self.by_id(args[0])
+            if task["status"] == "in_progress":
+                detail = json.loads(task["detail"] or "{}")
+                task["detail"] = json.dumps({**detail, "retry_due": {"intk_ids": list(args[1]), "expires_at": args[2]}})
         elif "UPDATE intake SET" in query or "INSERT INTO notification" in query:
             pass
         else:
@@ -276,7 +296,12 @@ def test_enqueue_never_rearms_or_resets_an_active_task(db, status):
     db.tasks[0].update(status=status, lease_owner=DEVICE, lease_until=T0 + timedelta(seconds=60))
     before = dict(db.tasks[0])
     assert enqueue(db, reason="missed_retry", expires=T0 + timedelta(hours=2)) == task_id
-    assert db.tasks[0] == before and len(db.tasks) == 1
+    after = dict(db.tasks[0])
+    if status == "in_progress":   # only marked for the retry (task_due, then queued when it ends)
+        assert json.loads(after.pop("detail")) == {"retry_due": {"intk_ids": [101, 102, 103],
+                                                                 "expires_at": (T0 + timedelta(hours=2)).isoformat()}}
+        before.pop("detail")
+    assert after == before and len(db.tasks) == 1
 
 
 @pytest.mark.parametrize("status", ["not_found", "aborted"])
@@ -850,6 +875,25 @@ def test_a_queued_checkin_or_a_task_with_nothing_left_to_take_is_no_medicine(db)
                      "finished_at": None, "expires_at": T0 + timedelta(hours=1), "detail": None})   # 103 is taken
     assert run(reachy_tasks.task_due(db, 7)) is False
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == "done"   # leased after the chat, as today
+
+
+def test_a_missed_retry_during_a_held_task_is_due_and_queued_when_it_ends(db):
+    # The 08:00 dose task left its doses pending and went on as a companion session, which holds the slot's task in
+    # progress; the missed-dose job's +10 min retry for that slot comes meanwhile.
+    task_id = enqueue(db, intk_ids=(101, 102))
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == task_id
+    for status in ("searching", "in_progress"):
+        run(reachy_tasks.set_status(7, DEVICE, task_id, status, None))
+    db.now = T0 + timedelta(minutes=10)
+    assert enqueue(db, reason="missed_retry", intk_ids=(101, 102)) == task_id   # the slot's task is held: none queued
+    assert [t["task_id"] for t in db.tasks] == [task_id]
+    assert run(reachy_tasks.task_due(db, 7)) is True   # but the doses still owed are medicine first
+    db.doses[102]["intake_stats"] = "taken"            # one of them taken meanwhile
+    run(reachy_tasks.set_status(7, DEVICE, task_id, "completed", {"outcomes": {"checkin": "medicine"}}))
+    (retry,) = [t for t in db.tasks if t["task_id"] != task_id]   # queued as the task ended, open doses only
+    assert (retry["reason"], retry["intk_ids"], retry["status"]) == ("missed_retry", [101], "queued")
+    assert retry["expires_at"] == T0 + timedelta(minutes=40)       # the retry's own expiry
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
 
 
 # ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────

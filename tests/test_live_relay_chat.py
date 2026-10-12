@@ -170,6 +170,8 @@ class LiveDB:
             if self.access_error is not None:
                 raise self.access_error
             return self.live_switch
+        if "SELECT ended_at FROM conversation WHERE conversation_id = $1::uuid" in query:   # the access re-check
+            return self.conversations[args[0]]["ended_at"]
         raise AssertionError(query)
 
     async def execute(self, query, *args):

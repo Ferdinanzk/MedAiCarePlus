@@ -300,8 +300,9 @@ def test_sweep_closes_abandoned_chats_and_reprocesses_pending(monkeypatch):
 
 def test_the_sweep_leaves_a_companion_chat_open_while_its_robot_holds_a_camera_session(monkeypatch):
     """Companion spec 2 and 4.2 (robot app 0.9.0): a patient may stay in view and quiet for longer than
-    ABANDON_MINUTES (no turns; a live companion's GPT-Live is paused). The robot keeps its camera session open until
-    the session ends, so the sweep leaves that patient's companion conversation open; any other one closes as before."""
+    ABANDON_MINUTES (no turns; a live companion's GPT-Live is paused), however long. While the robot keeps its camera
+    session open and holds its running session's task (in progress, not expired: its heartbeats extend it), the sweep
+    leaves that patient's newest companion conversation open; any other one closes as before."""
     from app.jobs import after_chat_job
     from app.services import monitor_service
 
@@ -339,12 +340,16 @@ def test_the_sweep_leaves_a_companion_chat_open_while_its_robot_holds_a_camera_s
     asyncio.run(after_chat_job.run_after_chat_sweep())
     close, args = sql[0]
     assert "end_reason = 'abandoned'" in close and "AND NOT (c.companion AND c.u_id = ANY($2::int[])" in close
-    assert args == (after_chat_job.ABANDON_MINUTES, [7], after_chat_job.COMPANION_ABANDON_HOURS)   # an open robot session only: no browser, no ended one
+    assert ("AND EXISTS (SELECT 1 FROM reachy_task rt WHERE rt.u_id = c.u_id AND rt.status = 'in_progress' "
+            "              AND rt.expires_at > NOW()))" in close)   # its robot holds a running session
+    assert "hours" not in close   # no ceiling: a quiet patient in view keeps the chat
+    assert args == (after_chat_job.ABANDON_MINUTES, [7])   # an open robot session only: no browser, no ended one
 
 
-def _companion_sweep(monkeypatch, chats):
+def _companion_sweep(monkeypatch, chats, running=(7,)):
     """The sweep's close statement over open companion chats {id: (u_id, started_hours_ago, last_turn_hours_ago)} of a
-    patient (7) whose robot is present. The fake applies the statement's companion exception to its arguments."""
+    patient (7) whose robot is present; `running`: the patients whose robot holds an in-progress task not yet expired.
+    The fake applies the statement's companion exception to its arguments."""
     from app.jobs import after_chat_job
 
     sent = []
@@ -363,10 +368,10 @@ def _companion_sweep(monkeypatch, chats):
         async def fetch(self, query, *args):
             sent.append(query)
             if query.startswith("UPDATE conversation c"):
-                _minutes, present, hours = args
+                _minutes, present = args
                 newest = {u: min(c[1] for c in open_chats.values() if c[0] == u) for u in {c[0] for c in open_chats.values()}}
                 for cid, (u_id, started, last_turn) in list(open_chats.items()):
-                    stays = u_id in present and started == newest[u_id] and last_turn < hours
+                    stays = u_id in present and started == newest[u_id] and u_id in running
                     if not stays:
                         del open_chats[cid]
             return []
@@ -383,19 +388,20 @@ def _companion_sweep(monkeypatch, chats):
     monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
     asyncio.run(after_chat_job.run_after_chat_sweep())
     assert "NOT EXISTS (SELECT 1 FROM conversation newer WHERE newer.u_id = c.u_id" in sent[0]
-    assert "make_interval(hours => $3)" in sent[0]
+    assert "rt.status = 'in_progress' " in sent[0] and "AND rt.expires_at > NOW()" in sent[0]
     return set(open_chats)
 
 
 def test_the_sweep_keeps_only_the_newest_companion_chat_of_a_present_patient(monkeypatch):
-    # Chat "old" was orphaned (a worker restart, no /end) before the robot opened "new".
-    assert _companion_sweep(monkeypatch, {"old": (7, 1.0, 1.0), "new": (7, 0.5, 0.5)}) == {"new"}
+    # Chat "old" was orphaned (a worker restart, no /end) before the robot opened "new"; "new" has had no turn for
+    # 3 hours, with the patient in view and quiet: no ceiling closes it while its session runs.
+    assert _companion_sweep(monkeypatch, {"old": (7, 4.0, 4.0), "new": (7, 3.5, 3.0)}) == {"new"}
 
 
-def test_the_sweep_closes_a_companion_chat_past_the_ceiling_although_its_robot_is_present(monkeypatch):
-    from app.jobs import after_chat_job
-    ago = after_chat_job.COMPANION_ABANDON_HOURS + 0.1
-    assert _companion_sweep(monkeypatch, {"quiet": (7, ago + 1, ago)}) == set()
+def test_the_sweep_closes_a_companion_chat_whose_robot_holds_no_running_session(monkeypatch):
+    # The robot is present (a camera session) but its companion session's task lapsed: the robot restarted or no
+    # heartbeat said companion within COMPANION_TASK_EXTEND_SECONDS.
+    assert _companion_sweep(monkeypatch, {"quiet": (7, 1.0, 0.5)}, running=()) == set()
 
 
 def test_retention_purges_transcripts_events_and_tombstones():
