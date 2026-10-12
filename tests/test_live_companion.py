@@ -272,6 +272,34 @@ def test_a_stretch_sends_the_kept_audio_at_no_more_than_twice_real_time(companio
     asyncio.run(scenario())
 
 
+def test_a_robot_sending_audio_too_fast_while_a_stretch_starts_keeps_at_most_kept_max_seconds(companion):
+    """While GPT-Live starts, the relay keeps the robot's audio in memory and sends it at up to twice real time. A
+    robot that sends faster than real time (broken or hostile) must not grow that memory without bound: at most
+    KEPT_MAX_SECONDS stay, the newest, and the stretch still gets them in order."""
+    async def scenario():
+        relay, running = await _start(companion)
+        companion.start_gate = asyncio.Event()                # GPT-Live takes its time to start
+        await _speak(companion)
+        flood = [_pcm(level, 100) for level in range(1, 201)]   # 20 s of audio at once
+        for frame in flood:
+            companion.robot.inbox.put_nowait(frame)
+        while not companion.robot.inbox.empty():
+            await _settle()
+        await _settle()
+        kept = list(relay._pre_roll)
+        assert relay._pre_roll_bytes == sum(map(len, kept))
+        assert relay._pre_roll_bytes <= int(live_session.KEPT_MAX_SECONDS * live_session.RATE) * 2
+        assert kept == flood[-len(kept):] and len(kept) == int(live_session.KEPT_MAX_SECONDS * 10)   # the newest
+        companion.start_gate.set()
+        await relay._starting
+        (client,) = companion.clients
+        assert client.audio == kept
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
 def test_each_stretch_gets_the_note_and_the_last_20_turns_quoted_as_data(companion):
     async def scenario():
         companion.consent["conversation_memory"] = {"granted": True, "terms_version": config.TERMS_VERSION}
