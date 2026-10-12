@@ -552,6 +552,10 @@ ALTER TABLE reachy_device ADD COLUMN IF NOT EXISTS live_voice BOOLEAN NOT NULL D
 ALTER TABLE conversation ADD COLUMN IF NOT EXISTS mode VARCHAR(10) NOT NULL DEFAULT 'text'
     CHECK (mode IN ('text','live'));
 ALTER TABLE conversation ADD COLUMN IF NOT EXISTS live JSONB;
+-- A companion session (spec 2026-10-12-companion-session-design.md): a check-in from robot app 0.9.0 that stays until
+-- a goodbye, a risk or the robot ends it (rest, medicine, a stop). A live one runs GPT-Live in stretches, and its
+-- live JSON adds stretches (how many times GPT-Live was started; usage_seconds is their sum).
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS companion BOOLEAN NOT NULL DEFAULT FALSE;
 -- E2: the live model on the AI connections card. One row (id is always TRUE): an OpenAI connection, the model id,
 -- the voice and the last Check. No ON DELETE: a connection this row uses cannot be deleted (409 in_use).
 CREATE TABLE IF NOT EXISTS ai_live (
