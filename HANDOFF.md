@@ -226,8 +226,13 @@ Known failures that are not caused by this branch: `test_a_broken_background_nev
    just after its session ended (`intake_detection.process_frame` raises `SessionEnded`).
 9. The check-ins switch records consent to the robot notice without showing it (only pairing shows it).
 10. **Phase 2, live voice with GPT-Live.** Phase 2a, live check-ins for testing, is on branch `live-voice-2a` (section
-   6). Phase 2b comes before any real patient uses it: the patient notice and opt-in, the camera kept on during the
-   chat to keep checking the face, reconnecting, a daily budget, and a second transcript for the safety check.
+   6). Phase 2b comes before any real patient uses it: the patient notice and opt-in, checking the face while GPT-Live
+   is talking (robot app 0.9.0 already keeps the camera on during the chat and starts GPT-Live only after a recent
+   sighting), reconnecting, a daily budget, and a second transcript for the safety check.
+11. **Release gate for robot app 0.9.0.** Before 0.9.0 reaches patients beyond the user's own test, a new robot notice
+   version must say that the camera stays on during a check-in (analysed in memory, never saved) and that the chat
+   lasts until goodbye or until Reachy rests. The user decides the notice text; the Reachy card's check-in help
+   already says so. (Robot alerts also don't repeat yet, although the notice §6 promises they do.)
 
 ## 6. Phase 2a: live voice check-ins (test only)
 
@@ -277,6 +282,16 @@ and nobody seen, and ends the chat for a medicine that falls due. This settles t
 45 s silence ending: only robots older than 0.9.0 keep it. Every timing is one constant (for example
 `QUIET_PAUSE_SECONDS` and `REST_AFTER_SECONDS`), to change after trying. Still to check on the robot with the user:
 greet, talk, stay quiet (pause), speak again (restart), say 拜拜.
+
+After the final review (same branch, 0.9.0): the medicine ending lets the patient finish first (`MEDICINE_WAIT_SECONDS`,
+`MEDICINE_SPEECH_GAP_SECONDS`); a dose left pending before the chat is brought up when its reminder retry comes
+(`retry_due`), and medicine tasks are leased before a queued check-in; the sweep keeps a quiet companion chat open
+while its robot holds the running task (no 2-hour ceiling), and the live relay ends a chat whose conversation someone
+else closed; endings drain GPT-Live's last words before storing them; a failed GPT-Live start asks the patient to say it
+again; camera first needs a verified sighting; only a fresh camera answer keeps Reachy awake, and a live chat without a
+working camera for `CAMERA_LOST_SECONDS` goes on as the text chat; the text chat ends when the microphone consent is
+withdrawn; once the server has ended a live chat, the robot never cuts its help line. See section 5 item 11 for the
+release gate.
 
 **Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
 daily cost limit, no reconnect, and no face check while GPT-Live is talking; its safety check reads only GPT-Live's own
