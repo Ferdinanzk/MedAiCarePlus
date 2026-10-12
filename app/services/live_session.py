@@ -20,10 +20,13 @@ POST /conversations. A first message that is not a valid start closes the socket
 The chat (spec B2, C1-C3), once the robot has `ready`: the robot's microphone goes to GPT-Live as it arrives, and
 GPT-Live's voice goes to the robot, but the start of every reply to the patient is held HOLD_SECONDS first (B2), so
 the safety checks on the patient's words can stop it before anything is heard. A reply starts when GPT-Live's audio
-turns non-silent (a sample above ONSET_LEVEL) after the patient spoke; after that onset the audio flows through, and
-silence between replies never goes to the robot. GPT-Live's transcripts become conversation turns (C1): fragments
-are grouped per role, a role switch closes the other role's group and a pause over TURN_GAP_SECONDS closes the
-patient's. The chat ends (C2) on a goodbye, SILENCE_END_SECONDS without patient speech, LIVE_MAX_SECONDS, the robot's
+turns non-silent (a sample above ONSET_LEVEL) after the patient spoke; after that onset the audio flows through, more
+words of the same patient turn hold nothing more, and silence between replies never goes to the robot. GPT-Live's
+transcripts become conversation turns (C1, amended after the Task 7 review): fragments are grouped per role. GPT-Live
+can answer before its transcript of the patient is complete, so its words never close the patient's turn: a pause
+over TURN_GAP_SECONDS, MAX_GROUP_CHARS or the end does. The patient's next turn closes Reachy's (the spoken opening
+once its sound is over), and turns are stored in the order they began.
+The chat ends (C2) on a goodbye, SILENCE_END_SECONDS without patient speech, LIVE_MAX_SECONDS, the robot's
 `end`, a dropped robot, access withdrawn (access_withdrawn: every ACCESS_RECHECK_SECONDS the chat re-checks what the
 text chat checks at every call, A2 and E1: the robot not unpaired, its live switch on, robot and check-in consent
 current), or access unverified (access_unverified: ACCESS_FAILURES_TO_END re-checks in a row could not read it, by an
@@ -198,11 +201,13 @@ def _loud(pcm: bytes) -> bool:
 
 @dataclass
 class _Group:
-    """Transcript fragments of one role that become one conversation turn."""
+    """Transcript fragments of one role that become one conversation turn (C1)."""
     first: float
     last: float
     text: str = ""
     fragments: int = 0
+    opening: bool = False              # Reachy's: GPT-Live's spoken opening, decided when the group is created
+    reply_onset: float | None = None   # the patient's: when GPT-Live's first sound since the group began started
 
     def add(self, text: str, now: float) -> None:
         self.text += text
@@ -273,7 +278,7 @@ class LiveRelay:
         self._reachy: _Group | None = None
         self._patient_turns = 0
         self._segment: _Segment | None = None
-        self._armed = False                     # the patient spoke since GPT-Live's last onset: hold the next one
+        self._armed = False                     # words GPT-Live has not started answering: hold its next onset
         self._reply_metrics: dict | None = None  # the open Reachy reply's timings, stored with its turn
         self._started_at = self._last_patient_at = self._reply_due_at = 0.0
         self._access_checked_at = 0.0                # the last access re-check started then (_check_access)
@@ -499,7 +504,7 @@ class LiveRelay:
             if self._segment is segment and (now - segment.last_signal > TAIL_SECONDS
                                              or now - segment.last_audio > QUIET_SECONDS):
                 self._segment = None
-                self._sound_ended(now)
+                await self._sound_ended(now)
         if self._patient is not None and now - self._patient.last > TURN_GAP_SECONDS:
             await self._close_patient()
         if (now - self._access_checked_at >= ACCESS_RECHECK_SECONDS
@@ -623,7 +628,9 @@ class LiveRelay:
                 return   # silence between replies never goes to the robot
             segment = self._segment = _Segment(onset=now, last_signal=now, last_audio=now, held=self._armed)
             self._armed = False
-            if not segment.held:   # nobody spoke since GPT-Live's last sound (its opening, or it goes on): no hold
+            if self._patient is not None and self._patient.reply_onset is None:
+                self._patient.reply_onset = now   # GPT-Live started answering the patient's open turn (C1)
+            if not segment.held:   # no words it has not begun answering (its opening, or it goes on): no hold
                 segment.released_at = now
                 self._reply_metrics = self._reply_metrics or {}
                 self._reply_metrics.setdefault("first_audio_ms", _ms(now - self._reply_due_at))
@@ -658,44 +665,55 @@ class LiveRelay:
         if self._goodbye and not self._goodbye_replied:
             self._goodbye_end_at = None   # GPT-Live answers the goodbye: the chat ends after this answer
 
-    def _sound_ended(self, now: float) -> None:
+    async def _sound_ended(self, now: float) -> None:
         if self._goodbye and not self._goodbye_replied:
             self._goodbye_replied = True
             self._goodbye_end_at = now + GOODBYE_GRACE_SECONDS
+        if self._reachy is not None and self._reachy.opening and (self._patient is not None or self._patient_turns):
+            await self._close_reachy()   # the spoken opening the patient talked over is over (C1)
 
     # ── transcripts into turns (C1) ──────────────────────────────────────────────────────────────────────────────
 
     async def _on_input_text(self, text: str) -> None:
+        """The patient's words (C1). A fragment within TURN_GAP_SECONDS of the last continues the patient's turn,
+        even after GPT-Live began answering it (its transcript can lag its answer). A fragment that starts a new turn
+        closes Reachy's open group, except the spoken opening while its sound plays (_sound_ended closes that). Until
+        GPT-Live's next sound starts, the turn's words hold that sound (_armed) and its timings count from them
+        (_reply_due_at); once it started, more words of the same turn change neither."""
         if not text.strip():
             if self._patient is not None:
                 self._patient.text += text
             return
         now = self.clock()
-        self._last_patient_at = self._reply_due_at = now
-        self._armed = True   # GPT-Live's next sound answers these words: hold its start
-        if self._reachy is not None:
-            await self._close_reachy()
-        elif self._segment is None:
-            self._reply_metrics = None   # sound without words (a backchannel) is not the next reply's timing
+        self._last_patient_at = now
         if self._patient is not None and now - self._patient.last > TURN_GAP_SECONDS:
             await self._close_patient()   # a pause the timers have not closed yet
         if self._patient is None:
+            if self._reachy is not None and not (self._reachy.opening and self._segment is not None):
+                await self._close_reachy()   # the reply these words follow or interrupt
             self._patient = _Group(first=now, last=now)
+        if self._patient.reply_onset is None:
+            self._reply_due_at = now
+            self._armed = True   # GPT-Live's next sound answers these words: hold its start
+            if self._reachy is None and self._segment is None:
+                self._reply_metrics = None   # sound without words (a backchannel) is not the next reply's timing
         self._patient.add(text, now)
         await self._screen(text, now)
         if len(self._patient.text) >= MAX_GROUP_CHARS:
             await self._close_patient()
 
     async def _on_output_text(self, text: str) -> None:
+        """GPT-Live's words (C1): they never close the patient's turn. A group started before the patient said
+        anything, while the opening's text was not yet replaced, is GPT-Live's spoken opening."""
         if not text.strip():
             if self._reachy is not None:
                 self._reachy.text += text
             return
         now = self.clock()
-        if self._patient is not None:
-            await self._close_patient()
         if self._reachy is None:
-            self._reachy = _Group(first=now, last=now)
+            opening = (self.opening_turn_id is not None and not self._opening_spoken and self._patient is None
+                       and self._patient_turns == 0)
+            self._reachy = _Group(first=now, last=now, opening=opening)
         self._reachy.add(text, now)
         if len(self._reachy.text) >= MAX_GROUP_CHARS:
             await self._close_reachy()
@@ -715,9 +733,12 @@ class LiveRelay:
         return turn_id
 
     async def _close_reachy(self) -> int | None:
-        """Store Reachy's open group as a turn with its reply timings; returns its turn id. The first group before
-        the patient said anything is GPT-Live's spoken opening: it replaces the opening turn's text, so the opening
-        stays the chat's first Reachy turn (memory.finish_followup reads it so)."""
+        """Store Reachy's open group as a turn with its reply timings; returns its turn id. Turns are stored in the
+        order their groups began (C1): a patient group still open began before this reply (the patient's next turn
+        closes Reachy's), so it is stored first. GPT-Live's spoken opening (_Group.opening) replaces the opening
+        turn's text instead, so the opening stays the chat's first Reachy turn (memory.finish_followup reads it so)."""
+        if self._reachy is not None and not self._reachy.opening and self._patient is not None:
+            await self._close_patient()
         group, self._reachy = self._reachy, None
         metrics, self._reply_metrics = self._reply_metrics or {}, None
         if group is None:
@@ -725,7 +746,7 @@ class LiveRelay:
         text = group.text.strip()
         live = {"live": {"first_audio_ms": metrics.get("first_audio_ms"), "hold_ms": metrics.get("hold_ms"),
                          "cut": bool(metrics.get("cut")), "robot_playing_ms": metrics.get("robot_playing_ms")}}
-        if self.opening_turn_id is not None and not self._opening_spoken and self._patient_turns == 0:
+        if group.opening:
             self._opening_spoken = True
             async with self._turn_lock, get_pool().acquire() as conn:
                 await conn.execute("UPDATE conversation_turn SET text = $2, metrics = $3::jsonb WHERE turn_id = $1",
@@ -772,8 +793,8 @@ class LiveRelay:
         """B1, step 1: conversation.screen() on the patient's words since their last pause, at every fragment. A hit
         holds GPT-Live's voice at once (_drain sends nothing) and flushes the robot's queue (a reply already playing
         is cut); _tick confirms it once the words have settled (CONFIRM_SECONDS without a new fragment). The words
-        run on across GPT-Live's fragments (a backchannel 「嗯」 closes the patient's turn), so 「我不想」「嗯」「活了」 is
-        still screened as 我不想活了."""
+        run on across GPT-Live's fragments (a backchannel 「嗯」 never splits them, nor the patient's turn, C1), so
+        「我不想」「嗯」「活了」 is screened as 我不想活了."""
         if self._hit_at is None and now - self._heard_at > TURN_GAP_SECONDS:
             self._heard, self._heard_turns = "", []
         self._heard += text

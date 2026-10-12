@@ -154,11 +154,15 @@ def test_held_audio_of_a_reply_that_ended_during_the_hold_is_dropped(safe):
         await _step(safe, relay, 0.3)
         await _live(safe, _said("了"))                             # still a hit
         await _step(safe, relay, 0.35)                             # 0.65 s after its sound: that reply ended, unheard
-        await _live(safe, _said("我孫子"), _sound())                # cleared; a new reply starts
-        await _step(safe, relay, 0.45)                             # settled: released, behind its own 0.5 s hold
+        await _live(safe, _said("我孫子"), _sound())                # cleared; GPT-Live's sound starts again
+        await _step(safe, relay, 0.3)                              # the words have not settled yet
         assert safe.robot.audio() == []
+        # Settled and cleared: released at once. GPT-Live already began answering this turn, so its sound is not held
+        # a second 0.5 s (C1). Only the new sound goes, none of the dropped reply's.
+        await _step(safe, relay, 0.15)
+        assert safe.robot.audio() == [_pcm(LOUD)]
         await _step(safe, relay, 0.1)
-        assert safe.robot.audio() == [_pcm(LOUD)]                  # only the new reply's sound
+        assert safe.robot.audio() == [_pcm(LOUD)]
         safe.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(safe, running)
         assert safe.alerts == [] and _flagged(safe) == []
@@ -166,16 +170,16 @@ def test_held_audio_of_a_reply_that_ended_during_the_hold_is_dropped(safe):
     asyncio.run(scenario())
 
 
-def test_the_words_are_screened_across_a_backchannel_and_each_of_their_turns_is_flagged(safe):
+def test_the_words_are_screened_across_a_backchannel_and_their_turn_is_flagged(safe):
     async def scenario():
         relay, running = await _begin(safe)
-        await _live(safe, _said("我不想"), _reachy("嗯"), _said("活了"))   # GPT-Live's 「嗯」 splits the patient's turn
+        await _live(safe, _said("我不想"), _reachy("嗯"), _said("活了"))   # GPT-Live's 「嗯」 between the patient's words
         assert safe.robot.json()[1:] == [FLUSH]
         await _step(safe, relay, 0.45)
         await _over(safe, running)
-        _blocked(safe, flagged=[2, 4], quote="我不想活了", source="keyword")
-        assert safe.db.rows() == [("reachy", OPENING), ("patient", "我不想"), ("reachy", "嗯"), ("patient", "活了"),
-                                  ("reachy", HELPLINE)]
+        _blocked(safe, flagged=[2], quote="我不想活了", source="keyword")
+        assert safe.db.rows() == [("reachy", OPENING), ("patient", "我不想活了"), ("reachy", "嗯"),
+                                  ("reachy", HELPLINE)]   # one turn: GPT-Live's words never close the patient's (C1)
 
     asyncio.run(scenario())
 
@@ -259,11 +263,19 @@ def test_layer_2_judges_each_stored_turn_in_the_background_and_a_risk_blocks(saf
         gate = safe.gates[text] = asyncio.Event()
         safe.verdicts[text] = [("self_harm", "self_harm")]
         relay, running = await _begin(safe)
-        await _live(safe, _said(text), _reachy("聽起來"))        # GPT-Live answers: the patient's turn is stored
+        await _live(safe, _said(text), _reachy("聽起來"), _sound())   # GPT-Live answers early
+        await _step(safe, relay, 0.5)
+        assert safe.robot.audio() == [_pcm(LOUD)]              # the reply plays after its hold
+        assert safe.db.rows() == [("reachy", OPENING)]         # the patient's turn stays open
+        for _ in range(2):
+            await _live(safe, _sound())
+            await _step(safe, relay, 0.5)
+        await _live(safe, _sound())
+        await _step(safe, relay, 0.125)                        # a pause over 1.5 s stores the turn: layer 2 judges it
+        assert safe.db.rows("patient") == [("patient", text)]
         assert after_chat._risk_checks[safe.db.chat()["conversation_id"]]   # post-chat work would wait for it
         await _live(safe, _sound())
-        await _step(safe, relay, 0.5)
-        assert safe.robot.audio() == [_pcm(LOUD)]              # the reply plays after its hold: no wait for the check
+        assert safe.robot.audio() == [_pcm(LOUD)] * 5          # the reply goes on: no wait for the check
         gate.set()
         await _over(safe, running)
         _blocked(safe, flagged=[2], quote=text, source="model")
@@ -403,12 +415,16 @@ def test_openais_cut_off_blocks_when_reading_the_turns_fails(safe, caplog):
 
 
 @pytest.mark.parametrize("words, confirmed", [(["我想自殺"], True), (["好久沒看到孫子了，真是想死", "他了"], False)])
-def test_a_turn_stored_during_a_screening_hold_is_judged_only_when_the_hit_clears(safe, words, confirmed):
+def test_a_turn_stored_during_a_screening_hold_is_judged_only_when_the_hit_clears(safe, monkeypatch, words,
+                                                                                   confirmed):
     text = "".join(words)
 
     async def scenario():
+        # GPT-Live's words never close the patient's turn (C1), and a pause comes only after the hit has settled: the
+        # length limit stores this turn, as its last words arrive
+        monkeypatch.setattr(live_session, "MAX_GROUP_CHARS", len(text))
         relay, running = await _begin(safe)
-        await _live(safe, *[_said(part) for part in words], _reachy("嗯"))   # Reachy's 「嗯」 stores the turn
+        await _live(safe, *[_said(part) for part in words])
         assert safe.db.rows("patient") == [("patient", text)] and safe.checks == []   # during the hold: not judged
         await _step(safe, relay, 0.45)                         # the words settled: the hit is confirmed or cleared
         if confirmed:
@@ -434,8 +450,9 @@ def test_a_model_block_landing_while_a_hit_settles_flags_its_turns_while_they_st
         relay, running = await _begin(safe)
         await _live(safe, _said(QUIET_RISK))
         await _step(safe, relay, 1.6)                          # the turn is stored; its check waits
-        await _live(safe, *[_said(part) for part in words], _reachy("嗯"))   # a hit holds; 「嗯」 stores its turn
+        await _live(safe, *[_said(part) for part in words], _reachy("嗯"))   # a hit holds; 「嗯」 leaves its turn open
         assert safe.robot.json()[1:] == [FLUSH] and relay._hit_at is not None   # still settling
+        assert safe.db.rows("patient") == [("patient", QUIET_RISK)]           # stored as the chat stops (still turn 3)
         gate.set()                                             # the model's block lands meanwhile
         await _over(safe, running)
         # 我想自殺 still screens as a risk: its turn is flagged too. 想死他 is "I miss him so": it is not.
