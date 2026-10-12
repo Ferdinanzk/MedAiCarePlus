@@ -36,8 +36,9 @@ WATCH_TIMEOUT = 180.0           # 3 min without an event -> help clip
 HELP_TIMEOUT = 180.0            # 3 more min -> leave the dose pending
 DONE_GRACE = 8.0                # after "I finished": time for the camera to resolve the dose first
 AWAY_TIMEOUT = 90.0             # patient out of sight this long while watched -> leave the dose pending
-CHECKIN_SILENCE = 25.0          # check-in: no answer this long after Reachy spoke -> say goodbye
-CHECKIN_MAX = 300.0             # check-in: at most 5 minutes
+CHECKIN_SILENCE: float | None = None   # check-in: off (0.7.1): a companion stays while the patient is quiet;
+                                       # seconds here end the chat that long after Reachy last spoke, unanswered
+CHECKIN_MAX = 300.0             # check-in: at most 5 minutes, then it ends as "finished"
 # Spoken (not prerecorded) greeting for a conversation-only task, already in the voice's Simplified characters.
 CHECKIN_GREETING = {"zh-TW": "您好！我来找您聊聊天。", "en": "Hello! I came to have a chat with you."}
 ACK_CLIP = "ack"                # check-in: the prerecorded 「嗯」 said the moment the patient pauses
@@ -447,8 +448,10 @@ class SlotSession:
                 await self._close_chat("risk" if answer.get("risk") else "goodbye")
             return
         now = self.clock.monotonic()
-        if now - self.last_spoke >= CHECKIN_SILENCE or now - self.since >= CHECKIN_MAX:
+        if CHECKIN_SILENCE is not None and now - self.last_spoke >= CHECKIN_SILENCE:
             await self._close_chat("silence")
+        elif now - self.since >= CHECKIN_MAX:
+            await self._close_chat("finished")
 
     async def _answer_pause(self) -> None:
         """The moment the VAD hears the patient pause, while SenseVoice is still decoding their words, Reachy says
