@@ -1,7 +1,8 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **12 October 2026**, GitHub branch **`reachy-integration-0.1`**. No passwords, keys or tokens are written
-here; [step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
+Status as of **12 October 2026**, GitHub branch **`reachy-integration-0.2`** (sections 6 and 7 are new in it;
+sections 1-5 describe `reachy-integration-0.1`, which 0.2 builds on). No passwords, keys or tokens are written here;
+[step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
 
 The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
 is out of date; the sections above it win where they disagree.
@@ -264,13 +265,76 @@ To turn it off: switch **Live voice (test)** off on the Reachy card (one robot),
 that Reachy's own voice never comes back as a patient turn (echo), one goodbye, and one fallback (break the connection
 briefly during a chat, e.g. the PC's internet: the check-in must go on as a text chat).
 
-**Open question.** Today's text chat no longer ends on silence (0.7.1), but the live chat still ends after 45 s
-without patient speech, because an open GPT-Live session is billed per second. Decide whether to keep that.
+**Open question (answered on 12 Oct).** Today's text chat no longer ends on silence (0.7.1), but the live chat still
+ends after 45 s without patient speech, because an open GPT-Live session is billed per second. The user's answer is
+the companion session (section 7): GPT-Live pauses while the patient is quiet instead of ending the chat. Until that is
+built, 0.8.0 keeps the 45 s ending.
 
 **Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
 daily cost limit, no reconnect, and no face check during the chat; its safety check reads only GPT-Live's own
 transcript (no second transcript and no echo guard on the server). Keep `LIVE_VOICE_TEST=0` on any installation a
 patient uses.
+
+## 7. What was finished on 12 October 2026
+
+`reachy-integration-0.2` is `reachy-integration-0.1` plus the work below (it was built on the local branch
+`live-voice-2a`).
+
+**Finished and tested**
+
+1. **Phase 2a, live voice check-ins with GPT-Live (test only)**, as in section 6. Built in 11 tasks, each one reviewed
+   before the next. The reviews added three more pieces of work:
+   - While a live chat runs, the server checks every 10 s that the robot is still paired, the live switch is on and
+     the consents are current. If one is gone, the chat ends at once, so the patient's voice stops going to OpenAI. If
+     3 checks in a row cannot be read, the chat ends too.
+   - GPT-Live often starts answering before the patient's last words arrive. The server still stores one patient turn
+     per sentence and one Reachy turn per reply, so a goodbye split in two (「拜」+「拜」) is still seen.
+   - A final review of the whole branch (5 reviewers, 2 more checking each finding) found 3 problems, all fixed: a
+     database error during the help-line ending could skip the family alert (now the alert always goes); a database
+     call that hangs could freeze the chat's safety checks (now every call gives up after 5 s); switching memory off
+     during a live chat was not noticed (now the text chat takes over). Production mode (`APP_ENV=prod`) now refuses
+     to start with `LIVE_VOICE_TEST=1`.
+2. **Robot app 0.7.1: a check-in no longer ends on silence.** After trying Reachy, the user decided that a companion
+   must not leave when the patient is quiet or steps away. Since 0.7.1 a check-in ends only on a goodbye, a risk, a
+   stop, or after 5 minutes. It was deployed to the robot on 12 Oct (the robot keeps a backup of the old app in
+   `~/.medcare_reachy/backup-20261012-111649.tgz`). 0.8.0 includes it.
+3. **A live test on this PC with the real gpt-live-1** (no robot; the server's real relay with stand-ins for the
+   database and the robot):
+   - A normal sentence (「今天天氣有點冷，我不太想出門散步。」): GPT-Live greeted 「王奶奶，今天感覺怎麼樣？想跟我聊聊嗎？」
+     3.8 s after the start, heard the sentence correctly, and answered 1.9 s after the patient finished (this includes
+     the 0.5 s safety hold). The reply was 30 characters.
+   - A risk sentence (「最近覺得活著沒什麼意思，我不想活了。」): the keyword check caught it while the patient was still
+     speaking. None of GPT-Live's voice reached the robot; the robot said the help line in its own voice; family were
+     alerted once.
+   - Cost: 39 billed seconds in all.
+4. **The companion session: designed and approved, not built yet.** Spec:
+   `docs/superpowers/specs/2026-10-12-companion-session-design.md`. Reachy greets the patient in its own voice. GPT-Live
+   starts only when the camera recognised the patient in the last 15 s and the patient speaks. It pauses after 30 s of
+   quiet (billing stops) and restarts with the conversation so far. The session ends on 拜拜/再見, a risk, a
+   withdrawal, a medicine falling due, or 10 minutes with no voice and nobody seen. Today's text chat follows the same
+   rules. It will be robot app 0.9.0; its implementation plan is being written.
+
+**Tests at this commit:** backend 2020 passed plus 1 known failure (BUG-37, older than this work); robot app 624
+passed, 6 skipped; web app 91 Playwright tests passed plus 1 known failure (BUG-38).
+
+**Where everything is**
+
+| What | Where |
+|---|---|
+| Code | GitHub `Ferdinanzk/MedAiCarePlus`, branch `reachy-integration-0.2` |
+| Robot app 0.8.0 | Hugging Face space `pearlyjam21/medcare_reachy`, branch `reachy-integration-0.2`. The space's `main` (what the robot's app store installs) is still 0.7.0. |
+| The robot | Runs 0.7.1 (deployed by SSH from this branch's parent `checkin-no-silence`, not from Hugging Face) |
+| The server on this PC | The `reachy-integration-0.1` build, with live voice off |
+
+**Not done yet**
+
+- The robot tests of Phase 2a (section 6, "Still to check on the robot"). They need the server rebuilt from this branch
+  with `LIVE_VOICE_TEST=1` and robot app 0.8.0 on the robot; the user will do them together with the developer.
+- Building the companion session (robot app 0.9.0).
+- Small points the reviews found and left for Phase 2b: a database insert that times out can slow the chat's later
+  writes; a late risk found while the chat is already falling back can end it without the spoken help line (family
+  are still alerted); the check-ins help text on the Reachy card still says only text is sent, also while the live
+  voice test switch is on.
 
 ---
 
