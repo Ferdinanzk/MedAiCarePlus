@@ -88,12 +88,14 @@ class HeartbeatPayload(BaseModel):
     bridge_version: str | None = Field(default=None, max_length=50)
     missing_clips: int | list[str] | None = None
     camera: CameraReport | None = None   # robots older than 0.7.0 send none
+    companion: bool = False   # robot app 0.9.0: a companion session runs; keep its task from expiring
 
 
 class MonitorStartPayload(BaseModel):
     mode: Literal["dose", "observe"]
     intk_id: int | None = Field(default=None, gt=0)
     task_id: str | None = None
+    companion: bool = False   # robot app 0.9.0: an observe session of a companion session (spec 3.2)
 
 
 def _uuid(value: str | None) -> str | None:
@@ -575,6 +577,8 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",
             device["device_id"], payload.robot_reachable, payload.landmark_fps, json.dumps(detail))
         await reachy_tasks.extend_leases(conn, device["device_id"])
+        if payload.companion:
+            await reachy_tasks.extend_for_companion(conn, device["device_id"])
     # Medicine first (companion spec 3.4): a robot in a companion session ends it when a medicine task waits. Read after
     # the writes commit: a failing read answers false and never rolls back last_seen_at or the lease extension.
     try:
@@ -612,7 +616,9 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
             if intk_id is not None and intk_id not in list(task["intk_ids"]):
                 raise HTTPException(409, "Dose does not belong to this task")
             # Only a check-in task's search verifies with the OpenVINO match alone (monitor_service.openvino_only).
-            checkin_search = task["reason"] == "checkin"
+            # A companion session's observe session too (robot app 0.9.0): it never records, and no dose prompt
+            # follows it, so the patient can be recognised from across the room (spec 3.2).
+            checkin_search = task["reason"] == "checkin" or (payload.companion and payload.mode == "observe")
         if intk_id is not None:
             row = await conn.fetchrow(
                 "SELECT m.dose_form, m.units_per_dose, i.intake_time_stamp FROM intake i "

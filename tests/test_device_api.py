@@ -362,6 +362,21 @@ def test_heartbeat_says_whether_a_medicine_task_waits(env, monkeypatch):
     assert env.conn.task_due_asked == [((7,), 0), ((7,), 0)]   # this patient, after the heartbeat's transaction ended
 
 
+def test_a_companion_heartbeat_keeps_the_held_task_alive(env, monkeypatch):
+    _no_leases(monkeypatch)
+    extended = []
+
+    async def extend_for_companion(conn, device_id):
+        extended.append((device_id, conn.depth))
+
+    monkeypatch.setattr(reachy_tasks, "extend_for_companion", extend_for_companion)
+    assert env.robot.post("/api/device/heartbeat", json={"companion": False}).status_code == 200
+    assert env.robot.post("/api/device/heartbeat", json={}).status_code == 200
+    assert extended == []
+    assert env.robot.post("/api/device/heartbeat", json={"companion": True}).status_code == 200
+    assert extended == [(DEVICE_ID, 1)]   # inside the write transaction, with the lease extension
+
+
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
 
 CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
@@ -604,6 +619,19 @@ def test_device_sessions_keep_the_mode_they_started_in(env):
     checkin_search = session(mode="observe", task_id=TASK_ID)
     assert checkin_search.started_mode == "observe" and checkin_search.checkin_search is True
     assert monitor_service.openvino_only(checkin_search) is True
+
+
+def test_a_companion_observe_session_of_a_dose_task_uses_the_checkin_face_rule(env):
+    # After a dose the companion phase keeps an observe session of the DOSE task: it needs the check-in face rule.
+    session = env.registry.sessions[_start(env, mode="observe", task_id=TASK_ID, companion=True).json()["session_id"]]
+    assert env.conn.task["reason"] != "checkin"
+    assert session.checkin_search is True and monitor_service.openvino_only(session) is True
+
+
+def test_a_companion_flag_never_loosens_a_dose_session(env):
+    session = env.registry.sessions[
+        _start(env, mode="dose", intk_id=101, task_id=TASK_ID, companion=True).json()["session_id"]]
+    assert session.checkin_search is False and monitor_service.openvino_only(session) is False
 
 
 def test_device_start_returns_503_when_models_not_ready(env, monkeypatch):

@@ -233,6 +233,19 @@ async def extend_leases(conn, device_id: str) -> None:
         device_id)
 
 
+COMPANION_TASK_EXTEND_SECONDS = 600   # a companion session's task stays open this long past each heartbeat saying so
+
+
+async def extend_for_companion(conn, device_id: str) -> None:
+    """A companion session can outlast its task's expiry (spec 2: it stays until goodbye). While the robot's heartbeat
+    says one runs, the in-progress task it holds stays open at least COMPANION_TASK_EXTEND_SECONDS longer."""
+    await conn.execute(
+        "UPDATE reachy_task SET expires_at = GREATEST(expires_at, "
+        f"NOW() + INTERVAL '{COMPANION_TASK_EXTEND_SECONDS} seconds') "
+        "WHERE lease_owner = $1::uuid AND status = 'in_progress'",
+        device_id)
+
+
 async def notify_robot_offline(conn, u_id: int, slot_time, now: datetime) -> int:
     """Caregiver notice through the outbox, at most once per patient per 6 hours."""
     recent = await conn.fetchval(
