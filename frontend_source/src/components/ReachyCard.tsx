@@ -5,7 +5,7 @@ import LegalDocument from './LegalDocument';
 import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalResponse } from '../lib/consent-api';
 import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
 import { deleteAllMemory } from '../lib/memory-api';
-import { fetchOverdoseProtection } from '../lib/notify-api';
+import { fetchOverdoseProtection, notifyApi } from '../lib/notify-api';
 import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, setAutoRecord, startCheckin, unpairReachy, type ReachyStatus } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
@@ -33,6 +33,8 @@ export default function ReachyCard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
+  const [lineReminderNotice, setLineReminderNotice] = useState('');
+  const [robotReminderNotice, setRobotReminderNotice] = useState('');
 
   const load = useCallback(async () => {
     const [robot, consent] = await Promise.all([fetchReachyStatus(), fetchConsentStatus()]);
@@ -164,6 +166,25 @@ export default function ReachyCard() {
     setTestNotice(null);
     await startCheckin();
     setTestNotice({ key: 'conversations.checkinQueued' });
+    await refresh();
+  });
+
+  const sendLineReminderNow = () => run(async () => {
+    setLineReminderNotice('');
+    try {
+      const result = await notifyApi.sendManualMedicationReminder();
+      setLineReminderNotice(t('reachy.manualReminderSent', { count: result.sent }));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : '';
+      setLineReminderNotice(detail === 'no_linked_line'
+        ? t('reachy.manualReminderNoLine') : t('reachy.manualReminderFailed'));
+    }
+  });
+
+  const sendRobotReminderNow = () => run(async () => {
+    setRobotReminderNotice('');
+    await startCheckin();
+    setRobotReminderNotice(t('reachy.robotReminderQueued'));
     await refresh();
   });
 
@@ -316,6 +337,12 @@ export default function ReachyCard() {
             <button onClick={sendTestAlert} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-[#0057B8] text-white font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
               <BellRing className="w-4 h-4" />{t('reachy.testAlert')}
             </button>
+            <button onClick={sendRobotReminderNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-[#0057B8] text-[#0057B8] font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}{t('reachy.robotReminderNow')}
+            </button>
+            <button onClick={sendLineReminderNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-green-700 text-green-800 font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <BellRing className="w-4 h-4" />}{t('reachy.manualReminderNow')}
+            </button>
             {checkins && (
               <button onClick={talkNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-[#0057B8] text-[#0057B8] font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
                 <MessageCircle className="w-4 h-4" />{t('conversations.talkNow')}
@@ -329,6 +356,8 @@ export default function ReachyCard() {
               {testNotice.noDose && checkins && ` ${t('reachy.testAlertTalkInstead', { label: t('conversations.talkNow') })}`}
             </p>
           )}
+          {lineReminderNotice && <p role="status" className="rounded-xl bg-green-50 p-3 text-sm text-green-800">{lineReminderNotice}</p>}
+          {robotReminderNotice && <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">{robotReminderNotice}</p>}
         </div>
       )}
 

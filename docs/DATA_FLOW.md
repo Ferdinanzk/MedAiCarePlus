@@ -45,7 +45,7 @@ flowchart LR
   subgraph Robot["Robot - stays on robot"]
     Mic["Microphone audio<br/>memory only"]
     Cam["Camera 1280x720"]
-    STT["SenseVoice text"]
+    STT["Whisper Base transcript"]
   end
   subgraph Laptop["Laptop"]
     RAM["In memory<br/>frames, landmarks, sessions,<br/>opt-in frame buffer"]
@@ -503,7 +503,7 @@ sequenceDiagram
   API-->>R: opening line and speech_text
   R->>Pt: Matcha TTS
   Pt->>R: speech
-  R->>R: VAD, ack 嗯, SenseVoice text, echo filter
+  R->>R: Silero VAD, ack 嗯, Whisper Base text, echo filter
   R->>API: POST /api/device/conversations/ID/turn text and metrics
   opt the ack 嗯 played for this turn
     R->>Pt: thinking phrase 0.5 s after hand-over
@@ -515,9 +515,9 @@ sequenceDiagram
     API-->>R: HELPLINE, end
   else no hit
     par reply
-      API->>LLM: reply call, 8 s deadline
+      API->>LLM: Gemini Flash reply via OpenRouter, 8 s deadline
     and risk check
-      API->>LLM: risk call, 4 s deadline
+      API->>LLM: Gemini Flash risk check via OpenRouter, 4 s deadline
     end
     API->>DB: store Reachy turn with metrics
     API-->>R: reply, speech_text, end, risk
@@ -535,7 +535,7 @@ sequenceDiagram
 1. **Start.** `POST /api/device/conversations {task_id, language}` (`app/routers/api_device.py:318-338`). 403 `checkin_consent_required` without the 4 scopes (`:275-277`).
    - With memory consent, the opening may use the patient's own preferred name, and one follow-up event from 1-7 days ago is chosen (`app/services/memory.py:143-152,390-407`).
    - Inserts `conversation` and the opening Reachy turn.
-2. **Robot listening** (`bridge/voice.py`, "chat" mode): Silero VAD (0.5 s pause ends a segment), the 「嗯」 ack at once, then SenseVoice. Echo guards drop Reachy's own voice. Only text and timings leave the robot (`:402-450`). The thinking phrase is armed only when the ack played for this turn, and plays 0.5 s after hand-over unless the patient speaks again (`:428-429`; [MODELS.md section 14](MODELS.md#14-robot-i-finished-matcher-and-echo-guards-bridgevoicepy)).
+2. **Robot listening** (`bridge/voice.py`, "chat" mode): Silero VAD (0.5 s pause ends a segment), the 「嗯」 ack at once, then Whisper Base through faster-whisper. Echo guards drop Reachy's own voice. Only text and timings leave the robot (`:402-450`); audio stays on the robot. The thinking phrase is armed only when the ack played for this turn, and plays 0.5 s after hand-over unless the patient speaks again (`:428-429`; [MODELS.md section 14](MODELS.md#14-robot-i-finished-matcher-and-echo-guards-bridgevoicepy)).
 3. **Turn.** `POST /api/device/conversations/ID/turn {text, metrics}`, robot timeout 60 s (`api_device.py:341-437`; `bridge/app_client.py:202-209`).
    1. Consent re-check; text 1-500 chars.
    2. **Layer 1 keyword screen** before any model call (`conversation.screen`, `conversation.py:227-249`).

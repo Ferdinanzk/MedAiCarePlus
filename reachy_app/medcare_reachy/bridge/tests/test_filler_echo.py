@@ -1,7 +1,7 @@
 """Reachy's thinking phrase: said once the patient's turn is handed over, and its echo removed by its words, only right
 after Reachy said it, and never together with a word of the patient's.
 
-The 0.5.3 review played the phrase the moment the patient paused, through the real Matcha voice and SenseVoice: a
+The 0.5.3 review played the phrase the moment the patient paused, through the real Mandarin voice and SenseVoice: a
 patient going on under it came out garbled (「我不想…活了」 lost its 活, or became 「我不想 我再想一活了」, which the
 keyword screen misses). Said after the hand-over, the phrase can no longer land inside the turn the patient is still
 saying.

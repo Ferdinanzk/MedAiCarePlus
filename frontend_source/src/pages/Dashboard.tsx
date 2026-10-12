@@ -16,6 +16,8 @@ import {
   Heart,
   Bot,
   AlertTriangle,
+  BellRing,
+  Loader2,
 } from 'lucide-react';
 import ServiceCard from '../components/ui/ServiceCard';
 import DoseEmotionChip from '../components/DoseEmotionChip';
@@ -96,6 +98,8 @@ export default function Dashboard() {
   const [busyDose, setBusyDose] = useState<number | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [checkinNotice, setCheckinNotice] = useState('');
+  const [manualReminderBusy, setManualReminderBusy] = useState(false);
+  const [manualReminderNotice, setManualReminderNotice] = useState('');
 
   const getGreeting = useCallback(() => {
     const hour = new Date().getHours();
@@ -201,6 +205,27 @@ export default function Dashboard() {
     }
   };
 
+  const sendManualReminder = async () => {
+    setManualReminderBusy(true);
+    setManualReminderNotice('');
+    const token = localStorage.getItem('face_auth_token');
+    try {
+      const resp = await fetch('/api/notify/manual-reminder', {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.detail || 'send_failed');
+      setManualReminderNotice(t('dashboard.reminderSent', { count: body.sent }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '';
+      setManualReminderNotice(detail === 'no_linked_line'
+        ? t('dashboard.reminderNoLine') : t('dashboard.reminderFailed'));
+    } finally {
+      setManualReminderBusy(false);
+    }
+  };
+
   const getStatusIcon = (status: string) => {
     switch (status) {
       case 'taken':
@@ -290,7 +315,16 @@ export default function Dashboard() {
             <Plus className="w-4 h-4" />
             {t('medications.addNew')}
           </button>
+          <button
+            onClick={sendManualReminder}
+            disabled={manualReminderBusy}
+            className="flex-1 bg-white text-[#003D82] rounded-xl py-4 text-base font-semibold hover:bg-blue-50 active:scale-95 transition-all flex items-center justify-center gap-2 touch-target-large disabled:opacity-70"
+          >
+            {manualReminderBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : <BellRing className="w-5 h-5" />}
+            {manualReminderBusy ? t('dashboard.reminderSending') : t('dashboard.sendReminderNow')}
+          </button>
         </div>
+        {manualReminderNotice && <p role="status" className="mt-3 rounded-lg bg-white/15 px-3 py-2 text-sm">{manualReminderNotice}</p>}
       </div>
 
       {/* Services Grid */}
