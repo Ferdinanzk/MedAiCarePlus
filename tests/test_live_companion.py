@@ -2,8 +2,9 @@
 3.5 and 5): a start from robot app 0.9.0 is paused (the robot says the opening; no GPT-Live), the robot's `speech`
 starts a GPT-Live stretch only for a patient its camera verified within SEEN_RECENT_SECONDS, the pre-roll goes first,
 each stretch gets the companion note and the last HISTORY_TURNS turns as quoted data, a stretch pauses after
-QUIET_PAUSE_SECONDS of quiet or at STRETCH_MAX_SECONDS, usage is summed over the stretches, nothing restarts after a
-risk, the access re-check runs while paused, and an older robot gets today's live chat.
+QUIET_PAUSE_SECONDS of quiet or, past STRETCH_MAX_SECONDS, at the patient's turn gap (STRETCH_HARD_MAX_SECONDS at the
+latest), what GPT-Live still sent is screened and judged at a pause, usage is summed over the stretches, nothing
+restarts after a risk, the access re-check runs while paused, and an older robot gets today's live chat.
 
 It drives the relay with Task 7's fakes (tests/test_live_relay_chat.py: the world fixture, FakeRobot, FakeLive, LiveDB
 and the fake clock) and Task 8's safety fakes (tests/test_live_safety.py), through the real LiveRelay._open. Nothing
@@ -27,8 +28,8 @@ from app.services import ai_settings, conversation, live_session, memory, monito
 from app.services.live_client import LiveError, LiveEvent  # noqa: E402
 from tests.test_live_relay_chat import (DEVICE, DEVICE_ID, LOUD, OPENING, TASK_ID, LiveDB, _live, _over,  # noqa: E402
                                         _pcm, _reachy, _said, _settle, _sound, _step, world)  # noqa: F401
-from tests.test_live_safety import (END_RISK, FLUSH, HELPLINE, QUIET_RISK, SAY, SafetyLive, _alert,  # noqa: E402
-                                    _blocked, safe)  # noqa: F401 (safe is a fixture)
+from tests.test_live_safety import (END_RISK, FLUSH, HELPLINE, QUIET_RISK, SAY, UNHEARD, SafetyLive,  # noqa: E402
+                                    _alert, _blocked, _flagged, safe)  # noqa: F401 (safe is a fixture)
 
 TARGET = ai_settings.LiveTarget("sk-test-live-key-0000", "gpt-live-1", "marin")
 START = {"type": "start", "task_id": TASK_ID, "language": "zh-TW", "rate": 16000, "bridge_version": "0.9.0"}
@@ -61,8 +62,7 @@ class CompanionDB(LiveDB):
 
 class CompanionLive(SafetyLive):
     """Task 8's fake GPT-Live (mutes counted). start() waits for world.start_gate when it is set, then raises
-    LiveError(world.fail) when that is set. close() waits for world.close_gate when it is set, then queues the closed
-    event, as LiveClient.close() does."""
+    LiveError(world.fail) when that is set. close() queues the closed event, as LiveClient.close() does."""
 
     async def start(self, timeout=8.0):
         assert timeout == live_session.CONNECT_TIMEOUT
@@ -72,8 +72,6 @@ class CompanionLive(SafetyLive):
             raise LiveError(self.world.fail)
 
     async def close(self, wait=2.0):
-        if self.world.close_gate is not None:
-            await self.world.close_gate.wait()
         usage = await super().close(wait)
         self.events_in.put_nowait(LiveEvent(type="closed", reason="close_requested", usage_seconds=usage))
         return usage
@@ -84,10 +82,10 @@ def companion(safe, monkeypatch):
     """Task 7's world with Task 8's safety fakes, for a start through the real LiveRelay._open: LIVE_VOICE_TEST on,
     the task leased by this robot (CompanionDB), a usable live model, the call name 王奶奶 and, with memory consent,
     the memory block MEMORY BLOCK. Each stretch's GPT-Live is a CompanionLive. `seen` answers the camera-first check
-    (each question recorded in `seen_asked`); `fail`, `start_gate` and `close_gate` steer CompanionLive."""
+    (each question recorded in `seen_asked`); `fail` and `start_gate` steer CompanionLive."""
     w = safe
     w.db = CompanionDB()
-    w.seen, w.seen_asked, w.fail, w.start_gate, w.close_gate = True, [], None, None, None
+    w.seen, w.seen_asked, w.fail, w.start_gate = True, [], None, None
 
     def factory(*args, **kwargs):
         w.clients.append(CompanionLive(w, *args, **kwargs))
@@ -327,17 +325,81 @@ def test_a_talking_stretch_pauses_at_stretch_max_seconds_and_the_chat_goes_on(co
             await _live(companion, _said("還有"))
         await _step(companion, relay, 19.5)
         await _live(companion, _said("最後"))                 # 599.5 s: still talking
-        assert companion.clients[0].closes == 0
-        await _step(companion, relay, 0.5)                    # 600 s after the stretch started
+        await _step(companion, relay, 0.5)                    # 600 s after the stretch started: their turn is open
+        await _step(companion, relay, 1.0)                    # 1.5 s after their words: not yet a turn gap
+        assert companion.clients[0].closes == 0 and companion.robot.json()[1:] == []
+        await _step(companion, relay, 0.25)                   # their turn gap: the turn is stored, then paused
         assert companion.clients[0].closes == 1 and companion.robot.json()[1:] == [PAUSED]
         assert relay.outcome is None                          # no LIVE_MAX_SECONDS ending
-        assert companion.db.rows("patient")[-1] == ("patient", "最後")   # the open turn stored at the pause
+        assert companion.db.rows("patient")[-1] == ("patient", "最後")
         assert len(companion.db.rows("patient")) == 30
+        await _step(companion, relay, 1.0)
+        assert len(companion.clients) == 1                    # a pause at a turn gap waits for the patient
         await _speak(companion)                               # the patient's next words start a new stretch
         assert len(companion.clients) == 2
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
         assert companion.db.chat()["live"]["stretches"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_the_hard_cap_pauses_a_patient_still_talking_and_their_queued_words_are_screened_and_stored(companion):
+    async def scenario():
+        relay, running = await _start(companion)
+        await _speak(companion)
+        first = companion.clients[0]
+        for _ in range(29):                                   # the patient talks every 20 s: 580 s
+            await _step(companion, relay, 20)
+            await _live(companion, _said("還有"))
+        for _ in range(79):                                   # then on and on, never a turn gap: 659 s
+            await _step(companion, relay, 1)
+            await _live(companion, _said("對"))
+        await _live(companion, _reachy("嗯嗯"), _sound())
+        await _step(companion, relay, 0.5)                    # GPT-Live's reply plays after its hold
+        await _live(companion, _sound())
+        assert first.closes == 0 and companion.robot.json()[1:] == [] and len(companion.robot.audio()) == 2
+        first.events_in.put_nowait(_said("我想自殺"))         # the patient's words, not yet handled
+        await _step(companion, relay, 0.5)                    # STRETCH_HARD_MAX_SECONDS: paused mid-reply
+        assert first.closes == 1
+        # the reply is cut (flush), the queued words are screened (a hit: flush) and stored, then paused
+        assert companion.robot.json()[1:] == [FLUSH, FLUSH, PAUSED]
+        words = "還有" + "對" * 79 + "我想自殺"
+        assert companion.db.rows()[-2:] == [("patient", words), ("reachy", "嗯嗯")]
+        assert companion.db.turns[-1]["metrics"]["live"]["cut"] is True
+        # the patient spoke within TURN_GAP_SECONDS of the cap: the next stretch starts at once, camera first
+        assert len(companion.clients) == 2 and companion.seen_asked == [7, 7]
+        await _step(companion, relay, 0.4)                    # the hit settled: still a risk, blocked
+        await _over(companion, running)
+        chat = companion.db.chat()
+        assert companion.robot.json()[1:] == [FLUSH, FLUSH, PAUSED, SAY, END_RISK]
+        assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True) and _flagged(companion) == [30]
+        assert companion.alerts == [_alert(companion, words, 30)]
+        assert len(companion.robot.audio()) == 2 and chat["live"]["stretches"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_openais_cut_off_still_queued_at_a_quiet_pause_is_judged_and_blocks(companion):
+    async def scenario():
+        companion.verdicts[UNHEARD] = [(None, "none"), ("self_harm", "self_harm")]   # layer 2, then B4's check
+        relay, running = await _start(companion)
+        await _speak(companion)
+        await _live(companion, _said(UNHEARD))                # no keyword
+        await _step(companion, relay, 1.75)                   # the turn is stored; layer 2 finds no risk
+        companion.clients[0].events_in.put_nowait(LiveEvent(type="error", code="content_filter"))   # not yet handled
+        await _step(companion, relay, 28.25)                  # 30 s of quiet: paused, OpenAI's cut-off still queued
+        await _over(companion, running)
+        chat = companion.db.chat()
+        assert companion.robot.json()[1:] == [FLUSH, SAY, END_RISK]   # blocked: never `paused`
+        assert [check[0] for check in companion.checks] == [UNHEARD, UNHEARD]
+        assert companion.db.turns[1]["metrics"]["live"]["risk_source"] == "content"
+        assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True) and _flagged(companion) == [2]
+        assert companion.alerts == [_alert(companion, UNHEARD, 2)]
+        assert companion.db.rows()[-1] == ("reachy", HELPLINE)
+        assert (companion.clients[0].mutes, companion.clients[0].closes) == (0, 1)   # closed at the pause
+        assert chat["live"] == {"usage_seconds": 42.0, "close_reason": "content", "fallback_reason": None,
+                                "stretches": 1}
 
     asyncio.run(scenario())
 

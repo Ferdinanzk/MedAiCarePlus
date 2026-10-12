@@ -47,8 +47,10 @@ camera first: only when seen(u_id) says the robot's camera verified the patient 
 robot gets {"type": "not_seen"}). A stretch is a new GPT-Live session, started within CONNECT_TIMEOUT with the live
 instructions plus companion_note (Reachy already greeted; the last HISTORY_TURNS stored turns quoted as transcript
 data); the pre-roll goes first, then the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
-transcript of it, or the robot's speech signals) once GPT-Live's sound has ended, or STRETCH_MAX_SECONDS after the
-stretch began, pauses it: the open turns are stored, GPT-Live is closed and the robot gets {"type": "paused"}. A
+transcript of it, or the robot's speech signals) once GPT-Live's sound has ended, or, once the stretch is
+STRETCH_MAX_SECONDS old, the patient's next turn gap (STRETCH_HARD_MAX_SECONDS at the latest, a reply cut with a
+flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient's words screened and grouped,
+OpenAI's cut-off judged), the open turns are stored and the robot gets {"type": "paused"}. A
 stretch runs as the chat above, and the access re-check runs while paused too; but SILENCE_END_SECONDS and
 LIVE_MAX_SECONDS end no companion chat (the robot ends it: a goodbye, rest as patient_left, medicine, a stop), a
 stretch that cannot start falls back as live_unavailable with the conversation id, and after a risk nothing restarts.
@@ -97,7 +99,12 @@ ACCESS_FAILURES_TO_END = 3     # this many failed re-checks in a row end the cha
 DB_TIMEOUT_SECONDS = 5.0       # one database operation of the chat (a pooled connection and its queries); then it fails
 # Companion mode (robot app 0.9.0; companion spec 3.1, 3.2): each timing is one constant, to change after trying it
 QUIET_PAUSE_SECONDS = 30.0     # no patient speech this long, once GPT-Live's sound ended: the stretch pauses
-STRETCH_MAX_SECONDS = 600.0    # the longest GPT-Live stretch; the patient's next words start a new one
+STRETCH_MAX_SECONDS = 600.0    # a stretch this long pauses at the patient's next turn gap, once GPT-Live's sound ended
+# ... and this long, it pauses even mid-sentence: the patient's words still queued are screened and stored, and when
+# they spoke within TURN_GAP_SECONDS of it the next stretch starts at once (camera first), so the pre-roll carries on
+STRETCH_HARD_MAX_SECONDS = STRETCH_MAX_SECONDS + 60.0
+PAUSE_DRAIN_SECONDS = 2.0      # a paused stretch's queued events: the longest wait for the next one (LiveClient.close()
+                               # already waited up to 2 s for them, so its closed event is queued last)
 SEEN_RECENT_SECONDS = 15.0     # GPT-Live (re)starts only for a patient the robot's camera verified this recently
 PRE_ROLL_SECONDS = 2.0         # the microphone audio kept while paused; a new stretch hears it first
 HISTORY_TURNS = 20             # the stored turns a new stretch gets, quoted as transcript data
@@ -407,6 +414,7 @@ class LiveRelay:
         self._pre_roll_bytes = 0
         self._starting: asyncio.Task | None = None   # the stretch being started (_start_stretch)
         self._listener: asyncio.Task | None = None   # the running stretch's GPT-Live events (_downlink)
+        self._in_hand = None                         # the event _downlink took and waits for _handler_lock with
         self._speech_waiting = False                 # the patient spoke while a stretch was being paused
         self._stretches = 0                          # GPT-Live sessions started (conversation.live stretches)
         self._stretch_started_at = 0.0
@@ -657,10 +665,13 @@ class LiveRelay:
 
     async def _downlink(self, client) -> None:
         """GPT-Live's events (in companion mode, one stretch's): audio through the hold, transcripts into turns, errors
-        and closes into a fallback. A stretch the relay pauses has this loop cancelled first (_pause)."""
+        and closes into a fallback. A stretch the relay pauses has this loop cancelled first (_pause), which then
+        handles the event it held while waiting for the lock (_in_hand) and the ones still queued."""
         try:
             async for event in client.events():
+                self._in_hand = event
                 async with self._handler_lock:
+                    self._in_hand = None
                     await self._on_live_event(event)
                 if self.outcome is not None:
                     return
@@ -686,8 +697,10 @@ class LiveRelay:
         patient's turn gap, the access re-check (A2, E1: started here, never awaited, so a slow database never delays
         the rest; in companion mode while paused too), and the endings: goodbye, silence and limit here,
         access_withdrawn and access_unverified from the re-check. In companion mode silence and limit end nothing: a
-        running stretch pauses instead (_pause), QUIET_PAUSE_SECONDS after the patient's last speech once GPT-Live's
-        sound has ended, or STRETCH_MAX_SECONDS after it started, never while a screening hit settles."""
+        running stretch pauses instead (_pause), never while a screening hit settles: QUIET_PAUSE_SECONDS after the
+        patient's last speech once GPT-Live's sound has ended; once it is STRETCH_MAX_SECONDS old, at the patient's
+        turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended); and once
+        it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and GPT-Live are doing."""
         now = self.clock()
         if self._hit_at is not None and now - self._heard_at >= CONFIRM_SECONDS:
             await self._confirm()
@@ -716,7 +729,11 @@ class LiveRelay:
             self._finish("end", "goodbye")
         elif self.companion:
             if self._phase == "running" and self.outcome is None and self._hit_at is None:
-                if now - self._stretch_started_at >= STRETCH_MAX_SECONDS:
+                stretch = now - self._stretch_started_at
+                if stretch >= STRETCH_HARD_MAX_SECONDS:
+                    await self._pause("stretch_hard_max")
+                elif (stretch >= STRETCH_MAX_SECONDS and self._patient is None and self._segment is None
+                      and now - self._last_patient_at > TURN_GAP_SECONDS):
                     await self._pause("stretch_max")
                 elif now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None:
                     await self._pause("quiet")
@@ -912,25 +929,69 @@ class LiveRelay:
         self._phase = "running"
 
     async def _pause(self, why: str) -> None:
-        """End the running stretch, as a timer (_handler_lock): its events loop is cancelled first (this close is no
-        failure), GPT-Live is closed (session.close, its usage kept, _close_live), the open turns are stored and the
-        robot gets `paused`. The microphone goes to the pre-roll again, and the patient's next words start a new
-        stretch (_on_speech). why: quiet or stretch_max, for the log."""
+        """End the running stretch, as a timer (_handler_lock). why: quiet, stretch_max or stretch_hard_max (_tick).
+
+        The microphone goes to the pre-roll from here on. The stretch's events loop is stopped first (this close is no
+        failure), keeping the event it held. A reply the hard cap cuts short ends as when its sound stops (cut, the
+        goodbye's grace) and the robot's queue is flushed. GPT-Live is closed (session.close, its usage kept,
+        _close_live), and what it still sent is handled as the events loop would have (_drain_stretch): the
+        patient's last words are screened and grouped, OpenAI's cut-off is judged. Only then are the open turns
+        stored and the robot sent `paused`; an outcome decided meanwhile is left to the wrap-up, which does both its
+        own way. The patient's next words start a new stretch (_on_speech), at once when they spoke during the pause
+        or, at the hard cap, within TURN_GAP_SECONDS of it: the pre-roll then carries their words on."""
+        began = self.clock()
         self._phase = "pausing"
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.cancel()
-        self._stop_voice()   # a reply STRETCH_MAX_SECONDS cut short; after a quiet pause there is none
+            await asyncio.gather(listener, return_exceptions=True)
+        in_hand, self._in_hand = self._in_hand, None
+        if self._segment is not None:   # the hard cap cuts GPT-Live's sound
+            self._stop_voice()
+            await self._to_robot({"type": "flush"})
+            await self._sound_ended(began)
         self._armed = False
+        client = self.client
         usage = await self._close_live()
+        await self._drain_stretch(client, in_hand)
+        if self.outcome is not None:
+            return
         await self._store_groups()
         self._phase = "paused"
         log.info("live chat %s: GPT-Live paused (%s) after stretch %d (%s s billed in all)", self.conversation_id, why,
                  self._stretches, usage)
         await self._to_robot({"type": "paused"})
-        if self._speech_waiting:
+        talking = why == "stretch_hard_max" and self._last_patient_at >= began - TURN_GAP_SECONDS
+        if self._speech_waiting or talking:
             self._speech_waiting = False
             await self._on_speech()
+
+    async def _drain_stretch(self, client, in_hand) -> None:
+        """A paused stretch's last events (_pause): the one its events loop held (in_hand), then those still queued
+        once GPT-Live was closed, through the events loop's handler (_on_live_event), so none of the patient's words
+        is lost: their transcript is screened and grouped (B1, C1), and OpenAI's cut-off, an error content_filter or a
+        close with reason content, is judged (B4: only an explicit NONE goes on). GPT-Live's audio is dropped (the
+        pause stopped its voice), and the closed event of the close the relay asked for (any other reason) is no
+        failure. It stops once an outcome is decided, as the events loop does, and waits at most PAUSE_DRAIN_SECONDS
+        for each event."""
+        if client is None:
+            return
+        events = client.events()
+        event = in_hand
+        try:
+            while self.outcome is None:
+                if event is None:
+                    try:
+                        event = await asyncio.wait_for(anext(events), PAUSE_DRAIN_SECONDS)
+                    except (StopAsyncIteration, asyncio.TimeoutError):
+                        return
+                if event.type == "closed" and event.reason != "content":
+                    return   # the session's last event
+                if event.type != "audio":
+                    await self._on_live_event(event)
+                event = None
+        finally:
+            await events.aclose()
 
     # ── GPT-Live's voice to the robot, behind the hold (B2) ──────────────────────────────────────────────────────
 
