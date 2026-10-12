@@ -18,7 +18,7 @@ _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
 from app import config  # noqa: E402
-from app.services import after_chat, consent_service, conversation, live_session  # noqa: E402
+from app.services import after_chat, consent_service, conversation, live_session, memory  # noqa: E402
 from app.services.live_client import LiveError, LiveEvent  # noqa: E402
 
 DEVICE_ID = str(uuid.uuid4())
@@ -257,6 +257,7 @@ async def _begin(w):
                                    "language": "zh-TW", "model": "gpt-live-1", "mode": "live",
                                    "followup_memory_id": None, "ended_at": None, "end_reason": None, "live": None}
         relay.opening = OPENING
+        relay._memory_on = memory.consent_current(w.consent)   # as _open keeps it for the access re-checks
         relay.opening_turn_id = await w.db.fetchval(
             "INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
             "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id", cid, 7, "reachy", OPENING, False, None)
@@ -801,5 +802,59 @@ def test_an_ending_and_a_fallback_at_the_same_moment_end_the_chat_once(world):
         sent = world.robot.json("end") + world.robot.json("fallback")
         assert len(sent) == 1 and world.clients[0].closes == 1
         assert len(world.after_chat) == (1 if sent[0]["type"] == "end" else 0)
+
+    asyncio.run(scenario())
+
+
+# ── final review: an unexpected failure, and a database that stops answering ──────────────────────────────────────
+
+
+@pytest.mark.parametrize("failing", ["ending", "fallback"])
+def test_an_unexpected_failure_mid_chat_falls_back_with_the_conversation_id(world, failing):
+    """The ending's or the fallback's own write fails: the robot goes on with today's text chat in the same
+    conversation (left open, as any fallback leaves it) instead of a bare 1011 and a new chat."""
+    async def scenario():
+        relay, running = await _begin(world)
+
+        async def broken(query, *args):
+            raise OSError("connection reset by the database")
+
+        if failing == "ending":
+            world.db.fetchval = broken                     # the 45 s silence ending cannot end the conversation
+            await _step(world, relay, 45)
+        else:
+            world.db.execute = broken                      # GPT-Live fails; the fallback cannot store why
+            await _live(world, LiveEvent(type="error", code="rate_limit_exceeded"))
+        await _over(world, running)
+        chat = world.db.chat()
+        assert world.robot.json() == [{"type": "ready", "conversation_id": chat["conversation_id"]},
+                                      {"type": "fallback", "reason": "error",
+                                       "conversation_id": chat["conversation_id"]}]
+        assert world.robot.closed == 1000 and world.clients[0].closes == 1
+        assert chat["ended_at"] is None and world.after_chat == []
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_insert_that_never_returns_still_ends_the_chat_and_closes_gpt_live(world, monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(live_session, "DB_TIMEOUT_SECONDS", 0.05)   # real seconds, so the test is quick
+        world.db.slow = asyncio.Event()                    # storing a patient turn never returns
+        relay, running = await _begin(world)
+        heard = _pcm(200, 20)
+        world.robot.inbox.put_nowait(heard)
+        await _live(world, _said("我今天"))
+        world.clock.now += 2.0
+        await _live(world, _said("想出門"))                 # a new turn stores the last one: its INSERT hangs
+        await asyncio.wait_for(relay._done.wait(), 1)      # given up on after DB_TIMEOUT_SECONDS: an error fallback
+        world.robot.inbox.put_nowait(_pcm(200, 20))        # the microphone after the outcome
+        await _over(world, running)                        # the fallback then goes as usual, the lost turn aside
+        chat = world.db.chat()
+        assert relay.outcome.kind == "fallback" and relay.outcome.reason == "error"
+        assert world.robot.json()[1:] == [{"type": "fallback", "reason": "error",
+                                           "conversation_id": chat["conversation_id"]}]
+        assert world.robot.closed == 1000 and world.clients[0].closes == 1   # GPT-Live closed, once
+        assert world.clients[0].audio == [heard]           # nothing reached GPT-Live after the outcome
+        assert world.db.rows() == [("reachy", OPENING)] and chat["ended_at"] is None
 
     asyncio.run(scenario())

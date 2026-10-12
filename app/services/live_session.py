@@ -33,7 +33,10 @@ text chat checks at every call, A2 and E1: the robot not unpaired, its live swit
 current), or access unverified (access_unverified: ACCESS_FAILURES_TO_END re-checks in a row could not read it, by an
 error or by taking over ACCESS_CHECK_TIMEOUT); every ending stores conversation.live and runs the post-chat work as
 /conversations/{id}/end does. When GPT-Live fails after the chat started, the robot gets `fallback` with the
-conversation id and goes on with today's text chat (C3).
+conversation id and goes on with today's text chat (C3); so it does when memory consent the chat started with is
+withdrawn (memory_withdrawn, at the access re-check), and when the relay itself fails unexpectedly (error), unless a
+risk was decided: then the robot still gets `end` with risk true. Every database call of the chat is given up on
+after DB_TIMEOUT_SECONDS, into these same paths, so a database that stopped answering never freezes the chat.
 """
 
 import asyncio
@@ -73,6 +76,7 @@ MUTE_WAIT_SECONDS = 1.0       # a block waits this long for GPT-Live to acknowle
 ACCESS_RECHECK_SECONDS = 10.0  # the running chat re-checks what the text chat checks at every call (A2, E1)
 ACCESS_CHECK_TIMEOUT = 5.0     # seconds one access re-check's reads may take; a read that hangs counts as a failed one
 ACCESS_FAILURES_TO_END = 3     # this many failed re-checks in a row end the chat (access_unverified): it fails closed
+DB_TIMEOUT_SECONDS = 5.0       # one database operation of the chat (a pooled connection and its queries); then it fails
 ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "stopped", "error")   # anything else: stopped
 
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
@@ -117,7 +121,7 @@ _letting_go: set = set()
 
 
 def _let_go(task: asyncio.Task) -> None:
-    """Cancel an access re-check's reads without waiting for them (LiveRelay._check_access): a cancelled asyncpg read
+    """Cancel database work without waiting for it (an access re-check's reads, _bounded): a cancelled asyncpg call
     lets go only once the server confirms the cancel, with no time limit. The reference keeps the task from being
     garbage-collected meanwhile, and a late error is read, so asyncio never logs it as never retrieved."""
 
@@ -129,6 +133,18 @@ def _let_go(task: asyncio.Task) -> None:
     task.cancel()
     _letting_go.add(task)
     task.add_done_callback(gone)
+
+
+async def _bounded(work):
+    """Run one database operation of the chat (`work`: a coroutine that takes a pooled connection and queries) within
+    DB_TIMEOUT_SECONDS. Past that it raises TimeoutError into the caller's error path, and the work is cancelled and
+    never waited for (_let_go), so a database that stopped answering never holds up the chat."""
+    task = asyncio.ensure_future(work)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), DB_TIMEOUT_SECONDS)
+    finally:
+        if not task.done():   # past its time limit, or the caller was cancelled
+            _let_go(task)
 
 
 def instructions(language: str, name: str | None, block: str) -> str:
@@ -287,6 +303,7 @@ class LiveRelay:
         self._access_checked_at = 0.0                # the last access re-check started then (_check_access)
         self._access_check: asyncio.Task | None = None
         self._access_failures = 0                    # failed access re-checks in a row (_check_access)
+        self._memory_on = False                      # the chat started with memory consent (_open, _check_access)
         self._goodbye = False
         self._goodbye_replied = False
         self._goodbye_end_at: float | None = None
@@ -299,11 +316,12 @@ class LiveRelay:
         self._deferred: list[tuple[int, str]] = []   # patient turns stored during that hold: judged if it clears
         self._keyword_too = False                    # a block landed during that hold on words still a risk (B3)
         self._cut_off = False                        # OpenAI's moderation stopped GPT-Live (B4)
+        self._judging_cut_off = False                # B4's own check runs and has not decided yet (_moderation_end)
         self._wrapping = False                       # the outcome is being carried out (_wrap_up)
 
     async def run(self) -> None:
         """The whole live chat; returns when it is over and never raises. GPT-Live is always closed at the end. A
-        failure the relay does not expect closes the robot's socket with 1011; the robot then uses today's chat."""
+        failure the relay does not expect still tells the robot how the chat goes on (_after_failure)."""
         try:
             start = await self._receive_start()
             if start is None:
@@ -312,9 +330,23 @@ class LiveRelay:
                 await self._chat()
         except Exception:
             log.exception("live chat %s of patient %s failed", self.conversation_id, self.u_id)
-            await self._close_robot(1011)
+            await self._after_failure()
         finally:
             await self._close_live()
+
+    async def _after_failure(self) -> None:
+        """run()'s unexpected failure. Once block() decided a risk (the help line went first, _end_blocked), the robot
+        still gets `end` with risk true, so it never starts a new text chat after the help line. A conversation that
+        exists goes on as today's text chat (`fallback` error with its id; the conversation stays open, as after any
+        fallback). Before any conversation exists the socket closes with 1011, and the robot starts today's chat."""
+        if self._risk is not None:
+            await self._to_robot({"type": "end", "reason": "risk", "risk": True})
+        elif self.conversation_id is not None:
+            await self._to_robot({"type": "fallback", "reason": "error", "conversation_id": self.conversation_id})
+        else:
+            await self._close_robot(1011)
+            return
+        await self._close_robot(1000)
 
     async def _receive_start(self) -> dict | None:
         """The robot's first message when it is a start with a task_id (and a language, when given, as text); None
@@ -363,7 +395,7 @@ class LiveRelay:
 
         # As POST /conversations: the name to call the patient (both chat types), and with memory consent the
         # follow-up and the memory block (for GPT-Live's instructions only).
-        memory_on = memory.consent_current(state)
+        memory_on = self._memory_on = memory.consent_current(state)   # re-checked while the chat runs
         today = memory.local_today()
         block = ""
         async with get_pool().acquire() as conn:
@@ -412,7 +444,9 @@ class LiveRelay:
 
         Three loops run meanwhile: the robot's messages (_uplink), GPT-Live's events (_downlink) and the timers
         (_ticker). GPT-Live's events and the timers are handled under _handler_lock, one at a time, and the loops are
-        stopped only once the one being handled has finished, so a turn being stored is never cut off part way."""
+        stopped only once the one being handled has finished, so a turn being stored is never cut off part way. That
+        wait lasts at most twice DB_TIMEOUT_SECONDS: then the loops are stopped anyway, so GPT-Live is always closed
+        (a check of OpenAI's cut-off stopped then blocks, _wrap_up)."""
         now = self.clock()
         self._started_at = self._last_patient_at = self._reply_due_at = self._access_checked_at = now
         try:
@@ -423,9 +457,17 @@ class LiveRelay:
         loops = [asyncio.create_task(loop) for loop in (self._uplink(), self._downlink(), self._ticker())]
         try:
             await self._done.wait()
-            async with self._handler_lock:
-                for loop in loops:
-                    loop.cancel()
+            try:
+                await asyncio.wait_for(self._handler_lock.acquire(), 2 * DB_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                log.warning("live chat %s: an event or a timer was still being handled; the chat stops it",
+                            self.conversation_id)
+            else:
+                try:
+                    for loop in loops:
+                        loop.cancel()
+                finally:
+                    self._handler_lock.release()
         finally:
             for loop in loops:
                 loop.cancel()
@@ -537,7 +579,9 @@ class LiveRelay:
         confirms the cancel. A read that fails or hangs is logged and tried again at the next re-check, but
         ACCESS_FAILURES_TO_END failed checks in a row end the chat with reason access_unverified: it fails closed, so a
         database that stopped answering never leaves the chat running unchecked. A check that completes its reads,
-        allowed or not, resets the count."""
+        allowed or not, resets the count. A chat that started with memory consent (its notes and the memory name are
+        in GPT-Live's instructions) whose memory consent is no longer current goes on as today's text chat, which
+        checks memory consent at every turn (fallback memory_withdrawn); the wrap-up closes GPT-Live and its notes."""
 
         async def read():
             async with get_pool().acquire() as conn:
@@ -558,10 +602,13 @@ class LiveRelay:
             if not reads.done():   # past its time limit, or the chat ended
                 _let_go(reads)
         self._access_failures = 0
-        if switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state):
-            return
-        log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id, self.u_id)
-        self._finish("end", "access_withdrawn")
+        if not (switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state)):
+            log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id,
+                        self.u_id)
+            self._finish("end", "access_withdrawn")
+        elif self._memory_on and not memory.consent_current(state):
+            log.warning("live chat %s: memory consent withdrawn; the text chat takes over", self.conversation_id)
+            self._finish("fallback", "memory_withdrawn")
 
     def _on_robot_message(self, message: dict) -> None:
         kind = message.get("type")
@@ -600,8 +647,8 @@ class LiveRelay:
         stored first), whose last patient turn is the one judged. Only an explicit NONE lets the chat go on as today's
         text chat (fallback live_ended, C3); any other answer blocks it: SELF_HARM, OVERDOSE, no answer ("unknown")
         or anything else. A check that fails blocks too: no answer is never a clear. It runs as a GPT-Live event's
-        handler (_handler_lock), so an ending decided meanwhile waits for it (at most
-        conversation.RISK_DEADLINE_SECONDS)."""
+        handler (_handler_lock), so an ending decided meanwhile waits for it (conversation.RISK_DEADLINE_SECONDS plus
+        its database calls), but at most twice DB_TIMEOUT_SECONDS (_chat): a check stopped then blocks (_wrap_up)."""
         if self._cut_off:
             return
         self._cut_off = True
@@ -609,6 +656,7 @@ class LiveRelay:
             return   # already blocked: the wrap-up says the help line
         self._stop_voice()
         await self._to_robot({"type": "flush"})
+        self._judging_cut_off = True
         try:
             await self._store_groups()
             history = await self._history()
@@ -619,10 +667,12 @@ class LiveRelay:
                 await self.block("content", kind=kind, quote=quote, turn_id=turn_id)
             else:
                 self._finish("fallback", "live_ended")
+            self._judging_cut_off = False
             await self._note_risk(turn_id, {**check, "risk_source": "content"})
         except Exception:
             log.exception("live chat %s: the check after OpenAI's cut-off failed; blocking", self.conversation_id)
             await self.block("content")
+            self._judging_cut_off = False
 
     # ── GPT-Live's voice to the robot, behind the hold (B2) ──────────────────────────────────────────────────────
 
@@ -758,18 +808,26 @@ class LiveRelay:
                          "cut": bool(metrics.get("cut")), "robot_playing_ms": metrics.get("robot_playing_ms")}}
         if group.opening:
             self._opening_spoken = True
-            async with self._turn_lock, get_pool().acquire() as conn:
-                await conn.execute("UPDATE conversation_turn SET text = $2, metrics = $3::jsonb WHERE turn_id = $1",
-                                   self.opening_turn_id, text or self.opening, json.dumps(live))
+
+            async def update():
+                async with self._turn_lock, get_pool().acquire() as conn:
+                    await conn.execute("UPDATE conversation_turn SET text = $2, metrics = $3::jsonb "
+                                       "WHERE turn_id = $1", self.opening_turn_id, text or self.opening,
+                                       json.dumps(live))
+
+            await _bounded(update())
             return self.opening_turn_id
         if not text:
             return None
         return await self._add_turn("reachy", text, live)
 
     async def _add_turn(self, role: str, text: str, metrics: dict, flagged: bool = False) -> int:
-        async with self._turn_lock, get_pool().acquire() as conn:
-            return await conn.fetchval(INSERT_TURN_SQL, self.conversation_id, self.u_id, role, text, flagged,
-                                       json.dumps(metrics))
+        async def insert():
+            async with self._turn_lock, get_pool().acquire() as conn:
+                return await conn.fetchval(INSERT_TURN_SQL, self.conversation_id, self.u_id, role, text, flagged,
+                                           json.dumps(metrics))
+
+        return await _bounded(insert())
 
     async def _store_groups(self) -> None:
         """Store whatever is still open, oldest group first."""
@@ -882,26 +940,31 @@ class LiveRelay:
     async def _history(self, until: int | None = None) -> list[dict]:
         """The stored turns of this chat, oldest first, as {turn_id, role, text}: all of them, or those up to turn
         `until` (so classify_risk judges that turn as the latest)."""
-        async with get_pool().acquire() as conn:
-            if until is None:
-                rows = await conn.fetch("SELECT turn_id, role, text FROM conversation_turn "
-                                        "WHERE conversation_id = $1::uuid ORDER BY turn_id", self.conversation_id)
-            else:
-                rows = await conn.fetch("SELECT turn_id, role, text FROM conversation_turn "
+        async def read():
+            async with get_pool().acquire() as conn:
+                if until is None:
+                    return await conn.fetch("SELECT turn_id, role, text FROM conversation_turn "
+                                            "WHERE conversation_id = $1::uuid ORDER BY turn_id", self.conversation_id)
+                return await conn.fetch("SELECT turn_id, role, text FROM conversation_turn "
                                         "WHERE conversation_id = $1::uuid AND turn_id <= $2 ORDER BY turn_id",
                                         self.conversation_id, until)
-        return [dict(row) for row in rows]
+
+        return [dict(row) for row in await _bounded(read())]
 
     async def _note_risk(self, turn_id: int | None, values: dict) -> None:
         """Merge a risk check's result into the patient turn's metrics.live (C1). A failure costs the numbers only."""
         if turn_id is None:
             return
-        try:
+
+        async def update():
             async with get_pool().acquire() as conn:
                 await conn.execute(
                     "UPDATE conversation_turn SET metrics = COALESCE(metrics, '{}'::jsonb) || jsonb_build_object("
                     "'live', COALESCE(metrics->'live', '{}'::jsonb) || $2::jsonb) WHERE turn_id = $1",
                     turn_id, json.dumps(values))
+
+        try:
+            await _bounded(update())
         except Exception:
             log.exception("live chat %s: storing the risk check of turn %s failed", self.conversation_id, turn_id)
 
@@ -945,7 +1008,9 @@ class LiveRelay:
         """B3, carried out by the wrap-up once the loops have stopped: the robot says the help line in its own voice
         (never GPT-Live: OpenAI's moderation cut it off 9 of 9 times), GPT-Live is muted and closed, the open turns
         are stored, the patient's turns flagged, family alerted once, the help line stored as Reachy's turn, and the
-        conversation ends with reason risk (_end_chat: post-chat work, then `end` with risk true)."""
+        conversation ends with reason risk (_end_chat: post-chat work, then `end` with risk true). Storing the open
+        turns failing never costs the alert (it quotes the words block() was given); a failure after that still
+        sends `end` with risk true (run, _after_failure)."""
         helpline = conversation.HELPLINE[self.language]
         await self._to_robot({"type": "say", "speech_text": conversation.speech_text(helpline, self.language),
                               "reason": "risk"})
@@ -955,7 +1020,11 @@ class LiveRelay:
             except Exception as exc:   # a session OpenAI already closed refuses it; session.close follows anyway
                 log.info("live chat %s: GPT-Live was not muted (%s)", self.conversation_id, type(exc).__name__)
         await self._close_live()
-        await self._store_groups()
+        try:
+            await self._store_groups()
+        except Exception:
+            log.exception("live chat %s: storing the open turns failed; family are still alerted",
+                          self.conversation_id)
         flag = list(self._heard_turns) if self._risk.source == "keyword" or self._keyword_too else []
         if self._risk.turn_id is not None:
             flag.append(self._risk.turn_id)
@@ -964,9 +1033,12 @@ class LiveRelay:
 
     async def _flag(self, turn_id: int) -> None:
         """Flag one more patient turn of a chat already blocked (its family alert went once already)."""
-        try:
+        async def update():
             async with get_pool().acquire() as conn:
                 await conn.execute(FLAG_TURN_SQL, turn_id)
+
+        try:
+            await _bounded(update())
         except Exception:
             log.exception("live chat %s: flagging turn %s failed", self.conversation_id, turn_id)
 
@@ -976,12 +1048,16 @@ class LiveRelay:
         is logged: the end-of-chat summary (layer 3) still judges the chat and alerts if this alert never went."""
         risk = self._risk
         text = conversation.safety_alert_text(self.device["name"], risk.quote, risk.kind)
-        try:
+
+        async def alert():
             async with get_pool().acquire() as conn, conn.transaction():
                 for turn_id in sorted(set(flag)):
                     await conn.execute(FLAG_TURN_SQL, turn_id)
                 await conversation.alert_family(conn, self.u_id, self.conversation_id, text,
                                                 str(max(flag)) if flag else risk.source)
+
+        try:
+            await _bounded(alert())
         except Exception:
             log.exception("live chat %s: flagging the risk or alerting family failed", self.conversation_id)
         if helpline is not None:
@@ -994,10 +1070,14 @@ class LiveRelay:
 
     async def _wrap_up(self) -> None:
         """Carry out the outcome, safety first (spec section 7, point 3): a screening hit still settling is judged on
-        the words heard (B1), and a block outranks the ending or the fallback decided (B3). From here on a block only
+        the words heard (B1), a check of OpenAI's cut-off that _chat stopped before it answered blocks (B4: no answer
+        is never a clear), and a block outranks the ending or the fallback decided (B3). From here on a block only
         flags and alerts (block)."""
         if self._hit_at is not None and self._risk is None:
             await self._confirm()
+        if self._judging_cut_off and self._risk is None:
+            log.warning("live chat %s: the check after OpenAI's cut-off was stopped; blocking", self.conversation_id)
+            await self.block("content")
         self._wrapping = True
         if self._risk is not None:
             await self._end_blocked()
@@ -1012,11 +1092,15 @@ class LiveRelay:
         await self._store_groups()
         usage = await self._close_live()
         live = {"usage_seconds": usage, "close_reason": self._close_reason, "fallback_reason": None}
-        async with get_pool().acquire() as conn, conn.transaction():
-            ended = await conn.fetchval(
-                "UPDATE conversation SET ended_at = NOW(), end_reason = $2, after_chat_state = 'pending', "
-                "live = $3::jsonb WHERE conversation_id = $1::uuid AND ended_at IS NULL RETURNING conversation_id",
-                self.conversation_id, reason, json.dumps(live))
+
+        async def end():
+            async with get_pool().acquire() as conn, conn.transaction():
+                return await conn.fetchval(
+                    "UPDATE conversation SET ended_at = NOW(), end_reason = $2, after_chat_state = 'pending', "
+                    "live = $3::jsonb WHERE conversation_id = $1::uuid AND ended_at IS NULL RETURNING conversation_id",
+                    self.conversation_id, reason, json.dumps(live))
+
+        ended = await _bounded(end())
         if ended is not None:
             _in_background(after_chat.process(self.conversation_id, self.u_id))
         log.info("live chat %s ended: %s (GPT-Live %s s, %s)", self.conversation_id, reason, usage,
@@ -1032,10 +1116,14 @@ class LiveRelay:
         usage = await self._close_live()
         live = {"usage_seconds": usage, "close_reason": self._close_reason, "fallback_reason": reason,
                 "live_patient_turns": self._patient_turns}
-        async with get_pool().acquire() as conn:
-            await conn.execute("UPDATE conversation SET live = $2::jsonb "
-                               "WHERE conversation_id = $1::uuid AND ended_at IS NULL",
-                               self.conversation_id, json.dumps(live))
+
+        async def update():
+            async with get_pool().acquire() as conn:
+                await conn.execute("UPDATE conversation SET live = $2::jsonb "
+                                   "WHERE conversation_id = $1::uuid AND ended_at IS NULL",
+                                   self.conversation_id, json.dumps(live))
+
+        await _bounded(update())
         log.warning("live chat %s falls back to the text chat: %s (GPT-Live %s s, %s)", self.conversation_id, reason,
                     usage, self._close_reason)
         await self._to_robot({"type": "fallback", "reason": reason, "conversation_id": self.conversation_id})

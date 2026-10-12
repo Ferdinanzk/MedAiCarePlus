@@ -341,6 +341,19 @@ def test_memory_consent_adds_the_followup_and_the_memory_block(live):
     assert row["followup_memory_id"] == FOLLOWUP_ID and row["end_reason"] == "goodbye"
 
 
+@pytest.mark.parametrize("consent, memory_on", [(CHECKIN, False), (MEMORY_ON, True)])
+def test_the_start_keeps_whether_memory_was_on_for_the_access_re_checks(live, monkeypatch, consent, memory_on):
+    seen = []
+
+    async def chat(relay):
+        seen.append(relay._memory_on)
+
+    monkeypatch.setattr(live_session.LiveRelay, "_chat", chat)
+    live.world["consent"] = consent
+    _run(live, FakeRobot(START))
+    assert seen == [memory_on]
+
+
 def test_a_memory_block_that_fails_costs_only_the_notes(live):
     live.world["consent"] = dict(MEMORY_ON)
     live.world["block_fails"] = True
