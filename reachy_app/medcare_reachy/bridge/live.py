@@ -19,7 +19,7 @@ Messages (JSON text frames carry a "type"; binary frames are PCM16 mono at 16 kH
 A companion chat (spec 2026-10-12 companion session, robot app 0.9.0): the server starts it paused and answers ready
 with Reachy's opening; GPT-Live starts only after a speech signal. The signals come from SpeechStart (silero VAD with
 the speech listener's settings) on the frames the server gets, never while Reachy makes sound or within
-MUTE_TAIL_SECONDS after it, at most one per SPEECH_SIGNAL_GAP_SECONDS. Such a chat has no length limit on the robot
+SPEECH_ECHO_GUARD_SECONDS after it, at most one per SPEECH_SIGNAL_GAP_SECONDS. Such a chat has no length limit on the robot
 (MAX_SECONDS): it lasts until the patient's goodbye or the robot's own ending (stop(), with a last line or without).
 
 Ported from the TCU companion (reachy-mini-tcu, companion/audio/reachy_audio.py, base.py, protected_playback.py and
@@ -43,7 +43,7 @@ import numpy as np
 from medcare_reachy.bridge import __version__
 from medcare_reachy.bridge.media import resample
 from medcare_reachy.bridge.speech import chunks
-from medcare_reachy.bridge.voice import MUTE_TAIL_SECONDS, STT_FILES, VAD_WINDOW, make_vad
+from medcare_reachy.bridge.voice import STT_FILES, VAD_WINDOW, make_vad
 
 log = logging.getLogger(__name__)
 
@@ -71,8 +71,12 @@ MAX_SECONDS = 660.0            # the server ends a chat at 600 s (LIVE_MAX_SECON
 MIC_IDLE_SECONDS = 0.005       # no microphone samples yet: look again after this (TCU reachy_audio.py:94)
 LATE_RESET_SECONDS = 0.1       # the speaker's clock this late: start afresh, never burst (TCU reachy_audio.py:125)
 # Companion chat (spec 4.3): at most one 'speech' to the server this often. None goes while Reachy makes sound, nor
-# within MUTE_TAIL_SECONDS (voice.py's 0.35 s, imported above) of the last block with sound pushed to its speaker.
+# within SPEECH_ECHO_GUARD_SECONDS of the last block with sound pushed to its speaker.
 SPEECH_SIGNAL_GAP_SECONDS = 1.0
+# Reachy's own sound reaches the voice detector up to about the SDK's playback delay (~0.22 s after the push, see the
+# latency notes above) + the echo's own tail (voice.MUTE_TAIL_SECONDS, 0.35 s) + the microphone delay (~0.17 s) after
+# the push of its last block with sound.
+SPEECH_ECHO_GUARD_SECONDS = 0.75
 
 # What a queued sound is: GPT-Live's voice, Reachy's own line, Reachy's own line said without moving.
 LIVE, SAY, STILL = "live", "say", "still"
@@ -539,7 +543,14 @@ class LiveChat:
         SPEECH_SIGNAL_GAP_SECONDS. The detector hears every frame, Reachy's own sound too: only the signal waits."""
         if self.speech_start is None:
             return
-        if not await self._run_blocking(self.speech_start.accept, frame.astype(np.float32) / 32768):
+        try:
+            onset = await self._run_blocking(self.speech_start.accept, frame.astype(np.float32) / 32768)
+        except Exception as error:
+            log.warning("live chat %s: the voice detector failed (%s); no more speech signals in this chat",
+                        self.conversation_id, type(error).__name__)
+            self.speech_start = None
+            return
+        if not onset:
             return
         if not self._hearing():
             return
@@ -553,10 +564,10 @@ class LiveChat:
     def _hearing(self) -> bool:
         """Whether a voice the microphone hears now is the patient's: Reachy says no line of its own (the microphone
         sends silence then, and SAY_TAIL_BLOCKS after it), and no block with sound went to its speaker within
-        MUTE_TAIL_SECONDS (its echo)."""
+        SPEECH_ECHO_GUARD_SECONDS (its echo)."""
         if self._say_active() or self._say_tail:
             return False
-        return self._sound_at is None or self.clock() - self._sound_at >= MUTE_TAIL_SECONDS
+        return self._sound_at is None or self.clock() - self._sound_at >= SPEECH_ECHO_GUARD_SECONDS
 
     async def _play_loop(self) -> None:
         """One block every BLOCK_SECONDS on an absolute-deadline clock (silence when nothing may play), as TCU's

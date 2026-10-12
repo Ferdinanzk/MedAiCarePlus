@@ -1,7 +1,7 @@
 """Live voice check-ins on the robot (bridge/live.py, spec 2026-10-12 F1): the WebSocket to the server's GPT-Live
 relay, the microphone frames, the playback queue and its jitter buffer, flush, Reachy's own lines through the same
 queue, the playing/idle reports and how a chat ends; and the companion chat (spec 2026-10-12 companion session):
-the voice detector and its speech signals, the spoken opening, paused / not_seen and a stop with a last line."""
+the voice detector and its speech signals, the spoken opening and a stop with a last line."""
 
 import asyncio
 import json
@@ -14,8 +14,8 @@ import pytest
 
 from medcare_reachy.bridge import __version__, live
 from medcare_reachy.bridge.live import (
-    BLOCK_SAMPLES, FRAME_SAMPLES, IDLE_QUIET_BLOCKS, JITTER_START_SECONDS, MAX_SECONDS, MUTE_TAIL_SECONDS,
-    POLL_SECONDS, READY_TIMEOUT, RATE, SAY_TAIL_BLOCKS, SPEECH_SIGNAL_GAP_SECONDS, LiveChat, LiveOutcome, Player,
+    BLOCK_SAMPLES, FRAME_SAMPLES, IDLE_QUIET_BLOCKS, JITTER_START_SECONDS, MAX_SECONDS,
+    POLL_SECONDS, READY_TIMEOUT, RATE, SAY_TAIL_BLOCKS, SPEECH_ECHO_GUARD_SECONDS, SPEECH_SIGNAL_GAP_SECONDS, LiveChat, LiveOutcome, Player,
     SpeechStart)
 from medcare_reachy.bridge.speech import chunks
 from medcare_reachy.bridge.tests.fakes import FakeApp, FakeClock, FakeRobot, FakeSocket, FakeSpeaker, make_task
@@ -677,20 +677,44 @@ def test_speech_goes_to_the_server_when_the_patient_begins_to_speak_never_on_rea
         await until(lambda: chat.robot.pushed)
         await onset()                                                 # 1001.0: its own voice, heard back
         await until(lambda: len(chat.robot.pushed) == 20)
-        chat.clock.t += MUTE_TAIL_SECONDS - 0.05
-        await onset()                                                 # 1001.3: still its echo
-        chat.clock.t += SPEECH_SIGNAL_GAP_SECONDS
-        await onset()                                                 # 1002.3: the patient again
+        chat.clock.t += SPEECH_ECHO_GUARD_SECONDS - 0.05
+        await onset()                                                 # 1001.7: just under the guard: still its echo
+        chat.clock.t += 0.05
+        await onset()                                                 # 1001.75: at the guard: the patient again
         chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
         await task
         return chat, seen
 
     chat, seen = run(scenario)
-    assert (MUTE_TAIL_SECONDS, SPEECH_SIGNAL_GAP_SECONDS) == (0.35, 1.0)
+    assert (SPEECH_ECHO_GUARD_SECONDS, SPEECH_SIGNAL_GAP_SECONDS) == (0.75, 1.0)
     assert seen[:3] == [(1, 1000.0)] * 3
-    assert seen[3] == (2, pytest.approx(1002.0 + MUTE_TAIL_SECONDS - 0.05))
+    assert seen[3] == (2, pytest.approx(1001.0 + SPEECH_ECHO_GUARD_SECONDS))
     assert chat.detector.fed == [0.75, 0.25] * 4                      # it hears every frame: only the signal waits
     assert len(chat.socket.frames_sent()) == 8
+
+
+def test_a_failing_voice_detector_is_logged_once_and_the_chat_goes_on(caplog):
+    class Failing(FakeSpeechStart):
+        def accept(self, samples):
+            super().accept(samples)
+            raise RuntimeError("detector broke")
+
+    async def scenario():
+        chat = Chat(speech_start=Failing())
+        task = chat.start()
+        await chat.ready()
+        await hear(chat, 0.75)
+        chat.robot.mic.append(mic_chunk(first=0.0, count=FRAME_SAMPLES))   # the chat still sends what the mic hears
+        await until(lambda: len(chat.socket.frames_sent()) == 2)
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        return chat, await task
+
+    with caplog.at_level("WARNING"):
+        chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("ended", "goodbye", "c9", False)    # not a robot_error fallback
+    assert chat.detector.fed == [0.75]                                # not called again after the failure
+    assert {"type": "speech"} not in chat.sent() and len(chat.socket.frames_sent()) == 2
+    assert [r.levelname for r in caplog.records if "voice detector" in r.getMessage()] == ["WARNING"]
 
 
 def test_speech_goes_to_the_server_at_most_once_a_second():
