@@ -575,8 +575,14 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",
             device["device_id"], payload.robot_reachable, payload.landmark_fps, json.dumps(detail))
         await reachy_tasks.extend_leases(conn, device["device_id"])
-        # Medicine first (companion spec 3.4): a robot in a companion session ends it when a medicine task waits.
-        task_due = await reachy_tasks.task_due(conn, device["u_id"])
+    # Medicine first (companion spec 3.4): a robot in a companion session ends it when a medicine task waits. Read after
+    # the writes commit: a failing read answers false and never rolls back last_seen_at or the lease extension.
+    try:
+        async with get_pool().acquire() as conn:
+            task_due = await reachy_tasks.task_due(conn, device["u_id"])
+    except Exception:
+        log.warning("heartbeat: the medicine-task check failed; answering task_due false")
+        task_due = False
     microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
     return {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}
 

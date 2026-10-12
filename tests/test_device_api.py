@@ -359,7 +359,7 @@ def test_heartbeat_says_whether_a_medicine_task_waits(env, monkeypatch):
     assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is False
     env.conn.task_due = True
     assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is True
-    assert env.conn.task_due_asked == [((7,), 1), ((7,), 1)]   # this patient, inside the heartbeat's transaction
+    assert env.conn.task_due_asked == [((7,), 0), ((7,), 0)]   # this patient, after the heartbeat's transaction ended
 
 
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
@@ -877,3 +877,21 @@ def test_device_start_needs_only_the_identity_model(env, monkeypatch):
 
     monkeypatch.setattr(EmotionService, "_available", False)
     assert _start(env, mode="observe").status_code == 200
+
+
+def test_a_failing_task_due_read_answers_false_and_keeps_the_heartbeat_writes(env, monkeypatch, caplog):
+    extended = []
+
+    async def extend_leases(conn, device_id):
+        extended.append(device_id)
+
+    async def task_due(conn, u_id):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
+    monkeypatch.setattr(reachy_tasks, "task_due", task_due)
+    with caplog.at_level("WARNING"):
+        response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"})
+    assert response.status_code == 200 and response.json()["task_due"] is False
+    assert any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed) and extended == [DEVICE_ID]
+    assert [r.levelname for r in caplog.records if "medicine-task check" in r.getMessage()] == ["WARNING"]

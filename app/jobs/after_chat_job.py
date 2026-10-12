@@ -16,6 +16,9 @@ log = logging.getLogger(__name__)
 # while the patient's robot holds its camera session here (_robots_present), which a robot that went away loses
 # after monitor_service.IDLE_SESSION_SECONDS without a frame.
 ABANDON_MINUTES = 15
+# The companion exception covers only the patient's newest open conversation, and only for this long without a turn:
+# an orphaned one (a worker restart mid-chat, no /end) must not stay open through the robot's later sessions.
+COMPANION_ABANDON_HOURS = 2
 BATCH = 20
 
 
@@ -34,8 +37,14 @@ async def run_after_chat_sweep():
             "  COALESCE((SELECT MAX(t.created_at) FROM conversation_turn t "
             "            WHERE t.conversation_id = c.conversation_id), c.started_at)) "
             "  < NOW() - make_interval(mins => $1) "
-            "AND NOT (c.companion AND c.u_id = ANY($2::int[])) "
-            "RETURNING c.conversation_id", ABANDON_MINUTES, _robots_present())
+            "AND NOT (c.companion AND c.u_id = ANY($2::int[]) "
+            "  AND NOT EXISTS (SELECT 1 FROM conversation newer WHERE newer.u_id = c.u_id "
+            "                  AND newer.started_at > c.started_at) "
+            "  AND GREATEST(c.started_at, "
+            "    COALESCE((SELECT MAX(t.created_at) FROM conversation_turn t "
+            "              WHERE t.conversation_id = c.conversation_id), c.started_at)) "
+            "    >= NOW() - make_interval(hours => $3)) "
+            "RETURNING c.conversation_id", ABANDON_MINUTES, _robots_present(), COMPANION_ABANDON_HOURS)
         try:
             stale = await after_chat.end_stale(conn)
         except Exception:
