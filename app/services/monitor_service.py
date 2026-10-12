@@ -161,6 +161,9 @@ class MonitorSession:
     # frame that produced it while a newer landmark request is arriving.
     packets: dict[int, dict] = field(default_factory=dict)
     verified_at: float = 0.0
+    # The last hit that made the status "verified" (identity_hits >= 2; monotonic): the live relay's camera-first
+    # check (live_session.patient_seen_recently) counts only a verified sighting, never a first hit still "verifying"
+    confirmed_at: float = 0.0
     identity_hits: int = 0
     identity_frame_seq: int = 0
     target_box: list | None = None
@@ -601,6 +604,8 @@ class MonitorRegistry:
                         state.identity_frame_seq = frame_seq
                         state.identity_distance = target["distance"]
                         state.verified_at = now
+                        if state.identity_hits >= 2:
+                            state.confirmed_at = now
                         state.identity_status = "verified" if state.identity_hits >= 2 else "verifying"
                 # The closest patient-labelled face (its OpenVINO box is in pixels of this frame). A frame of 4 or
                 # more faces comes back saturated with no faces at all: logged as 4.

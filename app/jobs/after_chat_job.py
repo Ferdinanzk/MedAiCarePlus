@@ -12,13 +12,13 @@ log = logging.getLogger(__name__)
 
 # No turn for this long and still open: the robot was switched off or lost the network. Counted from the last turn,
 # never from the start, so a live chat is never closed under the patient. A companion session (robot app 0.9.0)
-# can go much longer without a turn (the patient in view and quiet; a live one's GPT-Live paused): it stays open
-# while the patient's robot holds its camera session here (_robots_present), which a robot that went away loses
-# after monitor_service.IDLE_SESSION_SECONDS without a frame.
+# can go much longer without a turn (the patient in view and quiet; a live one's GPT-Live paused): its conversation
+# stays open while the patient's robot holds its camera session here (_robots_present) AND a running session: an
+# in-progress reachy_task whose expiry has not passed. reachy_tasks.extend_for_companion keeps that expiry ahead only
+# while the robot's heartbeats say a companion session runs, so a robot that went away or restarted lets it lapse
+# within COMPANION_TASK_EXTEND_SECONDS, and the rule above then closes the row. The exception covers only the patient's
+# newest conversation: an orphaned one (a worker restart mid-chat, no /end) never stays open through a later session.
 ABANDON_MINUTES = 15
-# The companion exception covers only the patient's newest open conversation, and only for this long without a turn:
-# an orphaned one (a worker restart mid-chat, no /end) must not stay open through the robot's later sessions.
-COMPANION_ABANDON_HOURS = 2
 BATCH = 20
 
 
@@ -40,11 +40,9 @@ async def run_after_chat_sweep():
             "AND NOT (c.companion AND c.u_id = ANY($2::int[]) "
             "  AND NOT EXISTS (SELECT 1 FROM conversation newer WHERE newer.u_id = c.u_id "
             "                  AND newer.started_at > c.started_at) "
-            "  AND GREATEST(c.started_at, "
-            "    COALESCE((SELECT MAX(t.created_at) FROM conversation_turn t "
-            "              WHERE t.conversation_id = c.conversation_id), c.started_at)) "
-            "    >= NOW() - make_interval(hours => $3)) "
-            "RETURNING c.conversation_id", ABANDON_MINUTES, _robots_present(), COMPANION_ABANDON_HOURS)
+            "  AND EXISTS (SELECT 1 FROM reachy_task rt WHERE rt.u_id = c.u_id AND rt.status = 'in_progress' "
+            "              AND rt.expires_at > NOW())) "
+            "RETURNING c.conversation_id", ABANDON_MINUTES, _robots_present())
         try:
             stale = await after_chat.end_stale(conn)
         except Exception:
