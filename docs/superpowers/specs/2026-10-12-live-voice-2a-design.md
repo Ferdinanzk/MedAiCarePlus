@@ -182,7 +182,9 @@ its reason, and run the after-chat work exactly as `/conversations/{id}/end` doe
   whenever the patient has one, not only with memory consent. A patient-entered memory `name` fact still wins when
   memory is on (it is the patient's own newer choice).
 - The name reaches the AI company as part of "the text of the conversation" (Reachy's opening line), which the robot
-  notice already covers; the live instructions include it for the live chat.
+  notice covers for today's text chat. The live chat also puts it in GPT-Live's instructions, and no notice covers
+  live voice yet (the patient's audio, the name and the notes go to OpenAI): one reason live voice stays test-only
+  until 2b (amended after the final review).
 
 ### E. Settings
 
