@@ -47,7 +47,8 @@ def test_after_the_last_dose_reachy_chats_then_observes():
     assert ("conversation_end", "c1", "goodbye") in h.app.calls
     assert h.slot.state == "POST_SLOT_OBSERVE" and h.slot.outcomes["checkin"] == "goodbye"
     assert h.voice.active is False
-    assert h.stream.attached["session_id"] == "s3" and h.stream.max_fps is None   # observing on, at the full rate
+    h.tick()   # POST_SLOT_OBSERVE opens its own camera session (the companion's was flagged)
+    assert h.stream.attached["session_id"] == "s4" and h.stream.max_fps is None   # observing on, at the full rate
 
 
 def test_the_observe_session_of_a_companion_session_says_companion_and_one_outside_it_does_not():
@@ -63,7 +64,9 @@ def test_the_observe_session_of_a_companion_session_says_companion_and_one_outsi
     h.voice.speak("好，拜拜")
     h.tick(1)
     assert h.slot.state == "POST_SLOT_OBSERVE" and h.slot.companion_since is None
-    assert h.app.monitor_companion[-1] is True   # the same camera session goes on, it is not reopened
+    h.tick()
+    assert h.app.monitor_companion[-1] is False   # the watch after the dose runs on a new session, without the flag
+    assert h.stream.attached["session_id"] == "s4"
 
 
 def test_without_checkin_consent_there_is_no_conversation():

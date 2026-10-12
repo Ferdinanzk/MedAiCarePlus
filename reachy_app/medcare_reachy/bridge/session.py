@@ -163,6 +163,7 @@ class SlotSession:
         self.index = 0
         self.monitor: dict | None = None
         self.monitor_key: tuple | None = None
+        self.monitor_companion = False   # whether the open camera session was opened as a companion session
         self.sent_extra: set[str] = set()
         self.chat_end: tuple[str, int] | None = None   # at the chat's end: (camera session id, its last frame_seq)
         self.stop_reason: str | None = None
@@ -1015,12 +1016,13 @@ class SlotSession:
             self.status = status
 
     async def _ensure_session(self, mode: str, intk_id: int | None = None) -> None:
-        if self.monitor is not None and self.monitor_key == (mode, intk_id):
+        companion = self.companion_since is not None and mode == "observe"
+        if self.monitor is not None and self.monitor_key == (mode, intk_id) and self.monitor_companion == companion:
             return
         await self._end_session()
-        self.monitor = await self.app.monitor_start(
-            mode, intk_id, self.task_id, companion=self.companion_since is not None and mode == "observe")
+        self.monitor = await self.app.monitor_start(mode, intk_id, self.task_id, companion=companion)
         self.monitor_key = (mode, intk_id)
+        self.monitor_companion = companion
         self.stream.attach(self.monitor)
 
     def _drop_session(self) -> None:
