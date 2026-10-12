@@ -34,6 +34,7 @@ class FakeRobot:
         self.mic = deque()          # (samples, rate) chunks get_audio() hands out, oldest first
         self.live_audio = True      # what start_live_audio() answers
         self.push_error = None      # raised by push_audio() when set
+        self.clear_error = None     # raised by clear_live_audio() when set
         self.blocks = 0             # blocks push_audio() got, silent ones too
         self.pushed = []            # the blocks with sound (float32 copies) ...
         self.pushed_at = []         # ... and the value of `blocks` once each was pushed
@@ -58,6 +59,8 @@ class FakeRobot:
     def clear_live_audio(self):
         self.calls.append("clear_live_audio")
         self.cleared_at = self.blocks
+        if self.clear_error is not None:
+            raise self.clear_error
 
     def stop_live_audio(self):
         self.calls.append("stop_live_audio")

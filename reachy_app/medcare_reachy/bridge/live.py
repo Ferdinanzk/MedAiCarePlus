@@ -293,6 +293,11 @@ class LiveChat:
             outcome, drain = await self._converse()
             if drain:
                 await self._drain()
+            if self._stop_reason is not None and not (outcome.kind == "ended" and outcome.reason == self._stop_reason):
+                # stop() came during the drain: the server's earlier fallback or end no longer decides; only a risk
+                # end keeps its flag
+                outcome = LiveOutcome("ended", self._stop_reason, self.conversation_id,
+                                      outcome.kind == "ended" and outcome.risk)
             log.info("live chat %s: %s (%s); %d microphone frames sent, %d underruns, buffer %.1f s",
                      self.conversation_id, outcome.kind, outcome.reason, self.frames_sent, self.player.underruns,
                      self.player.target)
@@ -485,7 +490,10 @@ class LiveChat:
         """Drop everything queued, here and in the SDK, at once; `report`: tell the server Reachy is idle again."""
         async with self._speaker_lock:
             self.player.flush()
-            await self._run_blocking(self.robot.clear_live_audio)
+            try:
+                await self._run_blocking(self.robot.clear_live_audio)
+            except Exception:
+                log.exception("live chat %s: clearing the speaker failed", self.conversation_id)
         if self._playing:
             self._playing, self._quiet = False, 0
             self._set_gesture(None)
