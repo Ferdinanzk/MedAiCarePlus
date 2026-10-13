@@ -172,11 +172,11 @@ class FakeDB:
             task = queued[0]
             task.update(status="leased", lease_owner=args[1], lease_until=self.now + timedelta(seconds=60))
             return dict(task)
-        if 'SELECT u.name, d.auto_record, d.live_voice' in query:
+        if 'SELECT u.name, d.auto_record, d.device_id IS NOT NULL AS paired' in query:
             device = self.devices.get(args[0])
             active = device if device and not device["revoked"] else None
             return {"name": self.users[args[0]], "auto_record": active["auto_record"] if active else None,
-                    "live_voice": active["live_voice"] if active else None}
+                    "paired": active is not None}
         if "WHERE u_id = $1 AND lease_owner = $2::uuid" in query:
             tasks = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["lease_owner"] == args[1]
                             and t["status"] in ("leased", "searching", "in_progress")),
@@ -904,14 +904,13 @@ CHECKIN_CONSENT = {**ROBOT_CONSENT, **{scope: {"granted": True, "terms_version":
 
 @pytest.fixture
 def live_ready(db, monkeypatch):
-    """Everything a live check-in needs: the .env test switch, the robot's switch, check-in consent and a checked
-    live model on an OpenAI connection."""
+    """Everything a live check-in needs: the .env test switch, a paired robot, check-in consent and a checked live
+    model on an OpenAI connection. The robot's own live switch stays off: it no longer counts."""
     openai = ai_settings.Connection(2, "OpenAI", "openai", "https://api.openai.com/v1", "sk-proj-live-4444", "4444",
                                     True, "OpenAI")
     live = ai_settings.LiveSetting(2, "gpt-live-1", "marin", T0, 1180, None)
     monkeypatch.setattr(ai_settings, "_snapshot", ai_settings.Snapshot({2: openai}, {}, {}, live=live))
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
-    db.devices[7]["live_voice"] = True
     db.consent[7] = CHECKIN_CONSENT
     return db
 
@@ -924,14 +923,22 @@ def test_a_task_says_live_when_every_condition_holds(live_ready, reason, intk_id
     assert "sk-proj-live-4444" not in str(task)   # the robot never sees the OpenAI key
 
 
-@pytest.mark.parametrize("missing", ["test_switch", "robot_switch", "checkin_consent", "passed_check",
-                                     "device_revoked"])
+def test_live_is_the_default_whatever_the_robots_old_live_switch_says(live_ready):
+    """13 Oct 2026: a robot paired to another patient had the Reachy card's "Live voice (test)" switch off, and its
+    check-ins silently ran the text chat. Live voice is now the default for every paired robot."""
+    for switch in (False, True):
+        live_ready.devices[7]["live_voice"] = switch
+        enqueue(live_ready, reason="checkin", intk_ids=())
+        task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+        assert task["live"] is True
+        live_ready.tasks.clear()
+
+
+@pytest.mark.parametrize("missing", ["test_switch", "checkin_consent", "passed_check", "device_revoked"])
 def test_a_task_says_no_live_when_any_condition_is_missing(live_ready, monkeypatch, missing):
     enqueue(live_ready, reason="checkin", intk_ids=())
     if missing == "test_switch":
         monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
-    elif missing == "robot_switch":
-        live_ready.devices[7]["live_voice"] = False
     elif missing == "checkin_consent":   # safety alerts withdrawn: no check-in at all, so no live one either
         live_ready.consent[7] = {**CHECKIN_CONSENT,
                                  "safety_alerts": {"granted": False, "terms_version": config.TERMS_VERSION}}

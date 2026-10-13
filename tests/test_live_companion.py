@@ -713,15 +713,15 @@ def test_nothing_restarts_after_a_risk_found_while_paused(companion):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("withdrawal", ["live_switch_off", "checkin_consent"])
+@pytest.mark.parametrize("withdrawal", ["revoked", "checkin_consent"])
 def test_the_access_re_check_runs_while_paused(companion, withdrawal):
     async def scenario():
         relay, running = await _start(companion)
-        reads = companion.db.access_reads                     # the start read the live switch once
+        reads = companion.db.access_reads                     # the start read the pairing once
         await _step(companion, relay, 10)
         assert companion.db.access_reads == reads + 1 and relay.outcome is None
-        if withdrawal == "live_switch_off":
-            companion.db.live_switch = False
+        if withdrawal == "revoked":
+            companion.db.paired = None
         else:
             companion.consent = {scope: value for scope, value in companion.consent.items()
                                  if scope != "safety_alerts"}

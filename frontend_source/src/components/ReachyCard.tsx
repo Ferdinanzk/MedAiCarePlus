@@ -153,8 +153,6 @@ export default function ReachyCard() {
 
   const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await updateReachySettings({ auto_record: value })));
 
-  const toggleLiveVoice = (value: boolean) => run(async () => setStatus(await updateReachySettings({ live_voice: value })));
-
   // "" goes back to the registered name. A name the server refuses (422 invalid_call_name) is explained next to the
   // field, and the typed name stays so it can be fixed.
   const saveCallName = (value: string) => run(async () => {
@@ -397,14 +395,11 @@ export default function ReachyCard() {
             {nameNotice === 'saved' && <p role="status" className="text-sm text-green-700">{t('reachy.callNameSaved')}</p>}
           </form>
           {status.live_voice_test && (
-            <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
-              <input type="checkbox" className="mt-1 w-5 h-5" checked={!!status.live_voice} disabled={busy}
-                onChange={event => void toggleLiveVoice(event.target.checked)} />
-              <span>
-                <span className="block text-sm font-medium text-gray-900">{t('reachy.liveVoice')}</span>
-                <span className="block text-xs text-gray-500 mt-1">{t('reachy.liveVoiceHelp')}</span>
-              </span>
-            </label>
+            // Live voice is the default for every check-in while the server's test mode is on: no switch here.
+            <div className="rounded-xl bg-gray-50 p-4">
+              <span className="block text-sm font-medium text-gray-900">{t('reachy.liveVoice')}</span>
+              <span className="block text-xs text-gray-500 mt-1">{t('reachy.liveVoiceHelp')}</span>
+            </div>
           )}
           <div className="flex flex-col sm:flex-row gap-3">
             <button onClick={sendTestAlert} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-[#0057B8] text-white font-semibold disabled:opacity-50 flex items-center justify-center gap-2">

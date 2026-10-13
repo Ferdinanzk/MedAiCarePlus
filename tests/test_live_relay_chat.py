@@ -123,13 +123,13 @@ class FakeLive:
 
 class LiveDB:
     """The conversation row the start wrote and its turns. `slow` (an asyncio.Event): storing a patient turn waits
-    for it. `live_switch` answers the access re-check's read of the robot's live switch (None: the robot is revoked
-    or gone, False: switched off), counted in `access_reads`; `access_error`, when set, is raised by that read."""
+    for it. `paired` answers the access re-check's read of whether the robot is still paired (None: the robot is
+    revoked or gone), counted in `access_reads`; `access_error`, when set, is raised by that read."""
 
     def __init__(self):
         self.conversations, self.turns = {}, []
         self.slow: asyncio.Event | None = None
-        self.live_switch: bool | None = True
+        self.paired: bool | None = True
         self.access_reads = 0
         self.access_error: Exception | None = None
 
@@ -165,11 +165,11 @@ class LiveDB:
                 return None
             row.update(ended_at="now", end_reason=args[1], after_chat_state="pending", live=json.loads(args[2]))
             return args[0]
-        if "SELECT live_voice FROM reachy_device" in query:
+        if "SELECT TRUE FROM reachy_device" in query:
             self.access_reads += 1
             if self.access_error is not None:
                 raise self.access_error
-            return self.live_switch
+            return self.paired
         if "SELECT ended_at FROM conversation WHERE conversation_id = $1::uuid" in query:   # the access re-check
             return self.conversations[args[0]]["ended_at"]
         raise AssertionError(query)

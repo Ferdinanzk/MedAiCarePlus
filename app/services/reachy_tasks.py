@@ -71,7 +71,7 @@ async def task_payload(conn, task) -> dict:
         "WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) ORDER BY m.med_name, m.med_id, i.intk_id",
         task["u_id"], list(task["intk_ids"]))
     head = await conn.fetchrow(
-        'SELECT u.name, d.auto_record, d.live_voice FROM "user" u '
+        'SELECT u.name, d.auto_record, d.device_id IS NOT NULL AS paired FROM "user" u '
         "LEFT JOIN reachy_device d ON d.u_id = u.u_id AND d.revoked_at IS NULL WHERE u.u_id = $1",
         task["u_id"])
     consent = await consent_service.fetch_state(conn, task["u_id"])
@@ -85,9 +85,11 @@ async def task_payload(conn, task) -> dict:
         "microphone": consent_service.is_current(consent, "robot_microphone"),
         # A check-in conversation needs every check-in scope (notice: check-ins only with safety alerts on).
         "checkin": checkin,
-        # A live voice check-in (spec 2026-10-12 E1): .env's test switch, this robot's switch, check-ins allowed and a
-        # usable live model on the AI card. Otherwise false, and the robot runs today's text chat.
-        "live": bool(config.LIVE_VOICE_TEST and head and head["live_voice"] and checkin
+        # A live voice check-in (spec 2026-10-12 E1): .env's test switch, a paired robot, check-ins allowed and a
+        # usable live model on the AI card. Otherwise false, and the robot runs today's text chat. Live voice is the
+        # default for every robot: the Reachy card's per-robot "Live voice (test)" switch no longer counts (13 Oct
+        # 2026: a robot paired to another patient had it off, and its check-ins silently ran the text chat).
+        "live": bool(config.LIVE_VOICE_TEST and head and head["paired"] and checkin
                      and ai_settings.live_target() is not None),
         "doses": [{
             "intk_id": d["intk_id"], "med_id": d["med_id"], "med_name": d["med_name"],

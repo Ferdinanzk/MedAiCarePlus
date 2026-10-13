@@ -11,7 +11,7 @@ one LiveRelay runs the chat on it. JSON text frames carry the messages; binary f
 The start: after `start` the server checks, in this order, and answers `fallback` (conversation_id null; then it
 closes the socket) at the first failure, before any conversation row exists: LIVE_VOICE_TEST (live_disabled), the
 rate (unsupported_rate), check-in consent (checkin_consent_required), the task this robot leased (task_not_found), the
-robot's live switch on the Reachy card (live_disabled), a usable live model on the AI connections card
+robot still paired (live_disabled), a usable live model on the AI connections card
 (live_not_configured). Then GPT-Live must start within CONNECT_TIMEOUT, else live_unavailable. Only then is the
 conversation row written (mode 'live', the live model's id), with Reachy's opening as its first turn; the robot gets
 `ready`, and GPT-Live says the opening in its own voice. A robot that gets a fallback starts today's text chat with
@@ -29,7 +29,7 @@ over TURN_GAP_SECONDS, MAX_GROUP_CHARS or the end does. The patient's next turn 
 once its sound is over), and turns are stored in the order they began.
 The chat ends (C2) on a goodbye, SILENCE_END_SECONDS without patient speech, LIVE_MAX_SECONDS, the robot's
 `end`, a dropped robot, access withdrawn (access_withdrawn: every ACCESS_RECHECK_SECONDS the chat re-checks what the
-text chat checks at every call, A2 and E1: the robot not unpaired, its live switch on, robot and check-in consent
+text chat checks at every call, A2 and E1: the robot not unpaired, robot and check-in consent
 current), or access unverified (access_unverified: ACCESS_FAILURES_TO_END re-checks in a row could not read it, by an
 error or by taking over ACCESS_CHECK_TIMEOUT); every ending stores conversation.live and runs the post-chat work as
 /conversations/{id}/end does. When GPT-Live fails after the chat started, the robot gets `fallback` with the
@@ -135,7 +135,9 @@ ROBOT_END_REASONS = ("finished", "goodbye", "silence", "patient_left", "medicine
 
 LEASED_TASK_SQL = ("SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
                    "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid")   # api_device uses it too
-LIVE_SWITCH_SQL = "SELECT live_voice FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL"
+# The robot is still paired (not revoked). Live voice is the default for every paired robot: the Reachy card's
+# per-robot live switch no longer counts (reachy_tasks.task_payload).
+PAIRED_SQL = "SELECT TRUE FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL"
 # The access re-check also reads whether another writer (the after-chat sweep) ended the conversation (_check_access)
 CONVERSATION_ENDED_SQL = "SELECT ended_at FROM conversation WHERE conversation_id = $1::uuid"
 INSERT_TURN_SQL = ("INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
@@ -518,10 +520,10 @@ class LiveRelay:
             return await self._refuse("task_not_found")
         async with get_pool().acquire() as conn:
             task = await conn.fetchrow(LEASED_TASK_SQL, task_id, self.u_id, self.device["device_id"])
-            switched_on = task is not None and bool(await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"]))
+            paired = task is not None and bool(await conn.fetchval(PAIRED_SQL, self.device["device_id"]))
         if task is None:
             return await self._refuse("task_not_found")
-        if not switched_on:
+        if not paired:
             return await self._refuse("live_disabled")
         target = ai_settings.live_target()
         if target is None:
@@ -777,8 +779,8 @@ class LiveRelay:
 
     async def _check_access(self) -> None:
         """Spec A2 and E1: what the text chat checks at every call (get_device, reachy_tasks.checkin_allowed), the
-        running chat re-checks every ACCESS_RECHECK_SECONDS: the robot not unpaired and the patient's live switch on
-        (LIVE_SWITCH_SQL), robot consent and check-in consent current. When one is gone the chat ends at once with
+        running chat re-checks every ACCESS_RECHECK_SECONDS: the robot not unpaired (PAIRED_SQL), robot consent and
+        check-in consent current. When one is gone the chat ends at once with
         reason access_withdrawn, as any ending (_end_chat), so the patient's voice stops going to OpenAI; a risk found
         meanwhile still outranks it (_wrap_up). The two reads together may take ACCESS_CHECK_TIMEOUT; then they are
         cancelled and never waited for (_let_go), because a cancelled asyncpg read lets go only once the server
@@ -795,13 +797,13 @@ class LiveRelay:
 
         async def read():
             async with get_pool().acquire() as conn:
-                switched_on = await conn.fetchval(LIVE_SWITCH_SQL, self.device["device_id"])
+                paired = await conn.fetchval(PAIRED_SQL, self.device["device_id"])
                 ended = await conn.fetchval(CONVERSATION_ENDED_SQL, self.conversation_id) is not None
-            return switched_on, ended, await consent_service.get_state(self.u_id)
+            return paired, ended, await consent_service.get_state(self.u_id)
 
         reads = asyncio.create_task(read())
         try:
-            switched_on, ended, state = await asyncio.wait_for(asyncio.shield(reads), ACCESS_CHECK_TIMEOUT)
+            paired, ended, state = await asyncio.wait_for(asyncio.shield(reads), ACCESS_CHECK_TIMEOUT)
         except Exception as exc:   # a timeout too (TimeoutError): a read that hangs is a failed read
             self._access_failures += 1
             log.warning("live chat %s: re-checking access failed (%s)", self.conversation_id, type(exc).__name__)
@@ -813,7 +815,7 @@ class LiveRelay:
             if not reads.done():   # past its time limit, or the chat ended
                 _let_go(reads)
         self._access_failures = 0
-        if not (switched_on and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state)):
+        if not (paired and device_auth.robot_consent_current(state) and reachy_tasks.checkin_allowed(state)):
             log.warning("live chat %s: access withdrawn for patient %s; the chat ends", self.conversation_id,
                         self.u_id)
             self._finish("end", "access_withdrawn")

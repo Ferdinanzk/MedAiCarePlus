@@ -47,7 +47,7 @@ class FakeDB:
         self.order = order
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": None, "intk_ids": [],
                      "status": "in_progress", "reason": "checkin", "lease_owner": DEVICE_ID}
-        self.live_voice = True
+        self.paired = True   # the robot is not unpaired
         self.broken = False   # the conversation insert fails
         self.device_row = {"token_hash": device_auth.hash_token(TOKEN), "device_id": uuid.UUID(DEVICE_ID),
                            "u_id": 7, "auto_record": False, "revoked_at": None}   # device_auth's token row
@@ -73,8 +73,8 @@ class FakeDB:
         raise AssertionError(query)
 
     async def fetchval(self, query, *args):
-        if "SELECT live_voice FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL" in query:
-            return self.live_voice if args[0] == DEVICE_ID else None
+        if "SELECT TRUE FROM reachy_device WHERE device_id = $1::uuid AND revoked_at IS NULL" in query:
+            return True if self.paired and args[0] == DEVICE_ID else None
         if "INSERT INTO conversation_turn" in query:
             cid, u_id, role, text, flagged, metrics = args
             self.turns.append({"turn_id": len(self.turns) + 1, "conversation_id": cid, "u_id": u_id, "role": role,
@@ -261,17 +261,17 @@ def test_a_start_that_passes_every_check_connects_then_stores_the_chat(live):
 
 def test_the_checks_run_in_order_and_the_first_failure_is_the_fallback(live, monkeypatch):
     """LIVE_VOICE_TEST first (spec 5: without it no live path is reachable), then spec A2's order: check-in consent,
-    the leased task, the robot's live switch, a usable live model, GPT-Live itself."""
+    the leased task, the robot still paired, a usable live model, GPT-Live itself."""
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
     live.world["consent"] = {scope: value for scope, value in CHECKIN.items() if scope != "safety_alerts"}
     live.db.task["lease_owner"] = str(uuid.uuid4())   # another robot holds the task
-    live.db.live_voice = False
+    live.db.paired = False
     live.world["target"] = None
     live.world["fail"] = "live_auth"
     fixes = [lambda: monkeypatch.setattr(config, "LIVE_VOICE_TEST", True),
              lambda: live.world.update(consent=dict(CHECKIN)),
              lambda: live.db.task.update(lease_owner=DEVICE_ID),
-             lambda: setattr(live.db, "live_voice", True),
+             lambda: setattr(live.db, "paired", True),
              lambda: live.world.update(target=TARGET),
              lambda: live.world.pop("fail")]
     reasons = []
