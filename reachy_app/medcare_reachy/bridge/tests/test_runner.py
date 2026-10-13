@@ -5,6 +5,7 @@ import numpy as np
 from medcare_reachy.bridge import __version__
 from medcare_reachy.bridge import runner as runner_module
 from medcare_reachy.bridge.app_client import AppUnreachable, NotAuthorised, SessionLost
+from medcare_reachy.bridge.camera_watch import CameraWatchdog
 from medcare_reachy.bridge.runner import MonitorStream, Runner
 from medcare_reachy.bridge.tests.fakes import FakeClips, FakeRobot, FakeStream, dose, make_task
 
@@ -163,6 +164,22 @@ def test_a_lower_stream_rate_keeps_its_schedule_on_a_15_fps_camera():
     stream, app, camera, clock = make_server_stream(fps=10.0)
     stream_camera(stream, clock, [50 + i / 15 for i in range(45)])    # 3 s
     assert len(app.frames) == 30                                       # 2 frames in 3, not every other one
+
+
+def test_a_companion_session_slows_the_stream_and_gives_the_rate_back(caplog):
+    stream, app, camera, clock = make_server_stream()
+    stream.set_max_fps(2.0)
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, [50 + i / 15 for i in range(45)])    # 3 s of a 15 fps camera
+    assert len(app.frames) == 7 and camera.grabs == 45                     # about one every 0.5 s
+    assert all(0.39 < b[3] - a[3] < 0.6 for a, b in zip(app.frames, app.frames[1:]))
+    assert not stall_lines(caplog)                                         # slow on purpose: no stall
+    stream.set_max_fps(None)
+    app.frames.clear()
+    stream_camera(stream, clock, [53.5 + i / 15 for i in range(45)])  # 3 s more, at the full rate again
+    assert len(app.frames) == 45
+    stream.set_max_fps(30.0)                                           # never faster than the stream's own rate
+    assert stream.interval == 1 / 15
 
 
 def test_after_the_camera_stalls_the_stream_does_not_burst_to_catch_up():
@@ -436,17 +453,28 @@ def test_fps_counters_use_a_10_second_window():
 
 class HeartbeatApp:
     def __init__(self, response=None, error=None):
-        self.payloads, self.response, self.error = [], response, error
+        self.payloads, self.cameras, self.response, self.error = [], [], response, error
         self.unreachable_since = None
 
-    async def heartbeat(self, payload):
+    async def heartbeat(self, payload, camera=None):
         self.payloads.append(payload)
+        self.cameras.append(camera)
         if self.error:
             raise self.error
         return self.response
 
 
+class StubCamera:
+    SNAPSHOT = {"state": "ok", "fps": 10.0, "since": 1760000000.0, "media": None}
+
+    def snapshot(self):
+        return dict(self.SNAPSHOT)
+
+
 class StubStream:
+    def __init__(self):
+        self.camera = StubCamera()
+
     def landmark_fps(self):
         return 14.8
 
@@ -458,9 +486,13 @@ class StubSlot:
     def __init__(self):
         self.stopped = None
         self.task = {"microphone": True}
+        self.medicine = 0
 
     def stop(self, reason, abort=True):
         self.stopped = (reason, abort)
+
+    def medicine_due(self):
+        self.medicine += 1
 
 
 def heartbeat_runner(app):
@@ -475,8 +507,33 @@ def test_heartbeat_payload_and_stop_all():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert app.payloads == [{"robot_reachable": True, "landmark_fps": 14.8, "vision_fps": 4.9,
-                             "bridge_version": __version__, "missing_clips": 2}]
+                             "bridge_version": __version__, "missing_clips": 2, "companion": False}]
+    assert app.cameras == [StubCamera.SNAPSHOT]
     assert runner.slot.stopped == ("stop_all", True)
+
+
+def test_the_heartbeat_says_companion_while_the_slot_is_in_a_companion_session():
+    app = HeartbeatApp({"stop_all": False})
+    runner = heartbeat_runner(app)
+    runner.slot = StubSlot()
+    runner.slot.companion_since = 12.5
+    asyncio.run(runner.heartbeat_once())
+    runner.slot.companion_since = None
+    asyncio.run(runner.heartbeat_once())
+    runner.slot = None
+    asyncio.run(runner.heartbeat_once())
+    assert [payload["companion"] for payload in app.payloads] == [True, False, False]
+
+
+def test_every_heartbeat_asks_for_media_a_refused_recovery_left_released():
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False}))
+    asyncio.run(runner.heartbeat_once())
+    asyncio.run(runner.heartbeat_once())
+    assert runner.robot.calls == ["is_reachable", "restore_media"] * 2
+    offline = heartbeat_runner(HeartbeatApp({"stop_all": False}))
+    offline.robot = FakeRobot(reachable=False)
+    asyncio.run(offline.heartbeat_once())
+    assert offline.robot.calls == ["is_reachable"]     # no robot: nothing to ask
 
 
 def test_heartbeat_not_authorised_stops_and_unreachable_does_not():
@@ -497,6 +554,20 @@ def test_heartbeat_microphone_consent_reaches_the_running_slot():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert runner.slot.task["microphone"] is False and runner.slot.stopped is None
+
+
+def test_a_due_medicine_task_reaches_the_running_slot():
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False, "task_due": True}))
+    runner.slot = StubSlot()
+    asyncio.run(runner.heartbeat_once())
+    assert runner.slot.medicine == 1 and runner.slot.stopped is None
+    for answer in ({"stop_all": False, "task_due": False}, {"stop_all": False}):   # none due; an older server
+        runner = heartbeat_runner(HeartbeatApp(answer))
+        runner.slot = StubSlot()
+        asyncio.run(runner.heartbeat_once())
+        assert runner.slot.medicine == 0
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False, "task_due": True}))
+    assert asyncio.run(runner.heartbeat_once()) == {"stop_all": False, "task_due": True}   # no slot: nothing to end
 
 
 class TaskApp:
@@ -540,7 +611,7 @@ def test_shutdown_does_not_wait_out_the_task_long_poll():
         async def tasks_next(self, wait):
             await asyncio.sleep(wait)   # the server's 25 s long poll
 
-        async def heartbeat(self, payload):
+        async def heartbeat(self, payload, camera=None):
             return {}
 
     stream = StubStream()
@@ -667,3 +738,169 @@ def test_emotion_failure_never_drops_the_landmark_frame():
 
     asyncio.run(scenario())
     assert len(app.landmarks) == 1 and "emotion" not in app.landmarks[0]
+
+
+# ── camera watchdog (spec 2026-10-11 A2, A3) ──
+RELEASED = {"available": False, "released": True, "no_media": False}
+
+
+class DyingCamera(Camera):
+    """A camera whose feed dies (`frame = None`) until reopen_camera() brings it back (`revives`)."""
+
+    def __init__(self, revives=True):
+        super().__init__()
+        self.alive_frame, self.revives, self.reopened = self.frame, revives, 0
+
+    def reopen_camera(self):
+        self.reopened += 1
+        if not self.revives:
+            return "failed: the daemon did not give the media back"
+        self.frame = self.alive_frame
+        return "acquired"
+
+    def media_status(self):
+        return RELEASED
+
+
+def make_dying_stream(engine=None, revives=True):
+    clock, app, camera = Clock(), FrameApp(), DyingCamera(revives)
+    stream = MonitorStream(app, camera, engine, clock=clock, run_blocking=inline, encode=lambda frame: b"big",
+                           stream_encode=lambda frame: b"jpg")
+    return stream, app, camera, clock
+
+
+def test_the_stream_notices_a_dead_camera_and_gets_it_back(caplog):
+    stream, app, camera, clock = make_dying_stream()
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()                       # frame 1 at 50.0
+        await stream.drain()
+        camera.frame = None                       # the daemon's camera was released
+        states = []
+        for i in range(1, 9):                     # reads every 0.25 s
+            clock.t = 50 + i * 0.25
+            await stream.step()
+            states.append(stream.camera.state)
+        clock.t = 52.25
+        await stream.step()                       # the reopened camera hands over a frame again
+        await stream.drain()
+        first = stream.camera.state, [frame[2] for frame in app.frames], list(caplog.records)
+        for i in range(1, 21):                    # steady frames for 5 s more: the stall is over
+            clock.t = 52.25 + i * 0.25
+            await stream.step()
+        return states, first
+
+    with caplog.at_level("INFO", logger="medcare_reachy.bridge.camera_watch"):
+        states, (state_at_first_frame, sent_at_first_frame, records_at_first_frame) = asyncio.run(scenario())
+    assert states == ["ok"] * 7 + ["recovering"] and camera.reopened == 1
+    assert state_at_first_frame == "ok" and sent_at_first_frame == [1, 2] and stream.camera.state == "ok"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("camera stalled: no new frame for 2.0 s") and "'released': True" in m for m in messages)
+    assert not any(r.getMessage().startswith("camera recovered") for r in records_at_first_frame)   # not yet
+    assert any(m.startswith("camera recovered: new frames for 5.0 s without a gap; the stall began 5.2 s ago")
+               for m in messages)
+
+
+def test_a_camera_that_stays_dead_is_unavailable_after_15_s_of_stall():
+    stream, app, camera, clock = make_dying_stream(revives=False)
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()
+        await stream.drain()
+        camera.frame = None
+        for i in range(1, 69):                    # 17 s of reads that find nothing
+            clock.t = 50 + i * 0.25
+            await stream.step()
+
+    asyncio.run(scenario())
+    assert stream.camera.state == "unavailable" and camera.reopened == 3   # at 52, 57 and 62
+    stream.detach()                                                        # the search ended: still reported
+    assert stream.camera.snapshot()["state"] == "unavailable"
+
+
+def test_on_robot_vision_watches_the_camera_too():
+    stream, app, camera, clock = make_dying_stream(engine=Engine())
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        camera.frame = None
+        for i in range(1, 9):
+            clock.t = 50 + i * 0.25
+            await stream.step()
+
+    asyncio.run(scenario())
+    assert camera.reopened == 1 and stream.camera.state == "recovering"
+
+
+def test_the_slow_camera_warning_can_fire_again_after_a_recovery(caplog):
+    stream, app, camera, clock = make_dying_stream()
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for i in range(101):                      # 10 s at 10 fps, the daemon's cap: warned
+            clock.t = 50 + i / 10
+            await stream.step()
+            await stream.drain()
+        camera.frame = None
+        for i in range(1, 13):                    # 3 s without a frame: stall, recovery
+            clock.t = 60 + i * 0.25
+            await stream.step()
+        for i in range(101):                      # 10 s at 10 fps again: warned again
+            clock.t = 63.25 + i / 10
+            await stream.step()
+            await stream.drain()
+
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        asyncio.run(scenario())
+    assert camera.reopened == 1
+    assert len([r for r in caplog.records if "camera hands this app only" in r.getMessage()]) == 2
+
+
+def test_the_heartbeat_reports_the_camera_in_each_state():
+    stream, app, camera, clock = make_dying_stream(revives=False)
+    beats = HeartbeatApp({"stop_all": False})
+    clips = FakeClips()
+    clips.missing_count = 0
+    runner = Runner(app=beats, robot=FakeRobot(), clips=clips, stream=stream, run_blocking=inline)
+
+    async def scenario():
+        await runner.heartbeat_once()                         # no session: idle
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()
+        await stream.drain()
+        await runner.heartbeat_once()                         # streaming: ok
+        camera.frame = None
+        for i in range(1, 9):
+            clock.t = 50 + i * 0.25
+            await stream.step()
+        await runner.heartbeat_once()                         # the recovery failed: stalled
+        for i in range(9, 69):
+            clock.t = 50 + i * 0.25
+            await stream.step()
+        await runner.heartbeat_once()                         # given up: unavailable
+        stream.detach()
+        await runner.heartbeat_once()                         # still, while no session runs
+
+    asyncio.run(scenario())
+    assert [beat["state"] for beat in beats.cameras] == ["idle", "ok", "stalled", "unavailable", "unavailable"]
+    assert beats.cameras[1]["fps"] == 0.1 and beats.cameras[2]["media"] == RELEASED
+    assert all(set(beat) == {"state", "fps", "since", "media"} for beat in beats.cameras)
+
+
+def test_a_robot_that_cannot_reopen_its_camera_only_reports_it():
+    stream, app, camera, clock = make_server_stream()
+    assert isinstance(stream.camera, CameraWatchdog)
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()
+        await stream.drain()
+        camera.frame = None
+        for i in range(1, 9):
+            clock.t = 50 + i * 0.25
+            await stream.step()
+
+    asyncio.run(scenario())
+    assert stream.camera.state == "stalled"

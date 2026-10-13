@@ -13,8 +13,9 @@ class ConfigUpdate(BaseModel):
     vision_on_server: bool | None = None
     checkin_ack: bool | None = None
     checkin_gestures: bool | None = None
-    elevenlabs_api_key: str | None = None
-    elevenlabs_voice_id: str | None = None
+    multimodal_emotion: bool | None = None
+    follow_face: bool | None = None
+    emotion_compute: str | None = None
 
 
 def register_routes(api, service) -> None:

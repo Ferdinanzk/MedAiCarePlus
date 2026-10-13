@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import logging
+import threading
 import time
 from pathlib import Path
 
@@ -168,6 +170,98 @@ def test_bridge_failure_is_reported_not_raised(tmp_path):
     assert "integrity" in service.status()["detail"]
 
 
+# ── one bridge at a time ──
+def tracked_bridge(alive, runs, start_seconds=0.1, stop_seconds=0.2):
+    """Shaped like default_bridge: a moment to start before it has a runner (robot, clips, voice, server client),
+    and a moment to shut down. `alive` holds the threads whose bridge is running right now."""
+    async def bridge(reachy_mini, settings, models_dir, on_runner):
+        me = threading.current_thread()
+        alive.add(me)
+        runs.append(settings)
+        try:
+            await asyncio.sleep(start_seconds)
+            runner = FakeRunner()
+            on_runner(runner)
+            await runner.stopping.wait()
+            await asyncio.sleep(stop_seconds)   # monitor_end, robot.sleep(), voice.stop()
+        finally:
+            alive.discard(me)
+    return bridge
+
+
+def test_two_restarts_at_once_leave_one_bridge_and_it_is_the_tracked_one(tmp_path):
+    """A double click on Save or Restart sends two requests, and the settings server runs them at the same time
+    (its endpoints are plain functions, run on a thread pool). Both bridges used to drive the same robot."""
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    alive, runs = set(), []
+    service = BridgeService(object(), store, bridge=tracked_bridge(alive, runs))
+    service.start()
+    assert wait_for(lambda: service.status()["state"] == "running")
+    began = time.monotonic()
+    callers = [threading.Thread(target=service.restart) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(20)
+    assert time.monotonic() - began < 5   # the second restart doesn't sit out stop()'s 15 s timeout
+    assert wait_for(lambda: service.status()["state"] == "running")
+    assert alive == {service._thread}     # exactly one bridge, and stop() can reach it
+    assert len(runs) == 3                 # each restart started a fresh bridge with the saved settings
+    service.stop()
+    assert not alive and service.status()["state"] == "stopped"
+
+
+def test_a_bridge_that_outlives_stop_stays_tracked_and_no_second_one_starts(tmp_path, caplog):
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    alive, runs = set(), []
+    release = threading.Event()
+
+    async def slow_to_stop(reachy_mini, settings, models_dir, on_runner):
+        me = threading.current_thread()
+        alive.add(me)
+        runs.append(settings)
+        try:
+            runner = FakeRunner()
+            on_runner(runner)
+            await runner.stopping.wait()
+            release.wait(5)   # shutdown work that takes longer than stop() waits (a blocking robot call)
+        finally:
+            alive.discard(me)
+
+    service = BridgeService(object(), store, bridge=slow_to_stop)
+    service.start()
+    assert wait_for(lambda: service.status()["state"] == "running")
+    first = service._thread
+    with caplog.at_level(logging.WARNING, logger="medcare_reachy"):
+        service.stop(timeout=0.2)
+        assert service.status()["state"] == "stopping"
+        service.start()
+    assert service._thread is first and alive == {first} and len(runs) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("did not stop" in m for m in messages) and any("not starting a second" in m for m in messages)
+    release.set()
+    first.join(2)
+    assert service.status()["state"] == "stopped"   # its own exit reports it
+    service.start()   # once it has ended, a new bridge may start
+    assert wait_for(lambda: service.status()["state"] == "running") and service._thread is not first
+    service.stop()
+    assert not alive
+
+
+def test_a_stop_while_the_bridge_is_still_starting_ends_it_once_it_has_a_runner(tmp_path):
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    alive, runs = set(), []
+    service = BridgeService(object(), store, bridge=tracked_bridge(alive, runs, start_seconds=0.3))
+    service.start()
+    began = time.monotonic()
+    service.stop(timeout=5)
+    assert time.monotonic() - began < 2   # stopped as soon as it had a runner, not after the timeout
+    assert not alive and service.status()["state"] == "stopped"
+
+
 # ── settings page API ──
 def test_settings_api_saves_restarts_and_masks_key(tmp_path):
     store = SettingsStore(tmp_path / "s.json")
@@ -241,3 +335,14 @@ def test_server_vision_runs_without_the_vision_models(tmp_path):
         assert wait_for(lambda: service.status()["state"] == "running")
     finally:
         service.stop()
+
+
+# ── version ──
+def test_the_package_and_the_heartbeat_report_the_same_version():
+    """The app store installs pyproject's version; heartbeats report bridge.__version__ (spec 2026-10-12 F3)."""
+    import tomllib
+
+    from medcare_reachy.bridge import __version__
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.10.0"

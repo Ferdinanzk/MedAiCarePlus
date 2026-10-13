@@ -1,5 +1,6 @@
 """Async client for the app's private device API (/api/device/*, port 8001)."""
 
+import json
 import logging
 import time
 
@@ -9,6 +10,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
 METRICS_TIMEOUT = 3.0   # timings only: never keep a conversation waiting on them
+LIVE_PATH = "/api/device/conversations/live"   # the live chat's WebSocket (bridge/live.py)
 
 
 class BridgeError(Exception):
@@ -97,7 +99,8 @@ def _is_busy(detail) -> bool:
 class AppClient:
     def __init__(self, base_url: str, token: str, *, transport: httpx.AsyncBaseTransport | None = None,
                  clock=time.monotonic, timeout: float = DEFAULT_TIMEOUT):
-        self._http = httpx.AsyncClient(base_url=base_url.rstrip("/"), transport=transport, timeout=timeout,
+        self._base_url, self._token = base_url.rstrip("/"), token   # the live chat's WebSocket (live_url, auth_header)
+        self._http = httpx.AsyncClient(base_url=self._base_url, transport=transport, timeout=timeout,
                                        headers={"Authorization": f"Bearer {token}"})
         self._clock = clock
         # First failure time of the current outage; the slot session fails closed on it.
@@ -168,12 +171,16 @@ class AppClient:
         return await self._request("POST", f"/api/device/tasks/{task_id}/extra-event",
                                    json={"event_id": event_id, "decision": decision, "confidence": confidence})
 
-    async def heartbeat(self, payload: dict) -> dict:
-        return await self._request("POST", "/api/device/heartbeat", json=payload) or {}
+    async def heartbeat(self, payload: dict, camera: dict | None = None) -> dict:
+        """`camera`: the camera watchdog's snapshot (state, fps, since, media), sent as "camera" when given. Servers
+        before it ignore the key."""
+        body = payload if camera is None else {**payload, "camera": camera}
+        return await self._request("POST", "/api/device/heartbeat", json=body) or {}
 
     # ── monitor ──────────────────────────────────────────────────────────
-    async def monitor_start(self, mode: str, intk_id: int | None, task_id: str) -> dict:
-        body = {"mode": mode, **({} if intk_id is None else {"intk_id": intk_id}), "task_id": task_id}
+    async def monitor_start(self, mode: str, intk_id: int | None, task_id: str, companion: bool = False) -> dict:
+        body = {"mode": mode, **({} if intk_id is None else {"intk_id": intk_id}), "task_id": task_id,
+                **({"companion": True} if companion else {})}
         return await self._request("POST", "/api/device/monitor/start", json=body)
 
     async def monitor_landmarks(self, packet: dict) -> dict:
@@ -186,18 +193,26 @@ class AppClient:
             files={"file": ("frame.jpg", jpeg, "image/jpeg")})
 
     async def monitor_frame(self, session_id: str, generation: str, frame_seq: int, timestamp: float,
-                            jpeg: bytes) -> dict:
-        """A camera frame for the server to compute the landmarks of (`timestamp`: capture time, seconds)."""
+                            jpeg: bytes, emotion: dict | None = None) -> dict:
+        """A camera frame for the server to compute the landmarks of (`timestamp`: capture time, seconds).
+
+        `emotion`: the robot's own multimodal score of the verified face on a recent frame ({"probabilities",
+        "target_box", "timestamp"}), as a JSON form field. Servers before the multimodal update ignore it.
+        """
+        data = {"session_id": session_id, "generation": generation, "frame_seq": str(frame_seq),
+                "timestamp": repr(float(timestamp))}
+        if emotion is not None:
+            data["emotion"] = json.dumps(emotion)
         return await self._request(
-            "POST", "/api/device/monitor/frame",
-            data={"session_id": session_id, "generation": generation, "frame_seq": str(frame_seq),
-                  "timestamp": repr(float(timestamp))},
+            "POST", "/api/device/monitor/frame", data=data,
             files={"file": ("frame.jpg", jpeg, "image/jpeg")})
 
     # ── check-in conversation (text only: speech is turned into text on the robot) ──
-    async def conversation_start(self, task_id: str, language: str) -> dict:
-        return await self._request("POST", "/api/device/conversations",
-                                   json={"task_id": task_id, "language": language})
+    async def conversation_start(self, task_id: str, language: str, companion: bool = False) -> dict:
+        """`companion`: a companion session (robot app 0.9.0), which the server ends only on a goodbye or a risk,
+        never at its patient-turn limit. Sent only when true: an older server gets the same request as before."""
+        body = {"task_id": task_id, "language": language, **({"companion": True} if companion else {})}
+        return await self._request("POST", "/api/device/conversations", json=body)
 
     async def conversation_turn(self, conversation_id: str, text: str, metrics: dict | None = None) -> dict:
         """One thing the patient said, with how long hearing it took (`metrics`: milliseconds, no audio).
@@ -223,3 +238,14 @@ class AppClient:
     async def monitor_end(self, session_id: str, generation: str) -> dict | None:
         return await self._request("POST", "/api/device/monitor/end",
                                    json={"session_id": session_id, "generation": generation})
+
+    # ── live chat (a WebSocket of its own: bridge/live.py) ──────────────
+    def live_url(self) -> str:
+        """The live chat's WebSocket address on this client's server (the settings page takes only http:// and https://
+        addresses): ws:// for http://, wss:// for https://."""
+        scheme, _, rest = self._base_url.partition("://")
+        return f"{'wss' if scheme.lower() == 'https' else 'ws'}://{rest}{LIVE_PATH}"
+
+    def auth_header(self) -> dict:
+        """The robot key, as the live chat's WebSocket sends it (the HTTP calls carry it already)."""
+        return {"Authorization": f"Bearer {self._token}"}

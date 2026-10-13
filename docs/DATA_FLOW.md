@@ -874,7 +874,7 @@ flowchart TD
 ```
 
 **Steps**
-1. **Heartbeat payload:** `robot_reachable`, `landmark_fps`, `vision_fps`, `bridge_version`, `missing_clips` (`bridge/runner.py:458-479`). Limits: fps 0-240, version ≤ 50 chars (`api_device.py:76-81`).
+1. **Heartbeat payload:** `robot_reachable`, `landmark_fps`, `vision_fps`, `bridge_version`, `missing_clips`, and `camera` (robot app 0.7.0 and later: `{state, fps, since, media}`; state is idle, ok, stalled, recovering or unavailable) (`bridge/runner.py:458-479`). Limits: fps 0-240, version ≤ 50 chars (`api_device.py:76-81`).
 2. **Server** (`api_device.py:524-540`; `reachy_tasks.py:205-209`): stores `last_seen_at`, `robot_reachable`, `landmark_fps` and `status_detail`, and extends leases. A revoked device or withdrawn consent gives `stop_all: true`.
 3. **Robot errors** (`bridge/app_client.py:115-148`; `bridge/session.py:143-191`):
 

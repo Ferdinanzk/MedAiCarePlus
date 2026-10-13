@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const robotNotice = {
@@ -17,6 +18,13 @@ const memoryNotice = {
 };
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
+
+/** The registered name ("user".name) the mocked server answers with when no call name is saved. */
+const REGISTERED_NAME = 'Robot Test';
+/** The character rules of a call name (memory.valid_name): 1-8 Chinese characters, or letters and single spaces up
+ *  to 20. The real server also refuses risk, health and command words; these tests don't need those. */
+const validName = (name: string) =>
+  /^[㐀-鿿]{1,8}$/.test(name) || (name.length <= 20 && /^[A-Za-z]+(?: [A-Za-z]+)*$/.test(name));
 
 const dose = {
   id: 41, med_id: 5, name: 'Aspirin', dosage: '100mg', status: 'pending', pills_remaining: 20,
@@ -44,6 +52,14 @@ interface MockOptions {
   memory?: boolean;
   /** What GET /api/memory lists. */
   memoryFacts?: Record<string, unknown>[];
+  /** The robot's camera from its last heartbeat (robot app 0.7.0+); left out: an older robot, no camera field. */
+  camera?: Record<string, unknown> | null;
+  online?: boolean;
+  /** The call name saved on the card ("user".reachy_call_name); left out: none, so the registered name is used. */
+  callName?: string | null;
+  /** The server's LIVE_VOICE_TEST, and this robot's live voice switch. */
+  liveVoiceTest?: boolean;
+  liveVoice?: boolean;
 }
 
 async function mockApi(page: Page, options: MockOptions = {}) {
@@ -59,10 +75,18 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     settingsPatches: [] as Record<string, unknown>[],
     taskPosts: [] as Record<string, unknown>[],
     memoryDeletes: [] as string[],
+    camera: options.camera,
+    online: options.online ?? true,
+    callName: options.callName ?? null,
+    liveVoiceTest: options.liveVoiceTest ?? false,
+    liveVoice: options.liveVoice ?? false,
   };
   const robotStatus = () => state.paired
     ? { paired: true, device_id: 'd-1', label: 'Reachy Mini', auto_record: state.autoRecord, last_seen_at: new Date().toISOString(),
-        online: true, robot_reachable: true, landmark_fps: 15.2, last_task: null, alert_contacts: 1 }
+        online: state.online, robot_reachable: true, landmark_fps: 15.2, last_task: null, alert_contacts: 1,
+        call_name: state.callName ?? REGISTERED_NAME, call_name_custom: state.callName !== null,
+        live_voice: state.liveVoice, live_voice_test: state.liveVoiceTest,
+        ...(state.camera === undefined ? {} : { camera: state.camera }) }
     : { paired: false };
   const consentStatus = () => ({
     terms_version: '2026-10', core_current: true, robot_current: false,
@@ -108,7 +132,15 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     if (path === '/api/reachy/settings') {
       const body = request.postDataJSON();
       state.settingsPatches.push(body);
-      state.autoRecord = body.auto_record;
+      // As the server does: a field left out keeps its value, "" goes back to the registered name, and a name that
+      // breaks the rules refuses the whole request with 422 invalid_call_name.
+      if ('call_name' in body) {
+        const name = String(body.call_name).trim();
+        if (name && !validName(name)) return route.fulfill({ status: 422, json: { detail: 'invalid_call_name' } });
+        state.callName = name || null;
+      }
+      if ('auto_record' in body) state.autoRecord = body.auto_record;
+      if ('live_voice' in body) state.liveVoice = body.live_voice;
       return route.fulfill({ json: robotStatus() });
     }
     if (path === '/api/reachy/tasks') {
@@ -356,6 +388,61 @@ test('the conversations page lists what Reachy remembers and deletes one note', 
   expect(dialogs).toEqual([expect.stringMatching(/Delete this note\?|刪除這則筆記/)]);
 });
 
+// ── The robot's camera (robot app 0.7.0): a warning while it is not working, its rate while a session runs ──
+
+const reachyCard = (page: Page) => page.locator('section[aria-labelledby="reachy-title"]');
+const CAMERA_WARNING = /Robot camera not working|機器人鏡頭無法使用/;
+const robotCamera = (state: string, fps: number) =>
+  ({ state, fps, since: 1791700000.5, media: { available: true, released: false, no_media: false } });
+
+/** The value next to the card's "Robot camera" row. */
+const robotCameraRate = (page: Page) =>
+  reachyCard(page).locator('dt', { hasText: /^(Robot camera|機器人鏡頭)$/ }).locator('xpath=following-sibling::dd[1]');
+
+test('the Reachy card warns when the robot camera is stalled, recovering or unavailable', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('stalled', 4.2) });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  for (const state of ['stalled', 'recovering', 'unavailable']) {
+    // a 10 s average that still counts the frames from before the stall: not shown
+    api.camera = robotCamera(state, 4.2);
+    await page.reload();
+    await expect(reachyCard(page).getByRole('alert')).toHaveText('機器人鏡頭無法使用');   // exact: no English fallback
+    await expect(robotCameraRate(page)).toHaveText('—');
+    await expect(reachyCard(page).getByText('4.2 fps')).toHaveCount(0);
+  }
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(reachyCard(page).getByRole('alert')).toHaveText('Robot camera not working');
+  await expect(robotCameraRate(page)).toHaveText('—');
+});
+
+test('the Reachy card shows no camera warning when the camera works, the robot is offline or older', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, camera: robotCamera('ok', 9.8) });
+  await page.goto('/settings');
+  await expect(robotCameraRate(page)).toHaveText('9.8 fps');               // the camera's rate while a session runs
+  await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
+
+  api.camera = robotCamera('idle', 0);                                       // no session: no rate, no warning
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();      // the card has its status first, or a count of 0 proves nothing
+  await expect(reachyCard(page).getByText(/Robot camera|機器人鏡頭/)).toHaveCount(0);
+  await expect(reachyCard(page).getByRole('alert').filter({ hasText: CAMERA_WARNING })).toHaveCount(0);
+
+  api.camera = robotCamera('unavailable', 0);                               // last report of a robot now offline
+  api.online = false;
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Offline|離線/)).toBeVisible();
+  await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
+
+  api.camera = undefined;                                                    // a robot older than 0.7.0
+  api.online = true;
+  await page.reload();
+  await expect(reachyCard(page).getByText(/Online|在線/)).toBeVisible();
+  await expect(reachyCard(page).getByText(/Robot camera|機器人鏡頭/)).toHaveCount(0);
+  await expect(reachyCard(page).getByRole('alert')).toHaveCount(0);
+});
+
 test('when every dose today is closed the test alert says so', async ({ page }) => {
   await seedSession(page);
   const api = await mockApi(page, {
@@ -364,4 +451,132 @@ test('when every dose today is closed the test alert says so', async ({ page }) 
   await sendTestAlert(page);
   await expect(page.getByText(/Every dose today is already taken|今天的藥都已服用/)).toBeVisible();
   expect(api.taskPosts).toEqual([]);
+});
+
+test('the check-ins help names the AI connections card, not a company', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  const help = page.locator('label').filter({ has: checkinSwitch(page) });
+  await expect(help).toContainText('只有文字會傳送到「AI 連線」卡片上選定的 AI 服務');
+  await expect(help).not.toContainText('OpenRouter');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(help).toContainText('only the text is sent to the AI service chosen on the AI connections card');
+  await expect(help).not.toContainText('OpenRouter');
+});
+
+// ── Live voice 2a (Oct 2026): what Reachy calls the patient, and the live voice test switch ──
+// Set REACHY_SCREENSHOTS to a folder to save the card at 390 and 1280 px.
+
+const nameField = (page: Page) =>
+  reachyCard(page).getByRole('textbox', { name: /What should Reachy call you\?|Reachy 要怎麼稱呼您？/ });
+const saveName = (page: Page) => reachyCard(page).getByRole('button', { name: /^(Save|儲存)$/ });
+const resetName = (page: Page) => reachyCard(page).getByRole('button', { name: /Use my registered name|改用註冊時的姓名/ });
+const liveSwitch = (page: Page) => page.getByRole('checkbox', { name: /Live voice \(test\)|即時語音（測試）/ });
+
+test('the name field starts with the registered name and saves only the new name', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  await expect(nameField(page)).toHaveValue(REGISTERED_NAME);
+  await expect(nameField(page)).toHaveAttribute('placeholder', '例如：林奶奶');
+  await expect(resetName(page)).toHaveCount(0);                 // the registered name is already in use
+  await expect(saveName(page)).toBeDisabled();                  // nothing typed yet
+  await nameField(page).evaluate(element => element.scrollIntoView({ block: 'center' }));
+  await nameField(page).fill('  阿嬤  ');
+  await clickCentred(saveName(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ call_name: '阿嬤' }]);   // trimmed, and nothing else
+  await expect(reachyCard(page).getByRole('status')).toHaveText('已儲存。');
+  await expect(nameField(page)).toHaveValue('阿嬤');
+  await expect(saveName(page)).toBeDisabled();
+  await expect(resetName(page)).toBeVisible();
+  await page.reload();
+  await expect(nameField(page)).toHaveValue('阿嬤');
+});
+
+test('a name of their own can go back to the registered name', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, callName: 'Grandma Lin' });
+  await page.goto('/settings');
+  await expect(nameField(page)).toHaveValue('Grandma Lin');
+  await clickCentred(resetName(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ call_name: '' }]);
+  await expect(nameField(page)).toHaveValue(REGISTERED_NAME);
+  await expect(resetName(page)).toHaveCount(0);
+});
+
+test('a name the server refuses is explained next to the field, in both languages', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  await nameField(page).evaluate(element => element.scrollIntoView({ block: 'center' }));
+  await nameField(page).fill('Dr. Lin 2');
+  await clickCentred(saveName(page));
+  await expect(reachyCard(page).getByRole('alert')).toHaveText(
+    'Reachy 無法使用這個名字。請用最多 8 個中文字，或最多 20 個英文字母和空格，不能有數字、符號，或和健康、藥物有關的字。');
+  expect(api.settingsPatches).toEqual([{ call_name: 'Dr. Lin 2' }]);
+  await expect(nameField(page)).toHaveValue('Dr. Lin 2');          // kept, so it can be fixed
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(reachyCard(page).getByRole('alert')).toHaveText(
+    "Reachy can't use this name. Use up to 8 Chinese characters, or up to 20 English letters and spaces, with no numbers, symbols, or words about health or medicine.");
+  await nameField(page).fill('Grandma Lin');
+  await expect(reachyCard(page).getByRole('alert')).toHaveCount(0);   // typing clears it
+  await clickCentred(saveName(page));
+  await expect(reachyCard(page).getByRole('status')).toHaveText('Saved.');
+  expect(api.settingsPatches).toEqual([{ call_name: 'Dr. Lin 2' }, { call_name: 'Grandma Lin' }]);
+});
+
+test('the live voice switch shows only when the server allows the test, and saves only live_voice', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');
+  await expect(nameField(page)).toBeVisible();     // the card has loaded, or a count of 0 proves nothing
+  await expect(liveSwitch(page)).toHaveCount(0);
+
+  api.liveVoiceTest = true;                        // LIVE_VOICE_TEST=1 in the server's .env
+  await page.reload();
+  await expect(liveSwitch(page)).not.toBeChecked();
+  await clickCentred(liveSwitch(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ live_voice: true }]);
+  await expect(liveSwitch(page)).toBeChecked();      // mirrors the server's answer
+  await clickCentred(liveSwitch(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ live_voice: true }, { live_voice: false }]);
+  await expect(liveSwitch(page)).not.toBeChecked();
+
+  // The help says plainly that the voice itself goes to OpenAI, unlike today's text-only check-ins.
+  const help = page.locator('label').filter({ has: liveSwitch(page) });
+  await expect(help).toContainText('您的聲音會傳送到 OpenAI 的即時語音模型');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(help).toContainText("your voice is sent to OpenAI's live voice model");
+});
+
+test('the name field and the live switch fit a phone and a desktop screen', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, { paired: true, robotConsent: true, checkins: true, liveVoiceTest: true, callName: '阿嬤' });
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/settings');
+    await expect(nameField(page)).toHaveValue('阿嬤');
+    await expect(resetName(page)).toBeVisible();
+    await expect(liveSwitch(page)).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect((await saveName(page).boundingBox())?.height).toBeGreaterThanOrEqual(48);   // min-h-12: easy to press
+    if (process.env.REACHY_SCREENSHOTS) {
+      // 'instant', because index.css scrolls smoothly and the picture would be taken mid-scroll.
+      await nameField(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-card-${width}.png` });
+    }
+  }
+});
+
+test('the Reachy card translations have the same keys in English and Traditional Chinese', () => {
+  const source = readFileSync(new URL('../src/i18n.ts', import.meta.url), 'utf8');
+  const blocks = [...source.matchAll(/^ {6}reachy: \{\r?\n([\s\S]*?)^ {6}\},/gm)];
+  expect(blocks).toHaveLength(2);
+  const keys = blocks.map(block => [...block[1].matchAll(/^ {8}(\w+):/gm)].map(match => match[1]).sort());
+  expect(keys[0]).toEqual(keys[1]);
+  expect(keys[0]).toEqual(expect.arrayContaining([
+    'callName', 'callNameHelp', 'callNamePlaceholder', 'callNameReset', 'callNameSaved', 'callNameInvalid',
+    'liveVoice', 'liveVoiceHelp',
+  ]));
 });

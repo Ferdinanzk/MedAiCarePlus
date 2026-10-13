@@ -1,15 +1,17 @@
 """Robot pairing, status and settings for the signed-in patient (public port, user auth)."""
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app import config
 from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.jobs.missed_dose_job import _slot_key
-from app.services import consent_service, dose_safety, reachy_tasks, schedule
+from app.services import consent_service, dose_safety, memory, reachy_tasks, schedule
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
@@ -19,7 +21,10 @@ MANUAL_TASK_MIN_MINUTES = 15
 
 
 class SettingsPayload(BaseModel):
-    auto_record: bool
+    """The Reachy card's settings. A field left out (or null) keeps its value."""
+    auto_record: bool | None = None
+    call_name: str | None = Field(default=None, max_length=memory.CALL_NAME_MAX)   # "" = the registered name
+    live_voice: bool | None = None
 
 
 class TaskPayload(BaseModel):
@@ -30,15 +35,27 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
+def _camera(status_detail) -> dict | None:
+    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.7.0 send none).
+    asyncpg hands JSONB back as text."""
+    if status_detail is None:
+        return None
+    detail = json.loads(status_detail) if isinstance(status_detail, str) else status_detail
+    camera = detail.get("camera") if isinstance(detail, dict) else None
+    return camera if isinstance(camera, dict) else None
+
+
 async def _status(conn, u_id: int) -> dict:
     device = await conn.fetchrow(
-        "SELECT device_id, label, auto_record, last_seen_at, robot_reachable, landmark_fps "
+        "SELECT device_id, label, auto_record, live_voice, last_seen_at, robot_reachable, landmark_fps, status_detail "
         "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
     if not device:
         return {"paired": False}
     task = await conn.fetchrow(
         "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1 "
         "ORDER BY created_at DESC LIMIT 1", u_id)
+    names = await conn.fetchrow('SELECT reachy_call_name, name FROM "user" WHERE u_id = $1', u_id)
+    stored = names["reachy_call_name"] if names else None
     last_seen = device["last_seen_at"]
     online = last_seen is not None and datetime.now(timezone.utc) - last_seen <= timedelta(seconds=ONLINE_SECONDS)
     # Family alerts (safety, confirmations, missed doses) go only to verified non-patient contacts on LINE.
@@ -49,8 +66,13 @@ async def _status(conn, u_id: int) -> dict:
         "alert_contacts": int(alert_contacts or 0),
         "paired": True, "device_id": str(device["device_id"]), "label": device["label"],
         "auto_record": bool(device["auto_record"]), "last_seen_at": _iso(last_seen), "online": online,
+        # What Reachy calls the patient without a memory 'name' entry; custom: saved on this card.
+        "call_name": memory.call_name_of(stored, names["name"] if names else None),
+        "call_name_custom": stored is not None,
+        "live_voice": bool(device["live_voice"]), "live_voice_test": config.LIVE_VOICE_TEST,
         "robot_reachable": device["robot_reachable"],
         "landmark_fps": float(device["landmark_fps"]) if device["landmark_fps"] is not None else None,
+        "camera": _camera(device["status_detail"]),
         "last_task": {"task_id": str(task["task_id"]), "status": task["status"],
                       "slot_time": _iso(task["slot_time"]), "finished_at": _iso(task["finished_at"])}
         if task else None,
@@ -89,12 +111,22 @@ async def status(user: dict = Depends(get_consented_user)):
 
 @router.patch("/settings")
 async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_user)):
-    async with get_pool().acquire() as conn:
+    """A call name follows the rules of the patient's memory 'name' entry (422 invalid_call_name); an empty one goes
+    back to the registered name (NULL)."""
+    call_name = None
+    if payload.call_name is not None and payload.call_name.strip():
+        call_name = memory.clean_call_name(payload.call_name)
+        if call_name is None:
+            raise HTTPException(422, "invalid_call_name")
+    async with get_pool().acquire() as conn, conn.transaction():
         updated = await conn.fetchval(
-            "UPDATE reachy_device SET auto_record = $2 WHERE u_id = $1 AND revoked_at IS NULL RETURNING device_id",
-            user["u_id"], payload.auto_record)
+            "UPDATE reachy_device SET auto_record = COALESCE($2, auto_record), live_voice = COALESCE($3, live_voice) "
+            "WHERE u_id = $1 AND revoked_at IS NULL RETURNING device_id",
+            user["u_id"], payload.auto_record, payload.live_voice)
         if updated is None:
             raise HTTPException(409, "robot_not_paired")
+        if payload.call_name is not None:
+            await conn.execute('UPDATE "user" SET reachy_call_name = $2 WHERE u_id = $1', user["u_id"], call_name)
         return await _status(conn, user["u_id"])
 
 

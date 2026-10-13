@@ -7,6 +7,8 @@ from collections import deque
 
 from medcare_reachy.bridge import __version__
 from medcare_reachy.bridge.app_client import BridgeError, NotAuthorised
+from medcare_reachy.bridge.camera_watch import NOT_WORKING, CameraWatchdog
+from medcare_reachy.bridge.multimodal.governor import ComputeGovernor
 from medcare_reachy.bridge.session import SlotSession
 
 log = logging.getLogger(__name__)
@@ -27,12 +29,23 @@ STALL_SECONDS = 0.25           # a longer gap between streamed frames makes the 
 STALL_LOG_SECONDS = 1.0        # at most one stall line per this long (a broken camera would log every frame)
 VISION_INTERVAL = 0.5          # identity-only snapshots, 2 fps (the server re-checks identity every 0.5 s)
 EMOTION_INTERVAL = 0.5         # emotion is scored on the robot, at most 2 fps, only for the verified face
+# When the governor hands emotion to the laptop the stream switches to sending frames (even with on-robot
+# landmarks): the server then scores identity and emotion on them itself, as it does for a browser.
 JPEG_QUALITY = 75
 FPS_WINDOW = 10.0
 HEARTBEAT_SECONDS = 10.0
 TICK_SECONDS = 0.2
 TASK_WAIT = 25
 RESUMABLE = frozenset({"app_unreachable"})   # slot results that leave the task leased to us
+
+
+def _cannot_reopen() -> str:
+    """The camera watchdog's recovery for a robot without reopen_camera() (VideoFileRobot, test cameras)."""
+    return "failed: this robot can't reopen its camera"
+
+
+def _no_media_status() -> None:
+    return None
 
 
 def encode_stream_jpeg(frame) -> bytes:
@@ -86,22 +99,39 @@ class MonitorStream:
     A frame that finds no free slot is dropped rather than queued. frame_seq restarts at 1 for every
     session; timestamps are capture times.
     A gap over STALL_SECONDS between streamed frames is logged with what held it up (see _note_stall).
+    `camera` (camera_watch.CameraWatchdog) follows every read of an attached session: frame() for a new frame,
+    tick() (off the event loop: a recovery blocks) for none. By default it recovers with the robot's
+    reopen_camera() and logs its media_status(); the heartbeat sends its snapshot().
+    `emotion` (multimodal.MultimodalEmotion, or anything with its score()) runs on the robot while `governor`
+    says so: with on-robot landmarks it rides on the landmark packet; with streamed frames it runs in the
+    background between frames and the latest report goes out with the next frame. Once the governor falls
+    back to the laptop the stream only sends frames and the server scores them.
     """
 
     def __init__(self, app, robot, engine, *, clock=time.monotonic, run_blocking=asyncio.to_thread,
                  encode=encode_jpeg, stream_encode=encode_stream_jpeg, fps=CAPTURE_FPS,
                  vision_interval=VISION_INTERVAL, emotion=None, emotion_interval=EMOTION_INTERVAL,
-                 max_in_flight=MAX_FRAMES_IN_FLIGHT):
+                 max_in_flight=MAX_FRAMES_IN_FLIGHT, camera=None, governor=None):
         self.app, self.robot, self.engine = app, robot, engine
+        self.camera = camera if camera is not None else CameraWatchdog(
+            getattr(robot, "reopen_camera", _cannot_reopen), getattr(robot, "media_status", _no_media_status),
+            clock=clock, media_released=getattr(robot, "media_released", None))
         self.emotion, self.emotion_interval = emotion, emotion_interval
+        self.governor = governor or ComputeGovernor("auto" if emotion is not None else "robot", clock=clock)
         self._last_emotion = float("-inf")
+        self._emotion_busy = False
+        self._emotion_report: dict | None = None   # scored on a streamed frame, not yet sent
+        self._emotion_times: deque = deque()
         self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
         self.max_in_flight = max_in_flight
         self._frames_in_flight = 0
+        self.fps = fps
         self.interval = 1.0 / fps
+        self._max_fps: float | None = None   # set_max_fps's cap, None without one
         self.vision_interval = vision_interval
         self.session: dict | None = None
         self.latest: dict | None = None
+        self.latest_at: float | None = None   # when `latest` came from the server (clock); None for attach's answer
         self.frame_seq = 0
         self._latest_seq = 0
         self._error: Exception | None = None
@@ -127,6 +157,7 @@ class MonitorStream:
     def attach(self, monitor: dict) -> None:
         self.session = {"session_id": monitor["session_id"], "generation": monitor["generation"]}
         self.latest = dict(monitor)
+        self.latest_at = None
         self.frame_seq = 0
         self._latest_seq = 0
         self._error = None
@@ -135,14 +166,24 @@ class MonitorStream:
         self._stalls = 0
         self._camera_asked = None
         self._clear_stall_notes()
+        self.camera.attach()
 
     def detach(self) -> None:
         self.session = None
         self.latest = None
+        self.latest_at = None
+        self.camera.detach()
 
     def take_error(self) -> Exception | None:
         error, self._error = self._error, None
         return error
+
+    def set_max_fps(self, fps: float | None) -> None:
+        """At most `fps` frames a second from the next frame on (a companion session's COMPANION_CAPTURE_FPS: its
+        camera only tells who is there, at less CPU for the robot and the server), or None: back to the rate this
+        stream was made with. Below SERVER_FPS_MIN the slow-camera warning is off: slow on purpose."""
+        self._max_fps = fps
+        self.interval = 1.0 / (self.fps if fps is None else min(self.fps, fps))
 
     # ── rates for the heartbeat ──────────────────────────────────────────
     def _rate(self, times: deque) -> float:
@@ -161,6 +202,30 @@ class MonitorStream:
         """New frames the camera handed the server stream: the ceiling for landmark_fps."""
         return self._rate(self._camera_times)
 
+    def emotion_fps(self) -> float:
+        """Emotion scores the robot itself completed (0 while the laptop scores)."""
+        return self._rate(self._emotion_times)
+
+    def emotion_compute(self) -> str | None:
+        """"robot" or "laptop" (multimodal.governor), None when emotion is off."""
+        return self.governor.compute if self.emotion is not None else None
+
+    def emotion_status(self) -> dict | None:
+        if self.emotion is None:
+            return None
+        status = {**self.governor.status(), "fps": self.emotion_fps(), "share": self.governor.share(self.clock())}
+        branches = getattr(self.emotion, "branches", None)
+        if branches is not None:
+            status["branches"] = branches
+        last = getattr(self.emotion, "last", None)
+        if last:
+            status["last"] = {"top": last.get("top"), "used": last.get("used")}
+        return status
+
+    def _server_vision(self) -> bool:
+        """Frames go to the server (it computes landmarks, identity and emotion) rather than landmarks."""
+        return self.engine is None or not self.governor.on_robot(self.clock())
+
     # ── pipeline ─────────────────────────────────────────────────────────
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -177,22 +242,26 @@ class MonitorStream:
             self._loop_late = max(self._loop_late, self.clock() - asleep - pause)
 
     def _pause(self, started: float) -> float:
-        if self.session is not None and self.engine is None:
+        if self.session is not None and self._server_vision():
             # Sleep until the next frame may go out, then take the first one the camera hands over.
             return max(FRAME_POLL_SECONDS, self._next_due - self.interval * PACE_EARLY - self.clock())
         return max(0.0, self.interval - (self.clock() - started))
 
     async def step(self) -> None:
         session = self.session
-        if session is not None and self.engine is None:
+        if session is not None and self._server_vision():
             await self._stream_frame(session)
             return
         if session is None or self._landmark_busy:
             return
         frame = await self.run_blocking(self.robot.get_frame)
         captured = self.clock()
-        if frame is None or self.session is not session:
+        if self.session is not session:
             return
+        if frame is None:
+            await self.run_blocking(self.camera.tick)   # a recovery blocks for a while: never on the event loop
+            return
+        self._camera_seen()
         self.frame_seq += 1
         seq = self.frame_seq
         packet = await self.run_blocking(self.engine.process, frame, seq, captured * 1000.0)
@@ -216,11 +285,14 @@ class MonitorStream:
         if frame is None:
             if self._camera_asked is None:
                 self._camera_asked = asked
+            await self.run_blocking(self.camera.tick)   # a recovery blocks for a while: never on the event loop
             return
         self._camera_wait = max(self._camera_wait, captured - (asked if self._camera_asked is None
                                                                else self._camera_asked))
         self._camera_asked = None
+        self._camera_seen()
         self._note_camera_frame(captured)
+        self._maybe_score(frame, captured)
         if captured < self._next_due - self.interval * PACE_EARLY:
             return   # the camera runs faster than the stream: skip this one
         jpeg = await self.run_blocking(self.stream_encode, frame)
@@ -263,25 +335,38 @@ class MonitorStream:
         """
         gap = 0.0 if self._last_streamed is None else captured - self._last_streamed
         self._last_streamed = captured
-        if gap > STALL_SECONDS:
+        limit = max(STALL_SECONDS, 2 * self.interval)   # a slowed stream (set_max_fps) has long gaps by design
+        if gap > limit:
             self._stalls += 1
             if captured - self._last_stall_log >= STALL_LOG_SECONDS:
                 self._last_stall_log = captured
                 log.warning("server stream: %.2f s between frames before frame %d (%d gap(s) over %.2f s since the "
                             "last report); longest wait for a camera frame %.2f s, event loop up to %.2f s late, "
                             "frames dropped for want of a free request slot: %d (oldest unanswered request %.2f s)",
-                            gap, self.frame_seq, self._stalls, STALL_SECONDS, self._camera_wait, self._loop_late,
+                            gap, self.frame_seq, self._stalls, limit, self._camera_wait, self._loop_late,
                             self._no_slot, self._oldest_request)
                 self._stalls = 0
         self._clear_stall_notes()
 
+    def _camera_seen(self) -> None:
+        """A new camera frame for the watchdog. After a stall the slow-camera warning may fire again, measured from
+        the recovery."""
+        recovered = self.camera.state in NOT_WORKING
+        self.camera.frame()
+        if recovered:
+            self._slow_camera_logged = False
+            self._streaming_since = None
+
     def _note_camera_frame(self, captured: float) -> None:
-        """Count camera frames, and say once in the log when the camera alone keeps the server from recording."""
+        """Count camera frames, and say once in the log when the camera alone keeps the server from recording; not
+        while this stream's own cap (set_max_fps, a companion session) reads the camera that slowly on purpose."""
         self._camera_times.append(captured)
         fps = self.camera_fps()   # also forgets frames older than the window
         if self._streaming_since is None:
             self._streaming_since = captured
-        if not self._slow_camera_logged and captured - self._streaming_since >= FPS_WINDOW and fps < SERVER_FPS_MIN:
+        capped = self._max_fps is not None and self._max_fps < SERVER_FPS_MIN
+        if (not self._slow_camera_logged and not capped and captured - self._streaming_since >= FPS_WINDOW
+                and fps < SERVER_FPS_MIN):
             self._slow_camera_logged = True
             # Reachy Mini daemon 1.11 caps the camera feed it shares with apps at 10 fps (IPC_FPS in
             # reachy_mini/media/media_server.py); tools/deploy_to_robot.py --camera-ipc-fps 15 lifts it.
@@ -290,8 +375,11 @@ class MonitorStream:
                         fps, SERVER_FPS_MIN)
 
     async def _send_frame(self, session, seq: int, captured: float, jpeg: bytes, request: object) -> None:
+        report, self._emotion_report = self._emotion_report, None
+        extra = {} if report is None else {"emotion": report}
         try:
-            response = await self.app.monitor_frame(session["session_id"], session["generation"], seq, captured, jpeg)
+            response = await self.app.monitor_frame(session["session_id"], session["generation"], seq, captured, jpeg,
+                                                    **extra)
             self._landmark_times.append(self.clock())
             self._accept(session, response)
         except BridgeError as exc:
@@ -300,18 +388,60 @@ class MonitorStream:
             self._sent_at.pop(request, None)
             self._frames_in_flight -= 1
 
-    async def _with_emotion(self, frame, packet: dict, captured: float) -> dict:
-        """Attach the robot-scored emotion of the server-verified face (the server re-checks it)."""
+    def _emotion_due(self, captured: float):
+        """The verified face to score now on the robot, or None (nothing verified, not due yet, or the laptop's turn)."""
         target = (self.latest or {}).get("target_box")
         if self.emotion is None or not target or captured - self._last_emotion < self.emotion_interval:
-            return packet
+            return None
+        if not self.governor.on_robot(captured):
+            return None
         self._last_emotion = captured
+        self.governor.due(captured)
+        return target
+
+    async def _with_emotion(self, frame, packet: dict, captured: float) -> dict:
+        """Attach the robot-scored emotion of the server-verified face (the server re-checks it)."""
+        target = self._emotion_due(captured)
+        if target is None:
+            return packet
+        started = self.clock()
         try:
             report = await self.run_blocking(self.emotion.score, frame, packet, target)
-        except Exception:   # emotion is optional; never lose the landmark frame over it
+        except Exception as exc:   # emotion is optional; never lose the landmark frame over it
             log.exception("emotion scoring failed")
+            self.governor.failed(exc, self.clock())
             return packet
+        self._note_scored(started)
         return packet if report is None else {**packet, "emotion": report}
+
+    def _maybe_score(self, frame, captured: float) -> None:
+        """Streamed frames: score the verified face in the background; a scorer still busy counts as too slow."""
+        target = self._emotion_due(captured)
+        if target is None or self._emotion_busy:
+            return
+        self._emotion_busy = True
+        self._spawn(self._score_frame(frame, target, captured))
+
+    async def _score_frame(self, frame, target, captured: float) -> None:
+        started = self.clock()
+        try:
+            report = await self.run_blocking(self.emotion.score, frame, None, target)
+        except Exception as exc:
+            log.exception("emotion scoring failed")
+            self.governor.failed(exc, self.clock())
+            return
+        finally:
+            self._emotion_busy = False
+        self._note_scored(started)
+        if report is not None:
+            # No landmarks on the robot here: the server matches the box to the face it verified.
+            self._emotion_report = {"probabilities": report["probabilities"], "target_box": list(target),
+                                    "timestamp": captured}
+
+    def _note_scored(self, started: float) -> None:
+        now = self.clock()
+        self._emotion_times.append(now)
+        self.governor.scored(now - started, now)
 
     async def drain(self) -> None:
         while self._tasks:
@@ -358,6 +488,7 @@ class MonitorStream:
             return
         self._latest_seq = seq
         self.latest = response
+        self.latest_at = self.clock()
 
     def _fail(self, session, exc: Exception) -> None:
         if self.session is session:
@@ -367,9 +498,9 @@ class MonitorStream:
 class Runner:
     def __init__(self, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
                  heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread,
-                 ack=True, gestures=True):
+                 ack=True, gestures=True, mood=None, follow=None):
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
-        self.speaker, self.language = speaker, language
+        self.speaker, self.language, self.mood, self.follow = speaker, language, mood, follow
         self.ack, self.gestures = ack, gestures   # check-in 「嗯」 and body language (SlotSession)
         self.heartbeat_seconds = heartbeat_seconds
         self.tick_seconds = tick_seconds
@@ -438,7 +569,8 @@ class Runner:
         log.info("task %s (%s): %d dose(s)", task.get("task_id"), task.get("reason"), len(task.get("doses", [])))
         slot = SlotSession(task, app=self.app, robot=self.robot, clips=self.clips, stream=self.stream,
                            voice=self.voice, speaker=self.speaker, language=self.language,
-                           run_blocking=self.run_blocking, ack=self.ack, gestures=self.gestures)
+                           run_blocking=self.run_blocking, ack=self.ack, gestures=self.gestures, mood=self.mood,
+                           follow=self.follow)
         self.slot = slot
         if self.stopping.is_set():
             slot.stop("bridge_shutdown", abort=False)
@@ -460,11 +592,19 @@ class Runner:
             self.robot_reachable = bool(await self.run_blocking(self.robot.is_reachable))
         except Exception:
             self.robot_reachable = False
+        if self.robot_reachable:
+            # A camera recovery the daemon refused leaves this app's media released, the speaker and the microphone
+            # with it, and outside a stalled session nothing else asks for it back (restore_media never raises).
+            await self.run_blocking(self.robot.restore_media)
         payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
                    "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
-                   "missing_clips": self.clips.missing_count}
+                   "missing_clips": self.clips.missing_count,
+                   "companion": bool(self.slot is not None and getattr(self.slot, "companion_since", None) is not None)}
+        compute = getattr(self.stream, "emotion_compute", lambda: None)()
+        if compute is not None:   # the server ignores fields it doesn't know yet
+            payload.update({"emotion_compute": compute, "emotion_fps": self.stream.emotion_fps()})
         try:
-            response = await self.app.heartbeat(payload)
+            response = await self.app.heartbeat(payload, camera=self.stream.camera.snapshot())
         except NotAuthorised:
             response = {"stop_all": True, "microphone": False}   # revoked device or withdrawn consent
         except BridgeError as exc:
@@ -476,6 +616,9 @@ class Runner:
         if self.slot and "microphone" in response:
             # Withdrawn microphone consent takes effect within one heartbeat, not only at the next task.
             self.slot.task["microphone"] = bool(response["microphone"])
+        if response.get("task_due") and self.slot:
+            # Medicine first (spec 2026-10-12 companion 4.5): a companion session ends for a medicine task now due.
+            self.slot.medicine_due()
         return response
 
     async def _heartbeat_loop(self) -> None:

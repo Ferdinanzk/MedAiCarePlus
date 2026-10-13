@@ -1,10 +1,16 @@
 from contextlib import asynccontextmanager
+import logging
 import os
 from fastapi import FastAPI
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from starlette.datastructures import Headers
 
+from app import config
 from app.database import init_pool, close_pool
 from app.config import FRONTEND_URL
 from app.services.face_recognition_service import FaceRecognitionService
@@ -16,15 +22,23 @@ from app.services.landmark_service import LandmarkService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
 from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations, api_memory
-from app.routers import api_dose_video
+from app.routers import api_ai, api_dose_video
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.startup_checks import run_startup_checks, check_restore_state
+from app.services import ai_settings, ai_store
+from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
 from app.services.schedule import DoseRefused
+
+# Nothing else configures logging, and Python drops INFO by default: the server's own INFO lines (robot identity
+# checks, the .env key fill) never reached `docker compose logs`. Give the root logger a handler and let "app.*" log INFO.
+logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s")
+logging.getLogger("app").setLevel(logging.INFO)
+
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -33,7 +47,15 @@ async def lifespan(app: FastAPI):
     await init_pool()
     async with get_pool().acquire() as conn:
         await check_restore_state(conn)
-        await register_documents(conn)
+        await ai_store.seed_from_env(conn)   # first start only; checks .env (check_ai_settings) before copying it
+        await ai_store.fill_openrouter_keys_from_env(config.OPENROUTER_API_KEY)   # every start: keyless ones only
+        ai_settings.set_current(await ai_store.load(conn))
+        for job in ai_settings.JOBS:   # before check_ai_settings, which can stop a prod start
+            if not ai_settings.job_usable(ai_settings.current(), job):
+                log.warning("AI job %s has no usable model (a tested model whose connection has a key that can be "
+                            "read), so it can't run; choose one on the Settings page's AI connections card", job)
+        check_ai_settings(ai_settings.current())
+        await register_documents(conn)   # after the AI settings: the notices name the services in use
     FaceRecognitionService.get_instance()
     EmotionService.get_instance()
     OCRService.get_instance()
@@ -58,17 +80,53 @@ async def dose_refused(request, exc: DoseRefused):
     return JSONResponse(exc.body(), status_code=409)
 
 
-@app.middleware("http")
-async def device_port_isolation(request, call_next):
-    """Device routes exist only on the private port; device tokens never work on the public one."""
-    server = request.scope.get("server")
-    on_device_port = bool(server) and server[1] == DEVICE_PORT
-    path = request.url.path
-    if path.startswith("/api/device/") != on_device_port:
-        return JSONResponse({"detail": "Not Found"}, status_code=404)
-    if not on_device_port and request.headers.get("authorization", "").lower().startswith("bearer rdv1."):
-        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
-    return await call_next(request)
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc: RequestValidationError):
+    """FastAPI's 422 copies the request input back. On the AI card that input holds a plain API key, so the card
+    answers a bare code. A device route answers without the input: a robot's NaN or Infinity cannot be written back
+    as JSON, and the default answer then failed with a 500. Every other route keeps the default answer."""
+    if request.url.path.startswith("/api/ai/"):
+        return JSONResponse({"detail": "invalid_request"}, status_code=422)
+    if request.url.path.startswith("/api/device/"):
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+        return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
+
+
+class DevicePortIsolation:
+    """Device routes exist only on the private port; device tokens never work on the public one.
+
+    A plain ASGI middleware, so the rule covers WebSockets too: an @app.middleware("http") never sees them (spec
+    2026-10-12-live-voice-2a-design.md A2, flaw F22). HTTP: 404 on the wrong port, then 401 for a device token on the
+    public port, as before. A WebSocket on the wrong port, or with a device token on the public port, is closed with
+    1008 before its handshake completes (uvicorn answers it with HTTP 403). scope["path"] is the path the router
+    matches."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        server = scope.get("server")
+        on_device_port = bool(server) and server[1] == DEVICE_PORT
+        wrong_port = scope["path"].startswith("/api/device/") != on_device_port
+        device_token = (not on_device_port
+                        and Headers(scope=scope).get("authorization", "").lower().startswith("bearer rdv1."))
+        if scope["type"] == "websocket" and (wrong_port or device_token):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        if wrong_port:
+            await JSONResponse({"detail": "Not Found"}, status_code=404)(scope, receive, send)
+            return
+        if device_token:
+            await JSONResponse({"detail": "Invalid or expired token"}, status_code=401)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(DevicePortIsolation)   # where the http-only rule was, so CORS still runs outside it
 
 # CORS for React frontend (local dev + Vercel production)
 _cors_origins = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]
@@ -120,6 +178,7 @@ app.include_router(api_conversations.router, tags=["conversations"])
 app.include_router(api_memory.router,        tags=["memory"])
 app.include_router(api_dose_video.router,    tags=["dose-video"])
 app.include_router(api_dose_video.media_router, tags=["dose-video"])
+app.include_router(api_ai.router,            tags=["ai-connections"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────

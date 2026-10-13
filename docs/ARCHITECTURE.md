@@ -351,7 +351,7 @@ Version 0.6.0 is in the working tree (`reachy_app/pyproject.toml:8`): ElevenLabs
 | `bridge/session.py` | Slot state machine (diagram below) |
 | `bridge/app_client.py` | HTTP client for `/api/device/*`; maps errors to exceptions |
 | `bridge/voice.py` | Silero VAD + Whisper Base via faster-whisper, "I finished" detection, chat hand-over, echo guards |
-| `bridge/speech.py` | ElevenLabs live speech over HTTPS; the API key is in robot-private settings |
+| `bridge/speech.py` | Matcha-TTS + Vocos live speech |
 | `bridge/clips.py`, `bridge/clips/manifest.json` | 16 prerecorded clips (rendered on the robot by the deploy tool). Optional per-medicine prompts `med_<med_id>.wav` (manifest `per_medication`, `clips.py:97`); without one, `med_prompt_generic` plays |
 | `bridge/media.py`, `bridge/gestures.py`, `bridge/moves.py` | SDK facade, "think"/"speak" gestures, the vendored `inquiring3` move |
 | `bridge/vision.py`, `bridge/emotion.py`, `models.py` | On-robot vision mode (`vision_on_server=false`, about 3 fps), SHA-256-pinned ONNX files |

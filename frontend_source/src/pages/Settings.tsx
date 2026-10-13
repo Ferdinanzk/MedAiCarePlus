@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import ReachyCard from '../components/ReachyCard';
+import AiConnectionsCard from '../components/AiConnectionsCard';
 import { getFaceToken } from '../lib/face-auth';
 import { forgetRefusals } from '../lib/doses';
 import { rememberOverdoseProtection } from '../lib/notify-api';
@@ -179,6 +180,8 @@ export default function Settings() {
       </section>
 
       <ReachyCard />
+
+      <AiConnectionsCard />
 
       {message && (
         <div className={`p-4 rounded-2xl flex items-center gap-3 border ${

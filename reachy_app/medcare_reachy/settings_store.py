@@ -6,11 +6,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from medcare_reachy.bridge.config import LANGUAGES
+from medcare_reachy.bridge.multimodal.governor import MODES as EMOTION_COMPUTE_MODES
 
 DEFAULT_PATH = Path.home() / ".medcare_reachy" / "settings.json"
 DEFAULTS = {"app_url": "", "device_token": "", "language": "zh-TW", "capture_fps": 15.0, "vision_on_server": True,
-            "checkin_ack": True, "checkin_gestures": True, "elevenlabs_api_key": "",
-            "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"}
+            "checkin_ack": True, "checkin_gestures": True, "multimodal_emotion": True,
+            "emotion_compute": "auto", "follow_face": True}
 # The server records doses automatically only at >= 12 fps. Computing landmarks on the robot reaches ~3 fps, so by
 # default the robot only streams frames and the server computes them (vision_on_server).
 MAX_FPS = 15.0
@@ -18,7 +19,10 @@ MAX_FPS = 15.0
 # once their words are in (checkin_ack), and moves its antennas, head and body while it prepares and speaks a reply
 # (checkin_gestures).
 # Either can be switched off here.
-SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures")
+# Multimodal emotion while a dose is watched (face + voice + words, multimodal_emotion) and where it is computed:
+# "auto" (the robot, falling back to the laptop when it can't keep up), "robot" or "laptop" (emotion_compute).
+# follow_face: while a dose is watched the head keeps the verified patient's face centred (bridge/follow.py).
+SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures", "multimodal_emotion", "follow_face")
 
 
 class SettingsError(ValueError):
@@ -38,22 +42,19 @@ class SettingsStore:
 
     def save(self, update: dict) -> dict:
         settings = self.load()
-        for key in ("app_url", "language", "capture_fps", "elevenlabs_voice_id", *SWITCHES):
+        for key in ("app_url", "language", "capture_fps", "emotion_compute", *SWITCHES):
             if key in update and update[key] is not None:
                 settings[key] = update[key]
         # The key is write-only: an empty field on the form means "keep the current key".
         token = (update.get("device_token") or "").strip()
         if token:
             settings["device_token"] = token
-        api_key = (update.get("elevenlabs_api_key") or "").strip()
-        if api_key:
-            settings["elevenlabs_api_key"] = api_key
         settings = validate(settings)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(settings), encoding="utf-8")
         try:
-            os.chmod(tmp, 0o600)   # the device and provider keys stay private to the app user
+            os.chmod(tmp, 0o600)   # the device key acts as this robot; keep it private to the app user
         except OSError:
             pass
         tmp.replace(self.path)
@@ -81,21 +82,19 @@ def validate(settings: dict) -> dict:
         raise SettingsError("Camera rate must be a number") from exc
     if not 1.0 <= fps <= MAX_FPS:
         raise SettingsError(f"Camera rate must be between 1 and {MAX_FPS:g} fps")
-    voice_id = str(settings["elevenlabs_voice_id"]).strip()
-    if not voice_id or len(voice_id) > 100:
-        raise SettingsError("Enter a valid ElevenLabs voice ID")
     for key in SWITCHES:
         if not isinstance(settings[key], bool):
             raise SettingsError(f"{key} must be true or false")
+    compute = str(settings.get("emotion_compute", DEFAULTS["emotion_compute"])).strip().lower()
+    if compute not in EMOTION_COMPUTE_MODES:
+        raise SettingsError(f"Emotion compute must be one of {', '.join(EMOTION_COMPUTE_MODES)}")
     return {"app_url": url, "device_token": token, "language": settings["language"], "capture_fps": fps,
-            "elevenlabs_api_key": str(settings.get("elevenlabs_api_key", "")).strip(),
-            "elevenlabs_voice_id": voice_id, **{key: settings[key] for key in SWITCHES}}
+            "emotion_compute": compute, **{key: settings[key] for key in SWITCHES}}
 
 
 def public_view(settings: dict) -> dict:
     """Never send the key back to the browser; only whether one is set."""
     return {"app_url": settings["app_url"], "language": settings["language"],
             "capture_fps": settings["capture_fps"], **{key: settings.get(key, True) for key in SWITCHES},
-            "device_token_set": bool(settings["device_token"]),
-            "elevenlabs_api_key_set": bool(settings.get("elevenlabs_api_key")),
-            "elevenlabs_voice_id": settings.get("elevenlabs_voice_id", DEFAULTS["elevenlabs_voice_id"])}
+            "emotion_compute": settings.get("emotion_compute", DEFAULTS["emotion_compute"]),
+            "device_token_set": bool(settings["device_token"])}

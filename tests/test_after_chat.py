@@ -292,10 +292,116 @@ def test_sweep_closes_abandoned_chats_and_reprocesses_pending(monkeypatch):
     monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
     monkeypatch.setattr(after_chat, "process", process)
     asyncio.run(after_chat_job.run_after_chat_sweep())
-    assert "end_reason = 'abandoned'" in sql[0][0] and sql[0][1] == (after_chat_job.ABANDON_MINUTES,)
+    assert "end_reason = 'abandoned'" in sql[0][0] and sql[0][1][0] == after_chat_job.ABANDON_MINUTES
     assert "after_chat_state = CASE" in sql[1][0]   # end_stale, before the chats it ends could be picked
     assert "make_interval(days => $3)" in sql[2][0] and sql[2][1][2] == after_chat.RETRY_DAYS
     assert processed == [(CID, 7)]
+
+
+def test_the_sweep_leaves_a_companion_chat_open_while_its_robot_holds_a_camera_session(monkeypatch):
+    """Companion spec 2 and 4.2 (robot app 0.9.0): a patient may stay in view and quiet for longer than
+    ABANDON_MINUTES (no turns; a live companion's GPT-Live is paused), however long. While the robot keeps its camera
+    session open and holds its running session's task (in progress, not expired: its heartbeats extend it), the sweep
+    leaves that patient's newest companion conversation open; any other one closes as before."""
+    from app.jobs import after_chat_job
+    from app.services import monitor_service
+
+    registry = monitor_service.MonitorRegistry()
+    for sid, u_id, client_type, ended in (("s1", 7, "reachy", False), ("s2", 8, "browser", False),
+                                          ("s3", 9, "reachy", True)):
+        registry.sessions[sid] = monitor_service.MonitorSession(sid, "g1", u_id, None, "pearl", "Pearl",
+                                                                mode="observe", client_type=client_type)
+        registry.sessions[sid].ended = ended
+    monkeypatch.setattr(monitor_service, "registry", registry)
+    sql = []
+
+    class C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def transaction(self):
+            return self
+
+        async def execute(self, query, *args):
+            sql.append((query, args))
+
+        async def fetch(self, query, *args):
+            sql.append((query, args))
+            return []
+
+    class P:
+        def acquire(self):
+            return C()
+
+    monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
+    asyncio.run(after_chat_job.run_after_chat_sweep())
+    close, args = sql[0]
+    assert "end_reason = 'abandoned'" in close and "AND NOT (c.companion AND c.u_id = ANY($2::int[])" in close
+    assert ("AND EXISTS (SELECT 1 FROM reachy_task rt WHERE rt.u_id = c.u_id AND rt.status = 'in_progress' "
+            "              AND rt.expires_at > NOW()))" in close)   # its robot holds a running session
+    assert "hours" not in close   # no ceiling: a quiet patient in view keeps the chat
+    assert args == (after_chat_job.ABANDON_MINUTES, [7])   # an open robot session only: no browser, no ended one
+
+
+def _companion_sweep(monkeypatch, chats, running=(7,)):
+    """The sweep's close statement over open companion chats {id: (u_id, started_hours_ago, last_turn_hours_ago)} of a
+    patient (7) whose robot is present; `running`: the patients whose robot holds an in-progress task not yet expired.
+    The fake applies the statement's companion exception to its arguments."""
+    from app.jobs import after_chat_job
+
+    sent = []
+    open_chats = dict(chats)
+
+    class C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def transaction(self):
+            return self
+
+        async def fetch(self, query, *args):
+            sent.append(query)
+            if query.startswith("UPDATE conversation c"):
+                _minutes, present = args
+                newest = {u: min(c[1] for c in open_chats.values() if c[0] == u) for u in {c[0] for c in open_chats.values()}}
+                for cid, (u_id, started, last_turn) in list(open_chats.items()):
+                    stays = u_id in present and started == newest[u_id] and u_id in running
+                    if not stays:
+                        del open_chats[cid]
+            return []
+
+    class P:
+        def acquire(self):
+            return C()
+
+    from app.services import monitor_service
+    registry = monitor_service.MonitorRegistry()
+    registry.sessions["s1"] = monitor_service.MonitorSession("s1", "g1", 7, None, "pearl", "Pearl",
+                                                             mode="observe", client_type="reachy")
+    monkeypatch.setattr(monitor_service, "registry", registry)
+    monkeypatch.setattr(after_chat_job, "get_pool", lambda: P())
+    asyncio.run(after_chat_job.run_after_chat_sweep())
+    assert "NOT EXISTS (SELECT 1 FROM conversation newer WHERE newer.u_id = c.u_id" in sent[0]
+    assert "rt.status = 'in_progress' " in sent[0] and "AND rt.expires_at > NOW()" in sent[0]
+    return set(open_chats)
+
+
+def test_the_sweep_keeps_only_the_newest_companion_chat_of_a_present_patient(monkeypatch):
+    # Chat "old" was orphaned (a worker restart, no /end) before the robot opened "new"; "new" has had no turn for
+    # 3 hours, with the patient in view and quiet: no ceiling closes it while its session runs.
+    assert _companion_sweep(monkeypatch, {"old": (7, 4.0, 4.0), "new": (7, 3.5, 3.0)}) == {"new"}
+
+
+def test_the_sweep_closes_a_companion_chat_whose_robot_holds_no_running_session(monkeypatch):
+    # The robot is present (a camera session) but its companion session's task lapsed: the robot restarted or no
+    # heartbeat said companion within COMPANION_TASK_EXTEND_SECONDS.
+    assert _companion_sweep(monkeypatch, {"quiet": (7, 1.0, 0.5)}, running=()) == set()
 
 
 def test_retention_purges_transcripts_events_and_tombstones():

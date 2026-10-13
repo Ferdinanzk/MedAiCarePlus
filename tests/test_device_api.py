@@ -1,5 +1,6 @@
 """Device API routes on the private port, the browser/robot 409, and manual 'Use Reachy' tasks."""
 
+import json
 import os
 import sys
 import types
@@ -50,7 +51,7 @@ class FakeConn:
     def __init__(self):
         self.depth = 0
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": SLOT, "intk_ids": [101, 102],
-                     "status": "in_progress", "lease_owner": DEVICE_ID}
+                     "status": "in_progress", "lease_owner": DEVICE_ID, "reason": "upcoming"}
         self.doses = {101: {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT},
                       102: {"dose_form": "liquid", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT},
                       103: {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_time_stamp": SLOT}}
@@ -62,6 +63,9 @@ class FakeConn:
         self.facts_asked = []
         self.device_row = {"device_id": uuid.UUID(DEVICE_ID)}
         self.source = self.doses   # monitor starts read `doses`, manual tasks `intakes`
+        self.status_detail = None  # what the heartbeat stored (asyncpg hands JSONB back as text)
+        self.task_due = False      # what reachy_tasks.task_due finds: a medicine task waiting (companion spec 3.4)
+        self.task_due_asked = []   # (arguments, transaction depth) of each task_due read
 
     def transaction(self):
         return _Transaction(self)
@@ -91,6 +95,15 @@ class FakeConn:
             return {"intk_id": args[0],
                     **self.doses.get(args[0], {"dose_form": "solid_oral", "units_per_dose": Decimal("1.00"),
                                                "intake_time_stamp": SLOT})}
+        if "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL" in query:
+            assert "status_detail" in query   # api_reachy._status reads the robot's camera from it
+            return {"device_id": uuid.UUID(DEVICE_ID), "label": "Reachy Mini", "auto_record": False,
+                    "live_voice": False, "last_seen_at": datetime.now(timezone.utc), "robot_reachable": True,
+                    "landmark_fps": 9.9, "status_detail": self.status_detail}
+        if "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1" in query:
+            return None
+        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
+            return {"reachy_call_name": None, "name": "Pearl"}
         raise AssertionError(query)
 
     def _stamp(self, intk_id):
@@ -129,10 +142,17 @@ class FakeConn:
             return "Pearl"
         if "FROM notification_outbox" in query and "kind = 'double_dose_alert'" in query:
             return None      # no alert for this dose within the hour
+        if "FROM family_contacts" in query:
+            return 1         # contacts that can receive family alerts (the Reachy card's status)
+        if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # reachy_tasks.task_due
+            self.task_due_asked.append((args, self.depth))
+            return self.task_due
         raise AssertionError(query)
 
     async def execute(self, query, *args):
         self.executed.append((query, args, self.depth))
+        if "status_detail = $4::jsonb" in query:
+            self.status_detail = args[3]
 
 
 class FakePool:
@@ -333,6 +353,90 @@ def test_heartbeat_reports_microphone_consent(env, monkeypatch):
     assert env.robot.post("/api/device/heartbeat", json={}).json()["microphone"] is True
 
 
+def test_heartbeat_says_whether_a_medicine_task_waits(env, monkeypatch):
+    # Companion spec 3.4: a robot in a companion session ends it, with its medicine line, when task_due is true.
+    _no_leases(monkeypatch)
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is False
+    env.conn.task_due = True
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"}).json()["task_due"] is True
+    assert env.conn.task_due_asked == [((7,), 0), ((7,), 0)]   # this patient, after the heartbeat's transaction ended
+
+
+def test_a_companion_heartbeat_keeps_the_held_task_alive(env, monkeypatch):
+    _no_leases(monkeypatch)
+
+    def extensions():
+        return [entry for entry in env.conn.executed
+                if "SET expires_at = GREATEST(expires_at" in entry[0] and "status = 'in_progress'" in entry[0]]
+
+    assert env.robot.post("/api/device/heartbeat", json={"companion": False}).status_code == 200
+    assert env.robot.post("/api/device/heartbeat", json={}).status_code == 200
+    assert extensions() == []
+    assert env.robot.post("/api/device/heartbeat", json={"companion": True}).status_code == 200
+    found = extensions()
+    assert len(found) == 1
+    assert found[0][1] == (DEVICE_ID,) and found[0][2] == 1   # inside the write transaction, with the lease extension
+
+
+# ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
+
+CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
+
+
+def _no_leases(monkeypatch):
+    async def extend_leases(conn, device_id):
+        return None
+
+    monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
+
+
+def _stored_detail(env) -> dict:
+    update = next(entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0])
+    return json.loads(update[1][3])
+
+
+@pytest.mark.parametrize("state", ["idle", "ok", "stalled", "recovering", "unavailable"])
+def test_heartbeat_stores_the_camera_report_and_status_returns_it(env, monkeypatch, state):
+    _no_leases(monkeypatch)
+    camera = {"state": state, "fps": 9.8 if state == "ok" else 0.0, "since": 1791700000.5, "media": CAMERA_MEDIA}
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.7.0", "camera": camera})
+    assert response.status_code == 200
+    assert _stored_detail(env) == {"vision_fps": None, "bridge_version": "0.7.0", "missing_clips": None,
+                                   "camera": camera}
+    status = env.browser.get("/api/reachy/status")
+    assert status.status_code == 200 and status.json()["camera"] == camera
+
+
+def test_an_older_robot_sends_no_camera_and_status_returns_none(env, monkeypatch):
+    _no_leases(monkeypatch)
+    assert env.browser.get("/api/reachy/status").json()["camera"] is None       # no heartbeat yet
+    assert env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.5.4"}).status_code == 200
+    assert "camera" not in _stored_detail(env)
+    assert env.browser.get("/api/reachy/status").json()["camera"] is None
+
+
+@pytest.mark.parametrize("camera", [
+    {"state": "broken"}, {"state": "OK"}, {"fps": 9.8}, {"state": "ok", "fps": -1}, {"state": "ok", "fps": 241},
+    {"state": "ok", "media": "released"}, "stalled",
+])
+def test_heartbeat_refuses_a_bad_camera_report(env, monkeypatch, camera):
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"camera": camera})
+    assert response.status_code == 422
+    assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
+
+
+def test_heartbeat_refuses_a_camera_number_that_is_not_finite(env, monkeypatch):
+    """json.dumps writes NaN and Infinity as bare words, which PostgreSQL's jsonb refuses: that must be a 422, not a 500."""
+    _no_leases(monkeypatch)
+    for field in ("since", "fps"):
+        for word in ("NaN", "Infinity", "-Infinity"):
+            body = '{"camera": {"state": "ok", "%s": %s}}' % (field, word)    # raw text: the test client would refuse to write it
+            response = env.robot.post("/api/device/heartbeat", content=body, headers={"content-type": "application/json"})
+            assert response.status_code == 422, f"{field}={word} gave {response.status_code}"
+    assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
+
+
 # ── Frame stream: the server computes the landmarks ─────────────────────────
 
 def _jpeg(width=64, height=48) -> bytes:
@@ -497,6 +601,38 @@ def test_device_observe_session_has_no_dose(env):
     body = response.json()
     assert response.status_code == 200
     assert body["mode"] == "observe" and body["intk_id"] is None and body["auto_commit"] is False
+
+
+def test_device_sessions_keep_the_mode_they_started_in(env):
+    # Only the search of a check-in task (observe) verifies with the OpenVINO match alone. The search of a dose task
+    # keeps the MediaPipe gate (final review of 11 Oct), and so does a dose session.
+    def session(**body):
+        return env.registry.sessions[_start(env, **body).json()["session_id"]]
+
+    dose_search = session(mode="observe", task_id=TASK_ID)
+    assert dose_search.started_mode == "observe" and dose_search.checkin_search is False
+    assert monitor_service.openvino_only(dose_search) is False
+    dose = session(mode="dose", intk_id=101, task_id=TASK_ID)
+    assert dose.started_mode == "dose" and monitor_service.openvino_only(dose) is False
+    no_task = session(mode="observe")
+    assert no_task.checkin_search is False and monitor_service.openvino_only(no_task) is False
+    env.conn.task.update(reason="checkin", intk_ids=[])
+    checkin_search = session(mode="observe", task_id=TASK_ID)
+    assert checkin_search.started_mode == "observe" and checkin_search.checkin_search is True
+    assert monitor_service.openvino_only(checkin_search) is True
+
+
+def test_a_companion_observe_session_of_a_dose_task_uses_the_checkin_face_rule(env):
+    # After a dose the companion phase keeps an observe session of the DOSE task: it needs the check-in face rule.
+    session = env.registry.sessions[_start(env, mode="observe", task_id=TASK_ID, companion=True).json()["session_id"]]
+    assert env.conn.task["reason"] != "checkin"
+    assert session.checkin_search is True and monitor_service.openvino_only(session) is True
+
+
+def test_a_companion_flag_never_loosens_a_dose_session(env):
+    session = env.registry.sessions[
+        _start(env, mode="dose", intk_id=101, task_id=TASK_ID, companion=True).json()["session_id"]]
+    assert session.checkin_search is False and monitor_service.openvino_only(session) is False
 
 
 def test_device_start_returns_503_when_models_not_ready(env, monkeypatch):
@@ -770,3 +906,21 @@ def test_device_start_needs_only_the_identity_model(env, monkeypatch):
 
     monkeypatch.setattr(EmotionService, "_available", False)
     assert _start(env, mode="observe").status_code == 200
+
+
+def test_a_failing_task_due_read_answers_false_and_keeps_the_heartbeat_writes(env, monkeypatch, caplog):
+    extended = []
+
+    async def extend_leases(conn, device_id):
+        extended.append(device_id)
+
+    async def task_due(conn, u_id):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(reachy_tasks, "extend_leases", extend_leases)
+    monkeypatch.setattr(reachy_tasks, "task_due", task_due)
+    with caplog.at_level("WARNING"):
+        response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.9.0"})
+    assert response.status_code == 200 and response.json()["task_due"] is False
+    assert any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed) and extended == [DEVICE_ID]
+    assert [r.levelname for r in caplog.records if "medicine-task check" in r.getMessage()] == ["WARNING"]
