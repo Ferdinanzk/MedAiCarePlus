@@ -36,11 +36,7 @@ LOST = ConnectionError("lost the connection to 10.0.0.5")
 
 
 def _revoked(w):
-    w.db.live_switch = None   # the robot was unpaired: LIVE_SWITCH_SQL finds no row
-
-
-def _switched_off(w):
-    w.db.live_switch = False   # the patient's live switch on the Reachy card
+    w.db.paired = None   # the robot was unpaired: PAIRED_SQL finds no row
 
 
 def _robot_consent_withdrawn(w):
@@ -51,7 +47,7 @@ def _checkin_consent_withdrawn(w):
     w.consent = {scope: value for scope, value in w.consent.items() if scope != "safety_alerts"}
 
 
-WITHDRAWALS = {"revoked": _revoked, "live_switch_off": _switched_off, "robot_consent": _robot_consent_withdrawn,
+WITHDRAWALS = {"revoked": _revoked, "robot_consent": _robot_consent_withdrawn,
                "checkin_consent": _checkin_consent_withdrawn}
 
 
@@ -141,7 +137,7 @@ def test_memory_consent_withdrawn_during_the_chat_falls_back_at_the_next_re_chec
         asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failing", ["live_switch", "consent"])
+@pytest.mark.parametrize("failing", ["paired", "consent"])
 def test_a_failed_access_read_is_logged_and_tried_again_10_s_later(world, caplog, monkeypatch, failing):
     async def scenario():
         relay, running = await _begin(world)
@@ -150,7 +146,7 @@ def test_a_failed_access_read_is_logged_and_tried_again_10_s_later(world, caplog
         async def broken(u_id):
             raise ConnectionError("lost the connection to 10.0.0.5")
 
-        if failing == "live_switch":
+        if failing == "paired":
             world.db.access_error = ConnectionError("lost the connection to 10.0.0.5")
         else:
             monkeypatch.setattr(consent_service, "get_state", broken)
@@ -161,7 +157,7 @@ def test_a_failed_access_read_is_logged_and_tried_again_10_s_later(world, caplog
         assert "10.0.0.5" not in warning.getMessage()
         world.db.access_error = None
         monkeypatch.setattr(consent_service, "get_state", get_state)
-        world.db.live_switch = False                           # meanwhile the patient switched live voice off
+        world.db.paired = None                                 # meanwhile the robot was unpaired
         await _step(world, relay, 9.5)
         assert relay.outcome is None
         await _step(world, relay, 0.5)                         # the next re-check, 10 s after the failed one
