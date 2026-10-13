@@ -7,14 +7,18 @@ expired leases to queued, or marks tasks expired once past expires_at.
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from app import config
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import consent_service, dose_safety, outbox
+from app.services import ai_settings, consent_service, dose_safety, outbox, schedule
+
+log = logging.getLogger(__name__)
 
 LEASE_SECONDS = 60
 OFFLINE_AFTER_SECONDS = 60
@@ -67,10 +71,11 @@ async def task_payload(conn, task) -> dict:
         "WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) ORDER BY m.med_name, m.med_id, i.intk_id",
         task["u_id"], list(task["intk_ids"]))
     head = await conn.fetchrow(
-        'SELECT u.name, d.auto_record FROM "user" u '
+        'SELECT u.name, d.auto_record, d.live_voice FROM "user" u '
         "LEFT JOIN reachy_device d ON d.u_id = u.u_id AND d.revoked_at IS NULL WHERE u.u_id = $1",
         task["u_id"])
     consent = await consent_service.fetch_state(conn, task["u_id"])
+    checkin = checkin_allowed(consent)
     return {
         "task_id": str(task["task_id"]), "slot_time": _iso(task["slot_time"]), "reason": task["reason"],
         "attempt": task["attempt"], "status": task["status"], "expires_at": _iso(task["expires_at"]),
@@ -79,7 +84,11 @@ async def task_payload(conn, task) -> dict:
         # The robot may listen (speech-to-text on the robot) only while this consent is current.
         "microphone": consent_service.is_current(consent, "robot_microphone"),
         # A check-in conversation needs every check-in scope (notice: check-ins only with safety alerts on).
-        "checkin": checkin_allowed(consent),
+        "checkin": checkin,
+        # A live voice check-in (spec 2026-10-12 E1): .env's test switch, this robot's switch, check-ins allowed and a
+        # usable live model on the AI card. Otherwise false, and the robot runs today's text chat.
+        "live": bool(config.LIVE_VOICE_TEST and head and head["live_voice"] and checkin
+                     and ai_settings.live_target() is not None),
         "doses": [{
             "intk_id": d["intk_id"], "med_id": d["med_id"], "med_name": d["med_name"],
             "pill_description": d["pill_description"], "dose_form": d["dose_form"],
@@ -95,7 +104,10 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
 
     Returns the open task id, or None when the patient has no active device or
     no current robot camera consent. A task already leased/searching/in_progress
-    is never re-armed or reset. Raises a schedule.DoseRefused when overdose
+    is never re-armed or reset; a missed_retry for a slot whose task is held
+    in_progress (a companion session after a dose was left pending) marks it
+    retry_due, so task_due brings the dose up and set_status queues the retry
+    once that task is over. Raises a schedule.DoseRefused when overdose
     protection refuses a listed dose (dose_safety.check, judged at `at`, default
     now): the robot must never start a dose hours early, a second dose, or a
     missed one. Callers that picked the doses at a moment of their own pass it.
@@ -126,7 +138,21 @@ async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], r
             "SELECT task_id FROM reachy_task WHERE u_id = $1 AND slot_time = $2 "
             "AND status IN ('leased','searching','in_progress')",
             u_id, slot_time)
+        if task_id is not None and reason == "missed_retry":
+            await conn.execute(
+                "UPDATE reachy_task SET detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('retry_due', "
+                "jsonb_build_object('intk_ids', $2::int[], 'expires_at', $3::text)) "
+                "WHERE task_id = $1::uuid AND status = 'in_progress'",
+                str(task_id), list(intk_ids), _iso(expires_at))
     return str(task_id) if task_id is not None else None
+
+
+def _leasable_sql() -> str:
+    """When the robot may lease a queued task t of patient $1 now (the rules in _lease_once's comment). task_due asks
+    the same question, so the robot is never told of a task it could not lease."""
+    return ("t.u_id = $1 AND t.status = 'queued' AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i "
+            "WHERE i.intk_id = ANY(t.intk_ids) "
+            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')}))")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
@@ -135,14 +161,14 @@ async def _lease_once(u_id: int, device_id: str) -> dict | None:
     # lapsed while queued). Doses already taken, skipped or waiting for family don't count: expiry is a matter of
     # time alone, and a taken dose past its halfway point must not keep the slot's other doses from the robot.
     # Overdose protection's switch decides, as in dose_safety.startable_sql; monitor/start checks the rest.
+    # Medicine comes first (companion spec 2.5): a check-in ('Talk to Reachy now', its slot_time the press) waits
+    # behind every leasable dose task, then the oldest slot goes first.
     async with get_pool().acquire() as conn, conn.transaction():
         task = await conn.fetchrow(
             "UPDATE reachy_task SET status = 'leased', lease_owner = $2::uuid, "
             f"lease_until = NOW() + INTERVAL '{LEASE_SECONDS} seconds' "
-            "WHERE task_id = (SELECT t.task_id FROM reachy_task t WHERE t.u_id = $1 AND t.status = 'queued' "
-            "AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i WHERE i.intk_id = ANY(t.intk_ids) "
-            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')})) "
-            "ORDER BY t.slot_time, t.created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
+            f"WHERE task_id = (SELECT t.task_id FROM reachy_task t WHERE {_leasable_sql()} "
+            "ORDER BY (t.reason = 'checkin'), t.slot_time, t.created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
             "RETURNING *",
             u_id, device_id)
         return await task_payload(conn, task) if task else None
@@ -157,6 +183,32 @@ async def lease_next(u_id: int, device_id: str, wait: float) -> dict | None:
         if task is not None or remaining <= 0:
             return task
         await asyncio.sleep(min(1.0, remaining))
+
+
+def _retry_due_sql() -> str:
+    """A held task of patient $1 that a missed-dose retry marked (enqueue_reachy_task: detail.retry_due) while a
+    companion session kept it in progress, with a marked dose still open and startable and the retry not expired:
+    set_status queues that retry when the task is over, so it is a medicine still to take."""
+    return ("SELECT 1 FROM reachy_task held WHERE held.u_id = $1 AND held.status = 'in_progress' "
+            "AND held.detail ? 'retry_due' AND (held.detail->'retry_due'->>'expires_at')::timestamptz > NOW() "
+            "AND EXISTS (SELECT 1 FROM intake i WHERE i.u_id = held.u_id AND i.intk_id IN "
+            "(SELECT jsonb_array_elements_text(held.detail->'retry_due'->'intk_ids')::int) "
+            f"AND i.intake_stats IN ('pending','missed') AND {dose_safety.startable_sql('i', 'NOW()')})")
+
+
+async def task_due(conn, u_id: int) -> bool:
+    """Medicine first (companion spec 3.4), for the heartbeat: would the robot lease a task of this patient now (the
+    lease's own rule, _leasable_sql) that holds a dose still to take? The task the robot is busy with is never
+    queued, so it never counts, except when a missed-dose retry for its own slot came meanwhile (_retry_due_sql: a
+    dose the patient left pending during a dose task, still owed while the companion session holds that task). A
+    queued check-in ('Talk to Reachy now' pressed during a chat), or a task whose doses were all taken, skipped or
+    sent to family meanwhile, is no medicine: it never interrupts a chat, and the robot leases it afterwards as
+    today."""
+    return bool(await conn.fetchval(
+        f"SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE {_leasable_sql()} AND EXISTS (SELECT 1 FROM intake "
+        "open_dose WHERE open_dose.intk_id = ANY(t.intk_ids) AND open_dose.intake_stats IN ('pending','missed'))) "
+        f"OR EXISTS ({_retry_due_sql()})",
+        u_id))
 
 
 async def current_task(u_id: int, device_id: str) -> dict | None:
@@ -188,10 +240,12 @@ async def set_status(u_id: int, device_id: str, task_id: str, status: str, detai
             raise ValueError(f"Illegal transition {task['status']} -> {status}")
         detail_json = json.dumps(detail) if detail is not None else None
         if status in TERMINAL_STATUSES:
+            held = task   # its detail before the robot's own replaces it: a retry_due mark (enqueue_reachy_task)
             task = await conn.fetchrow(
                 "UPDATE reachy_task SET status = $2, detail = COALESCE($3::jsonb, detail), "
                 "finished_at = NOW(), lease_until = NULL WHERE task_id = $1::uuid RETURNING *",
                 task_id, status, detail_json)
+            await _queue_retry_due(conn, held)
         else:
             task = await conn.fetchrow(
                 "UPDATE reachy_task SET status = $2, detail = COALESCE($3::jsonb, detail), "
@@ -202,10 +256,52 @@ async def set_status(u_id: int, device_id: str, task_id: str, status: str, detai
         return await task_payload(conn, task)
 
 
+async def _queue_retry_due(conn, held) -> None:
+    """A task that a missed-dose retry marked while it was held (detail.retry_due) has just ended: queue that retry
+    now, inside the caller's transaction and a savepoint, for the marked doses still open (pending or missed), until
+    the retry's own expiry. Nothing when none is open or the retry has expired; a dose overdose protection refuses
+    now is logged and skipped, as missed_dose_job.send_robot does. The robot then leases it before any check-in."""
+    detail = held["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    retry = detail.get("retry_due") if isinstance(detail, dict) else None
+    if not retry:
+        return
+    expires_at = datetime.fromisoformat(retry["expires_at"])
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= schedule.current_time():
+        return
+    still_open = [row["intk_id"] for row in await conn.fetch(
+        "SELECT intk_id FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[]) "
+        "AND intake_stats IN ('pending','missed') ORDER BY intk_id", held["u_id"], list(retry["intk_ids"]))]
+    if not still_open:
+        return
+    try:
+        async with conn.transaction():
+            await enqueue_reachy_task(conn, held["u_id"], held["slot_time"], still_open, "missed_retry", expires_at)
+    except schedule.DoseRefused as refused:
+        log.info("no robot retry for the %s slot of patient %s after its task ended: dose %s refused (%s)",
+                 slot_label(held["slot_time"]), held["u_id"], refused.intk_id, refused.detail)
+
+
 async def extend_leases(conn, device_id: str) -> None:
     await conn.execute(
         f"UPDATE reachy_task SET lease_until = NOW() + INTERVAL '{LEASE_SECONDS} seconds' "
         "WHERE lease_owner = $1::uuid AND status IN ('leased','searching','in_progress')",
+        device_id)
+
+
+COMPANION_TASK_EXTEND_SECONDS = 600   # a companion session's task stays open this long past each heartbeat saying so
+
+
+async def extend_for_companion(conn, device_id: str) -> None:
+    """A companion session can outlast its task's expiry (spec 2: it stays until goodbye). While the robot's heartbeat
+    says one runs, the in-progress task it holds stays open at least COMPANION_TASK_EXTEND_SECONDS longer."""
+    await conn.execute(
+        "UPDATE reachy_task SET expires_at = GREATEST(expires_at, "
+        f"NOW() + INTERVAL '{COMPANION_TASK_EXTEND_SECONDS} seconds') "
+        "WHERE lease_owner = $1::uuid AND status = 'in_progress'",
         device_id)
 
 

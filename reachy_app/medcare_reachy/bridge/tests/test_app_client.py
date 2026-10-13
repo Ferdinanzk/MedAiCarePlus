@@ -278,3 +278,55 @@ def test_failed_timings_raise_but_never_start_an_outage(failure):
             return client.unreachable_since              # the conversation itself still counts
 
     assert run(scenario()) == 100.0
+
+
+def test_heartbeat_sends_the_camera_only_when_given():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"stop_all": False})
+
+    camera = {"state": "stalled", "fps": 0.0, "since": 1760000000.0,
+              "media": {"available": False, "released": True, "no_media": False}}
+
+    async def scenario():
+        async with make_client(handler) as client:
+            await client.heartbeat({"robot_reachable": True})
+            await client.heartbeat({"robot_reachable": True}, camera=camera)
+
+    run(scenario())
+    assert bodies == [{"robot_reachable": True}, {"robot_reachable": True, "camera": camera}]
+
+
+def test_a_companion_check_in_says_so_and_a_plain_one_sends_what_it_always_did():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"conversation_id": "c1", "reply": "你好", "speech_text": "你好"})
+
+    async def scenario():
+        async with make_client(handler) as client:
+            await client.conversation_start("t1", "zh-TW", companion=True)
+            await client.conversation_start("t1", "en")
+
+    run(scenario())
+    assert bodies == [{"task_id": "t1", "language": "zh-TW", "companion": True}, {"task_id": "t1", "language": "en"}]
+
+
+@pytest.mark.parametrize("base_url, expected", [
+    ("http://app:8001", "ws://app:8001/api/device/conversations/live"),
+    ("http://192.168.137.1:8001/", "ws://192.168.137.1:8001/api/device/conversations/live"),
+    ("HTTPS://medcare.example:8443", "wss://medcare.example:8443/api/device/conversations/live"),
+])
+def test_the_live_chat_websocket_is_on_the_same_server(base_url, expected):
+    client = AppClient(base_url, "rdv1.token", transport=httpx.MockTransport(lambda request: httpx.Response(204)))
+    assert client.live_url() == expected
+    run(client.aclose())
+
+
+def test_the_live_chat_websocket_carries_the_robot_key():
+    client = make_client(lambda request: httpx.Response(204))
+    assert client.auth_header() == {"Authorization": "Bearer rdv1.token"}
+    run(client.aclose())

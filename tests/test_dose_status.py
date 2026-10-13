@@ -163,7 +163,7 @@ def _reply_post(monkeypatch, answers):
     """A fake OpenRouter for reply_with_metrics: call n gets answers[n]; every request is recorded."""
     calls = []
 
-    def post(messages, max_tokens, model=None, timeout=None, info=None, temperature=0.7, tools=None,
+    def post(messages, max_tokens, model=None, timeout=None, info=None, temperature=0.7, target=None, tools=None,
              tool_choice=None):
         calls.append({"messages": [dict(m) for m in messages], "tools": tools, "tool_choice": tool_choice})
         if info is not None:

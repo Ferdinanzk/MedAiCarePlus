@@ -3,12 +3,41 @@ const STATE_TEXT = {
   not_configured: "Not connected yet",
   starting: "Starting…",
   running: "Connected",
+  stopping: "Stopping…",
   stopped: "Stopped",
   error: "Error",
 };
 
 const form = document.getElementById("config");
 const formError = document.getElementById("form-error");
+const saveButton = form.querySelector('button[type="submit"]');
+const restartButton = document.getElementById("restart");
+
+// Save and Restart both restart the robot's connection, so they send one request at a time: two at once
+// (a double click) once left two connections driving the robot. Both buttons wait for the answer.
+function oneAtATime(send) {
+  return async (event) => {
+    event.preventDefault();
+    if (saveButton.disabled) return;
+    saveButton.disabled = true;
+    restartButton.disabled = true;
+    try {
+      await send();
+    } finally {
+      saveButton.disabled = false;
+      restartButton.disabled = false;
+    }
+  };
+}
+
+function emotionText(emotion) {
+  if (!emotion) return null;
+  const where = emotion.compute === "laptop" ? "on the laptop" : "on the robot";
+  const branches = Object.entries(emotion.branches || {}).filter(([, on]) => on).map(([name]) => name).join(" + ");
+  const rate = emotion.compute === "robot" && emotion.fps != null ? `, ${emotion.fps} fps` : "";
+  const why = emotion.mode === "auto" && emotion.fallbacks ? ` (fell back ${emotion.fallbacks}×: ${emotion.reason})` : "";
+  return `${where}${branches ? ` (${branches})` : ""}${rate}${why}`;
+}
 
 function show(status) {
   const state = document.getElementById("state");
@@ -22,6 +51,7 @@ function show(status) {
     ["Camera feed", status.camera_fps == null ? null : `${status.camera_fps} fps`],
     ["Camera landmarks", status.landmark_fps == null ? null : `${status.landmark_fps} fps`],
     ["Snapshots", status.vision_fps == null ? null : `${status.vision_fps} fps`],
+    ["Emotion", emotionText(status.emotion)],
     ["Current step", status.slot_state],
     ["Missing voice clips", status.missing_clips],
   ];
@@ -50,29 +80,30 @@ async function loadConfig() {
   form.app_url.value = config.app_url || "";
   form.language.value = config.language;
   form.capture_fps.value = config.capture_fps;
-  form.elevenlabs_voice_id.value = config.elevenlabs_voice_id;
   form.checkin_ack.checked = config.checkin_ack !== false;
   form.checkin_gestures.checked = config.checkin_gestures !== false;
+  form.multimodal_emotion.checked = config.multimodal_emotion !== false;
+  form.follow_face.checked = config.follow_face !== false;
+  form.emotion_compute.value = config.emotion_compute || "auto";
   document.getElementById("token-hint").textContent = config.device_token_set
     ? "A robot key is saved. Leave empty to keep it, or paste a new one."
     : "Shown once when you pair the robot in the web app.";
-  document.getElementById("elevenlabs-key-hint").textContent = config.elevenlabs_api_key_set
-    ? "An API key is saved privately on this robot. Leave empty to keep it, or paste a replacement."
-    : "Required for spoken replies. Stored privately on this robot; never shown again.";
 }
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+form.addEventListener("submit", oneAtATime(async () => {
   formError.textContent = "";
   const body = {
     app_url: form.app_url.value.trim(),
     device_token: form.device_token.value.trim(),
-    elevenlabs_api_key: form.elevenlabs_api_key.value.trim(),
-    elevenlabs_voice_id: form.elevenlabs_voice_id.value.trim(),
     language: form.language.value,
     capture_fps: Number(form.capture_fps.value),
     checkin_ack: form.checkin_ack.checked,
     checkin_gestures: form.checkin_gestures.checked,
+    multimodal_emotion: form.multimodal_emotion.checked,
+    follow_face: form.follow_face.checked,
+    emotion_compute: form.emotion_compute.value,
+    multimodal_emotion: form.multimodal_emotion.checked,
+    emotion_compute: form.emotion_compute.value,
   };
   const response = await fetch("/api/config", {
     method: "POST",
@@ -85,15 +116,14 @@ form.addEventListener("submit", async (event) => {
     return;
   }
   form.device_token.value = "";
-  form.elevenlabs_api_key.value = "";
   show(data.status);
   await loadConfig();
-});
+}));
 
-document.getElementById("restart").addEventListener("click", async () => {
+restartButton.addEventListener("click", oneAtATime(async () => {
   const response = await fetch("/api/restart", { method: "POST" });
   show(await response.json());
-});
+}));
 
 loadConfig().catch(() => { formError.textContent = "Could not load settings."; });
 refreshStatus();

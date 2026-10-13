@@ -629,10 +629,13 @@ All of this runs on the robot, in `reachy_app/medcare_reachy/bridge/voice.py`. A
 | Pipeline | Producer thread submits each chunk while the previous WAV plays. PCM responses are wrapped in temporary WAVs, played, then deleted | `speech.py` |
 | Metrics | `tts_first_audio_ms`, `tts_total_ms`, `tts_chunks`, `tts_synth_ms` | `speech.py` |
 
-**Prerequisites and prerecorded clips**
-- Enter the ElevenLabs API key and a Mandarin-capable voice ID in the robot's settings page. The key is stored on the robot and is not returned by the settings API.
-- Each changed or missing Chinese prompt WAV is synthesized by ElevenLabs during deployment and read back with Whisper Base. The render record tracks the provider and voice ID, so switching from Matcha or changing voices refreshes the cached clips.
-- The English language currently has no prerecorded clips.
+**Prerecorded clips** (`bridge/clips/manifest.json`)
+- 16 clips: 12 prompts plus `ack` (「嗯」) and `thinking_1..3` (「我再想一下喔。」「讓我想一想喔。」「我想想看喔。」). Every clip is `pending_clinician_review`.
+- Optional per-medicine prompts `med_<med_id>.wav` (manifest `per_medication`, `bridge/clips/manifest.json:89-90`; `bridge/clips.py:97`). Without one, `med_prompt_generic` plays (manifest note, line 3).
+- They are rendered on the robot by the deploy tool with Matcha at speeds (0.85, 0.8, 0.9), or (1.0, 1.1, 0.9) for the thinking phrases.
+- Each render is read back with Whisper Base, and the best match is kept. A filler is kept only if Whisper hears it as a removable echo.
+- Leading silence is trimmed to 10 ms at threshold 0.003, about −50 dBFS (`reachy_app/tools/deploy_to_robot.py:72-157`).
+- English has no clips.
 
 **Limitations**
 - Speech requires robot internet access and an ElevenLabs account with available API quota; without a key, check-in replies and dose refusal speech are silent.

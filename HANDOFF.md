@@ -1,5 +1,455 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
+Status as of **12 October 2026, evening**, GitHub branch **`reachy-integration-0.3`** (section 8 is new in it;
+sections 6 and 7 came with `reachy-integration-0.2`; sections 1-5 describe `reachy-integration-0.1`, which both build
+on). **Start with [section 8](#8-what-was-finished-on-12-october-2026-evening) for what to do next.** No passwords, keys or tokens are written here;
+[step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
+
+The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
+is out of date; the sections above it win where they disagree.
+
+## 1. What this branch is
+
+`reachy-integration-0.1` = the team's `reachy-integration` branch (`a67a215`) plus two pieces of work:
+
+1. **AI connections** (10-11 Oct, 18 commits). AI keys and models moved from `.env` into a card on the Settings page.
+2. **Robot camera, finding the patient, AI card fixes and thinking levels** (11-12 Oct, 40 commits, robot app
+   **0.7.0**).
+
+In total: 66 files changed and about 21,900 lines added, of which about 14,100 are the design docs and plans under
+`docs/superpowers/` and about 7,800 are code, tests and docs.
+
+Why the second piece: on 11 Oct the robot "couldn't detect the patient's face" before a check-in. The face model was
+not the problem. The robot's **camera was dead**: the TCU companion (another app on the robot) released the camera
+at every boot, and MedCare Reachy's camera reader never reconnected. It searched blind for 10 minutes and logged
+nothing. Even with a working camera, the robot could only verify a patient within about 1.35 m.
+
+Design docs (in this branch):
+- `docs/superpowers/specs/2026-10-10-ai-connections-design.md` and its plan in `docs/superpowers/plans/`.
+- `docs/superpowers/specs/2026-10-11-robot-camera-identity-thinking-design.md` and its plan.
+
+## 2. Before and after
+
+| Area | Before (`reachy-integration`, robot app 0.5.4) | After (this branch, robot app 0.7.0) |
+|---|---|---|
+| **AI keys and models** | In `.env` only (OpenRouter key and two model names). Changing them meant editing `.env` and restarting. | **Settings → AI connections card.** Add OpenRouter, OpenAI or any OpenAI-compatible service. Keys are stored encrypted (derived from `SECRET_KEY`); only the last 4 characters are ever shown. |
+| **Which model does which job** | Every job used `LLM_MODEL`, with `LLM_FALLBACK_MODEL` as backup. | Each job (Reachy's replies, the safety check, the after-chat summary and memory) has its own main and backup model. |
+| **Testing a model** | Not possible. | **Test** sends a short real request and finds the settings that model accepts (token setting, temperature, reasoning off). |
+| **Thinking (reasoning)** | Always off. | Each job can think at **Off / Low / Medium / High** (default Off: requests are exactly as before). Test finds which levels each model accepts and how long each takes. While thinking, no temperature is sent and the token budget grows (+800 / +1600 / +3000). Reasoning tokens are recorded. A model that can't do the chosen level gets the nearest lower one. |
+| **Voice-only models (gpt-live-1)** | Test failed with OpenAI's confusing "Did you mean v1/completions?". | Test says "Voice-only model (like GPT-Live or a TTS model): it can't write Reachy's text replies." |
+| **A job with no usable model** | No warning: the safety check could be silently off. | A warning under each such job on the card ("Reachy's model safety check is off."), and one in the server log at start. |
+| **OpenRouter key added to `.env` later** | Ignored after the first start. | An OpenRouter connection without a key takes `OPENROUTER_API_KEY` from `.env` at every start. |
+| **Company named in the robot notice** | Fixed text from `.env`. | Filled from the models chosen on the card, without asking patients again. |
+| **Robot camera stops** | The robot searched blind for 10 minutes and logged nothing. | A **camera watchdog**: no frame for 2 s → one ERROR line and a recovery (at most once every 5 s); no steady frames for 15 s → the search ends as "camera_unavailable" (about 17 s after the last frame). The Reachy card shows **"Robot camera not working"** (「機器人鏡頭無法使用」). If the robot's daemon won't give the media back, the app asks again with the heartbeat (at most once a minute), so the speaker and microphone come back too. |
+| **Pressing Save or Restart twice on the robot page** | Could start two copies of the bridge, which ended each other's sessions. | One copy only (a restart lock); the buttons are disabled while a request runs. |
+| **Finding the patient before a check-in** | Needed the face match **and** a second face detector that loses faces smaller than about 50 px: about **1.35 m** at most. | A check-in's search accepts the face match alone (2 matches in a row, face at least 6.5% of the frame width: roughly **2.5 m**). Dose reminders keep the strict rule, and recording a dose never uses the looser one. |
+| **Why a search failed** | No trace. | Each robot identity check is logged: status, rule, match distance, face size, face counts. No names, no images. (The server's INFO lines now reach `docker compose logs` at all: before, nothing set up logging and every INFO line was dropped.) |
+| **Safety keywords** | Missed 「活著沒什麼意思」 and similar. | Caught: 活著(真/也/都/好…)沒(有)什麼意思/意義, 活得沒啥意思, 活著一點意思都沒有, with control phrases that stay unmatched (「活著真有意思」「我活著沒什麼問題」). |
+| **Robot speech recognition** | SenseVoice on the robot (older than the repo). | Whisper Base, as in the repo. |
+| **Tests** | Backend 1500, robot app 494, browser 48 passing. | Backend 1756, robot app 548, browser 70 passing. The same 3 old failures remain (BUG-37, BUG-38, and timing flakes BUG-39 / F19). |
+
+## 3. What was checked on the real system (12 Oct)
+
+On this PC's Docker stack and the Reachy Mini Wireless (`192.168.137.235`), after the whole-branch review and its fixes:
+
+| Check | Result |
+|---|---|
+| Test suites | Backend 1756 passed, robot app 548 passed (6 skipped), browser 70 passed. Only the known old failures (BUG-37, BUG-38). |
+| Security scan (semgrep, 25 changed files) | 5 findings, all in code older than this branch and not real problems (triaged in the build ledger). |
+| Server start | Healthy in about 10 s; the `ai_job.thinking` column added, every job Off. |
+| OpenRouter key from `.env` | Filled into the keyless connection at start. The key turned out to be **expired**; the user made a new one, which was put on the card (both OpenRouter models then passed Test, 1.2-1.4 s). |
+| Test on the card | gpt-5.4-mini and gpt-6-luna think at low / medium / high (1.1-1.4 s each); Gemini 2.5 on OpenRouter: "Can't think". |
+| A real reply at Low thinking | gpt-5.4-mini, 1.83 s, 60 reasoning tokens: 「真好，公園散步很舒服。看到什麼呢？」 |
+| Robot app 0.7.0 deployed (SSH) | Running; the server sees `bridge_version` 0.7.0 and the camera state. The TCU companion is off at boot; the camera is available. |
+| Check-in 1 | Camera about 10 frames/s; the patient found about 30 s after start; the greeting played; then no speech was recognised and the chat ended on "silence". |
+| Check-in 2 | Found (`rule=openvino_only`, match distance 0.20, face 150 px); a 5-turn chat that ended on 「再見」. |
+| Camera-failure test (release the camera during a search) | **Skipped** at the user's request; covered only by the robot app's tests. |
+
+**Where the time goes in a check-in turn** (check-in 2): the robot's speech-to-text (Whisper Base) 8.7-11.1 s, the
+server's reply 0.7-1.4 s, Reachy's first sound 1.7-3.0 s. Measured on the robot with the same recordings, Whisper Base
+takes about 9 s whatever the length (it pads every clip to 30 s), while SenseVoice-Small takes 0.4 s for 「嗯」, 1.0 s
+for 「謝謝您」 and 2.4 s for a 3.9 s sentence, both word-perfect. **Switching the robot back to SenseVoice would cut
+about 7-8 s from every turn** (its model is still on the robot). Not done in this branch.
+
+## 4. Set it up, step by step
+
+Commands are for PowerShell on Windows, run in the project folder unless stated otherwise.
+
+### 4.1 Install the tools
+
+1. **Docker Desktop.** Start it, and turn on *Start Docker Desktop when you sign in*.
+2. **Git for Windows** and **Git LFS** (`git lfs install` once; the face models are stored in LFS).
+3. **Python 3.10 or newer**, only for deploying the robot app: `pip install paramiko`.
+
+### 4.2 Get the code
+
+```powershell
+git clone --branch reachy-integration-0.1 https://github.com/Ferdinanzk/MedAiCarePlus.git
+cd MedAiCarePlus
+git lfs pull
+```
+
+### 4.3 Create `.env` and put in the credentials
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+`.env` is gitignored: **never commit it** (the repository is public). Fill in these lines:
+
+| Line in `.env` | What it is for | Where to get it | Needed? |
+|---|---|---|---|
+| `SECRET_KEY` | Signs logins and the robot's pairing key, and **encrypts the AI keys stored on the card**. | Make one: `python -c "import secrets; print(secrets.token_hex(32))"` | **Yes.** Keep it forever: a new value logs everyone out, unpairs the robot and makes the stored AI keys unreadable (re-enter them on the card). |
+| `OPENROUTER_API_KEY` | OpenRouter models (the default safety and summary models). Copied into the AI connections card on the first start; any OpenRouter connection on the card that has no key takes it at every start. | openrouter.ai → Keys | Recommended. If it expires, **Test** on an OpenRouter model shows `HTTP 401: API key expired`: put a new key on the card (*Replace key*) or here. |
+| `LLM_MODEL`, `LLM_FALLBACK_MODEL` | The OpenRouter models copied in on the first start. | Model ids from openrouter.ai | First start only. `google/gemini-2.5-flash-lite` is retired by OpenRouter on **20 Oct 2026**: pick a replacement. |
+| `LLM_SERVICE`, `LLM_PROVIDER`, `LLM_PROVIDER_REGION`, `LLM_RETENTION` | The company, region and retention named in the patient notice. | Your AI provider's terms | Required with `APP_ENV=prod`; afterwards edit them on the card (*Notice details*). |
+| `GEMINI_API_KEY` | Prescription scanning (the Scan page). | aistudio.google.com/apikey | For OCR. |
+| `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | Messages to family on LINE. | LINE Developers Console → your channel | For LINE. |
+| `DEVICE_BIND` | The address the robot uses to reach this PC (port 8001). | `ipconfig`: this PC's address on the robot's network, e.g. `192.168.137.1` when the robot is on the PC's Windows hotspot. Never `0.0.0.0`. | **Yes** for the robot. |
+| `WEB_PORT`, `MEDCARE_FRONTEND_URL` | The web app's port (8080 leaves 8000 to the robot daemon). | Keep `8080` and `http://localhost:8080`. | Yes. |
+| `OPERATOR_NAME`, `OPERATOR_CONTACT`, `TUNNEL_PROVIDER` | Named in the patient notices. | You | Required with `APP_ENV=prod`. |
+| `RISK_CLASSIFIER_API_KEY` | Required by the production checks when the robot feature is on. | Your provider | With `APP_ENV=prod` and `REACHY_FEATURE_ENABLED=1`. |
+| `BACKUP_PASSPHRASE` | Encrypts the weekly backups. | Make a strong passphrase; store it somewhere else too. | Recommended. |
+
+The **OpenAI key does not go in `.env`.** Paste it on the AI connections card (step 4.6).
+
+A filled `.env` looks like this (made-up values, never real ones in any file you share):
+
+```dotenv
+SECRET_KEY=3f9c...64 hex characters...a1
+OPENROUTER_API_KEY=sk-or-v1-...
+GEMINI_API_KEY=AIza...
+DEVICE_BIND=192.168.137.1
+WEB_PORT=8080
+MEDCARE_FRONTEND_URL=http://localhost:8080
+```
+
+### 4.4 Start the server
+
+```powershell
+docker compose up -d --build
+docker compose ps
+Invoke-RestMethod http://localhost:8080/health
+```
+
+Expected: `face_recognition`, `emotion`, `intake_detection` and `landmarks` are `true`; `ocr` is `true` with
+`GEMINI_API_KEY`; `line` is `true` with the LINE keys.
+
+Let the robot reach port 8001 (once, in an **administrator** PowerShell; this allows only the hotspot's devices):
+
+```powershell
+New-NetFirewallRule -DisplayName "MedAiCare robot device API" -Direction Inbound -Protocol TCP -LocalPort 8001 -RemoteAddress 192.168.137.0/24 -Action Allow
+```
+
+### 4.5 Sign in
+
+Open http://localhost:8080, register (or sign in) and enroll the patient's face.
+
+### 4.6 Set up the AI on the AI connections card
+
+Settings → **AI connections**:
+1. **Add connection** → OpenAI → paste the OpenAI key. (OpenRouter is already there from `.env`.)
+2. **Add model** → e.g. `gpt-5.4-mini` and `gpt-6-luna` on OpenAI.
+3. Press **Test** on every model you will use. It shows the time and "Can think: low · medium · high" or "Can't think".
+   Models tested before this branch say "Not checked yet: press Test".
+4. Under **Jobs**, pick a main and a backup model for each job, and a **Thinking** level (start with Off; Low is
+   measured at about 1.8 s for a reply). Press **Save jobs**.
+5. No job may show "No usable model". A model with an expired key shows its error under the model.
+
+### 4.7 Prepare the robot
+
+1. Turn the Reachy Mini on and join it to the same network (on our setup: the PC's Windows hotspot).
+2. **Turn off the TCU companion** on the robot: it releases the camera at boot and uses the same port (8042).
+   ```bash
+   ssh pollen@reachy-mini.local
+   sudo systemctl disable --now reachy-ai-companion
+   curl -s localhost:8000/api/media/status        # expect "available":true; if "released":true:
+   curl -s -X POST localhost:8000/api/media/acquire
+   ```
+3. Install robot app **0.7.0** from this repository (in Git Bash; the tool asks for the robot's SSH password, or
+   reads `REACHY_SSH_PASSWORD`):
+   ```bash
+   cd reachy_app
+   python tools/deploy_to_robot.py --host <robot-ip>
+   ```
+   Then start **medcare_reachy** in Reachy Mini Control (or `curl -s -X POST localhost:8000/api/apps/start-app/medcare_reachy`
+   on the robot).
+
+### 4.8 Pair the robot
+
+1. Web app → Settings → **Reachy robot** → read the notice → **Pair**. Copy the robot key (`rdv1.…`, shown once).
+2. Open the robot's page `http://<robot-ip>:8042`. Server address: `http://<DEVICE_BIND address>:8001` (port **8001**,
+   not 8080). Paste the key. **Save and connect**.
+3. Within about 10 s the Reachy card shows **Online**.
+
+### 4.9 LINE (optional)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\line-tunnel.ps1
+```
+
+It ends with `LINE webhook is set and reachable.` Run it again after every PC or Docker restart (the tunnel address
+changes).
+
+### 4.10 Check it works
+
+- Reachy card → **Talk to Reachy now**: the robot wakes, looks for the patient, greets them and chats.
+- Reachy card → **Send test alert**: a dose reminder for the first pending dose.
+- `docker compose logs -f app`: `identity of session …` lines show how the robot's face checks go.
+
+### 4.11 Run the tests
+
+```powershell
+.venv\Scripts\python -m pytest tests -q -p no:cacheprovider                     # backend (a Python 3.11 venv with requirements.txt)
+cd reachy_app; ..\.venv\Scripts\python -m pytest tests medcare_reachy/bridge/tests -q -p no:cacheprovider
+cd ..\frontend_source; npx tsc -b; npm run build
+```
+
+Known failures that are not caused by this branch: `test_a_broken_background_never_costs_the_reply` (BUG-37),
+`scan.spec.ts:148` (BUG-38), and timing tests that fail now and then (BUG-39, `test_speech` first-sound).
+
+## 5. Still open
+
+1. **Make check-ins faster: switch the robot's speech-to-text back to SenseVoice** (see section 3; about 7-8 s per turn).
+2. **Keys on the card don't follow `.env`.** A key already on the card is not replaced when `.env` changes (only a
+   keyless OpenRouter connection takes the `.env` key), and the card's "usable" check only sees that a key exists, not
+   that it still works. After changing a key, use *Replace key* on the card and press **Test**.
+3. **`google/gemini-2.5-flash-lite` retires on 20 Oct 2026** (OpenRouter). Replace it on the card.
+4. **Robot doses always go to family to confirm.** The robot daemon gives apps the camera at 10 fps; the server needs
+   12 to record a dose by itself. `deploy_to_robot.py --camera-ipc-fps 15` raises it (a daemon update undoes it).
+5. **The robot still has the factory SSH password.** Change it (`passwd` on the robot).
+6. **The TCU companion can't run alongside MedCare Reachy** as it is (it releases the camera).
+7. **The Hugging Face space** `pearlyjam21/medcare_reachy` has 0.7.0 since 12 Oct. Its history also holds an ElevenLabs
+   voice line (numbered 0.6.0, 4-5 Oct) that is on no GitHub branch; it is kept there for a later version.
+8. **Server errors seen live, in code older than this branch:** a database deadlock when the robot leases a task
+   (`reachy_tasks._lease_once`; the robot's retry worked), and a 500 instead of a 409 for a camera frame that arrives
+   just after its session ended (`intake_detection.process_frame` raises `SessionEnded`).
+9. The check-ins switch records consent to the robot notice without showing it (only pairing shows it).
+10. **Phase 2, live voice with GPT-Live.** Phase 2a, live check-ins for testing, is on branch `live-voice-2a` (section
+   6). Phase 2b comes before any real patient uses it: the patient notice and opt-in, checking the face while GPT-Live
+   is talking (robot app 0.9.0 already keeps the camera on during the chat and starts GPT-Live only after a recent
+   sighting), reconnecting, a daily budget, and a second transcript for the safety check.
+11. **Release gate for robot app 0.9.0.** Before 0.9.0 reaches patients beyond the user's own test, a new robot notice
+   version must say that the camera stays on during a check-in (analysed in memory, never saved) and that the chat
+   lasts until goodbye or until Reachy rests. The user decides the notice text; the Reachy card's check-in help
+   already says so. (Robot alerts also don't repeat yet, although the notice §6 promises they do.)
+
+## 6. Phase 2a: live voice check-ins (test only)
+
+Branch `live-voice-2a` (from `reachy-integration-0.1`), robot app **0.8.0**, then **0.9.0** (the companion session,
+below). Design: `docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`. How it works: CLAUDE.md, section "Live
+voice check-ins (Phase 2a, test)". The branch also carries robot app 0.7.1 (today's check-in chat no longer ends on
+silence); the robot has run 0.7.1 since 12 Oct.
+
+**What it is.** A check-in can be a live voice chat with OpenAI's GPT-Live (gpt-live-1) instead of the turn-by-turn
+text chat, which takes 12-14 s a turn. The robot streams its microphone to the server; the server talks with GPT-Live
+and sends its voice back to the robot. The OpenAI key stays on the server. The server holds the start of every reply
+for 0.5 s so the safety check can stop it, has the robot say the help line in its own voice, and falls back to the
+text chat whenever something fails. While the chat runs, the server checks every 10 s that the robot is still paired
+and the consents and the live switch are still on. Reachy also greets the patient by name now, in both chat types
+("What should Reachy call you?" on the Reachy card). GPT-Live costs about US$0.05 per minute of chat.
+
+**Turn it on for testing:**
+
+1. In `.env`, set `LIVE_VOICE_TEST=1`. Rebuild and start the app: `docker compose up -d --build app`.
+2. Settings → **AI connections** → **Live voice (test)**: pick the OpenAI connection (step 4.6), keep the model
+   `gpt-live-1` and the voice `marin` (or pick another), press **Save live voice**, then **Check**. Check must show a
+   time; while it shows an error, live check-ins stay off.
+3. Install the robot app (0.9.0 on this branch) as in step 4.7 (`python tools/deploy_to_robot.py --host <robot-ip>`),
+   then restart it on the robot: `curl -s -X POST localhost:8000/api/apps/restart-current-app`. Heartbeats then report
+   `bridge_version` 0.9.0.
+4. Settings → **Reachy robot**: **Daily check-ins** on, **Live voice (test)** on. Optionally fill in **What should
+   Reachy call you?** and save it.
+5. Press **Talk to Reachy now**. Reachy looks for the patient, greets them by name in its own voice and listens.
+   Answer while it can see you: GPT-Live then answers. Say 「再見」 to end. The chat is on the Conversations page like
+   any check-in.
+
+To turn it off: switch **Live voice (test)** off on the Reachy card (one robot), or set `LIVE_VOICE_TEST=0` and run
+`docker compose up -d app` (everyone). Check-ins are then text chats again.
+
+**Still to check on the robot** (the spec's robot tests, not done yet): the time to each reply, the name greeting,
+that Reachy's own voice never comes back as a patient turn (echo), one goodbye, and one fallback (break the connection
+briefly during a chat, e.g. the PC's internet: the check-in must go on as a text chat).
+
+**Companion session (robot app 0.9.0).** Decided with the user on 12 Oct; design:
+`docs/superpowers/specs/2026-10-12-companion-session-design.md`; how it works: CLAUDE.md, "How it ends" in the
+check-in section and "Companion session" in the live voice section. A check-in now stays until the patient says
+goodbye, with either chat. Reachy greets in its own voice and keeps the camera on (2 frames a second). GPT-Live starts
+only when the patient speaks and the camera recognised them in the last 15 s, pauses after 30 s without patient speech
+(billing stops) and starts again with the last 20 turns when the patient speaks. The patient's first words (the last
+2 s kept while paused, and what they said while GPT-Live started) go to GPT-Live at up to twice real time
+(`PRE_ROLL_SEND_SPEED`), because GPT-Live drops a faster burst. A talking stretch pauses at the next
+gap in the talk after 10 minutes, and at 11 minutes whatever is happening. Reachy rests after 10 minutes with no voice
+and nobody seen, and ends the chat for a medicine that falls due. This settles the old question about the live chat's
+45 s silence ending: only robots older than 0.9.0 keep it. Every timing is one constant (for example
+`QUIET_PAUSE_SECONDS` and `REST_AFTER_SECONDS`), to change after trying. Still to check on the robot with the user:
+greet, talk, stay quiet (pause), speak again (restart), say 拜拜.
+
+After the final review (same branch, 0.9.0): the medicine ending lets the patient finish first (`MEDICINE_WAIT_SECONDS`,
+`MEDICINE_SPEECH_GAP_SECONDS`); a dose left pending before the chat is brought up when its reminder retry comes
+(`retry_due`), and medicine tasks are leased before a queued check-in; the sweep keeps a quiet companion chat open
+while its robot holds the running task (no 2-hour ceiling), and the live relay ends a chat whose conversation someone
+else closed; endings drain GPT-Live's last words before storing them; a failed GPT-Live start asks the patient to say it
+again; camera first needs a verified sighting; only a fresh camera answer keeps Reachy awake, and a live chat without a
+working camera for `CAMERA_LOST_SECONDS` goes on as the text chat; the text chat ends when the microphone consent is
+withdrawn; once the server has ended a live chat, the robot never cuts its help line. See section 5 item 11 for the
+release gate.
+
+**Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
+daily cost limit, no reconnect, and no face check while GPT-Live is talking; its safety check reads only GPT-Live's own
+transcript (no second transcript and no echo guard on the server). Keep `LIVE_VOICE_TEST=0` on any installation a
+patient uses.
+
+## 7. What was finished on 12 October 2026
+
+`reachy-integration-0.2` is `reachy-integration-0.1` plus the work below (it was built on the local branch
+`live-voice-2a`).
+
+**Finished and tested**
+
+1. **Phase 2a, live voice check-ins with GPT-Live (test only)**, as in section 6. Built in 11 tasks, each one reviewed
+   before the next. The reviews added three more pieces of work:
+   - While a live chat runs, the server checks every 10 s that the robot is still paired, the live switch is on and
+     the consents are current. If one is gone, the chat ends at once, so the patient's voice stops going to OpenAI. If
+     3 checks in a row cannot be read, the chat ends too.
+   - GPT-Live often starts answering before the patient's last words arrive. The server still stores one patient turn
+     per sentence and one Reachy turn per reply, so a goodbye split in two (「拜」+「拜」) is still seen.
+   - A final review of the whole branch (5 reviewers, 2 more checking each finding) found 3 problems, all fixed: a
+     database error during the help-line ending could skip the family alert (now the alert always goes); a database
+     call that hangs could freeze the chat's safety checks (now every call gives up after 5 s); switching memory off
+     during a live chat was not noticed (now the text chat takes over). Production mode (`APP_ENV=prod`) now refuses
+     to start with `LIVE_VOICE_TEST=1`.
+2. **Robot app 0.7.1: a check-in no longer ends on silence.** After trying Reachy, the user decided that a companion
+   must not leave when the patient is quiet or steps away. Since 0.7.1 a check-in ends only on a goodbye, a risk, a
+   stop, or after 5 minutes. It was deployed to the robot on 12 Oct (the robot keeps a backup of the old app in
+   `~/.medcare_reachy/backup-20261012-111649.tgz`). 0.8.0 includes it.
+3. **A live test on this PC with the real gpt-live-1** (no robot; the server's real relay with stand-ins for the
+   database and the robot):
+   - A normal sentence (「今天天氣有點冷，我不太想出門散步。」): GPT-Live greeted 「王奶奶，今天感覺怎麼樣？想跟我聊聊嗎？」
+     3.8 s after the start, heard the sentence correctly, and answered 1.9 s after the patient finished (this includes
+     the 0.5 s safety hold). The reply was 30 characters.
+   - A risk sentence (「最近覺得活著沒什麼意思，我不想活了。」): the keyword check caught it while the patient was still
+     speaking. None of GPT-Live's voice reached the robot; the robot said the help line in its own voice; family were
+     alerted once.
+   - Cost: 39 billed seconds in all.
+4. **The companion session: built and reviewed on this branch (robot app 0.9.0).** Its live tests on the PC and on the
+   robot are still to do (see "Not done yet"). Spec:
+   `docs/superpowers/specs/2026-10-12-companion-session-design.md`. Reachy greets the patient in its own voice. GPT-Live
+   starts only when the camera recognised the patient in the last 15 s and the patient speaks. It pauses after 30 s of
+   quiet (billing stops) and restarts with the conversation so far. The session ends on 拜拜/再見, a risk, a
+   withdrawal, a medicine falling due, or 10 minutes with no voice and nobody seen. Today's text chat follows the same
+   rules.
+
+**Tests at this commit:** backend 2020 passed plus 1 known failure (BUG-37, older than this work); robot app 624
+passed, 6 skipped; web app 91 Playwright tests passed plus 1 known failure (BUG-38).
+
+**Where everything is**
+
+| What | Where |
+|---|---|
+| Code | GitHub `Ferdinanzk/MedAiCarePlus`, branch `reachy-integration-0.2` |
+| Robot app 0.8.0 | Hugging Face space `pearlyjam21/medcare_reachy`, branch `reachy-integration-0.2`. The space's `main` (what the robot's app store installs) is still 0.7.0. |
+| The robot | Runs 0.7.1 (deployed by SSH from this branch's parent `checkin-no-silence`, not from Hugging Face) |
+| The server on this PC | The `reachy-integration-0.1` build, with live voice off |
+
+**Not done yet**
+
+- The robot tests of Phase 2a (section 6, "Still to check on the robot"). They need the server rebuilt from this branch
+  with `LIVE_VOICE_TEST=1` and robot app 0.8.0 on the robot; the user will do them together with the developer.
+- The companion session's live test on this PC and its robot test with the user (robot app 0.9.0; section 6).
+- Small points the reviews found and left for Phase 2b: a database insert that times out can slow the chat's later
+  writes; a late risk found while the chat is already falling back can end it without the spoken help line (family
+  are still alerted); the check-ins help text on the Reachy card still says only text is sent, also while the live
+  voice test switch is on.
+
+## 8. What was finished on 12 October 2026, evening
+
+`reachy-integration-0.3` is `reachy-integration-0.2` plus the companion session (robot app **0.9.0**), the fixes from
+its final review and from its live tests, and this section. It was built on the local branch `live-voice-2a`.
+
+**Finished and tested**
+
+1. **The companion session (robot app 0.9.0)**, as in section 6: Reachy stays with the patient until goodbye, in both
+   chat types. Built in 7 reviewed tasks. A final review of the whole work (4 reviewers, 2 more checking each finding)
+   found 14 problems, all fixed. The most important ones:
+   - a medicine or rest ending could drop the patient's last words before the safety check saw them;
+   - a medicine ending could cut the server's help line;
+   - after the camera stopped, its last answer kept Reachy awake for ever;
+   - the text chat ignored a withdrawn microphone switch;
+   - a dose left untaken was never brought up again during a long chat.
+2. **A live test on this PC with the real gpt-live-1 found one more problem, now fixed.** After each pause, GPT-Live
+   lost the patient's first 1-2 s, because the server sent the saved audio all at once and GPT-Live limits how fast
+   audio may arrive (`input_audio_rate_limit_exceeded`; no OpenAI document states the limit). The server now sends it
+   at up to twice real time (`PRE_ROLL_SEND_SPEED`; measured: every word kept). A security review then added a memory
+   cap (`KEPT_MAX_SECONDS`) and a rule against a robot that sends audio too fast (`CATCH_UP_MARGIN_SECONDS`). The
+   final PC test heard every word, and after the pause GPT-Live remembered what was said before
+   (「因為你說天氣有點冷，不太想出門散步。」).
+3. **Two robot tests with the user** (22:18 and 22:25, "Talk to Reachy now"). Both worked from start to end: Reachy
+   found the patient, greeted him by name in its own voice, GPT-Live started 1.2-2.1 s after he spoke, replies began
+   0.65-3 s after he finished, every patient turn went through the safety check (no risk), and 「拜拜」 / 「先這樣」 ended
+   the chat cleanly. GPT-Live cost about US$0.18 for both. **Not reached on the robot:** the pause and restart (it
+   needs 30 s of quiet; the longest gap was about 20 s), the rest ending and the medicine ending. The pause and restart
+   passed the PC test.
+
+**Tests at this commit:** backend 2068 passed plus 1 known failure (BUG-37); robot app 650 passed, 6 skipped, plus the
+known flaky tests (`test_speech` first sound, a `test_gestures` clip timing); web app type check and build pass.
+
+**Repeat the robot test on another computer** (section 6, "Turn it on for testing", in short): set
+`LIVE_VOICE_TEST=1` in `.env` and run `docker compose up -d --build app`; on the AI connections card save the live
+voice model (`gpt-live-1`, voice `marin`) on the OpenAI connection and press **Check**; on the Reachy card switch
+**Live voice (test)** on; install robot app 0.9.0 with `python tools/deploy_to_robot.py --host <robot-ip>` and start it
+(`curl -s -X POST http://<robot-ip>:8000/api/apps/start-app/medcare_reachy`); press **Talk to Reachy now**.
+
+**Where everything is**
+
+| What | Where |
+|---|---|
+| Code | GitHub `Ferdinanzk/MedAiCarePlus`, branch `reachy-integration-0.3` |
+| Robot app 0.9.0 | Hugging Face space `pearlyjam21/medcare_reachy`, branch `reachy-integration-0.3`. The space's `main` (what the robot's app store installs) is still 0.7.0. |
+| The robot | Runs 0.9.0 (deployed by SSH; the old app is backed up in `~/.medcare_reachy/backup-20261012-221715.tgz`) |
+| The server on this PC | This branch, with `LIVE_VOICE_TEST=1` in `.env` and the robot's live voice switch on |
+
+**Seen in the robot tests (not fixed yet)**
+
+- **GPT-Live makes up facts it cannot know.** Asked about the weather it said 「今晚是晴天」 and 「現在22度，晴天」; it has
+  no weather source.
+- **GPT-Live cannot see.** Asked 「你會看得到我的臉嗎」 and 「你知道我穿什麼衣服嗎」 it said it could not; it only hears.
+- One reply was stored split across two Reachy turns (text only: the patient's words, which the safety check reads,
+  are not affected). GPT-Live writes the patient's words in Simplified characters at times (the keyword check reads
+  both scripts), and its own transcript sometimes holds a broken character 「�」.
+- The robot's camera reaches the app at about 10 frames a second; recording a dose needs 12 (see step 4.7,
+  `--camera-ipc-fps 15`).
+- **Release gate (section 5 item 11):** before 0.9.0 reaches patients beyond the user's own test, a new robot notice
+  version must say that the camera stays on during a check-in and that the chat lasts until goodbye.
+
+**Next (asked by the user on 12 Oct)**
+
+1. **Face tracking.** Once Reachy finds the patient, it should keep its head turned to the patient's face (lock on)
+   for the whole session. The server's camera answers already give the face's box (see the `box_px` in the identity
+   log lines); during a companion session the robot sends 2 frames a second, so smooth following may need a face
+   detector on the robot itself. Head moves must not fight Reachy's speaking gestures.
+2. **Let GPT-Live see.** The patient asks what he is wearing or how he looks, and GPT-Live cannot answer because it
+   gets only sound. A way to build it: GPT-Live's "delegation" (below) with a tool such as `look()` that the server
+   answers from the latest camera frame. This sends a camera image (or a description of it) to OpenAI, which today's
+   notice does not allow ("analysed in memory, never saved"): it needs a new notice and consent first, and a design.
+3. **Tool calling for GPT-Live.** GPT-Live can hand questions that need facts or tools to a backend model, which can
+   use OpenAI's web search or call functions our server runs ("Responses delegation"; the TCU companion's
+   `companion/ai/openai_live.py` already does this). A weather tool (for example Taiwan's Central Weather
+   Administration open data) or web search would stop the made-up weather; a tool could also read the patient's
+   medicine schedule. Backend calls are billed on top of the $0.05 per minute. Until then, one line in GPT-Live's
+   instructions ("never claim to know the weather or news you cannot check") is the cheap fix.
+4. **Still to test on the robot:** the pause and restart (stay quiet 40 s, then ask about what was said), the rest
+   ending (step away for 10 minutes), a medicine falling due during a chat, and a fallback (cut the PC's internet
+   during a chat).
+
+---
+
+# History: handoff of 2 October 2026
+
+Kept as it was written. Parts of it are out of date (robot app version, SenseVoice, the publishing and
+LINE items); the sections above win where they disagree.
+
 Status as of **2 October 2026**. This covers what exists, how the pieces fit, what has been verified, and what is still open. No passwords, keys or tokens are written here; see [Secrets](#secrets) for where they live.
 
 ## 1. The system in one picture

@@ -23,6 +23,7 @@ MAX_FACTS = 5
 SUBJECT_MAX = 60
 TEXT_MAX = 160
 NAME_SUBJECT = "preferred_name"
+CALL_NAME_MAX = 40   # "user".reachy_call_name VARCHAR(40)
 LINE_MAX = {"zh-TW": 60, "en": 150}
 BLOCK_MAX = {"zh-TW": 400, "en": 1200}
 EVENT_PAST_DAYS, EVENT_FUTURE_DAYS = 7, 180
@@ -151,6 +152,20 @@ def opening_line(language: str, name: str | None) -> str:
     return f"{name}，{base}" if language == "zh-TW" else f"{name}, {base[0].lower()}{base[1:]}"
 
 
+def clean_call_name(text: str | None) -> str | None:
+    """A name for Reachy to call the patient, by the rules of their own memory 'name' entry (validate_fact: no risk,
+    health or command words, 1-8 Chinese characters or up to 20 Latin letters and spaces), or None."""
+    fact = validate_fact({"kind": "name", "text": text or ""}, today=local_today(), source="patient")
+    return fact["text"] if fact else None
+
+
+def call_name_of(stored: str | None, registered: str | None) -> str | None:
+    """The name Reachy uses without a memory 'name' entry: the call name saved on the Reachy card, else the
+    registered name when it passes the same rules (registration takes any text, such as 'Demo Patient 1790963685'),
+    else None."""
+    return (stored or "").strip() or clean_call_name(registered)
+
+
 # "The rules above still apply", as BACKGROUND_RULES says: the block is a second system message, and the reply
 # rules (no medical advice) are in the first.
 PREAMBLE = {
@@ -244,6 +259,17 @@ async def lock_user(conn, u_id: int) -> None:
 
 async def current_facts(conn, u_id: int) -> list[dict]:
     return [dict(row) for row in await conn.fetch(CURRENT_FACTS_SQL, u_id)]
+
+
+async def call_name(conn, u_id: int, memory_on: bool) -> str | None:
+    """What Reachy calls the patient in the opening line of both chat types (spec D): their own memory 'name' entry
+    while memory is on (their newer choice), else call_name_of(the Reachy card's call name, the registered name)."""
+    if memory_on:
+        name = preferred_name(await current_facts(conn, u_id))
+        if name:
+            return name
+    row = await conn.fetchrow('SELECT reachy_call_name, name FROM "user" WHERE u_id = $1', u_id)
+    return call_name_of(row["reachy_call_name"], row["name"]) if row else None
 
 
 async def store_facts(conn, u_id: int, conversation_id: str, facts: list[dict]) -> int:

@@ -502,3 +502,69 @@ CREATE TABLE IF NOT EXISTS dose_emotion (
 );
 CREATE INDEX IF NOT EXISTS idx_dose_emotion_intake ON dose_emotion(intk_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dose_emotion_user ON dose_emotion(u_id, created_at DESC);
+
+-- AI connections card (spec 2026-10-10-ai-connections-design.md): services with encrypted keys, their models with
+-- the request profile the Test button found, and the main and backup model of each job. No ON DELETE CASCADE:
+-- what a job uses cannot be deleted (409 in_use).
+CREATE TABLE IF NOT EXISTS ai_connection (
+    connection_id  BIGSERIAL PRIMARY KEY,
+    name           VARCHAR(60)  NOT NULL UNIQUE,
+    kind           VARCHAR(20)  NOT NULL CHECK (kind IN ('openrouter','openai','openai_compatible')),
+    base_url       VARCHAR(300) NOT NULL,
+    api_key_enc    TEXT,                     -- Fernet token; NULL = no key yet
+    api_key_last4  VARCHAR(4),
+    service_name   VARCHAR(80)  NOT NULL,    -- {LLM_SERVICE} in the notices
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS ai_model (
+    model_ref      BIGSERIAL PRIMARY KEY,
+    connection_id  BIGINT NOT NULL REFERENCES ai_connection(connection_id),
+    model_id       VARCHAR(100) NOT NULL,    -- as the service names it, e.g. gpt-5.4-mini
+    company        VARCHAR(80)  NOT NULL DEFAULT '',   -- {LLM_PROVIDER}
+    region         VARCHAR(80)  NOT NULL DEFAULT '',   -- {LLM_PROVIDER_REGION}
+    retention      VARCHAR(200) NOT NULL DEFAULT '',   -- {LLM_RETENTION}
+    profile        JSONB,                    -- request settings (ai_profile); NULL = not tested
+    tested_at      TIMESTAMPTZ,
+    test_ms        INTEGER,
+    last_error     TEXT,                     -- last failed real call or test; NULL after a success
+    UNIQUE (connection_id, model_id)
+);
+CREATE TABLE IF NOT EXISTS ai_job (
+    job            VARCHAR(20) PRIMARY KEY CHECK (job IN ('reply','safety','after_chat')),
+    primary_ref    BIGINT NOT NULL REFERENCES ai_model(model_ref),
+    fallback_ref   BIGINT REFERENCES ai_model(model_ref),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Thinking level per job (spec 2026-10-11-robot-camera-identity-thinking-design.md D1). 'off' sends today's
+-- requests unchanged; a model that can't do the job's level gets the nearest lower level it accepts.
+ALTER TABLE ai_job ADD COLUMN IF NOT EXISTS thinking VARCHAR(10) NOT NULL DEFAULT 'off';
+ALTER TABLE ai_job DROP CONSTRAINT IF EXISTS ai_job_thinking_check;
+ALTER TABLE ai_job ADD CONSTRAINT ai_job_thinking_check CHECK (thinking IN ('off','low','medium','high'));
+
+-- Live voice check-ins with GPT-Live, first version (spec 2026-10-12-live-voice-2a-design.md).
+-- D: what Reachy calls the patient, set on the Reachy card; NULL = the registered name ("user".name).
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_call_name VARCHAR(40);
+-- E1: the Reachy card's "Live voice (test)" switch. It has an effect only while .env has LIVE_VOICE_TEST=1.
+ALTER TABLE reachy_device ADD COLUMN IF NOT EXISTS live_voice BOOLEAN NOT NULL DEFAULT FALSE;
+-- How a check-in ran: 'text' (today's turns) or 'live' (GPT-Live; it stays 'live' after a fallback to text).
+-- live = {usage_seconds, close_reason, fallback_reason} for a live chat (C2, C3).
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS mode VARCHAR(10) NOT NULL DEFAULT 'text'
+    CHECK (mode IN ('text','live'));
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS live JSONB;
+-- A companion session (spec 2026-10-12-companion-session-design.md): a check-in from robot app 0.9.0 that stays until
+-- a goodbye, a risk or the robot ends it (rest, medicine, a stop). A live one runs GPT-Live in stretches, and its
+-- live JSON adds stretches (how many times GPT-Live was started; usage_seconds is their sum).
+ALTER TABLE conversation ADD COLUMN IF NOT EXISTS companion BOOLEAN NOT NULL DEFAULT FALSE;
+-- E2: the live model on the AI connections card. One row (id is always TRUE): an OpenAI connection, the model id,
+-- the voice and the last Check. No ON DELETE: a connection this row uses cannot be deleted (409 in_use).
+CREATE TABLE IF NOT EXISTS ai_live (
+    id             BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    connection_id  BIGINT REFERENCES ai_connection(connection_id),
+    model_id       VARCHAR(100) NOT NULL DEFAULT 'gpt-live-1',
+    voice          VARCHAR(20)  NOT NULL DEFAULT 'marin',
+    tested_at      TIMESTAMPTZ,
+    test_ms        INTEGER,
+    last_error     TEXT,                     -- the last Check's error code; NULL after a pass
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);

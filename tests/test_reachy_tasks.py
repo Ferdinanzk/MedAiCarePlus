@@ -1,6 +1,8 @@
 """Leased robot tasks: enqueue rules, leasing, transitions, lease expiry and the reminder hook."""
 
 import asyncio
+import dataclasses
+import json
 import os
 import sys
 import types
@@ -19,7 +21,7 @@ import dose_facts  # noqa: E402
 
 from app import config  # noqa: E402
 from app.jobs import missed_dose_job, reachy_task_job  # noqa: E402
-from app.services import consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
+from app.services import ai_settings, consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
 
 T0 = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)          # 08:00 in Taipei
 OPEN = ("queued", "leased", "searching", "in_progress")
@@ -49,7 +51,8 @@ class FakeDB:
         self.now = T0
         self.depth = 0
         self.tasks = []
-        self.devices = {7: {"device_id": DEVICE, "auto_record": False, "last_seen_at": T0, "revoked": False}}
+        self.devices = {7: {"device_id": DEVICE, "auto_record": False, "live_voice": False, "last_seen_at": T0,
+                            "revoked": False}}
         self.users = {7: "Pearl"}
         self.doses = {
             101: {"intk_id": 101, "med_id": 2, "med_name": "Metformin", "pill_description": "white round",
@@ -101,6 +104,22 @@ class FakeDB:
         return not row["protection"] or (schedule.is_due(row["intake_time_stamp"], self.now, row["previous_time"])
                                          and (expiry is None or self.now < expiry))
 
+    def retry_due(self, task, u_id):
+        """reachy_tasks._retry_due_sql: patient u_id's in-progress task marked retry_due, not expired, with a marked
+        dose still open and startable."""
+        retry = json.loads(task["detail"] or "{}").get("retry_due")
+        return (task["u_id"] == u_id and task["status"] == "in_progress" and retry is not None
+                and datetime.fromisoformat(retry["expires_at"]) > self.now
+                and any(i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")
+                        and self.startable(i) for i in retry["intk_ids"]))
+
+    def leasable(self, task, u_id):
+        """reachy_tasks._leasable_sql: patient u_id's queued task, not expired, whose open doses may all start now.
+        Only open doses hold a task back: a taken one past its halfway point does not."""
+        return (task["u_id"] == u_id and task["status"] == "queued" and task["expires_at"] > self.now
+                and all(self.startable(i) for i in task["intk_ids"]
+                        if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")))
+
     # asyncpg surface
     async def fetchval(self, query, *args):
         if "SELECT device_id FROM reachy_device" in query:
@@ -130,6 +149,12 @@ class FakeDB:
         if "FROM notification_outbox" in query and "kind = 'robot_offline'" in query:
             self.outbox_now = args[1] + timedelta(hours=6)
             return 1 if any(n["u_id"] == args[0] and n["at"] > args[1] for n in self.notices) else None
+        if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # task_due
+            assert reachy_tasks._leasable_sql() in query and len(args) == 1
+            assert f"OR EXISTS ({reachy_tasks._retry_due_sql()})" in query
+            return any(self.leasable(t, args[0]) and any(
+                i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed") for i in t["intk_ids"])
+                for t in self.tasks) or any(self.retry_due(t, args[0]) for t in self.tasks)
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):
@@ -139,23 +164,19 @@ class FakeDB:
             assert (f"AND i.intake_stats IN ('pending','missed') "
                     f"AND NOT ({dose_safety.startable_sql('i', 'NOW()')})") in query and len(args) == 2
 
-            def due(task):
-                # Only open doses hold a task back: a taken one past its halfway point does not.
-                return all(self.startable(i) for i in task["intk_ids"]
-                           if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed"))
-
-            queued = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["status"] == "queued"
-                             and t["expires_at"] > self.now and due(t)),
-                            key=lambda t: (t["slot_time"], t["created_at"]))
+            assert "ORDER BY (t.reason = 'checkin'), t.slot_time, t.created_at" in query   # medicine first
+            queued = sorted((t for t in self.tasks if self.leasable(t, args[0])),
+                            key=lambda t: (t["reason"] == "checkin", t["slot_time"], t["created_at"]))
             if not queued:
                 return None
             task = queued[0]
             task.update(status="leased", lease_owner=args[1], lease_until=self.now + timedelta(seconds=60))
             return dict(task)
-        if 'SELECT u.name, d.auto_record' in query:
+        if 'SELECT u.name, d.auto_record, d.live_voice' in query:
             device = self.devices.get(args[0])
-            return {"name": self.users[args[0]],
-                    "auto_record": device["auto_record"] if device and not device["revoked"] else None}
+            active = device if device and not device["revoked"] else None
+            return {"name": self.users[args[0]], "auto_record": active["auto_record"] if active else None,
+                    "live_voice": active["live_voice"] if active else None}
         if "WHERE u_id = $1 AND lease_owner = $2::uuid" in query:
             tasks = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["lease_owner"] == args[1]
                             and t["status"] in ("leased", "searching", "in_progress")),
@@ -181,6 +202,9 @@ class FakeDB:
             assert args[0] == 7
             self.due_checks.append(list(args[1]))
             return self.facts(args)
+        if "SELECT intk_id FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[])" in query:   # retry_due's open doses
+            return [{"intk_id": i} for i in sorted(args[1])
+                    if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")]
         if "FROM intake i JOIN medication m" in query:
             assert "ORDER BY m.med_name, m.med_id" in query
             rows = [self.doses[i] for i in args[1] if i in self.doses]
@@ -213,6 +237,11 @@ class FakeDB:
             for t in self.tasks:
                 if t["lease_owner"] == args[0] and t["status"] in ("leased", "searching", "in_progress"):
                     t["lease_until"] = self.now + timedelta(seconds=60)
+        elif "jsonb_build_object('retry_due'" in query:   # enqueue_reachy_task: a missed retry for a held task
+            task = self.by_id(args[0])
+            if task["status"] == "in_progress":
+                detail = json.loads(task["detail"] or "{}")
+                task["detail"] = json.dumps({**detail, "retry_due": {"intk_ids": list(args[1]), "expires_at": args[2]}})
         elif "UPDATE intake SET" in query or "INSERT INTO notification" in query:
             pass
         else:
@@ -267,7 +296,12 @@ def test_enqueue_never_rearms_or_resets_an_active_task(db, status):
     db.tasks[0].update(status=status, lease_owner=DEVICE, lease_until=T0 + timedelta(seconds=60))
     before = dict(db.tasks[0])
     assert enqueue(db, reason="missed_retry", expires=T0 + timedelta(hours=2)) == task_id
-    assert db.tasks[0] == before and len(db.tasks) == 1
+    after = dict(db.tasks[0])
+    if status == "in_progress":   # only marked for the retry (task_due, then queued when it ends)
+        assert json.loads(after.pop("detail")) == {"retry_due": {"intk_ids": [101, 102, 103],
+                                                                 "expires_at": (T0 + timedelta(hours=2)).isoformat()}}
+        before.pop("detail")
+    assert after == before and len(db.tasks) == 1
 
 
 @pytest.mark.parametrize("status", ["not_found", "aborted"])
@@ -316,8 +350,9 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     task = run(reachy_tasks.lease_next(7, DEVICE, 0))
     assert task["task_id"] == first and task["status"] == "leased"
     assert set(task) == {"task_id", "slot_time", "reason", "attempt", "status", "expires_at",
-                         "patient_name", "auto_record", "microphone", "checkin", "doses"}
+                         "patient_name", "auto_record", "microphone", "checkin", "live", "doses"}
     assert task["patient_name"] == "Pearl" and task["auto_record"] is False
+    assert task["live"] is False         # no live test switch, robot switch or live model in the fixture
     assert task["microphone"] is False   # no robot_microphone consent in the fixture
     assert task["checkin"] is False      # nor the check-in scopes
     assert [d["med_name"] for d in task["doses"]] == ["Aspirin", "Metformin", "Zinc"]
@@ -817,3 +852,94 @@ def test_with_protection_off_a_task_for_a_later_dose_is_leased_at_once(db):
     assert enqueue(db, reason="manual", slot=T0 + timedelta(hours=12), intk_ids=(104,),
                    expires=T0 + timedelta(hours=13))
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["doses"][0]["intk_id"] == 104
+
+
+# ── Medicine first: task_due for the heartbeat (companion spec 3.4) ─────────
+
+def test_task_due_when_a_medicine_task_waits_during_a_chat(db):
+    # The robot is chatting in a check-in task it leased; that task is not queued, so it never counts.
+    db.tasks.append({"task_id": "chat", "u_id": 7, "slot_time": T0 - timedelta(minutes=30), "intk_ids": [],
+                     "reason": "checkin", "attempt": 1, "status": "in_progress", "lease_owner": DEVICE,
+                     "lease_until": T0 + timedelta(seconds=60), "created_at": T0 - timedelta(minutes=30),
+                     "finished_at": None, "expires_at": T0 + timedelta(minutes=15), "detail": None})
+    assert run(reachy_tasks.task_due(db, 7)) is False
+    enqueue(db)                                         # the 08:00 doses, due now
+    assert run(reachy_tasks.task_due(db, 7)) is True
+    assert run(reachy_tasks.task_due(db, 8)) is False   # another patient's robot is told nothing of it
+
+
+def test_a_queued_checkin_or_a_task_with_nothing_left_to_take_is_no_medicine(db):
+    enqueue(db, reason="checkin", slot=T0 + timedelta(minutes=5), intk_ids=())   # 'Talk to Reachy now' again
+    db.tasks.append({"task_id": "done", "u_id": 7, "slot_time": T0, "intk_ids": [103], "reason": "manual",
+                     "attempt": 1, "status": "queued", "lease_owner": None, "lease_until": None, "created_at": T0,
+                     "finished_at": None, "expires_at": T0 + timedelta(hours=1), "detail": None})   # 103 is taken
+    assert run(reachy_tasks.task_due(db, 7)) is False
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == "done"   # leased after the chat, as today
+
+
+def test_a_missed_retry_during_a_held_task_is_due_and_queued_when_it_ends(db):
+    # The 08:00 dose task left its doses pending and went on as a companion session, which holds the slot's task in
+    # progress; the missed-dose job's +10 min retry for that slot comes meanwhile.
+    task_id = enqueue(db, intk_ids=(101, 102))
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == task_id
+    for status in ("searching", "in_progress"):
+        run(reachy_tasks.set_status(7, DEVICE, task_id, status, None))
+    db.now = T0 + timedelta(minutes=10)
+    assert enqueue(db, reason="missed_retry", intk_ids=(101, 102)) == task_id   # the slot's task is held: none queued
+    assert [t["task_id"] for t in db.tasks] == [task_id]
+    assert run(reachy_tasks.task_due(db, 7)) is True   # but the doses still owed are medicine first
+    db.doses[102]["intake_stats"] = "taken"            # one of them taken meanwhile
+    run(reachy_tasks.set_status(7, DEVICE, task_id, "completed", {"outcomes": {"checkin": "medicine"}}))
+    (retry,) = [t for t in db.tasks if t["task_id"] != task_id]   # queued as the task ended, open doses only
+    assert (retry["reason"], retry["intk_ids"], retry["status"]) == ("missed_retry", [101], "queued")
+    assert retry["expires_at"] == T0 + timedelta(minutes=40)       # the retry's own expiry
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
+
+
+# ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────
+
+CHECKIN_CONSENT = {**ROBOT_CONSENT, **{scope: {"granted": True, "terms_version": config.TERMS_VERSION}
+                                       for scope in reachy_tasks.CHECKIN_SCOPES}}
+
+
+@pytest.fixture
+def live_ready(db, monkeypatch):
+    """Everything a live check-in needs: the .env test switch, the robot's switch, check-in consent and a checked
+    live model on an OpenAI connection."""
+    openai = ai_settings.Connection(2, "OpenAI", "openai", "https://api.openai.com/v1", "sk-proj-live-4444", "4444",
+                                    True, "OpenAI")
+    live = ai_settings.LiveSetting(2, "gpt-live-1", "marin", T0, 1180, None)
+    monkeypatch.setattr(ai_settings, "_snapshot", ai_settings.Snapshot({2: openai}, {}, {}, live=live))
+    monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    db.devices[7]["live_voice"] = True
+    db.consent[7] = CHECKIN_CONSENT
+    return db
+
+
+@pytest.mark.parametrize("reason, intk_ids", [("checkin", ()), ("upcoming", (101, 102, 103))])
+def test_a_task_says_live_when_every_condition_holds(live_ready, reason, intk_ids):
+    enqueue(live_ready, reason=reason, intk_ids=intk_ids)   # a dose task's check-in follows the same rule
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task["checkin"] is True and task["live"] is True
+    assert "sk-proj-live-4444" not in str(task)   # the robot never sees the OpenAI key
+
+
+@pytest.mark.parametrize("missing", ["test_switch", "robot_switch", "checkin_consent", "passed_check",
+                                     "device_revoked"])
+def test_a_task_says_no_live_when_any_condition_is_missing(live_ready, monkeypatch, missing):
+    enqueue(live_ready, reason="checkin", intk_ids=())
+    if missing == "test_switch":
+        monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
+    elif missing == "robot_switch":
+        live_ready.devices[7]["live_voice"] = False
+    elif missing == "checkin_consent":   # safety alerts withdrawn: no check-in at all, so no live one either
+        live_ready.consent[7] = {**CHECKIN_CONSENT,
+                                 "safety_alerts": {"granted": False, "terms_version": config.TERMS_VERSION}}
+    elif missing == "passed_check":
+        snapshot = ai_settings.current()
+        monkeypatch.setattr(ai_settings, "_snapshot", dataclasses.replace(
+            snapshot, live=dataclasses.replace(snapshot.live, last_error="live_auth")))
+    else:
+        live_ready.devices[7]["revoked"] = True
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task["live"] is False

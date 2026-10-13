@@ -72,7 +72,12 @@ def test_screen_flags_risk_words_but_not_everyday_phrases(text, kind):
     "我想死，你了解嗎", "我想死，後來想想算了", "我想死，心好痛",
     "我不想，活了",   # a pause the speech-to-text wrote as a comma
     "我想要死", "我要去死", "我好想要去死", "我不想活", "我真的不想活", "我不想再活了", "我不想再活下去了", "我不想活著",
-    "我恨不得去死", "讓我死了吧", "让我死了吧", "死了比較好", "我不如死掉", "活著有什麼意思", "我想自我了斷", "我想尋短",
+    "我恨不得去死", "讓我死了吧", "让我死了吧", "死了比較好", "我不如死掉", "活著有什麼意思",
+    "活著沒什麼意思", "我覺得活著沒什麼意思", "活着没什么意义", "活著沒有什麼意思", "活著還沒什麼意義", "活著真的沒什麼意思",
+    # final review of 11 Oct: common forms the 2 Oct pattern still missed
+    "活著真沒意思", "活着真没意思", "活著也沒什麼意思", "活著好沒意思", "活著都沒什麼意思", "活著根本沒有意義",
+    "活著已經沒有意義了", "活著真的很沒意思", "活得沒什麼意思", "活著沒啥意思", "活著實在沒意思", "活著一點意思都沒有",
+    "我想自我了斷", "我想尋短",
     "我想喝農藥", "我想喝农药", "我喝了一瓶農藥", "我想吃老鼠藥", "我想安樂死", "我想安乐死", "我想吊死", "我想去跳河",
     "我想跳海", "我想烧碳", "睡著就不要醒來最好", "我永遠不要醒來", "我不想再醒來",
     "I want to end it all", "I don't want to be alive", "我想kill myself",
@@ -95,6 +100,8 @@ def test_explicit_overdose_statements_match(text):
     "我想死後葬在老家", "今天去市場看到跳樓大拍賣", "那家店跳樓價", "最近好忙，好想消失一下", "早上好睏，不想醒來",
     "今天好累不想醒來", "早上好睏，都不想醒來了", "我們家的狗要安樂死了", "今天去田裡噴農藥", "我怕吃到農藥", "他死了好幾年了", "我不想去活動中心",
     "我不想活在過去",
+    "這個節目沒什麼意思", "我活著沒什麼問題", "他活著沒什麼意見", "活著真有意思", "他活得很有意義", "活得沒什麼問題",
+    "最近生活得沒什麼意思",   # 生活 (daily life) is left to the model on purpose: (?<!生) in the pattern
     # what a patient says right after a dose
     "我把早上的藥全部吃了", "早上的藥全部吃了", "這個月的藥全部吃完了", "我一次吃了兩顆，是醫生說的",
     "我早上一次吃了四種藥", "我一次吃了一大碗飯", "我生病以後吃了很多藥", "我這輩子吃了很多藥", "我每天要吃好多顆藥",
@@ -117,7 +124,7 @@ def _model_answers(monkeypatch, *answers):
     """Stands in for OpenRouter (conversation._post): call n gets answers[n], or the last one when they run out."""
     calls = []
 
-    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7):
+    def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7, target=None):
         calls.append({"messages": messages, "max_tokens": max_tokens, "model": model, "timeout": timeout,
                       "temperature": temperature})
         if info is not None:
@@ -416,6 +423,7 @@ class FakeDB:
         self.task = {"task_id": uuid.UUID(TASK_ID), "u_id": 7, "slot_time": None, "intk_ids": [],
                      "status": "in_progress", "lease_owner": DEVICE_ID, "reason": "manual"}
         self.conversations, self.turns, self.notifications = {}, [], []
+        self.user = {"reachy_call_name": None, "name": "Pearl"}   # the patient's "user" row (memory.call_name)
 
     def transaction(self):
         return self
@@ -427,6 +435,8 @@ class FakeDB:
         return False
 
     async def fetchrow(self, query, *args):
+        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
+            return dict(self.user) if args[0] == 7 else None
         if "FROM reachy_task WHERE task_id" in query:
             ok = str(self.task["task_id"]) == args[0] and self.task["u_id"] == args[1] and self.task["lease_owner"] == args[2]
             return dict(self.task) if ok else None
@@ -492,11 +502,11 @@ class FakeDB:
 
     async def execute(self, query, *args):
         if "INSERT INTO conversation " in query:
-            cid, u_id, task_id, language, model, followup = args
+            cid, u_id, task_id, language, model, followup, companion = args
             self.conversations[cid] = {"conversation_id": cid, "u_id": u_id, "language": language,
                                        "ended_at": None, "risk_flag": False, "summary": None, "mood": None,
                                        "after_chat_state": "done", "after_chat_attempts": 0,
-                                       "followup_memory_id": followup}
+                                       "followup_memory_id": followup, "companion": companion}
         elif "SET ended_at = NOW()" in query:
             self.conversations[args[0]].update(ended_at="now", end_reason=args[1], after_chat_state="pending")
         elif "SET after_chat_state" in query:
@@ -623,7 +633,7 @@ def _openrouter(monkeypatch, robot, **answers):
     sent.opens = []
 
     def post(messages, max_tokens, model=None, timeout=conversation.CALL_TIMEOUT, info=None, temperature=0.7,
-             tools=None, tool_choice=None):
+             target=None, tools=None, tool_choice=None):
         system = messages[0]["content"]
         kind = ("risk" if system == conversation.RISK_PROMPT else
                 "summary" if system in conversation.SUMMARY_PROMPT.values() else
@@ -667,7 +677,9 @@ def test_conversation_needs_every_checkin_consent(robot):
 
 def test_start_and_a_normal_turn(robot):
     opened = _start(robot)
-    assert opened["reply"] == conversation.OPENING["zh-TW"] and opened["speech_text"] == "今天感觉怎么样？想跟我聊聊吗？"
+    # Reachy calls the patient by the registered name (spec D), with or without memory consent.
+    assert opened["reply"] == "Pearl，" + conversation.OPENING["zh-TW"]
+    assert opened["speech_text"] == "Pearl，今天感觉怎么样？想跟我聊聊吗？"
     assert opened["reply_turn_id"] == 1
     body = _turn(robot, opened["conversation_id"], "我早上去散步了").json()
     assert isinstance(body.pop("server_ms"), int)
@@ -1312,6 +1324,47 @@ def test_memory_on_names_the_patient_and_sends_the_block(robot, monkeypatch):
     assert len(robot.checks) == 1 and _never_in_a_risk_check(robot, BLOCK)   # the risk check never gets it
 
 
+# ── What Reachy calls the patient (live voice spec D): with or without memory consent ──
+
+NAME_FACT = {"kind": "name", "subject": "preferred_name", "text": "王奶奶", "event_date": None, "source": "patient",
+             "created_at": None, "memory_id": "m", "followed_up_at": None}
+
+
+def test_without_memory_consent_the_opening_uses_the_cards_call_name(robot, monkeypatch):
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch, facts=[NAME_FACT])   # memory is off: the patient's memory name is not used
+    opened = _start(robot)
+    assert opened["reply"] == "阿嬤，" + conversation.OPENING["zh-TW"]
+    assert opened["speech_text"] == "阿嬷，今天感觉怎么样？想跟我聊聊吗？"
+    turn = dict(robot.db.turns[0])
+    metrics = turn.pop("metrics")
+    assert turn == {"turn_id": 1, "conversation_id": opened["conversation_id"], "role": "reachy",
+                    "text": opened["reply"], "flagged": False}
+    # The opening's dose status (get_today_dose_status) is stored in the background, so it may be there already.
+    assert metrics is None or (set(metrics) == {"server"} and set(metrics["server"]) == {"dose_tool"})
+
+
+def test_with_memory_consent_the_patients_memory_name_wins(robot, monkeypatch):
+    robot.state["consent"] = MEMORY_ON
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch, facts=[NAME_FACT])
+    assert _start(robot)["reply"] == "王奶奶，" + conversation.OPENING["zh-TW"]
+
+
+def test_with_memory_consent_and_no_memory_name_the_cards_call_name_is_used(robot, monkeypatch):
+    robot.state["consent"] = MEMORY_ON
+    robot.db.user["reachy_call_name"] = "阿嬤"
+    _memory(monkeypatch)
+    assert _start(robot)["reply"] == "阿嬤，" + conversation.OPENING["zh-TW"]
+
+
+def test_the_registered_name_is_used_only_when_it_passes_the_name_rules(robot):
+    english = robot.client.post("/api/device/conversations", json={"task_id": TASK_ID, "language": "en"}).json()
+    assert english["reply"] == "Pearl, how are you feeling today? Would you like to chat?"
+    robot.db.user["name"] = "Demo Patient 1790963685"
+    assert _start(robot)["reply"] == conversation.OPENING["zh-TW"]
+
+
 def test_no_memory_block_is_built_for_a_turn_the_model_does_not_answer(robot, monkeypatch):
     robot.state["consent"] = MEMORY_ON
     built = _memory(monkeypatch)
@@ -1407,3 +1460,65 @@ def test_a_turn_after_a_risk_turn_never_reaches_the_model(robot):
     body = _turn(robot, cid, "今天天氣很好").json()
     assert body["end"] is True and body["risk"] is True and body["reply"] == conversation.HELPLINE["zh-TW"]
     assert robot.prompts == [] and robot.checks == [] and len(robot.alerts) == 1
+
+
+def test_after_a_live_chat_falls_back_the_turn_limit_counts_from_the_fallback(robot):
+    # A live chat (live_session) that fell back to this text chat left its patient turns in the conversation and
+    # their number in conversation.live: the text chat's turn limit counts from the fallback (spec C3).
+    cid = _start(robot)["conversation_id"]
+    for number in range(8):
+        robot.db.turns.append({"turn_id": len(robot.db.turns) + 1, "conversation_id": cid, "role": "patient",
+                               "text": f"第{number}句", "flagged": False, "metrics": None})
+    robot.db.conversations[cid]["live"] = json.dumps({"usage_seconds": 30.0, "close_reason": "connection_lost",
+                                                      "fallback_reason": "live_closed", "live_patient_turns": 8})
+    for _ in range(conversation.MAX_PATIENT_TURNS - 1):
+        assert _turn(robot, cid, "嗯").json()["end"] is False
+    last = _turn(robot, cid, "嗯").json()
+    assert last["end"] is True and last["reply"] == conversation.CLOSING["zh-TW"]
+    assert len(robot.prompts[0]) == 10   # the replies still read the live chat's turns
+
+
+# ── Companion sessions (spec 2026-10-12-companion-session-design.md 3.3, 3.5): robot app 0.9.0 ──
+
+def _start_companion(robot):
+    response = robot.client.post("/api/device/conversations",
+                                 json={"task_id": TASK_ID, "language": "zh-TW", "companion": True})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_the_companion_flag_is_stored_and_an_older_robot_gets_false(robot):
+    older = _start(robot)["conversation_id"]   # a robot app before 0.9.0 sends no companion field
+    companion = _start_companion(robot)["conversation_id"]
+    assert robot.db.conversations[older]["companion"] is False
+    assert robot.db.conversations[companion]["companion"] is True
+
+
+def test_a_companion_chat_has_no_turn_limit_and_ends_on_a_goodbye(robot):
+    cid = _start_companion(robot)["conversation_id"]
+    for _ in range(conversation.MAX_PATIENT_TURNS + 4):
+        body = _turn(robot, cid, "嗯").json()
+        assert body["end"] is False and body["reply"] == "真好，您走了多久呢？"
+    bye = _turn(robot, cid, "好，拜拜").json()
+    assert bye["end"] is True and bye["risk"] is False and bye["reply"] == conversation.CLOSING["zh-TW"]
+    assert len(robot.prompts) == conversation.MAX_PATIENT_TURNS + 4   # the goodbye got the fixed line
+    assert robot.alerts == []
+
+
+def test_a_companion_chat_still_ends_on_a_risk(robot):
+    cid = _start_companion(robot)["conversation_id"]
+    for _ in range(conversation.MAX_PATIENT_TURNS):
+        assert _turn(robot, cid, "嗯").json()["end"] is False
+    body = _turn(robot, cid, "我覺得活不下去了").json()
+    assert body["end"] is True and body["risk"] is True and body["reply"] == conversation.HELPLINE["zh-TW"]
+    assert len(robot.alerts) == 1 and robot.db.conversations[cid]["risk_flag"] is True
+
+
+@pytest.mark.parametrize("reason", ["medicine", "patient_left"])
+def test_end_accepts_the_companion_reasons(robot, reason):
+    cid = _start_companion(robot)["conversation_id"]
+    _turn(robot, cid, "我早上去散步了")
+    response = robot.client.post(f"/api/device/conversations/{cid}/end", json={"reason": reason})
+    assert response.status_code == 200 and response.json() == {"ended": True}
+    assert robot.db.conversations[cid]["end_reason"] == reason
+    assert _eventually(lambda: robot.db.conversations[cid]["summary"] == "談到散步，心情愉快。")

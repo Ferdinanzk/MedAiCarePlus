@@ -12,6 +12,7 @@ import wave
 from pathlib import Path
 from typing import Protocol
 
+import httpx
 import numpy as np
 
 from medcare_reachy.bridge import moves
@@ -34,6 +35,14 @@ NEUTRAL_ANTENNAS = (-0.1745, 0.1745)   # rad, [right, left]: reachy_mini's INIT_
 # Provisional (the robot's journal could not be read): re-derive both from those log lines.
 NEUTRAL_TOLERANCE = {"head_deg": 4.5, "head_mm": 6.0, "body_deg": 1.5, "antenna_deg": 3.0}
 RECENTER_LIMIT = {"head_deg": 15.0, "head_mm": 20.0, "body_deg": 8.0, "antenna_deg": 30.0}
+DAEMON_PORT = 8000
+MEDIA_STATUS_TIMEOUT = 2.0   # seconds: the camera watchdog logs the daemon's media status with every stall
+RESTORE_RETRY_SECONDS = 60.0   # restore_media(): while the daemon refuses, ask again at most this often
+RECORDING_RETRY_SECONDS = 5.0  # get_audio(): after the microphone failed to start, try again this often
+LIVE_RATE = 16000   # the live chat's audio (bridge/live.py): the robot's own rate, so the SDK needs no resampling
+# stop_live_audio(): the SDK still plays what the live chat pushed last, about 0.17 s through its pipeline plus its
+# 50 ms sink buffer (audio_gstreamer.py PLAYBACK_SINK_BUFFER_TIME_US); the next clip waits that out.
+LIVE_TAIL_SECONDS = 0.3
 
 
 class Robot(Protocol):
@@ -44,10 +53,17 @@ class Robot(Protocol):
     def set_head(self, pose: np.ndarray) -> None: ...
     def hold_head(self) -> None: ...
     def look_around(self, step: int) -> None: ...
+    def look_at(self, u: float, v: float, duration: float) -> None: ...   # face centre in the streamed frame (0-1)
     def wake(self) -> None: ...
     def sleep(self) -> None: ...
     def is_reachable(self) -> bool: ...
+    def restore_media(self) -> bool: ...   # ask for released media back (speaker, microphone, camera); never raises
     def gesture(self, mode: str | None) -> None: ...   # check-in body language: "think", "speak", None (still)
+    # The live chat (bridge/live.py) owns the speaker from start_live_audio() to stop_live_audio(); no clip plays then.
+    def start_live_audio(self) -> bool: ...   # False: no speaker now
+    def push_audio(self, samples: np.ndarray) -> bool: ...   # one block, float32 mono at LIVE_RATE, not waited for
+    def clear_live_audio(self) -> None: ...   # drop what the speaker still has queued
+    def stop_live_audio(self) -> None: ...
 
 
 def crop_4_3(frame: np.ndarray) -> np.ndarray:
@@ -129,8 +145,16 @@ class ReachyRobot:
         self.host = host
         self._mini = None
         self._owned = True              # False when a Reachy Mini app runtime owns the connection
+        daemon_host = "127.0.0.1" if host == "localhost" else host
+        self._media_status_url = f"http://{daemon_host}:{DAEMON_PORT}/api/media/status"
         self._lock = threading.Lock()   # audio: the SDK is driven from worker threads
         self._quiet_at = 0.0            # when the last clip handed to the speaker has finished playing
+        self._restore_failing = False   # restore_media(): the daemon refused, already logged for this streak
+        self._restore_retry_at = 0.0    # restore_media(): when a refused streak may ask the daemon again
+        self._now = time.monotonic      # clock for restore_media()'s retry pace (tests replace it)
+        self._recording_media = None    # get_audio(): the media manager whose microphone this app has started
+        self._recording_retry_at = 0.0  # get_audio(): after a failed start, when to try again
+        self._recording_failed = False  # get_audio(): a failed start is already logged
         # Gestures start only after hold_head() and stop for every other move (wake, sleep, look_around, close).
         self._gestures = Gestures(self._send_gesture, ready=self._motors_on, start_from=self._start_pose,
                                   move=thinking_move())
@@ -172,25 +196,59 @@ class ReachyRobot:
         frame = self.get_camera_frame()
         return None if frame is None else crop_4_3(frame)
 
+    def _media(self):
+        """The SDK's media manager now, or None: no connection, or this app's media is released (during a camera
+        recovery, or after one whose acquire failed; the SDK would log a warning on every call then).
+
+        acquire_media() replaces the manager, so it is looked up on every call, never kept.
+        """
+        if self._mini is None or getattr(self._mini, "media_released", False):
+            return None
+        return self._mini.media
+
     def get_camera_frame(self) -> np.ndarray | None:
         """The camera's 1280x720 BGR frame, or None when no new one came within ~20 ms.
 
         The daemon shares the camera with apps at its own rate: 10 fps on reachy_mini 1.11 (IPC_FPS), whatever
         this app asks for.
         """
-        if self._mini is None:
-            return None
-        return self._mini.media.get_frame()
+        media = self._media()
+        return None if media is None else media.get_frame()
 
     def get_audio(self) -> tuple[np.ndarray, int] | None:
         """The microphone samples received since the last call (float32) and their rate, or None."""
-        if self._mini is None:
+        media = self._media()
+        if media is None:
             return None
-        media = self._mini.media
+        self._ensure_recording(media)
         samples = media.get_audio_sample()
         if samples is None or len(samples) == 0:
             return None
         return np.asarray(samples, dtype=np.float32), int(media.get_input_audio_samplerate())
+
+    def _ensure_recording(self, media) -> None:
+        """Start the SDK's microphone pipeline once per media manager (acquire_media() builds a new one).
+
+        Reachy Mini SDK 1.8.3, which the robot came back with after its reset on 12 Oct 2026, keeps the microphone
+        in a pipeline of its own that runs only after start_recording(), and nothing else calls it: every read was
+        empty, so neither 「我吃完了」 nor a check-in was ever heard. Starting it again is harmless (it only sets the
+        pipeline playing). A failed start is logged once and tried again after RECORDING_RETRY_SECONDS."""
+        if self._recording_media is media:
+            return
+        now = self._now()
+        if now < self._recording_retry_at:
+            return
+        try:
+            media.start_recording()
+        except Exception:
+            if not self._recording_failed:
+                log.exception("the microphone did not start; trying again every %.0f s", RECORDING_RETRY_SECONDS)
+            self._recording_failed = True
+            self._recording_retry_at = now + RECORDING_RETRY_SECONDS
+            return
+        if self._recording_failed:
+            log.info("the microphone started")
+        self._recording_media, self._recording_failed, self._recording_retry_at = media, False, 0.0
 
     def play_clip(self, path: Path, wait: bool = True) -> bool:
         """Play a WAV, blocking for its length; `wait=False` returns as soon as it is handed to the speaker.
@@ -198,15 +256,18 @@ class ReachyRobot:
         A clip never starts while the previous one is still playing: the SDK's start_playing() restarts the
         stream's timestamps, so overlapping clips would clip or mix.
         """
-        if self._mini is None:
+        media = self._media()
+        if media is None:
             return False
         samples, rate = read_wav(Path(path))
-        media = self._mini.media
         out_rate = int(media.get_output_audio_samplerate())
         samples = resample(samples, rate, out_rate)
         seconds = len(samples) / out_rate
         with self._lock:
             time.sleep(max(0.0, self._quiet_at - time.monotonic()))
+            media = self._media()   # a camera recovery may have replaced the manager while this waited
+            if media is None:
+                return False
             media.start_playing()
             for start in range(0, len(samples), self.CHUNK):
                 media.push_audio_sample(samples[start:start + self.CHUNK])
@@ -214,6 +275,163 @@ class ReachyRobot:
         if wait:
             # Playback is asynchronous in the SDK; keep the robot quiet for the clip's length.
             time.sleep(seconds)
+        return True
+
+    # ── the live chat's speaker (bridge/live.py) ─────────────────────────
+    def start_live_audio(self) -> bool:
+        """Start the speaker for a live chat, which owns it until stop_live_audio(): the SDK's start_playing() once,
+        after any clip still playing, then push_audio() blocks paced by the chat. False when this app has no media."""
+        with self._lock:
+            time.sleep(max(0.0, self._quiet_at - time.monotonic()))   # never cut a clip short
+            media = self._media()
+            if media is None:
+                return False
+            media.start_playing()
+        return True
+
+    def push_audio(self, samples: np.ndarray) -> bool:
+        """One block of the live chat's audio (float32 mono at LIVE_RATE), handed to the speaker without waiting: the
+        SDK plays pushed blocks back to back, so the caller paces them. False when this app has no media."""
+        with self._lock:
+            media = self._media()
+            if media is None:
+                return False
+            samples = np.asarray(samples, dtype=np.float32)
+            out_rate = int(media.get_output_audio_samplerate())
+            media.push_audio_sample(resample(samples, LIVE_RATE, out_rate))   # 16 kHz on the robot: no change
+        return True
+
+    def clear_live_audio(self) -> None:
+        """Drop what the speaker still has queued (the live chat's flush), with the SDK's clear_player(). In reachy_mini
+        1.11.0 that call is on the media manager's audio object (the manager has none): GStreamerAudio pauses its one
+        pipeline, flushes the player and plays again. Does nothing without media."""
+        with self._lock:
+            media = self._media()
+            clear = getattr(getattr(media, "audio", None), "clear_player", None)
+            if clear is not None:
+                clear()
+
+    def stop_live_audio(self) -> None:
+        """The live chat is over. Never the SDK's stop_playing(): GStreamerAudio keeps the microphone and the speaker in
+        one pipeline, which stop_playing() sets to NULL, and the speech listener would then hear nothing. The next clip
+        starts the playback itself (play_clip) and waits LIVE_TAIL_SECONDS for the audio the chat pushed last."""
+        with self._lock:
+            self._quiet_at = max(self._quiet_at, time.monotonic() + LIVE_TAIL_SECONDS)
+
+    def media_status(self) -> dict | None:
+        """The daemon's GET /api/media/status ({"available", "released", "no_media"}), or None on any error."""
+        try:
+            response = httpx.get(self._media_status_url, timeout=MEDIA_STATUS_TIMEOUT)
+            response.raise_for_status()
+            status = response.json()
+        except Exception as exc:   # the daemon busy or gone, or not JSON: the status is only logged
+            log.warning("daemon media status unavailable: %r", exc)
+            return None
+        return status if isinstance(status, dict) else None
+
+    def reopen_camera(self) -> str:
+        """Get the camera feed back after it stalled (the camera watchdog's recovery, spec 2026-10-11 A2).
+
+        Uses the SDK's public media calls (reachy_mini 1.11.0, reachy_mini.py:203-240):
+        - release_media() closes this app's media manager and marks it released; it also asks the daemon to release
+          its media, which the daemon ignores when it already has (daemon.py:145-146), e.g. after the TCU companion
+          released it;
+        - acquire_media() asks the daemon for its media back (daemon.py:155-169 restarts its pipeline) and builds a
+          fresh media manager. On its own it does nothing unless this app's media is marked released, hence the
+          release first.
+        Returns "acquired" (the daemon had released its media, or lost it), "reopened" (the daemon had it: the cycle
+        renewed this app's reader) or "failed: <reason>". Never raises.
+
+        The media manager holds the speaker and the microphone too, so this waits for a clip still playing, holds the
+        playback lock throughout, and starts the fresh manager's audio pipeline, which every clip used to leave
+        running (play_clip and get_audio look the manager up on every call).
+        """
+        mini = self._mini
+        if mini is None:
+            return "failed: no robot connection"
+        try:
+            with self._lock:
+                time.sleep(max(0.0, self._quiet_at - time.monotonic()))   # never cut a clip short
+                return self._renew_media(mini)
+        except Exception as exc:   # a failed attempt: the watchdog tries again later
+            log.exception("camera recovery failed")
+            return f"failed: {exc!r}"
+
+    def _renew_media(self, mini) -> str:
+        """reopen_camera's release/acquire cycle, with the playback lock held."""
+        status = None
+        if getattr(mini, "media_released", False):
+            outcome = "acquired"   # an earlier attempt released this app's media and the daemon kept it: ask again
+        else:
+            status = self.media_status()
+            if status is not None and status.get("no_media"):
+                return "failed: the daemon runs without media"
+            daemon_has_it = status is None or (status.get("available") and not status.get("released"))
+            outcome = "reopened" if daemon_has_it else "acquired"
+            mini.release_media()
+        mini.acquire_media()
+        if getattr(mini, "media_released", False):
+            return "failed: the daemon did not give the media back"
+        try:
+            mini.media.start_recording()
+        except Exception:   # the camera is back; the microphone restarts with the next clip anyway
+            log.exception("the microphone did not restart after the camera recovery")
+        # The fresh manager is LOCAL when the daemon's camera socket is there; a "webrtc" here means it wasn't yet.
+        log.info("camera recovery: %s with the SDK's release_media() and acquire_media() (daemon media status %s, "
+                 "media backend %s)", outcome, status, getattr(mini.media, "backend", None))
+        return outcome
+
+    def media_released(self) -> bool:
+        """Whether the SDK has this app's media released: camera, speaker and microphone all off (a camera recovery
+        whose acquire the daemon refused). The camera watchdog reads it when it gives up."""
+        return self._mini is not None and bool(getattr(self._mini, "media_released", False))
+
+    def restore_media(self) -> bool:
+        """Ask for this app's media back when the SDK says it is released; returns whether this app has it now.
+
+        A camera recovery releases the whole media manager, the speaker and the microphone with the camera. When the
+        daemon refused to give it back, only an attached, stalled session's watchdog used to ask again, so after a
+        give-up Reachy stayed mute and deaf (final review of 11 Oct). The runner calls this at every heartbeat and
+        before a task wakes the robot. It only ever calls the SDK's acquire_media(), never release_media(), so media
+        this app has is never touched; it holds the playback lock, as the recovery does, and starts the fresh
+        manager's microphone. Never raises: a refusal or an SDK error logs one WARNING per streak of failures.
+        While the daemon keeps refusing it asks again at most once every RESTORE_RETRY_SECONDS: the SDK logs a WARNING
+        and an ERROR for each refused acquire and its request can take 10 s, so asking at every heartbeat filled the
+        robot's log and delayed the heartbeat.
+        """
+        mini = self._mini
+        if mini is None:
+            return False
+        if not getattr(mini, "media_released", False):
+            self._restore_failing = False
+            return True
+        if self._restore_failing and self._now() < self._restore_retry_at:
+            return False   # refused a moment ago: wait before asking the daemon again
+        failure, restored = None, False
+        try:
+            with self._lock:
+                if getattr(mini, "media_released", False):   # a camera recovery may have got it back meanwhile
+                    mini.acquire_media()
+                    if getattr(mini, "media_released", False):
+                        failure = "the daemon did not give the media back"
+                    else:
+                        restored = True
+                        try:
+                            mini.media.start_recording()
+                        except Exception:   # the speaker works again; only the microphone is missing
+                            log.exception("the microphone did not restart after the media came back")
+        except Exception as exc:   # asked again at the next heartbeat
+            failure = repr(exc)
+        if failure is not None:
+            if not self._restore_failing:
+                log.warning("this app's media is still released (%s): the speaker and microphone stay off; asking "
+                            "again about once a minute", failure)
+            self._restore_failing = True
+            self._restore_retry_at = self._now() + RESTORE_RETRY_SECONDS
+            return False
+        self._restore_failing = False
+        if restored:
+            log.info("this app's media is back with the SDK's acquire_media(): camera, speaker and microphone")
         return True
 
     def gesture(self, mode: str | None) -> None:
@@ -291,6 +509,23 @@ class ReachyRobot:
     def look_around(self, step: int) -> None:
         self.set_head(head_pose(SCAN_YAWS_DEG[step % len(SCAN_YAWS_DEG)], pitch_deg=-5), duration=1.5)
 
+    def look_at(self, u: float, v: float, duration: float = 0.35) -> None:
+        """Turn the head towards a point of the streamed frame (normalised 0-1, see runner.encode_stream_jpeg):
+        the server's face box is in that 4:3 centre crop, the SDK's look_at_image wants a pixel of the camera's
+        own image."""
+        media = self._media()
+        if self._mini is None or media is None:
+            return
+        camera = getattr(media, "camera", None)
+        width, height = (getattr(camera, "resolution", None) or (1280, 720))[:2]
+        crop_width = min(width, int(height * 4 / 3))
+        x0 = (width - crop_width) // 2
+        px = int(round(x0 + min(1.0, max(0.0, u)) * crop_width))
+        py = int(round(min(1.0, max(0.0, v)) * height))
+        px, py = min(width - 1, max(1, px)), min(height - 1, max(1, py))
+        self._gestures.halt()
+        self._mini.look_at_image(px, py, duration=duration)
+
     def wake(self) -> None:
         if self._mini is None:
             return
@@ -339,10 +574,25 @@ class VideoFileRobot:
     def get_audio(self) -> None:
         return None   # no microphone when replaying a file
 
+    def restore_media(self) -> bool:
+        return True   # a video file has no media to give back
+
     def play_clip(self, path: Path, wait: bool = True) -> bool:
         self.actions.append(("play_clip", Path(path).name))
         log.info("[video robot] play %s", path)
         return True
+
+    def start_live_audio(self) -> bool:
+        return False   # no microphone to stream: a live chat falls back to the text chat
+
+    def push_audio(self, samples: np.ndarray) -> bool:
+        return False
+
+    def clear_live_audio(self) -> None:
+        pass
+
+    def stop_live_audio(self) -> None:
+        pass
 
     def gesture(self, mode: str | None) -> None:
         self.actions.append(("gesture", mode))
@@ -355,6 +605,9 @@ class VideoFileRobot:
 
     def look_around(self, step: int) -> None:
         self.actions.append(("look_around", step))
+
+    def look_at(self, u: float, v: float, duration: float = 0.35) -> None:
+        self.actions.append(("look_at", round(u, 2), round(v, 2)))
 
     def wake(self) -> None:
         self.actions.append(("wake",))

@@ -46,6 +46,13 @@ ACTIVE_EVENT_STAGES = ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING")
 # verified, and afterwards at most every 0.5 s (its verified_at gate), so identity never exceeds 2 Hz.
 VISION_INTERVAL = 0.5
 DOSE_VISION_INTERVAL = 0.25
+# A robot session's identity log (_log_identity): a line on every change of identity_status, otherwise at most one
+# per IDENTITY_LOG_SECONDS (identity runs up to 2 Hz).
+IDENTITY_LOG_SECONDS = 5.0
+# The OpenVINO-only rule (openvino_only) counts a hit only for a patient face at least this share of the frame's
+# width wide: about 32 px of the robot's 480x360 frame. The MediaPipe gate set a floor of about 50 px by itself;
+# without one, faces of about 24 px matched at distances of 0.20-0.27, close to the 0.3 threshold (review of 11 Oct).
+OPENVINO_ONLY_MIN_FACE_FRACTION = 0.065
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +143,12 @@ class MonitorSession:
     display_name: str
     # 'observe' sessions carry no dose and have no commit path (see vision()).
     mode: str = "dose"
+    # The mode the session started in (set in __post_init__), never changed: `mode` becomes 'observe' after a record,
+    # so only this tells the search before talking (a robot session started in 'observe') apart (openvino_only).
+    started_mode: str = ""
+    # The robot started this session for a check-in task (reachy_task.reason 'checkin', read at
+    # /api/device/monitor/start): its search verifies with the OpenVINO match alone (openvino_only).
+    checkin_search: bool = False
     client_type: str = "browser"
     auto_commit: bool = True
     detector_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -148,12 +161,18 @@ class MonitorSession:
     # frame that produced it while a newer landmark request is arriving.
     packets: dict[int, dict] = field(default_factory=dict)
     verified_at: float = 0.0
+    # The last hit that made the status "verified" (identity_hits >= 2; monotonic): the live relay's camera-first
+    # check (live_session.patient_seen_recently) counts only a verified sighting, never a first hit still "verifying"
+    confirmed_at: float = 0.0
     identity_hits: int = 0
     identity_frame_seq: int = 0
     target_box: list | None = None
     last_identity_box: list | None = None
     identity_distance: float | None = None
     identity_status: str = "searching"
+    # The identity log (_log_identity): the status it last logged, and when (monotonic).
+    identity_logged_status: str | None = None
+    identity_logged_at: float = float("-inf")
     # The live expression shown to the client: only ever an uncovered face.
     emotion: dict | None = None
     # The latest scored face had its mouth covered (a hand at the mouth): scored, kept as an occluded sample.
@@ -198,6 +217,10 @@ class MonitorSession:
     # When the session began (wall clock, the overdose rules' clock): start had allowed the dose then, so a pill seen
     # later in the session is judged for "due" and "expired" at this moment (dose_safety.evaluate's started_at).
     started_at: datetime.datetime = field(default_factory=schedule.current_time)
+
+    def __post_init__(self) -> None:
+        if not self.started_mode:
+            self.started_mode = self.mode
 
     def verified(self, now: float | None = None) -> bool:
         return self.identity_hits >= 2 and (now or time.monotonic()) - self.verified_at <= 1.5
@@ -310,6 +333,36 @@ def vision_interval(state: MonitorSession) -> float:
     return VISION_INTERVAL
 
 
+def openvino_only(state: MonitorSession) -> bool:
+    """The identity rule of a check-in's camera: a robot session that started in observe mode for a check-in task
+    (the search before the chat), or that /api/device/monitor/start received with companion true (robot app 0.9.0,
+    which keeps its camera on during the chat and never records), is marked checkin_search and verifies the patient
+    with the OpenVINO match alone. MediaPipe's short-range face detector misses faces under about 50 px wide (beyond
+    about 1.35 m from the robot), where dashboard login, which uses OpenVINO alone, still works. Under this rule a hit
+    needs a patient face at least OPENVINO_ONLY_MIN_FACE_FRACTION of the frame's width wide. No dose is ever recorded
+    from such a session. Every other session also needs a MediaPipe face on the same box: dose sessions (also once a
+    record switched them to observe), browser sessions, and the search and the watch of a dose task. Narrowed to
+    check-in searches after the final review of 11 Oct: a dose task's search could verify a patient the strict dose
+    session after it then found 'ambiguous', and the robot asked that patient for the person whose medicine it was."""
+    return state.client_type == "reachy" and state.started_mode == "observe" and state.checkin_search
+
+
+def _log_identity(state: MonitorSession, rule: str, distance: float | None, box_px: int | None,
+                  ov_faces: int, mp_faces: int) -> None:
+    """One INFO line for a robot session's identity check: on every change of identity_status, otherwise at most one
+    per IDENTITY_LOG_SECONDS. Numbers only: no image, name or face label."""
+    if state.client_type != "reachy":
+        return
+    now = time.monotonic()
+    if state.identity_status == state.identity_logged_status and now - state.identity_logged_at < IDENTITY_LOG_SECONDS:
+        return
+    state.identity_logged_status, state.identity_logged_at = state.identity_status, now
+    log.info("identity of session %s: status=%s rule=%s distance=%s box_px=%s ov_faces=%d mp_faces=%d",
+             state.session_id, state.identity_status, rule,
+             "none" if distance is None else f"{distance:.3f}", "none" if box_px is None else box_px,
+             ov_faces, mp_faces)
+
+
 class MonitorRegistry:
     def __init__(self):
         self.sessions: dict[str, MonitorSession] = {}
@@ -322,7 +375,8 @@ class MonitorRegistry:
             raise BusyOtherClient(old.client_type)
 
     def start(self, u_id: int, intk_id: int | None, face_label: str, display_name: str, *,
-              mode: str = "dose", client_type: str = "browser", auto_commit: bool = True) -> MonitorSession:
+              mode: str = "dose", client_type: str = "browser", auto_commit: bool = True,
+              checkin_search: bool = False) -> MonitorSession:
         if mode not in MODES:
             raise ValueError("Unknown monitor mode")
         if client_type not in CLIENT_TYPES:
@@ -346,13 +400,15 @@ class MonitorRegistry:
                 if self.by_user.get(session.u_id) == session_id:
                     self.by_user.pop(session.u_id, None)
         state = MonitorSession(str(uuid.uuid4()), str(uuid.uuid4()), u_id, intk_id, face_label.lower(), display_name,
-                               mode=mode, client_type=client_type, auto_commit=bool(auto_commit))
+                               mode=mode, client_type=client_type, auto_commit=bool(auto_commit),
+                               checkin_search=bool(checkin_search))
         self.sessions[state.session_id] = state
         self.by_user[u_id] = state.session_id
         return state
 
     async def replace(self, u_id: int, intk_id: int | None, face_label: str, display_name: str, *,
-                      mode: str = "dose", client_type: str = "browser", auto_commit: bool = True) -> MonitorSession:
+                      mode: str = "dose", client_type: str = "browser", auto_commit: bool = True,
+                      checkin_search: bool = False) -> MonitorSession:
         """Close an existing detector session before replacing its registry entry.
 
         First holder wins across client types: a live session (activity within
@@ -368,7 +424,7 @@ class MonitorRegistry:
                 old.ended = True
                 await IntakeDetectionService.get_instance().end_session(old.u_id, old.detector_session_id)
         return self.start(u_id, intk_id, face_label, display_name,
-                          mode=mode, client_type=client_type, auto_commit=auto_commit)
+                          mode=mode, client_type=client_type, auto_commit=auto_commit, checkin_search=checkin_search)
 
     async def end(self, state: MonitorSession) -> None:
         async with state.lock:
@@ -516,6 +572,7 @@ class MonitorRegistry:
                 return state.public()
             now = time.monotonic()
             if matches is not None:
+                rule = "openvino_only" if openvino_only(state) else "with_mediapipe"
                 targets = [face for face in matches["faces"] if face["label"].lower() == state.face_label]
                 if matches["error"] or matches["saturated"] or len(targets) != 1:
                     state.identity_hits = 0
@@ -525,11 +582,19 @@ class MonitorRegistry:
                     target = targets[0]
                     h, w = frame.shape[:2]
                     box = [target["box"][0] / w, target["box"][1] / h, target["box"][2] / w, target["box"][3] / h]
-                    geometric_matches = sorted(((overlap(face["box"], box), i) for i, face in enumerate(faces)), reverse=True)
-                    if not geometric_matches or geometric_matches[0][0] < .20 or len(faces) >= 4:
+                    failed = None   # the status of a check that is not a hit
+                    if rule == "with_mediapipe":
+                        # The MediaPipe gate: a MediaPipe face on the same box, in a frame of fewer than 4 faces.
+                        geometric_matches = sorted(((overlap(face["box"], box), i) for i, face in enumerate(faces)),
+                                                   reverse=True)
+                        if not geometric_matches or geometric_matches[0][0] < .20 or len(faces) >= 4:
+                            failed = "ambiguous"
+                    elif target["box"][2] < OPENVINO_ONLY_MIN_FACE_FRACTION * w:
+                        failed = "searching"   # too small to trust the OpenVINO match alone
+                    if failed:
                         state.identity_hits = 0
                         state.target_box = None
-                        state.identity_status = "ambiguous"
+                        state.identity_status = failed
                     else:
                         if state.last_identity_box and overlap(box, state.last_identity_box) < .20:
                             state.identity_hits = 0
@@ -539,7 +604,15 @@ class MonitorRegistry:
                         state.identity_frame_seq = frame_seq
                         state.identity_distance = target["distance"]
                         state.verified_at = now
+                        if state.identity_hits >= 2:
+                            state.confirmed_at = now
                         state.identity_status = "verified" if state.identity_hits >= 2 else "verifying"
+                # The closest patient-labelled face (its OpenVINO box is in pixels of this frame). A frame of 4 or
+                # more faces comes back saturated with no faces at all: logged as 4.
+                best = min(targets, key=lambda face: face["distance"], default=None)
+                _log_identity(state, rule, None if best is None else best["distance"],
+                              None if best is None else best["box"][2],
+                              4 if matches["saturated"] else len(matches["faces"]), len(faces))
             if not state.verified(now) or state.target_box is None:
                 state.emotion, state.emotion_occluded = None, False
                 return state.public()

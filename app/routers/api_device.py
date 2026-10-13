@@ -1,7 +1,7 @@
 """Robot device API, served only on the private port (main.py enforces the port rule).
 
-Every route authenticates a device token (device_auth.get_device) and acts only
-for that device's own patient.
+Every route authenticates a device token (device_auth.get_device; the live chat's
+WebSocket: device_auth.get_device_ws) and acts only for that device's own patient.
 """
 
 import asyncio
@@ -13,19 +13,18 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, WebSocket
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app import config
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
-from app.services import (after_chat, consent_service, conversation, dose_safety, dose_status, dose_video, memory,
-                          outbox,
-                          reachy_tasks, schedule)
-from app.services.device_auth import get_device, get_device_for_heartbeat
+from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_status, dose_video,
+                          live_session, memory, outbox, reachy_tasks, schedule)
+from app.services.device_auth import get_device, get_device_for_heartbeat, get_device_ws
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
+from app.services.live_session import _in_background
 from app.services.monitor_service import LABELS, BusyOtherClient, registry
 
 log = logging.getLogger(__name__)
@@ -74,18 +73,29 @@ class ExtraEventPayload(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+class CameraReport(BaseModel):
+    """The robot's camera as its watchdog reports it (robot app 0.7.0+). idle: no session, so 0 fps is normal."""
+    state: Literal["idle", "ok", "stalled", "recovering", "unavailable"]
+    fps: float | None = Field(default=None, ge=0, le=240, allow_inf_nan=False)
+    since: float | None = Field(default=None, allow_inf_nan=False)   # unix seconds (robot clock) of the last state change
+    media: dict | None = None    # the robot daemon's GET /api/media/status answer, e.g. {"available", "released"}
+
+
 class HeartbeatPayload(BaseModel):
     robot_reachable: bool | None = None
     landmark_fps: float | None = Field(default=None, ge=0, le=240)
     vision_fps: float | None = Field(default=None, ge=0, le=240)
     bridge_version: str | None = Field(default=None, max_length=50)
     missing_clips: int | list[str] | None = None
+    camera: CameraReport | None = None   # robots older than 0.7.0 send none
+    companion: bool = False   # robot app 0.9.0: a companion session runs; keep its task from expiring
 
 
 class MonitorStartPayload(BaseModel):
     mode: Literal["dose", "observe"]
     intk_id: int | None = Field(default=None, gt=0)
     task_id: str | None = None
+    companion: bool = False   # robot app 0.9.0: an observe session of a companion session (spec 3.2)
 
 
 def _uuid(value: str | None) -> str | None:
@@ -98,10 +108,7 @@ def _uuid(value: str | None) -> str | None:
 
 
 async def _leased_task(conn, device: dict, task_id: str):
-    task = await conn.fetchrow(
-        "SELECT task_id, u_id, slot_time, intk_ids, status, reason FROM reachy_task "
-        "WHERE task_id = $1::uuid AND u_id = $2 AND lease_owner = $3::uuid",
-        _uuid(task_id), device["u_id"], device["device_id"])
+    task = await conn.fetchrow(live_session.LEASED_TASK_SQL, _uuid(task_id), device["u_id"], device["device_id"])
     if not task:
         raise HTTPException(404, "Task not found")
     return task
@@ -202,6 +209,7 @@ async def extra_event(task_id: str, payload: ExtraEventPayload, device: dict = D
 class ConversationStartPayload(BaseModel):
     task_id: str
     language: Literal["zh-TW", "en"] = "zh-TW"
+    companion: bool = False   # robot app 0.9.0's companion session: no turn limit (companion spec 3.3)
 
 
 MAX_METRIC_KEYS = 30
@@ -255,18 +263,9 @@ class TurnMetricsPayload(BaseModel):
 
 
 class ConversationEndPayload(BaseModel):
-    reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error"] = "finished"
-
-
-_background: set = set()
-
-
-def _in_background(coro) -> asyncio.Task:
-    """Run after the response; the reference keeps the task from being garbage-collected mid-run."""
-    task = asyncio.create_task(coro)
-    _background.add(task)
-    task.add_done_callback(_background.discard)
-    return task
+    # Robot app 0.9.0 (companion spec 3.5): patient_left after its rest rule, medicine when a medicine task fell due.
+    reason: Literal["finished", "goodbye", "silence", "risk", "patient_left", "stopped", "error",
+                    "medicine"] = "finished"
 
 
 def _ms_since(started: float) -> int:
@@ -331,7 +330,7 @@ async def _own_conversation(conn, device: dict, conversation_id: str):
     except ValueError as exc:
         raise HTTPException(404, "Conversation not found") from exc
     row = await conn.fetchrow(
-        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id FROM conversation "
+        "SELECT conversation_id, language, ended_at, risk_flag, followup_memory_id, live, companion FROM conversation "
         "WHERE conversation_id = $1::uuid AND u_id = $2 FOR UPDATE", conversation_id, device["u_id"])
     if not row:
         raise HTTPException(404, "Conversation not found")
@@ -345,11 +344,18 @@ async def _history(conn, conversation_id) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _live_patient_turns(row) -> int:
+    """Patient turns a live chat stored before it fell back to this text chat (live_session, spec C3): the text
+    chat's turn limit counts from the fallback, so they are left out of it."""
+    live = row.get("live")
+    live = json.loads(live) if isinstance(live, str) else live   # asyncpg hands JSONB back as text
+    return int((live or {}).get("live_patient_turns") or 0)
+
+
 async def _add_turn(conn, conversation_id, u_id: int, role: str, text: str, flagged: bool = False,
                     metrics: dict | None = None) -> int:
     return await conn.fetchval(
-        "INSERT INTO conversation_turn (conversation_id, u_id, role, text, flagged, metrics) "
-        "VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb) RETURNING turn_id",
+        live_session.INSERT_TURN_SQL,
         str(conversation_id), u_id, role, text, flagged, json.dumps(metrics) if metrics is not None else None)
 
 
@@ -365,17 +371,17 @@ def _spoken(reply: str, language: str, end: bool, reply_turn_id: int, risk: bool
 
 @router.post("/conversations")
 async def conversation_start(payload: ConversationStartPayload, device: dict = Depends(get_device)):
-    """Open a check-in conversation for a task leased by this robot; returns the opening line."""
+    """Open a check-in conversation for a task leased by this robot; returns the opening line. A companion session
+    (robot app 0.9.0 sends companion: true) is stored as such: its chat has no turn limit (companion spec 3.3)."""
     await _checkin_consent(device)
     language = conversation.language_of(payload.language)
     conversation_id = str(uuid.uuid4())
     memory_on = memory.consent_current(await consent_service.get_state(device["u_id"]))
     async with get_pool().acquire() as conn, conn.transaction():
         task = await _leased_task(conn, device, payload.task_id)
-        name, followup = None, None
-        if memory_on:
-            name = memory.preferred_name(await memory.current_facts(conn, device["u_id"]))
-            followup = await memory.pick_followup(conn, device["u_id"], memory.local_today())
+        # The name: the memory 'name' entry (memory on), else the Reachy card's call name, else the registered name.
+        name = await memory.call_name(conn, device["u_id"], memory_on)
+        followup = await memory.pick_followup(conn, device["u_id"], memory.local_today()) if memory_on else None
         if task["reason"] == "checkin":
             opening = {
                 "zh-TW": "我來提醒您查看用藥時間表，並依照處方在排定時間服藥。若現在還沒到時間，請不要提前服用。需要我陪您確認嗎？",
@@ -384,10 +390,10 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
         else:
             opening = memory.opening_line(language, name)
         await conn.execute(
-            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id) "
-            "VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid)",
+            "INSERT INTO conversation (conversation_id, u_id, task_id, language, model, followup_memory_id, "
+            "companion) VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6::uuid, $7)",
             conversation_id, device["u_id"], str(task["task_id"]), language,
-            config.LLM_MODEL or config.LLM_FALLBACK_MODEL, str(followup["memory_id"]) if followup else None)
+            ai_settings.main_model_id("reply"), str(followup["memory_id"]) if followup else None, payload.companion)
         turn_id = await _add_turn(conn, conversation_id, device["u_id"], "reachy", opening)
     # The forced get_today_dose_status call runs while the robot says the opening.
     _dose_openings[conversation_id] = _in_background(
@@ -439,8 +445,11 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         turn_id = await _add_turn(conn, cid, device["u_id"], "patient", text, bool(keyword),
                                   metrics=None if payload.metrics is None else {"robot": payload.metrics})
         history = await _history(conn, cid)
-        patient_turns = sum(1 for turn in history if turn["role"] == "patient")
-        closing = conversation.wants_to_end(text) or patient_turns >= conversation.MAX_PATIENT_TURNS
+        patient_turns = sum(1 for turn in history if turn["role"] == "patient") - _live_patient_turns(row)
+        # A companion chat (robot app 0.9.0, companion spec 3.3) has no turn limit: a goodbye or a risk ends it, or
+        # the robot does (rest, medicine, a stop).
+        closing = conversation.wants_to_end(text) or (
+            not row["companion"] and patient_turns >= conversation.MAX_PATIENT_TURNS)
         block = ""
         # The memory block (facts only) goes to the reply alone, so it is built only when the model will write
         # one: never for a risk turn, a flagged conversation or a fixed closing line.
@@ -596,6 +605,37 @@ async def conversation_end(conversation_id: str, payload: ConversationEndPayload
     return {"ended": True}
 
 
+# ── Live voice check-ins (spec 2026-10-12-live-voice-2a-design.md A2) ───────
+
+LIVE_CHAT_OPEN = 4409   # WebSocket close code: this patient already has a live chat running
+_live_chats: dict[int, live_session.LiveRelay] = {}   # u_id -> the patient's running live chat (this process)
+
+
+@router.websocket("/conversations/live")
+async def conversation_live(websocket: WebSocket):
+    """A live voice check-in: live_session.LiveRelay runs the start checks (a fallback to today's text chat at the
+    first failure), GPT-Live and the chat. Device port only (main.py's DevicePortIsolation also covers WebSockets).
+    get_device_ws closes the socket itself on a bad key (4401) or without robot consent (4403). One live chat per
+    patient: a second connection while one runs is accepted and closed with 4409."""
+    device = await get_device_ws(websocket)
+    if device is None:
+        return
+    u_id = device["u_id"]
+    if u_id in _live_chats:
+        log.warning("patient %s: a second live chat was refused while one runs", u_id)
+        await websocket.accept()
+        await websocket.close(code=LIVE_CHAT_OPEN, reason="live_chat_open")
+        return
+    relay = live_session.LiveRelay(live_session.WebSocketRobot(websocket), device)
+    _live_chats[u_id] = relay   # before the accept, with no await since the check: no second chat slips in
+    try:
+        await websocket.accept()
+        await relay.run()
+    finally:
+        if _live_chats.get(u_id) is relay:
+            del _live_chats[u_id]
+
+
 @router.post("/heartbeat")
 async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device_for_heartbeat)):
     server_time = datetime.now(timezone.utc).isoformat()
@@ -603,14 +643,26 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         return {"stop_all": True, "microphone": False, "server_time": server_time}
     detail = {"vision_fps": payload.vision_fps, "bridge_version": payload.bridge_version,
               "missing_clips": payload.missing_clips}
+    if payload.camera is not None:
+        detail["camera"] = payload.camera.model_dump()   # the Reachy card reads it through /api/reachy/status
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE reachy_device SET last_seen_at = NOW(), robot_reachable = $2, landmark_fps = $3, "
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",
             device["device_id"], payload.robot_reachable, payload.landmark_fps, json.dumps(detail))
         await reachy_tasks.extend_leases(conn, device["device_id"])
+        if payload.companion:
+            await reachy_tasks.extend_for_companion(conn, device["device_id"])
+    # Medicine first (companion spec 3.4): a robot in a companion session ends it when a medicine task waits. Read after
+    # the writes commit: a failing read answers false and never rolls back last_seen_at or the lease extension.
+    try:
+        async with get_pool().acquire() as conn:
+            task_due = await reachy_tasks.task_due(conn, device["u_id"])
+    except Exception:
+        log.warning("heartbeat: the medicine-task check failed; answering task_due false", exc_info=True)
+        task_due = False
     microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
-    return {"stop_all": False, "microphone": microphone, "server_time": server_time}
+    return {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}
 
 
 # ── Monitor (same payloads as /api/intake/monitor/*) ─────────────────────────
@@ -628,6 +680,7 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
     if payload.mode == "dose" and (payload.intk_id is None or payload.task_id is None):
         raise HTTPException(422, "A dose session needs intk_id and task_id")
     auto_commit = False
+    checkin_search = False
     intk_id = payload.intk_id if payload.mode == "dose" else None
     async with get_pool().acquire() as conn:
         if payload.task_id is not None:
@@ -636,6 +689,10 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
                 raise HTTPException(409, "Task is no longer active")
             if intk_id is not None and intk_id not in list(task["intk_ids"]):
                 raise HTTPException(409, "Dose does not belong to this task")
+            # Only a check-in task's search verifies with the OpenVINO match alone (monitor_service.openvino_only).
+            # A companion session's observe session too (robot app 0.9.0): it never records, and no dose prompt
+            # follows it, so the patient can be recognised from across the room (spec 3.2).
+            checkin_search = task["reason"] == "checkin" or (payload.companion and payload.mode == "observe")
         if intk_id is not None:
             row = await conn.fetchrow(
                 "SELECT m.dose_form, m.units_per_dose, i.intake_time_stamp FROM intake i "
@@ -651,7 +708,8 @@ async def monitor_start(payload: MonitorStartPayload, device: dict = Depends(get
             auto_commit = device["auto_record"] and reachy_tasks.is_supported(row["dose_form"], row["units_per_dose"])
     try:
         state = await registry.replace(device["u_id"], intk_id, device["face_label"], device["name"],
-                                       mode=payload.mode, client_type=CLIENT_TYPE, auto_commit=auto_commit)
+                                       mode=payload.mode, client_type=CLIENT_TYPE, auto_commit=auto_commit,
+                                       checkin_search=checkin_search)
     except BusyOtherClient as exc:
         raise HTTPException(409, "busy_other_client") from exc
     state.clip_enabled = await dose_video.enabled(device["u_id"])

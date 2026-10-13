@@ -120,3 +120,7 @@ DELETION_LEDGER_FILE = Path(os.getenv("DELETION_LEDGER_FILE", "/ledger/deletion_
 # ── Reachy robot (Phase 2) ───────────────────────────────────────────────────
 PUBLIC_PORT = int(os.getenv("PUBLIC_PORT", "8000"))
 DEVICE_PORT = int(os.getenv("DEVICE_PORT", "8001"))   # never published or tunnelled
+# Live voice check-ins with GPT-Live (spec 2026-10-12-live-voice-2a-design.md), for testing only: no patient notice
+# covers them yet. Off (the default), no live path is reachable: no card switch or section, no task flag, and the
+# robot's live WebSocket answers fallback.
+LIVE_VOICE_TEST = os.getenv("LIVE_VOICE_TEST", "").strip().lower() in ("1", "true", "yes")
