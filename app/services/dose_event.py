@@ -51,6 +51,7 @@ INTAKE_WORDS = {
 }
 _TZ = ZoneInfo(MEDCARE_TIMEZONE)
 _tasks: set = set()
+_sending: set = set()     # scheduled reports past their delay: making or sending their message (sending())
 _clock = time.monotonic   # the buffer's clock (tests replace it here, never time.monotonic itself: asyncio's clock)
 
 
@@ -181,7 +182,9 @@ async def report(u_id: int, *, kind: str, dedupe: str, intk_ids: list[int], fram
 def schedule(u_id: int, *, delay: float = 0.0, **fields) -> asyncio.Task:
     """report() in the background, the frames taken now (the moment is this one, whatever the delay): the
     robot's request or the agent's tool answers at once. `delay`: seconds to wait first, so a caller that settles
-    the event meanwhile can cancel the task (a watch the agent records right after)."""
+    the event meanwhile can cancel the task (a watch the agent records right after) while it still waits
+    (sending() is False). The task's result is report()'s answer: its "video" is True only when the clip went
+    with the message."""
     frames = fields.pop("frames", None)
     if frames is None:
         frames = take_frames(u_id, fields.get("event_started_at"))
@@ -189,9 +192,17 @@ def schedule(u_id: int, *, delay: float = 0.0, **fields) -> asyncio.Task:
     async def run():
         if delay > 0:
             await asyncio.sleep(delay)
+        _sending.add(asyncio.current_task())
         return await report(u_id, frames=frames, **fields)
 
     task = asyncio.get_running_loop().create_task(run())
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+    task.add_done_callback(_sending.discard)
     return task
+
+
+def sending(task) -> bool:
+    """Whether a schedule() task has left its delay and is making or sending its message: cancelling it now could
+    cut a message half made, so a caller waits for its outcome instead. False while it waits, and once it is done."""
+    return task in _sending

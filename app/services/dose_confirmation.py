@@ -49,6 +49,17 @@ _REFUSED_TEXT = {
     "daily_max_reached": ("當天已經達到每日服用上限", "was over the medicine's daily maximum"),
     "dose_expired": ("當時已經錯過，不能補吃", "had already been missed and is not made up"),
 }
+# Where the request's video is: its evidence "video", decided before the request was made (dose_video.clip_outlook;
+# sent_earlier: the GPT-Live agent's review message of the same moment carried it). Requests from before have none.
+_VIDEO_LINES = {
+    "with_request": ("📹 影片會在下一則訊息送出。", "📹 The video follows in the next message."),
+    "sent_earlier": ("📹 影片已在前一則訊息送出。", "📹 The video went with the previous message."),
+    "none:no_consent": ("（沒有影片：這位病人沒有開啟「服藥影片傳給家人」）",
+                        "(No video: \"Dose videos for family\" is off for this patient.)"),
+    "none:no_frames": ("（沒有影片：鏡頭最近沒有畫面）", "(No video: the camera had no recent frames.)"),
+}
+# The reminder comes an hour after the request: a video that went with it is in the messages before
+_VIDEO_REMINDER_LINE = ("📹 影片請看稍早的訊息。", "📹 The video is in the earlier messages.")
 
 
 # ── postback signing ──
@@ -149,8 +160,8 @@ def _request_messages(details: dict, source: str, confirmation_id: str, contact_
     ai_en = "".join([f"AI estimate that it was taken: {found['en']}\n",
                      *(f"Note: {note}\n" for note in found["notes_en"]),
                      dose_report.FOOTNOTE_EN + "\n" if found["scored"] else ""])
-    # The GPT-Live agent's workflow adds what else it knows about the event: the label check, the camera's mood
-    # reading when clearly negative, and where the clip went (the review message sent just before)
+    # The GPT-Live agent's workflow adds what else it knows about the event: the label check and the camera's mood
+    # reading when clearly negative; every request says where its video is, or why there is none
     extra_zh, extra_en = "", ""
     words = dose_report.verification_words(evidence.get("verification"))
     if words:
@@ -160,9 +171,13 @@ def _request_messages(details: dict, source: str, confirmation_id: str, contact_
     if mood:
         extra_zh += f"{mood[0]}\n"
         extra_en += f"{mood[1]}\n"
-    if evidence.get("video") == "sent_earlier":
-        extra_zh += "📹 影片已在前一則訊息送出。\n"
-        extra_en += "📹 The video went with the previous message.\n"
+    where = evidence.get("video")
+    video = _VIDEO_LINES.get(where) if isinstance(where, str) else None
+    if video and reminder and where in ("with_request", "sent_earlier"):
+        video = _VIDEO_REMINDER_LINE
+    if video:
+        extra_zh += f"{video[0]}\n"
+        extra_en += f"{video[1]}\n"
     detail = (f"{prefix_zh}💊 用藥確認\n{patient} {slot} 的用藥需要您確認（{reason_zh}）。\n"
               f"藥物：{meds}\n{notes_zh}{ai_zh}{extra_zh}請查看藥盒後回覆。\n\n"
               f"{prefix_en}Please confirm {patient}'s {slot} dose ({reason_en}).\n"

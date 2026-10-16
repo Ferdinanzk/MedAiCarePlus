@@ -160,6 +160,12 @@ async def confirmation(task_id: str, payload: ConfirmationPayload, device: dict 
     session = registry.sessions.get(registry.by_user.get(device["u_id"]) or "")
     started_at = (getattr(session, "started_at", None) if session is not None and session.client_type == CLIENT_TYPE
                   and session.intk_id == payload.intk_id else None)
+    # What the request says about its video is known before it is made (dose_video.clip_outlook: the dose-video
+    # consent and enough fresh frames); the clip of a detected moment starts before its approach.
+    started = session.event_started_at if session is not None and session.client_type == CLIENT_TYPE else None
+    video, frames = await dose_video.clip_outlook(
+        device["u_id"], event_started_at=started if payload.source == "uncertain_detection" else None)
+    evidence = {**(payload.evidence or {}), "video": video}
     try:
         async with get_pool().acquire() as conn, conn.transaction():
             task = await _leased_task(conn, device, task_id)
@@ -168,16 +174,14 @@ async def confirmation(task_id: str, payload: ConfirmationPayload, device: dict 
             try:
                 confirmation_id = await dose_confirmation.create(
                     conn, u_id=device["u_id"], task_id=str(task["task_id"]), intk_ids=[payload.intk_id],
-                    source=payload.source, evidence=payload.evidence, started_at=started_at)
+                    source=payload.source, evidence=evidence, started_at=started_at)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
     except schedule.DoseRefused as refused:
         await dose_safety.alert_after(refused)
         raise
-    # Frames are only buffered for a patient who switched dose videos on; capture() re-checks consent.
-    started = session.event_started_at if session is not None and session.client_type == CLIENT_TYPE else None
-    dose_video.capture(device["u_id"], [payload.intk_id],
-                       event_started_at=started if payload.source == "uncertain_detection" else None)
+    if frames:   # capture() re-checks consent before writing
+        dose_video.capture(device["u_id"], [payload.intk_id], frames=frames)
     return {"confirmation_id": str(confirmation_id)}
 
 

@@ -41,9 +41,16 @@ def reports(monkeypatch):
 
 @pytest.fixture
 def captures(monkeypatch):
-    taken = []
-    monkeypatch.setattr(dose_video, "capture",
-                        lambda u_id, intk_ids, event_started_at=None: taken.append((u_id, intk_ids, event_started_at)) or True)
+    """A clip can come (dose_video.clip_outlook, before the request: consent on, frames buffered); capture() is
+    recorded with the patient, the doses and the detected moment its frames were chosen for."""
+    taken, moments = [], []
+
+    async def clip_outlook(u_id, *, event_started_at=None):
+        moments.append(event_started_at)
+        return "with_request", [(0.0, b"jpeg")] * dose_video.MIN_FRAMES
+    monkeypatch.setattr(dose_video, "clip_outlook", clip_outlook)
+    monkeypatch.setattr(dose_video, "capture", lambda u_id, intk_ids, *, event_started_at=None, frames=None:
+                        taken.append((u_id, intk_ids, moments[-1])) or True)
     return taken
 
 
@@ -109,7 +116,7 @@ def test_a_record_right_after_an_uncertain_watch_sends_the_clip_with_the_request
                                                    patient_confirmed=True))
     assert reports[0]["task"].cancelled()                                  # the review message never goes
     assert answer["status"] == "pending_confirmation" and answer["video"] == "with_request"
-    assert captures == [(7, [2], None)] and asked[0]["video"] is None and asked[0]["emotion"] is None
+    assert captures == [(7, [2], None)] and asked[0]["video"] == "with_request" and asked[0]["emotion"] is None
 
 
 def test_a_record_after_the_review_message_went_says_the_video_was_sent_earlier(now, reports, camera, captures,
