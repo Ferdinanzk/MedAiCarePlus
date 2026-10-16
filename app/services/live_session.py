@@ -1581,21 +1581,25 @@ class LiveRelay:
         if self.tools is not None:
             self.tools.forget_intents()
 
-    def _asked_since(self, mark: tuple, kind: str) -> bool:
-        """Whether GPT-Live asked for one of the tools that satisfy `kind` since `mark` (a stretch's new session
-        counts from its start)."""
+    def _asked_since(self, mark: tuple, tools: tuple) -> bool:
+        """Whether GPT-Live asked for one of `tools` since `mark` (a stretch's new session counts from its start)."""
         client, count = mark
         requests = self._requests()
         since = requests[count:] if client is self.client else requests
-        return any(name in tool_intents.TOOLS[kind] for name in since)
+        return any(name in tools for name in since)
 
     def _told(self, intent: dict) -> bool:
         """Whether GPT-Live has its own answer for a waiting request: it asked for one of its tools since the request
-        (_asked_since), or, for a stop, one of its dance calls was answered stopped_by_patient since
-        (ToolRegistry.stops_told; BACKEND_INSTRUCTION has it say Reachy stopped, so the stop's line is not said as
-        well; round 3 of 17 Oct 2026)."""
-        return self._asked_since(intent["mark"], intent["kind"]) or (
-            intent["kind"] == "stop_dance" and self.tools.stops_told > intent["told"])
+        (_asked_since, tool_intents.TOOLS; for a claim of a dose while a camera watch is open also its start or its
+        result, tool_intents.WATCH_TOOLS: GPT-Live runs the camera workflow, round 4 of 17 Oct 2026), or, for a stop,
+        one of its dance calls was answered stopped_by_patient since (ToolRegistry.stops_told; BACKEND_INSTRUCTION has
+        it say Reachy stopped, so the stop's line is not said as well; round 3)."""
+        kind = intent["kind"]
+        tools = tool_intents.TOOLS[kind]
+        if kind == "took_medicine" and self.tools.watching():
+            tools += tool_intents.WATCH_TOOLS
+        return self._asked_since(intent["mark"], tools) or (
+            kind == "stop_dance" and self.tools.stops_told > intent["told"])
 
     def _want_tool(self, words: str, now: float) -> None:
         """The patient's words so far in this turn: a clear request to dance or to look is noted, once per turn, and

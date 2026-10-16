@@ -191,6 +191,22 @@ def test_a_watch_never_read_is_settled_too_and_the_chats_end_reports_nothing(now
     assert reports == []                       # before: an "unresolved" report beside the request
 
 
+def test_a_watch_is_open_from_its_start_until_a_record_settles_it_or_the_chat_ends(now, camera, reports, captures,
+                                                                                    asked):
+    """Round 4 (R4.4): while a watch is open, GPT-Live starting or reading it takes the patient's claim of a dose
+    (live_session.LiveRelay._told reads ToolRegistry.watching)."""
+    b, _ = backend(monotonic=lambda: 100.0)
+    registry = ToolRegistry(Robot(), b)
+    assert registry.watching() is False
+    asyncio.run(b.start_pill_intake_detection(30, "Allegra"))
+    assert registry.watching() is True
+    asyncio.run(b.record_medication_taken("dose-2", True))   # the record settles it
+    assert registry.watching() is False
+    asyncio.run(b.start_pill_intake_detection(30, "Allegra"))
+    asyncio.run(b.close())                                    # the chat's end
+    assert registry.watching() is False
+
+
 def test_a_watch_of_another_medicine_is_left_as_it_is(now, camera, reports, captures, asked):
     meds = {**MEDS, 11: {**MEDS[10], "med_name": "Metformin"}}
     doses = {**intakes(), 3: {"med_id": 11, "intake_stats": "pending", "intake_time_stamp": at(20),
