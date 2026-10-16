@@ -481,6 +481,43 @@ def test_no_dance_starts_after_a_stop(world):
     asyncio.run(scenario())
 
 
+def test_a_stop_while_the_robot_still_loads_the_backstops_dance_stops_it_and_gpt_live_hears_it_stopped(world):
+    # The real robot (medcare-reachy-bridge reachy_hardware.start_move) loads a dance's move off its event loop before
+    # it starts it and answers: a stop meanwhile finds no move, answers idle, and the move starts after it (Task 5
+    # fix round). The stop goes again when the dance answers, and GPT-Live is told it stopped, never that the dance
+    # started or failed
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        loaded, dance, moving = asyncio.Event(), link.dance, []
+
+        async def loading(name, repeat):
+            await loaded.wait()
+            moving.append(name or "groovy_sway_and_roll")
+            return await dance(name, repeat)
+
+        async def stop():
+            link.stops += 1
+            stopped = moving.pop() if moving else None
+            return {"status": "cancelled", "dance": stopped} if stopped else {"status": "idle"}
+
+        link.dance, link.stop_dance = loading, stop
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said("跳舞給我看"), _sound(), _reachy("好，我來跳"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)   # the backstop's dance loads
+        assert relay.tools.dancing() and link.dances == []
+        await _live(world, _said("停"))
+        assert link.stops == 1                             # at once: the robot has no move yet, so idle
+        loaded.set()                                       # the move starts after the stop
+        await _step(world, relay)
+        assert link.dances == [(None, 2)] and link.stops == 2 and moving == []
+        await _live(world, _sound(), _reachy("好"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
+        assert world.clients[-1].commentaries[before:] == [live_session.INTENT_LINES["stop_dance"]["zh-TW"]]
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("delegated", [True, False])
 def test_a_new_dance_request_after_the_stop_dances_again(world, delegated):
     async def scenario():

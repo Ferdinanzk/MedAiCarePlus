@@ -1785,6 +1785,8 @@ class LiveRelay:
             return self._claim_line(result)
         answer = result.get("result") if isinstance(result.get("result"), dict) else {}
         if kind == "dance":
+            if result.get("error") == "stopped_by_patient":
+                return None   # the stop's own line says it (_stop), or GPT-Live's stop_dance call
             started = result.get("ok") and answer.get("status") == "started"
             return INTENT_LINES["dance" if started else "dance_failed"][self.language]
         if kind == "stop_dance":
