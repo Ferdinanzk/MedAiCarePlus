@@ -331,6 +331,10 @@ def test_a_new_turn_lets_gpt_live_dance_again_after_a_backstop_dance():
     "我吃完藥了", "我吃過藥了", "藥吃了", "我已經吃藥了", "I took my medicine", "I've taken my pills",
     "我吃完药了", "我剛剛吃藥了", "藥吃好了", "我已經吃過藥了", "日希，我吃完藥了！", "我把藥吃了", "吃完藥了", "我吃藥了",
     "我吃完藥了，你呢？", "我吃完藥了，今天好累", "Reachy, I already took my medication.", "yes, I have taken my pills",
+    # a call name or a filler in front, without a comma (GPT-Live's transcripts leave some out)
+    "日希我吃完藥了", "嗯我吃過藥了", "對我已經吃藥了", "我跟你說我吃完藥了", "瑞希，我跟你說，我吃完藥了",
+    "我把藥吃完了", "藥我吃過了",
+    "我吃完藥了，再見", "我吃完藥了，就是有點累",   # a goodbye and "it's just that", not a "then"
 ])
 def test_the_patients_own_finished_intake_is_a_claim(words):
     assert tool_intents.detect(words) == "took_medicine"
@@ -349,6 +353,17 @@ def test_the_patients_own_finished_intake_is_a_claim(words):
     "did I take my medicine?", "have I taken my pills", "I haven't taken my pills", "I didn't take my medicine",
     "I will take my medicine", "I'm going to take my pills", "he took his medicine", "I took my medicine?",
     "I took my medicine yesterday", "I finished my dinner",
+    # a condition, a plan, a belief, a doubt or someone else's words before it (the claim starts its clause)
+    "如果我吃完藥了，可以出去玩嗎", "等我吃完藥了，再跟你聊", "要是我吃完藥了，就去散步", "我以為我吃完藥了",
+    "我不記得我吃過藥了", "我不確定我吃過藥了", "他說我吃完藥了", "他說我把藥吃了",
+    "如果，我吃完藥了，可以出去玩嗎", "我以為，我吃完藥了", "他說，我吃完藥了", "I'm not sure, I took my medicine",
+    # a "then" after it: the transcript's comma does not make it a claim
+    "我吃完藥了，再跟你說", "我吃完藥了，就去睡覺",
+    # ran out
+    "藥吃完了，要再去拿", "藥吃完了", "藥已經吃完了", "我藥吃完了", "我把藥吃完了，要再去拿",
+    # took extra: never praised, left to GPT-Live and the safety checks
+    "我吃完藥了，又多吃了一次", "我吃完藥了，好像吃了兩次", "我吃完藥了，我吃太多了", "I took my medicine, I took it twice",
+    "I took my medicine, and an extra pill",
 ])
 def test_no_claim_for_another_person_the_future_a_negation_a_question_or_food(words):
     assert tool_intents.detect(words) is None
@@ -483,7 +498,10 @@ def test_words_that_claim_no_intake_run_no_medicine_tool(world, words):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("fragments, claimed", [(["我吃完藥了", "再跟你說"], False), (["我吃完藥了", "，今天好累"], True)])
+@pytest.mark.parametrize("fragments, claimed", [
+    (["我吃完藥了", "再跟你說"], False), (["我吃完藥了", "，今天好累"], True), (["我吃完藥了", "，再跟你說"], False),
+    (["我吃完藥了", "，好像吃了兩次"], False), (["I took my medicine", ", I took it twice"], False),
+])
 def test_a_claim_is_judged_on_the_whole_turn_its_words_come_in(world, fragments, claimed):
     # GPT-Live's transcript of the patient comes in fragments: 「我吃完藥了」 alone reads as a claim, but the turn
     # 「我吃完藥了再跟你說」 is a plan
@@ -495,6 +513,49 @@ def test_a_claim_is_judged_on_the_whole_turn_its_words_come_in(world, fragments,
         for _ in range(5):
             await relay_chat._settle()
         assert bool(backend.calls) == claimed
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_an_extra_dose_said_in_the_next_turn_drops_a_claim_still_waiting(world):
+    # 「我吃完藥了」, a pause, then 「我好像吃了兩次」 before the backstop's grace ran out: no request to family and no
+    # praise from the backstop; GPT-Live and the safety checks answer it (conversation.LIVE_CLAIM_PRAISE)
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)    # the turn closes; the claim still waits
+        assert relay._intent is not None and relay._intent["kind"] == "took_medicine"
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said("我好像吃了兩次"))
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
+        for _ in range(5):
+            await relay_chat._settle()
+        assert backend.calls == [] and len(world.clients[-1].commentaries) == before
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_an_extra_dose_said_while_the_claim_runs_is_never_praised(world):
+    # The request to family already went: the line says so without the applause, and asks the patient to tell family
+    # if they feel unwell
+    async def scenario():
+        backend = Backend()
+        backend.gate = asyncio.Event()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)   # GPT-Live said nothing: the backstop runs
+        assert backend.calls == [("check_medication_due",)]
+        await _live(world, _said("我好像吃了兩次"))                          # while the due check runs
+        backend.gate.set()
+        for _ in range(5):
+            await relay_chat._settle()
+        assert [call[0] for call in backend.calls] == ["check_medication_due", "record_medication_taken"]
+        line = world.clients[-1].commentaries[-1]
+        assert line == "我已經請家人確認了。" + live_session.CLAIM_UNWELL["zh-TW"]
+        assert gpt_live_config.CELEBRATION["zh-TW"] not in line
         await _end(world, running)
 
     asyncio.run(scenario())
@@ -536,6 +597,8 @@ def test_every_claim_line_is_said_in_both_languages_and_praises_only_a_dose_that
         line = live_session.INTENT_LINES[key][language].format(why="x")
         assert (gpt_live_config.CELEBRATION[language] in line) == (key in praised)
     assert all(reason[language] for reason in live_session.CLAIM_REASONS.values())
+    unwell = live_session.CLAIM_UNWELL[language]   # what replaces the praise when the patient says they took extra
+    assert unwell and gpt_live_config.CELEBRATION[language] not in unwell
 
 
 def test_the_backends_completion_flow_records_before_it_applauds():

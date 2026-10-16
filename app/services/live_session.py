@@ -147,6 +147,9 @@ CLAIM_REASONS = {
     "refused_not_due": {"zh-TW": "還沒到吃這次藥的時間", "en": "this dose is not due yet"},
     "refused_expired": {"zh-TW": "這次的藥已經錯過了，請不要補吃", "en": "this dose was missed and must not be made up"},
 }
+# Said instead of the praise (gpt_live_config.CELEBRATION) when the patient said, while the claim ran, that they took it
+# twice, took extra or took too much (tool_intents.extra_dose): a doubled dose is never praised
+CLAIM_UNWELL = {"zh-TW": "如果覺得不舒服，請馬上告訴家人。", "en": "If you feel unwell, please tell your family right away."}
 # The relay's own voice (speak): the chat's live voice says a reminder; GPT-Live is told it was said
 SPEAK_WAIT_SECONDS = 15.0      # how long a line waits for GPT-Live's sound and the robot's playback to end
 SPEAK_CHUNK_BYTES = 3200       # 0.1 s of PCM16 16 kHz a frame (the robot's socket takes at most 1 MiB)
@@ -574,6 +577,7 @@ class LiveRelay:
         # The tool backstop (services/tool_intents.py): the patient's tool request GPT-Live has yet to ask for
         self._intent: dict | None = None             # {kind, at, words, mark, reply_at}
         self._intent_turn_read = False               # the open patient turn already gave a request
+        self._extra_dose_at: float | None = None     # when the patient last spoke of an extra dose (tool_intents)
         self._requests_mark: tuple = (None, 0)       # (client, how many tools it had asked for) at the turn's start
         self._intent_tasks: set = set()                   # the backstop's runs (_run_intent) still going, but a
                                                           # claim of a dose, which the tool registry holds
@@ -1553,9 +1557,16 @@ class LiveRelay:
         """The patient's words so far in this turn: a clear request to dance, to stop or to look is noted, once per
         turn, and _intent_due runs its tool unless GPT-Live asks for it in time. Nothing during a screening hold or
         after a risk decision, and nothing without the agent's tools. The patient's word that the medicine is taken
-        is read again as the turn's words come in: 「我吃完藥了」 that goes on 「再跟你說」 is a plan, and is dropped."""
+        is read again as the turn's words come in: 「我吃完藥了」 that goes on 「再跟你說」 is a plan, and is dropped. Words
+        of an extra dose (「我好像吃了兩次」) drop a claim still waiting, from this turn or the one before, and keep the
+        praise from one already running (_run_intent)."""
         if self.tools is None or not self._with_tools() or self._risk is not None or self._hit_at is not None:
             return
+        if tool_intents.extra_dose(words):
+            self._extra_dose_at = now
+            if self._intent is not None and self._intent["kind"] == "took_medicine":
+                self._intent = None
+                log.info("live chat %s: the patient speaks of an extra dose; no claim of a dose", self.conversation_id)
         if self._intent_turn_read:
             intent = self._intent   # this turn's request, until it runs
             if intent is not None and intent["kind"] == "took_medicine" and not tool_intents.claims_intake(words):
@@ -1611,6 +1622,9 @@ class LiveRelay:
                     or self._asked_since(intent["mark"], kind)):
                 return   # safety decides first; GPT-Live asked for the tool meanwhile, so it says the answer itself
             line = self._intent_line(kind, result)
+            if kind == "took_medicine" and self._extra_dose_at is not None and self._extra_dose_at >= intent["at"]:
+                # an extra dose spoken of while the claim ran: what stands is said without the praise
+                line = line.replace(gpt_live_config.CELEBRATION[self.language], CLAIM_UNWELL[self.language])
             if line and self.client is not None and not self._live_closed:
                 await self.client.commentary(line)
         except LiveError:
