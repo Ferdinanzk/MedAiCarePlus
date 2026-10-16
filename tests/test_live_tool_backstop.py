@@ -1209,7 +1209,8 @@ def test_a_claim_taken_back_in_the_next_turn_is_dropped(world, words):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("words", ["謝謝", "拜拜", "Thanks!", "我吃完藥了", "日希，再見", "Thank you, Reachy"])
+@pytest.mark.parametrize("words", ["謝謝", "拜拜", "Thanks!", "我吃完藥了", "日希，再見", "Thank you, Reachy",
+                                   "日希，我吃完藥了", "Reachy, I took my medicine"])
 def test_a_closing_word_or_the_same_claim_in_the_next_turn_keeps_the_claim(world, words):
     async def scenario():
         backend = Backend()
@@ -1226,7 +1227,10 @@ def test_a_closing_word_or_the_same_claim_in_the_next_turn_keeps_the_claim(world
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("answer", ["對", "對啊", "嗯", "yes", "yeah", "對，謝謝"])
+@pytest.mark.parametrize("answer", ["對", "對啊", "嗯", "yes", "yeah", "對，謝謝",
+                                    # round 4 (R4.3): the same claim again with an answer word in front answers the
+                                    # question too, so it no longer keeps the claim
+                                    "對，我吃過藥了", "嗯，我吃過藥了", "Yes, I took my medicine"])
 def test_an_answer_to_gpt_lives_question_drops_the_claim(world, answer):
     # Round 3 review: 「我吃過藥了」, GPT-Live asks 「是昨天晚上吃的嗎？」 and the patient answers 「對」 within the grace.
     # A turn of only fillers kept the claim, so the backstop filed today's dose on last night's pill, and overdose
@@ -1257,6 +1261,19 @@ def test_an_answer_to_gpt_lives_question_drops_the_claim(world, answer):
 ])
 def test_only_one_closing_word_leaves_a_claim_standing(words, closing):
     assert tool_intents.closes(words) is closing
+
+
+@pytest.mark.parametrize("words, again", [
+    ("我吃過藥了", True), ("日希，我吃過藥了", True), ("我吃過藥了，日希", True), ("I took my medicine", True),
+    ("Reachy, I took my medicine", True), ("我吃完藥了，謝謝", True),
+    # round 4 (R4.3): an answer word or a filler in front of it answers GPT-Live's question as well
+    ("對，我吃過藥了", False), ("嗯，我吃過藥了", False), ("好，我吃過藥了", False), ("是，我吃過藥了", False),
+    ("對我吃過藥了", False), ("Yes, I took my medicine", False), ("yeah I took my medicine", False),
+    ("ok, I took my medicine", False), ("okay I took my medicine", False), ("uh, I took my medicine", False),
+    ("我吃過藥了，昨天晚上", False), ("", False),
+])
+def test_a_later_turn_is_the_same_claim_only_with_no_answer_word_in_front(words, again):
+    assert tool_intents.claims_again(words) is again
 
 
 def test_a_request_in_the_next_turn_runs_and_drops_the_claim_still_waiting(world):

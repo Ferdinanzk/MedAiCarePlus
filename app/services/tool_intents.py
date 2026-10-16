@@ -139,6 +139,11 @@ CLAIM_LEAD = re.compile(r"^(?:\s*(?:日希|瑞希|瑞奇|嗯|喔|哦|欸|誒|啊
                         r"|(?:reachy|richy|rishi|um|uh|oh|okay|ok|well|so|yes|yeah)(?![a-z'])))+")
 CLAIM_TRAIL = re.compile(r"(?:\s*(?:日希|瑞希|瑞奇|嗯|喔|哦|欸|誒|啊|呀"
                          r"|(?<![a-z'])(?:reachy|richy|rishi|um|uh|oh|okay|ok)))+$")
+# The same claim in a later turn (claims_again) drops only the call name around a clause: an answer word in front
+# (對, 嗯, 好, 是, yes, yeah, ok, uh) answers GPT-Live's question too (round 4 of 17 Oct 2026: after 「我吃過藥了」 and
+# 「是昨天晚上吃的嗎？」, 「對，我吃過藥了」 kept the claim and filed today's dose on last night's pill)
+NAME_LEAD = re.compile(r"^(?:\s*(?:日希|瑞希|瑞奇|(?:reachy|richy|rishi)(?![a-z'])))+")
+NAME_TRAIL = re.compile(r"(?:\s*(?:日希|瑞希|瑞奇|(?<![a-z'])(?:reachy|richy|rishi)))+$")
 _PILLS = r"(藥|藥物|藥丸|藥片)"
 _JUST = r"(已經|剛剛|剛才|剛|有)*"
 _SINCE = r"(已經|剛剛|剛才|剛|有)?"
@@ -179,13 +184,14 @@ def _prepare(text: str) -> tuple[str, str]:
     return compact, spaced
 
 
-def _claim_words(text: str) -> tuple[str, str]:
+def _claim_words(text: str, lead: re.Pattern = CLAIM_LEAD, trail: re.Pattern = CLAIM_TRAIL) -> tuple[str, str]:
     """(compact, spaced): the turn as the claim reader sees it (_normal), each clause without the call name and the
-    fillers around it (CLAIM_LEAD, CLAIM_TRAIL; a clause of nothing else is dropped), the punctuation dropped."""
+    fillers around it (`lead`, `trail`: CLAIM_LEAD, CLAIM_TRAIL; a clause of nothing else is dropped), the
+    punctuation dropped."""
     clauses = []
     for clause in _CLAUSE_END.split(_normal(text))[::2]:
         words = re.sub(r"\s+", " ", re.sub(r"[^\w\s']+|_", " ", clause)).strip()
-        words = CLAIM_TRAIL.sub("", CLAIM_LEAD.sub("", words)).strip()
+        words = trail.sub("", lead.sub("", words)).strip()
         if words:
             clauses.append(words)
     spaced = " ".join(clauses)
@@ -196,9 +202,21 @@ def claims_intake(text: str) -> bool:
     """Whether the whole turn is the patient's word that they took their medicine (took_medicine): with the call
     name and the fillers dropped, nothing but one plain first-person finished intake that names the medicine
     (CLAIM_ZH, CLAIM_EN), and at most one closing word after it. Never with a question mark."""
+    return _claims(text, CLAIM_LEAD, CLAIM_TRAIL)
+
+
+def claims_again(text: str) -> bool:
+    """Whether a later turn of the patient's is the same claim again, which leaves a waiting claim standing: as
+    claims_intake, but only the call name is dropped (NAME_LEAD, NAME_TRAIL), so an answer word or a filler in front
+    (「對，我吃過藥了」, 「嗯，我吃過藥了」, "Yes, I took my medicine") makes it no claim: it can answer GPT-Live's
+    question (「是昨天晚上吃的嗎？」) as well (round 4 of 17 Oct 2026)."""
+    return _claims(text, NAME_LEAD, NAME_TRAIL)
+
+
+def _claims(text: str, lead: re.Pattern, trail: re.Pattern) -> bool:
     if not text or not text.strip() or _ASKED.search(text):
         return False
-    compact, spaced = _claim_words(text)
+    compact, spaced = _claim_words(text, lead, trail)
     if CLAIM_EN.fullmatch(spaced):
         return True
     for form, done in CLAIM_ZH:
