@@ -362,7 +362,9 @@ STOPS = ["停", "停下來", "停止", "不要跳了", "不要再跳了", "別�
          "你要不要停下來", "要不要停一下", "不要跳", "別跳", "不要再跳", "不要再跳啦", "你不要繼續跳了", "好啦", "夠啦",
          "你怎麼還沒停", "你還不停",
          # round 3 review: 不要不要 is still a "no", so 「不要不要跳了」 stops
-         "不要不要跳了"]
+         "不要不要跳了",
+         # round 4 (R4.10): these three need the 不要不要 half of _NOT_ASKED (a plain (?<!要) misses them)
+         "不要不要跳", "不要不要跳啦", "不要不要再跳"]
 # 「好了」 and 「好啦」 as a whole clause are a stop only while a dance actually runs: while a dance request only waits
 # for the backstop, 「好了，開始跳吧」 is the patient agreeing to it (round 3)
 OKAYS = ["好了", "好了好了", "好啦"]
@@ -458,11 +460,20 @@ def test_dont_stop_and_other_kinds_of_stop_are_never_a_stop(words):
     assert not tool_intents.stops(words, waiting=True)
 
 
-@pytest.mark.parametrize("words", ["你要不要繼續跳", "要不要再跳", "你要不要跳", "你要不要跳舞給我看"])
+@pytest.mark.parametrize("words", ["你要不要繼續跳", "要不要再跳", "你要不要跳", "你要不要跳舞給我看",
+                                   "你要不要再跳舞給我看", "要不要再跳舞", "你要不要再跳舞"])
 def test_a_question_whether_reachy_wants_to_dance_is_never_a_stop(words):
     # 要不要…跳 holds 不要…跳 (round 3 review): the clause-end form read 「你要不要繼續跳」 as a stop
     assert not tool_intents.stops(words, dancing=True, danced=True)
     assert not tool_intents.stops(words, waiting=True, danced=True)
+
+
+@pytest.mark.parametrize("words", ["你要不要再跳舞給我看", "要不要再跳舞", "你要不要再跳舞"])
+def test_asking_whether_reachy_will_dance_again_is_a_dance_request_at_any_time(words):
+    # Round 4 (R4.10): the always-on 「不要再跳舞」 had no 要不要 guard, so these stopped the dance and started the hold
+    for state in ({}, {"dancing": True}, {"waiting": True}, {"danced": True}):
+        assert not tool_intents.stops(words, **state)
+        assert tool_intents.detect(words, **state) == "dance"
 
 
 @pytest.mark.parametrize("fragments", [["不要再跳了"], ["日希，", "停下來"], ["Reachy,", " stop"], ["please stop"],
