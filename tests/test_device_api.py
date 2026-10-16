@@ -104,6 +104,8 @@ class FakeConn:
             return None
         if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
             return {"reachy_call_name": None, "name": "Pearl"}
+        if "SELECT m.med_name FROM intake i JOIN medication m" in query:   # the dose event route's medicine
+            return {"med_name": "Allegra"} if args[0] in self.doses and args[1] == 7 else None
         raise AssertionError(query)
 
     def _stamp(self, intk_id):

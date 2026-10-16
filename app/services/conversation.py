@@ -183,6 +183,18 @@ SYSTEM_PROMPT = {
         + MEDICATION_RULES["en"]
     ),
 }
+# Where MEDICATION_RULES says the dose status comes from: the text chat's opening call (open_dose_status). A live chat
+# with the agent's tools (live_session.instructions, tools=True) has no such call; its backend looks the status up.
+DOSE_STATUS_SOURCE = {
+    "zh-TW": ("對話一開始已經用 get_today_dose_status 查過今天的服藥狀態，結果就在對話裡；"
+              "長者說他剛吃了藥、或你不確定時，可以再查一次。"),
+    "en": ("at the start of the conversation get_today_dose_status was already called, and its answer is in the "
+           "conversation. Call it again when the patient says they just took their medicine or you are unsure. "),
+}
+LIVE_DOSE_STATUS_SOURCE = {
+    "zh-TW": "要知道今天的服藥狀態，就交給後端查，不要猜。",
+    "en": "to know today's dose status, delegate it to the backend; never guess. ",
+}
 # Examples for conversational tone. Weather details in the example are illustrative: the live answer must follow
 # context_info's current forecast above and must never reuse the example's drizzle when today's data differs.
 CONVERSATION_EXAMPLES = {
@@ -234,6 +246,17 @@ BACKGROUND_RULES = {
     "en": ("Background for today follows. Use it only when the patient asks or it fits the conversation; never "
            "recite it unprompted. Never guess weather that is not given below: say you are not sure. You cannot "
            "look anything up, so never offer to check. The rules above still apply."),
+}
+# The same for a live chat with the agent's tools: its backend looks the weather up for any place, so the line that
+# forbids looking anything up (which GPT-Live also applied to the camera and the dances) is left out.
+LIVE_TOOLS_BACKGROUND_RULES = {
+    "zh-TW": ("以下是今天的背景資料。只在對方問到或話題自然相關時才用，不要主動唸出來。"
+              "問天氣就交給後端查即時天氣，不要用下面的資料猜。問現在幾點、今天幾號、星期幾，或任何地方現在的時間，"
+              "也一律交給後端查，不要用下面的時間回答。上面的規則照樣適用。"),
+    "en": ("Background for today follows. Use it only when the patient asks or it fits the conversation; never "
+           "recite it unprompted. Any weather question goes to the backend for the live weather; never answer it "
+           "from the lines below. The time now, today's date or the weekday, or the time anywhere else, also always "
+           "go to the backend; never answer them from the lines below. The rules above still apply."),
 }
 SUMMARY_PROMPT = {
     "zh-TW": ("以下是陪伴機器人和長者的對話。請用一句繁體中文總結長者談到的主題和心情（不要引用原話），"
@@ -603,17 +626,21 @@ def usable_reply(text: str | None, language: str) -> bool:
     return bool(_CJK.search(text)) if language == "zh-TW" else True
 
 
-def reply_prompt(language: str) -> str:
+def reply_prompt(language: str, tools: bool = False) -> str:
     """SYSTEM_PROMPT plus today's background. The background comes from data already in the process (fetched by
     the checkin_background job) and local tables only, so a reply never waits on the network for it; if it breaks,
-    the reply goes out without it."""
+    the reply goes out without it. `tools`: for a live chat with the agent's tools, whose backend looks the dose
+    status and the weather up (LIVE_DOSE_STATUS_SOURCE, LIVE_TOOLS_BACKGROUND_RULES)."""
+    system = SYSTEM_PROMPT[language]
+    if tools:
+        system = system.replace(DOSE_STATUS_SOURCE[language], LIVE_DOSE_STATUS_SOURCE[language])
     try:
-        block = context_info.background(language)
+        block = context_info.background(language, started=tools)
     except Exception:
         log.exception("check-in background failed; replying without it")
-        return f"{SYSTEM_PROMPT[language]}\n\n{CONVERSATION_EXAMPLES[language]}"
-    return (f"{SYSTEM_PROMPT[language]}\n\n{BACKGROUND_RULES[language]}\n{block}\n\n"
-            f"{CONVERSATION_EXAMPLES[language]}")
+        return f"{system}\n\n{CONVERSATION_EXAMPLES[language]}"
+    rules = (LIVE_TOOLS_BACKGROUND_RULES if tools else BACKGROUND_RULES)[language]
+    return f"{system}\n\n{rules}\n{block}\n\n{CONVERSATION_EXAMPLES[language]}"
 
 
 @dataclass

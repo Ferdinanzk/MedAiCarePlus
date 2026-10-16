@@ -246,6 +246,41 @@ class MonitorSession:
                 "extra_events": list(self.extra_events)}
 
 
+EVIDENCE_KEYS = {
+    # The detector's per-event evidence (intake_detection.py's result) grouped as the live agent's intake tool
+    # reports it: how the hand approached, touched the mouth, stayed and withdrew (tool_registry.get_pill_intake_result)
+    "approach": ("avg_approach_norm", "approach_std_norm"),
+    "contact": ("peak_mouth_contact", "in_mouth_zone_occurred", "mouth_open_allowed"),
+    "dwell": ("dwell",),
+    "withdrawal": ("withdrew_enough", "partial_withdrawal_seen"),
+    "trajectory": ("trajectory_contribution", "mouth_contact_contribution", "dwell_contribution",
+                   "withdrawal_contribution", "fingertip_delivery_contribution"),
+}
+
+
+def detector_evidence(result: dict | None) -> dict:
+    """The JSON-safe subset of a detector result the live agent's intake tool reports, by EVIDENCE_KEYS group, plus
+    the event's style; a key the detector did not set is left out."""
+    if not isinstance(result, dict):
+        return {}
+
+    def plain(value):
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, (int, float)):
+            return round(float(value), 4)
+        return str(value)
+
+    evidence = {}
+    for group, keys in EVIDENCE_KEYS.items():
+        values = {key: plain(result[key]) for key in keys if key in result and result[key] is not None}
+        if values:
+            evidence[group] = values
+    if result.get("event_style") is not None:
+        evidence["event_style"] = str(result["event_style"])
+    return evidence
+
+
 def _mouth_hidden(selected: dict, hands: list, box: list) -> bool:
     """True when the owned face's mouth can't be scored: no mouth points, or a hand over it."""
     mouth_points = [selected["face"][index] for index in (5, 8)
@@ -499,6 +534,7 @@ class MonitorRegistry:
                 state.u_id, state.detector_session_id, payload, result_transform=apply_policy)
             state.latest_detector = {key: result.get(key) for key in
                                      ("stage", "decision", "event_confidence", "mouth_open", "hand_near_mouth", "frame_seq")}
+            state.latest_detector["evidence"] = detector_evidence(result)   # the live agent's intake tool reads it
             stage = result.get("stage")
             if stage == "APPROACHING" and state.event_started_at is None:
                 state.event_started_at = now
@@ -517,7 +553,7 @@ class MonitorRegistry:
                 if all(event["event_id"] != event_id for event in state.extra_events):
                     state.extra_events.append({"event_id": event_id, "decision": result["decision"],
                                                "confidence": float(result.get("event_confidence") or 0),
-                                               "frame_seq": frame_seq})
+                                               "frame_seq": frame_seq, "evidence": detector_evidence(result)})
                     del state.extra_events[:-EXTRA_EVENT_CAP]
             elif is_event:
                 # The commit's emotion row (and the alert job's input), as before: the faces since this event's
@@ -532,6 +568,7 @@ class MonitorRegistry:
                                    "emotion_probabilities": average,
                                    "identity_distance": state.identity_distance,
                                    "degraded": state.degraded,
+                                   "evidence": detector_evidence(result),
                                    "ready": False}
                 reason = _hold_reason(state, state.candidate)
                 if reason:

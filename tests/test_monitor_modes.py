@@ -287,7 +287,7 @@ def test_after_record_session_switches_to_observe_and_reports_extra_events(detec
         assert commits.calls == [("evt-dose", "auto")]            # no second commit, no stock change
         assert state.candidate["event_id"] == "evt-dose"            # extra events never become candidates
         assert [e["event_id"] for e in result["extra_events"]] == ["evt-extra-1", "evt-extra-2"]
-        assert set(result["extra_events"][0]) == {"event_id", "decision", "confidence", "frame_seq"}
+        assert set(result["extra_events"][0]) == {"event_id", "decision", "confidence", "frame_seq", "evidence"}
     asyncio.run(scenario())
 
 

@@ -21,6 +21,7 @@ def start_scheduler():
     from app.jobs.after_chat_job import run_after_chat_sweep
     from app.services.dose_video import cleanup as delete_finished_dose_videos
     from app.services.context_info import refresh as refresh_checkin_background
+    from app.services.reminders import sweep as sweep_reminders
 
     scheduler.add_job(
         check_missed_doses,
@@ -95,6 +96,15 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1,
         next_run_time=datetime.now(TZ_TAIPEI),
+        misfire_grace_time=None,
+        coalesce=True,
+    )
+    scheduler.add_job(   # the reminders' safety net: re-arm what a restart lost, fire what is due (services/reminders.py)
+        sweep_reminders,
+        IntervalTrigger(minutes=1),
+        id="reminders",
+        replace_existing=True,
+        max_instances=1,
         misfire_grace_time=None,
         coalesce=True,
     )

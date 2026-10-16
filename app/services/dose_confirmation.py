@@ -149,10 +149,24 @@ def _request_messages(details: dict, source: str, confirmation_id: str, contact_
     ai_en = "".join([f"AI estimate that it was taken: {found['en']}\n",
                      *(f"Note: {note}\n" for note in found["notes_en"]),
                      dose_report.FOOTNOTE_EN + "\n" if found["scored"] else ""])
+    # The GPT-Live agent's workflow adds what else it knows about the event: the label check, the camera's mood
+    # reading when clearly negative, and where the clip went (the review message sent just before)
+    extra_zh, extra_en = "", ""
+    words = dose_report.verification_words(evidence.get("verification"))
+    if words:
+        extra_zh += f"藥物辨識：{words[0]}\n"
+        extra_en += f"Medicine check: {words[1]}\n"
+    mood = dose_report.emotion_note(evidence.get("emotion"))
+    if mood:
+        extra_zh += f"{mood[0]}\n"
+        extra_en += f"{mood[1]}\n"
+    if evidence.get("video") == "sent_earlier":
+        extra_zh += "📹 影片已在前一則訊息送出。\n"
+        extra_en += "📹 The video went with the previous message.\n"
     detail = (f"{prefix_zh}💊 用藥確認\n{patient} {slot} 的用藥需要您確認（{reason_zh}）。\n"
-              f"藥物：{meds}\n{notes_zh}{ai_zh}請查看藥盒後回覆。\n\n"
+              f"藥物：{meds}\n{notes_zh}{ai_zh}{extra_zh}請查看藥盒後回覆。\n\n"
               f"{prefix_en}Please confirm {patient}'s {slot} dose ({reason_en}).\n"
-              f"Medication: {meds}\n{notes_en}{ai_en}Check the pill box, then answer below.")
+              f"Medication: {meds}\n{notes_en}{ai_en}{extra_en}Check the pill box, then answer below.")
     # The buttons card holds 160 characters: it gives the plain reason, and the text above it the frame rate.
     short_zh, short_en = _REASONS[source]
     short = f"{patient} {slot}\n{meds}\n{short_zh}\n{short_en}"

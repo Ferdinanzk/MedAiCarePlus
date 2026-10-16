@@ -20,3 +20,6 @@ pytz==2024.2
 passlib[bcrypt]==1.7.4
 zhconv==1.4.3
 cryptography==50.0.1
+# GPT-Live agent layer (services/gpt_live_config.py, agent_bridge.py, tool_registry.py; robot app 0.11.0): no new
+# package. websockets, numpy and requests above cover it; the reference agent's scipy and opencv are not needed (the
+# robot resamples with numpy and encodes JPEGs with Pillow, media.py and runner.py).

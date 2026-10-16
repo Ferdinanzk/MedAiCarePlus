@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
 from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_status, dose_video,
-                          live_session, memory, outbox, reachy_tasks, schedule)
+                          live_session, memory, outbox, reachy_tasks, reminders, schedule)
 from app.services.device_auth import get_device, get_device_for_heartbeat, get_device_ws
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored
@@ -64,6 +64,14 @@ class StatusPayload(BaseModel):
 class ConfirmationPayload(BaseModel):
     intk_id: int = Field(gt=0)
     source: Literal["uncertain_detection", "unsupported_dose", "degraded", "auto_record_off", "patient_claim"]
+    evidence: dict | None = None
+
+
+class DoseEventPayload(BaseModel):
+    """A watched dose that ended without a result (bridge/session.py WATCHING): family get the clip and the AI's
+    reading (services/dose_event.py)."""
+    intk_id: int = Field(gt=0)
+    outcome: Literal["not_seen", "patient_left"]
     evidence: dict | None = None
 
 
@@ -202,6 +210,49 @@ async def extra_event(task_id: str, payload: ExtraEventPayload, device: dict = D
                 messages=[{"type": "text", "text": text}],
                 dedupe_prefix=f"extra_event:{extra_id}", contact_flag="notify_missed")
     return {"extra_id": extra_id, "recorded": inserted is not None, "notified": notified}
+
+
+@router.post("/tasks/{task_id}/event")
+async def dose_event_report(task_id: str, payload: DoseEventPayload, device: dict = Depends(get_device)):
+    """The robot watched a dose and nothing settled it: no hand-to-mouth moment in the watch (not_seen) or the
+    patient left (patient_left). Family get the camera's clip of those moments and the AI's reading in one LINE
+    message, to judge for themselves (services/dose_event.py); the dose stays as it is. Idempotent per dose and
+    outcome. Answers at once: the clip is made in the background."""
+    from app.services import dose_event
+
+    async with get_pool().acquire() as conn:
+        task = await _leased_task(conn, device, task_id)
+        if payload.intk_id not in list(task["intk_ids"]):
+            raise HTTPException(409, "Dose does not belong to this task")
+        row = await conn.fetchrow(
+            "SELECT m.med_name FROM intake i JOIN medication m ON m.med_id = i.med_id WHERE i.intk_id = $1 "
+            "AND i.u_id = $2", payload.intk_id, device["u_id"])
+    evidence = payload.evidence if isinstance(payload.evidence, dict) else {}
+    emotion = evidence.get("emotion") if isinstance(evidence.get("emotion"), dict) else None
+    notes = []
+    if evidence.get("said_done"):
+        notes.append(("本人有說「吃完了」", "The patient said they had finished"))
+    dedupe = f"robot:{task['task_id']}:{payload.intk_id}:{payload.outcome}"
+    dose_event.schedule(device["u_id"], kind="watch", dedupe=dedupe, intk_ids=[payload.intk_id],
+                        medication_name=row["med_name"] if row else None, verification=None, intake=payload.outcome,
+                        confidence=None, event_time=schedule.current_time(), needs_review=True, emotion=emotion,
+                        notes=notes)
+    return {"event": dedupe, "queued": True}
+
+
+@router.get("/clips/med/{med_id}")
+async def medication_clip(med_id: int, position: int = Query(1, ge=1, le=8), language: str = Query("zh-TW"),
+                          device: dict = Depends(get_device)):
+    """The spoken prompt for this patient's medicine in `position` of its slot (services/med_clips.py), as a WAV
+    with its key in ETag; 304 for a matching If-None-Match; 404 when there is none (the robot then says its
+    generic prompt)."""
+    from app.services import med_clips
+
+    found = await med_clips.clip(device["u_id"], med_id, position, language)
+    if found is None:
+        raise HTTPException(404, "No prompt clip for this medicine")
+    data, key = found
+    return Response(content=data, media_type="audio/wav", headers={"ETag": f'"{key}"', "Cache-Control": "private"})
 
 
 # ── Check-in conversations ───────────────────────────────────────────────────
@@ -382,7 +433,12 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
         # The name: the memory 'name' entry (memory on), else the Reachy card's call name, else the registered name.
         name = await memory.call_name(conn, device["u_id"], memory_on)
         followup = await memory.pick_followup(conn, device["u_id"], memory.local_today()) if memory_on else None
-        if task["reason"] == "checkin":
+        reminder = live_session._reminder_of(task)
+        reminder_row = await reminders.take_for_robot(str(reminder["reminder_id"])) if reminder else None
+        if reminder_row is not None:   # a reminder's check-in without the live voice: the robot's own voice says it
+            opening = reminder_row["text"]
+            await reminders.said_by_robot(str(reminder["reminder_id"]), "robot_text")
+        elif task["reason"] == "checkin":
             opening = {
                 "zh-TW": "我來提醒您查看用藥時間表，並依照處方在排定時間服藥。若現在還沒到時間，請不要提前服用。需要我陪您確認嗎？",
                 "en": "I'm here to remind you to check your medication schedule and follow your prescription. If it isn't due yet, please don't take it early. Would you like me to help you check?",
@@ -609,6 +665,7 @@ async def conversation_end(conversation_id: str, payload: ConversationEndPayload
 
 LIVE_CHAT_OPEN = 4409   # WebSocket close code: this patient already has a live chat running
 _live_chats: dict[int, live_session.LiveRelay] = {}   # u_id -> the patient's running live chat (this process)
+reminders.find_relay = _live_chats.get   # a reminder that fires during a live chat is said through its relay
 
 
 @router.websocket("/conversations/live")

@@ -208,7 +208,7 @@ def live(monkeypatch):
     monkeypatch.setattr(memory, "pick_followup", pick_followup)
     monkeypatch.setattr(memory, "build_block", build_block)
     monkeypatch.setattr(after_chat, "process", process)
-    monkeypatch.setattr(conversation, "reply_prompt", lambda language: f"REPLY PROMPT {language}")
+    monkeypatch.setattr(conversation, "reply_prompt", lambda language, tools=False: f"REPLY PROMPT {language}")
     monkeypatch.setattr(api_device, "_live_chats", {})
     return types.SimpleNamespace(db=db, world=world, order=order)
 

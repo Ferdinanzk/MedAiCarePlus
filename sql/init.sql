@@ -413,6 +413,29 @@ CREATE TABLE IF NOT EXISTS monitor_extra_event (
 
 -- Every LINE push added from Phase 2 on goes through this table so a crash
 -- between commit and send never loses a message.
+-- Reminders the patient asks Reachy for (services/reminders.py): due on the server's clock, said by the live
+-- voice through the running chat, a check-in task for the robot (task_id), or a LINE text.
+CREATE TABLE IF NOT EXISTS reminder (
+    reminder_id   UUID PRIMARY KEY,
+    u_id          INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    text          TEXT NOT NULL,
+    what          TEXT,
+    med_id        INTEGER,
+    med_name      VARCHAR(200),
+    position      SMALLINT,
+    language      VARCHAR(10) NOT NULL DEFAULT 'zh-TW',
+    due_at        TIMESTAMPTZ NOT NULL,
+    status        VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','firing','queued_robot','fired','cancelled','expired','undelivered')),
+    delivered_via VARCHAR(20),
+    conversation_id UUID,
+    task_id       UUID,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fired_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_reminder_open ON reminder(u_id, due_at)
+    WHERE status IN ('pending','firing','queued_robot');
+
 CREATE TABLE IF NOT EXISTS notification_outbox (
     outbox_id    BIGSERIAL PRIMARY KEY,
     dedupe_key   VARCHAR(160) NOT NULL UNIQUE,

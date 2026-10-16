@@ -82,6 +82,8 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
         monkeypatch.setattr(main, name, lambda: None)
     for name in ("start_dispatcher", "stop_dispatcher"):
         monkeypatch.setattr(main, name, nothing)
+    monkeypatch.setattr(main.reminders, "reload", nothing)                          # no database here
+    monkeypatch.setattr(main.startup_report, "finish_in_background", lambda *a, **k: None)   # no network probes
 
     async def start_and_stop():
         async with main.lifespan(main.app):
