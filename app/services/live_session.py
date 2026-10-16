@@ -1680,10 +1680,11 @@ class LiveRelay:
     def _claim_stands(self, claim: dict) -> bool:
         """Whether a claim of a dose still stands: its whole turn (every fragment so far) is still a closed-form claim,
         and each later turn of the patient's is nothing but a closing word (tool_intents.closes: 「謝謝」, 「再見」;
-        never 「對」 or "yes", which can answer GPT-Live's question) or the same claim again. Any other words drop it
-        before its due check, and cancel its records not yet started after."""
+        never 「對」 or "yes", which can answer GPT-Live's question) or the same claim again with no answer word in
+        front (tool_intents.claims_again: 「對，我吃過藥了」 answers 「是昨天晚上吃的嗎？」 too; round 4). Any other words
+        drop it before its due check, and cancel its records not yet started after."""
         return (tool_intents.claims_intake(claim["turn"].text)
-                and all(tool_intents.closes(group.text) or tool_intents.claims_intake(group.text)
+                and all(tool_intents.closes(group.text) or tool_intents.claims_again(group.text)
                         for group in claim["later"]))
 
     def _intent_due(self, now: float) -> None:
