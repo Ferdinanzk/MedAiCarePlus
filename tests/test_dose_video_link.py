@@ -164,6 +164,9 @@ def test_the_probe_rejects_anything_but_this_servers_marker(monkeypatch, tunnel,
     (Answer(200, payload={"endpoint": "http://x.trycloudflare.com/api/notify/webhook/line"}), dose_video.WEBHOOK_ERROR),
     (Answer(200, payload={}), dose_video.WEBHOOK_ERROR),
     (requests.ConnectionError("no route"), dose_video.WEBHOOK_ERROR),
+    # Round 3 (F1.9): a malformed address raised ValueError into _store, the job, status() and the dose event
+    (Answer(200, payload={"endpoint": "https://[x.trycloudflare.com/api/notify/webhook"}), dose_video.WEBHOOK_ERROR),
+    (Answer(200, payload=["not", "an", "object"]), dose_video.WEBHOOK_ERROR),
 ])
 def test_without_a_usable_webhook_address_there_is_no_link(monkeypatch, line, reason):
     internet = Internet(monkeypatch, line=line)
@@ -226,15 +229,34 @@ def test_public_base_url_is_still_taken_as_configured(monkeypatch):
     assert _check() == (None, dose_video.NOT_HTTPS)
 
 
-def test_the_startup_report_names_the_reason(monkeypatch):
-    Internet(monkeypatch, tunnel=Answer(404))
+@pytest.mark.parametrize("internet, reason, hint", [
+    ({"tunnel": Answer(404)}, dose_video.OTHER_SERVER, True),
+    ({"tunnel": Answer(530)}, dose_video.TUNNEL_DOWN, True),
+    ({"line": Answer(401)}, dose_video.WEBHOOK_ERROR, False),     # round 3 (F1.13): the tunnel is not the cause
+])
+def test_the_startup_report_names_the_reason(monkeypatch, internet, reason, hint):
+    Internet(monkeypatch, **internet)
     startup_report.begin()
     try:
         startup_report.mark("line", True, "token set")
         asyncio.run(startup_report.public_link())
         stage = startup_report._report["line"]
-        assert not stage["ok"] and dose_video.OTHER_SERVER in stage["detail"]
+        assert not stage["ok"] and f"no public link: {reason}" in stage["detail"]
+        assert ("scripts/line-tunnel.ps1" in stage["detail"]) is hint
         assert dose_video.PROBE_TOKEN not in stage["detail"]
+    finally:
+        startup_report._report.clear()
+
+
+def test_the_startup_report_gives_no_tunnel_hint_without_a_line_token(monkeypatch):
+    """Round 3 (F1.13): only "tunnel reaches another server" and "tunnel not answering" get the tunnel hint."""
+    monkeypatch.setattr(config, "LINE_CHANNEL_ACCESS_TOKEN", "")
+    startup_report.begin()
+    try:
+        startup_report.mark("line", True, "token set")
+        asyncio.run(startup_report.public_link())
+        detail = startup_report._report["line"]["detail"]
+        assert f"no public link: {dose_video.NO_LINE_TOKEN}" in detail and "line-tunnel" not in detail
     finally:
         startup_report._report.clear()
 
@@ -249,15 +271,36 @@ class Tx:
         return False
 
 
+REQUEST_A = "aaaaaaaa-0000-4000-8000-000000000001"
+REQUEST_B = "bbbbbbbb-0000-4000-8000-000000000002"
+
+
 class VideoDB:
-    """The dose_video rows, one family request for intake 4 and one contact, answering the queries of _store,
-    cleanup, the retry and send_with_confirmation."""
+    """The dose_video rows, the family requests (one for intake 4, made just before its clip, at first) and one
+    contact, answering the queries of _store, cleanup, the retry and send_with_confirmation. A clip's own request is
+    the newest request sharing an intake made before the clip. `on_insert` runs as a clip's row is written, `on_scan`
+    once the retry has read its candidates (another worker acting meanwhile)."""
 
     def __init__(self, resolution=None):
         self.videos = {}
-        self.resolution = resolution
+        self.requests = [{"confirmation_id": REQUEST_A, "intk_ids": [4], "resolution": resolution,
+                          "created_at": datetime.datetime.now(UTC) - datetime.timedelta(seconds=5)}]
         self.links = []
         self.cutoffs = []
+        self.on_insert = self.on_scan = None
+
+    @property
+    def resolution(self):
+        return self.requests[0]["resolution"]
+
+    @resolution.setter
+    def resolution(self, value):
+        self.requests[0]["resolution"] = value
+
+    def own_request(self, video):
+        mine = [request for request in self.requests if set(request["intk_ids"]) & set(video["intk_ids"])
+                and request["created_at"] <= video["created_at"]]
+        return max(mine, key=lambda request: request["created_at"]) if mine else None
 
     def transaction(self):
         return Tx()
@@ -266,6 +309,8 @@ class VideoDB:
         if query.startswith("INSERT INTO dose_video ("):
             self.videos[args[0]] = {"video_id": args[0], "u_id": args[1], "intk_ids": list(args[2]),
                                     "created_at": datetime.datetime.now(UTC), "sent_at": None, "deleted_at": None}
+            if self.on_insert is not None:
+                self.on_insert()
         elif query.startswith("INSERT INTO dose_video_link"):
             self.links.append(args[1])
         elif "SET sent_at = NOW()" in query:
@@ -278,21 +323,35 @@ class VideoDB:
     async def fetch(self, query, *args):
         live = [row for row in self.videos.values() if row["deleted_at"] is None]
         if "LEFT JOIN dose_video_link" in query:                 # cleanup
-            return [{**row, "expires_at": None, "links": 0, "waiting": 0, "last_done": None} for row in live]
+            assert "dc.created_at <= v.created_at" in query       # the clip's own request
+            return [{**row, "expires_at": None, "links": 0, "waiting": 0, "last_done": None,
+                     "request_open": (None if self.own_request(row) is None
+                                      else self.own_request(row)["resolution"] is None)} for row in live]
         if "FROM dose_video v" in query:                          # the retry's candidates
             assert "sent_at IS NULL" in query and "deleted_at IS NULL" in query
             assert "resolution IS NULL" in query and "intk_ids && v.intk_ids" in query
+            assert "dc.created_at <= v.created_at" in query       # the clip's own request, never a newer one
             self.cutoffs.append(args[0])
-            return [{"video_id": row["video_id"], "u_id": row["u_id"], "intk_ids": row["intk_ids"]} for row in live
-                    if row["sent_at"] is None and row["created_at"] > args[0] and self.resolution is None
-                    and 4 in row["intk_ids"]]
+            rows = [{"video_id": row["video_id"], "u_id": row["u_id"], "intk_ids": row["intk_ids"],
+                     "confirmation_id": self.own_request(row)["confirmation_id"]} for row in live
+                    if row["sent_at"] is None and row["created_at"] > args[0] and self.own_request(row) is not None
+                    and self.own_request(row)["resolution"] is None]
+            if self.on_scan is not None:
+                self.on_scan()
+            return rows
         if "FROM family_contacts" in query:
             return [{"id": 34, "name": "aisha", "line_id": "U34"}]
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):                      # send_with_confirmation: the open request
         assert "resolution IS NULL" in query
-        return {"created_at": NOW, "name": "Aisha"} if self.resolution is None else None
+        if "dc.confirmation_id = $1::uuid" in query:             # the retry: the clip's own request
+            request = next((request for request in self.requests if request["confirmation_id"] == args[0]), None)
+        else:                                                     # _store: the newest open request of its doses
+            mine = [request for request in self.requests if set(request["intk_ids"]) & set(args[1])
+                    and request["resolution"] is None]
+            request = max(mine, key=lambda request: request["created_at"]) if mine else None
+        return {"created_at": NOW, "name": "Aisha"} if request and request["resolution"] is None else None
 
     async def fetchval(self, query, *args):                      # the retry locks the clip and checks it again
         assert "FOR UPDATE" in query
@@ -415,3 +474,61 @@ def test_the_dose_videos_job_runs_the_retry(monkeypatch):
     func, trigger, kwargs = jobs["dose_videos"]
     assert func is dose_video.maintain and trigger.interval == datetime.timedelta(minutes=2)
     assert kwargs.get("max_instances") == 1
+
+
+def test_the_kept_unsent_warning_names_the_reason_that_went_with_the_missing_link(world, caplog):
+    """Round 3 (F1.8): _store read the last check's reason several awaits after its answer, so a check that found the
+    link meanwhile made the WARNING say "(None)"."""
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
+    world.db.on_insert = lambda: setattr(dose_video, "_link_reason", None)    # another check found a link meanwhile
+    _store()
+    (video_id,) = world.db.videos
+    kept = [r.getMessage() for r in caplog.records if "kept unsent" in r.getMessage()]
+    assert kept == [f"dose video {video_id} for intakes [4] kept unsent: no public link ({dose_video.OTHER_SERVER})"]
+
+
+def test_a_kept_clip_goes_only_with_the_request_it_was_made_for(world, fresh_link):
+    """Round 3 (F1.10): the retry sent a kept clip with the newest open request sharing an intake, so when family had
+    answered the clip's own request and a new request for the same dose opened, they got the older footage under the
+    new request. Now a clip goes only with its own request; when that one is closed, the clip is left to cleanup."""
+    _store()
+    (video_id,) = world.db.videos
+    world.db.resolution = "denied"                                   # family answered "not taken"
+    world.db.requests.append({"confirmation_id": REQUEST_B, "intk_ids": [4], "resolution": None,
+                              "created_at": datetime.datetime.now(UTC) + datetime.timedelta(seconds=1)})
+    world.internet.tunnel = Answer(200, dose_video.PROBE_MARKER)
+    fresh_link.now += dose_video.BASE_URL_RETRY_SECONDS + 1
+    assert asyncio.run(dose_video.retry_unsent()) == 0
+    assert world.enqueued == [] and world.db.videos[video_id]["sent_at"] is None
+
+
+@pytest.mark.parametrize("change", ["sent_at", "deleted_at"])
+def test_the_retry_sends_nothing_when_its_lock_finds_the_clip_sent_or_deleted_meanwhile(world, fresh_link, change):
+    """Round 3 (F1.11): between reading its candidates and sending, the retry locks the clip's row and checks it
+    again (SELECT ... FOR UPDATE): another worker may have sent or deleted it meanwhile."""
+    _store()
+    (video_id,) = world.db.videos
+    world.db.on_scan = lambda: world.db.videos[video_id].update({change: datetime.datetime.now(UTC)})
+    world.internet.tunnel = Answer(200, dose_video.PROBE_MARKER)
+    fresh_link.now += dose_video.BASE_URL_RETRY_SECONDS + 1
+    assert asyncio.run(dose_video.retry_unsent()) == 0
+    assert world.enqueued == [] and world.db.links == []
+
+
+@pytest.mark.parametrize("closed, why", [
+    (True, "its family request was closed"),
+    (False, "no public link for 4 h"),
+])
+def test_cleanup_says_why_each_kept_clip_is_lost(world, caplog, closed, why):
+    """Round 3 (F1.12): cleanup deleted a clip never sent within 4 h (not_sent) with no log line. Now each one lost
+    this way logs one WARNING with its reason, and no token."""
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
+    _store()
+    (video_id,) = world.db.videos
+    caplog.clear()
+    world.db.resolution = "confirmed" if closed else None
+    later = datetime.datetime.now(UTC) + dose_video.UNSENT_MAX_AGE + datetime.timedelta(minutes=1)
+    assert asyncio.run(dose_video.cleanup(later)) == 1
+    lost = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert lost == [f"dose video {video_id} for intakes [4] deleted unsent: {why}"]
+    assert dose_video.PROBE_TOKEN not in caplog.text

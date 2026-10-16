@@ -502,7 +502,8 @@ class JobConn:
         return Tx()
 
 
-def _run_job(monkeypatch, conn, base_url="https://x.trycloudflare.com"):
+def _run_job(monkeypatch, conn, base_url="https://x.trycloudflare.com", meanwhile=None):
+    """`meanwhile`: called while the job reads the clips, after it asked for the public link."""
     enqueued, deleted = [], []
 
     async def enqueue(conn, **kwargs):
@@ -513,6 +514,8 @@ def _run_job(monkeypatch, conn, base_url="https://x.trycloudflare.com"):
         return bool(conn.videos)
 
     async def unsent_videos(conn, u_id, intk_ids):
+        if meanwhile is not None:
+            meanwhile()
         return conn.videos
 
     async def public_base_url():
@@ -556,6 +559,17 @@ def test_job_without_a_public_link_sends_text_only_and_deletes_the_clip(monkeypa
     assert [item["kind"] for item in enqueued] == ["taken_confirmation"]
     assert "📹" not in enqueued[0]["messages"][0]["text"] and deleted == [("vid", "no_public_link")]
     # A lost video says why, once.
+    lost = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "vid" in r.getMessage()]
+    assert lost == ["dose video vid for intakes [5] deleted: no public link (tunnel not answering)"]
+
+
+def test_job_names_the_reason_that_went_with_the_missing_link(monkeypatch, caplog):
+    """Round 3 (F1.8): the WARNING read the last check's reason several awaits after the answer, so a check that
+    found the link meanwhile made it say "(None)"."""
+    reason = [dose_video.TUNNEL_DOWN]
+    monkeypatch.setattr(dose_video, "no_link_reason", lambda: reason[0])
+    conn = JobConn([_dose()], [{"id": 3, "line_id": "U3", "name": "aisha"}], [{"video_id": "vid", "intk_ids": [5]}])
+    _run_job(monkeypatch, conn, base_url=None, meanwhile=lambda: reason.__setitem__(0, None))
     lost = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "vid" in r.getMessage()]
     assert lost == ["dose video vid for intakes [5] deleted: no public link (tunnel not answering)"]
 

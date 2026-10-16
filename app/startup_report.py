@@ -168,13 +168,15 @@ async def network_and_clock() -> None:
 async def public_link() -> None:
     from app.services import dose_video
     try:
-        base = await dose_video.public_base_url()
+        base, why = await dose_video.public_link()
     except Exception as error:
         base = None
         reason = f"{type(error).__name__}"
     else:
-        reason = (f"{dose_video.no_link_reason()} (scripts/line-tunnel.ps1 points LINE's webhook at this server): "
-                  f"family get no videos")
+        # The tunnel hint only where the tunnel is the cause (no LINE token or a webhook error is not)
+        hint = (" (scripts/line-tunnel.ps1 points LINE's webhook at this server)"
+                if why in (dose_video.OTHER_SERVER, dose_video.TUNNEL_DOWN) else "")
+        reason = f"{why}{hint}: family get no videos"
     stage = _report.get("line", {})
     detail = stage.get("detail", "").split(";")[0]   # the token line, without an earlier public-link verdict
     if base:

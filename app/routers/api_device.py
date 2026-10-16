@@ -677,7 +677,9 @@ async def conversation_live(websocket: WebSocket):
     """A live voice check-in: live_session.LiveRelay runs the start checks (a fallback to today's text chat at the
     first failure), GPT-Live and the chat. Device port only (main.py's DevicePortIsolation also covers WebSockets).
     get_device_ws closes the socket itself on a bad key (4401) or without robot consent (4403). One live chat per
-    patient: a second connection while one runs is accepted and closed with 4409."""
+    patient: a second connection while one runs is accepted and closed with 4409. The slot is freed once the chat is
+    over and GPT-Live closed (LiveRelay.on_over), before the relay waits for a record or a note to family still
+    running, so the patient's next live chat is not refused meanwhile and a reminder never looks for the old one."""
     device = await get_device_ws(websocket)
     if device is None:
         return
@@ -688,13 +690,18 @@ async def conversation_live(websocket: WebSocket):
         await websocket.close(code=LIVE_CHAT_OPEN, reason="live_chat_open")
         return
     relay = live_session.LiveRelay(live_session.WebSocketRobot(websocket), device)
+
+    def free() -> None:
+        if _live_chats.get(u_id) is relay:   # a newer chat may hold the slot already
+            del _live_chats[u_id]
+
+    relay.on_over = free
     _live_chats[u_id] = relay   # before the accept, with no await since the check: no second chat slips in
     try:
         await websocket.accept()
         await relay.run()
     finally:
-        if _live_chats.get(u_id) is relay:
-            del _live_chats[u_id]
+        free()
 
 
 @router.post("/heartbeat")

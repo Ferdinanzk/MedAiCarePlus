@@ -136,12 +136,11 @@ async def report(u_id: int, *, kind: str, dedupe: str, intk_ids: list[int], fram
                 video = "attached"
             else:
                 video = "off"
-        base_url = await dose_video.public_base_url() if video_id is not None else None
+        base_url, no_link = await dose_video.public_link() if video_id is not None else (None, None)
         if video_id is not None and base_url is None:
             dose_video._unlink(video_id)
             video_id, video = None, "none"
-            log.warning("dose event %s: no public link for the clip (%s); the text goes without it", dedupe,
-                        dose_video.no_link_reason())
+            log.warning("dose event %s: no public link for the clip (%s); the text goes without it", dedupe, no_link)
         async with get_pool().acquire() as conn, conn.transaction():
             from app.services import dose_confirmation   # dose_confirmation -> intake_repository -> dose_video
 

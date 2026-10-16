@@ -466,6 +466,29 @@ def test_a_fallback_through_the_socket_frees_the_patient(live_socket, monkeypatc
     assert api_device._live_chats == {} and live_socket.db.conversations == {}
 
 
+def test_the_patients_slot_is_free_once_the_chat_is_over_not_after_its_held_calls(live_socket, monkeypatch):
+    """Round 3 (F1.5): the relay frees the patient's live-chat slot once its chat is over (on_over), before it waits
+    for a record or a note to family still running, so the patient's next live chat is not refused with 4409; a chat
+    that took the slot meanwhile keeps it."""
+    seen, newer = [], object()
+
+    class Relay:
+        def __init__(self, robot, device):
+            self.robot, self.on_over = robot, None
+
+        async def run(self):
+            seen.append(sorted(api_device._live_chats))
+            self.on_over()                                    # GPT-Live is closed: the chat is over
+            seen.append(sorted(api_device._live_chats))
+            api_device._live_chats[7] = newer                 # the patient's next live chat starts meanwhile
+            await self.robot.close(1000)                      # the held calls would be waited for now
+
+    monkeypatch.setattr(live_session, "LiveRelay", Relay)
+    with _connect(live_socket) as websocket:
+        assert websocket.receive() == {"type": "websocket.close", "code": 1000, "reason": ""}
+    assert seen == [[7], []] and api_device._live_chats == {7: newer}
+
+
 def test_one_live_chat_per_patient(live_socket):
     with _connect(live_socket) as first:
         with _connect(live_socket) as second:   # the same patient's robot, while the first chat runs

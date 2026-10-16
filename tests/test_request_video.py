@@ -154,6 +154,29 @@ def test_a_consent_that_cannot_be_read_never_fails_the_request(monkeypatch, capl
     assert "consent could not be read" in caplog.text
 
 
+def test_a_consent_read_that_hangs_counts_as_unreadable_within_its_time_limit(monkeypatch, caplog):
+    """Round 3 (F1.6): the consent read had no time limit inside record_medication_taken's TIMEOUTS entry, so a slow
+    database could time the tool out and lose the request. Now it gets CONSENT_READ_SECONDS (about
+    DB_TIMEOUT_SECONDS); a timeout is an unreadable consent, and the buffered frames decide."""
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
+    assert getattr(dose_video, "CONSENT_READ_SECONDS", None) == 5.0
+    monkeypatch.setattr(dose_video, "CONSENT_READ_SECONDS", 0.05, raising=False)
+
+    async def enabled(u_id):
+        await asyncio.Event().wait()                        # the database never answers
+    monkeypatch.setattr(dose_video, "enabled", enabled)
+    fill(7, 8)
+    video, frames = asyncio.run(asyncio.wait_for(dose_video.clip_outlook(7), 1.0))
+    assert video == "with_request" and len(frames) == 8
+    assert "consent could not be read (TimeoutError)" in caplog.text
+
+
+def test_a_record_has_time_for_a_review_being_made_beside_its_database_calls():
+    """Round 3 (F1.6): record_medication_taken may wait REVIEW_WAIT_SECONDS for a review being made, beside its two
+    database calls (DB_TIMEOUT_SECONDS each), inside its TIMEOUTS entry: the entry was raised by that wait."""
+    assert tool_registry.TIMEOUTS["record_medication_taken"] == 10.0 + tool_registry.REVIEW_WAIT_SECONDS == 15.0
+
+
 def test_capture_makes_the_clip_from_the_frames_it_is_given(monkeypatch):
     stored = []
 
