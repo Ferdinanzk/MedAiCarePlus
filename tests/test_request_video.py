@@ -12,6 +12,7 @@ clip, and a request with no clip at all said nothing about why. Now:
 """
 
 import asyncio
+import logging
 import sys
 import time
 import types
@@ -98,20 +99,40 @@ def test_a_reminder_points_back_to_the_video_and_never_promises_a_next_message()
 
 # ── what can come: dose_video.clip_outlook ──
 
-def test_the_outlook_needs_the_consent_and_enough_fresh_frames(monkeypatch):
+def video_warnings(caplog):
+    """The WARNING lines dose_video logged since the last call (then forgotten)."""
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == dose_video.log.name and record.levelno == logging.WARNING]
+    caplog.clear()
+    return lines
+
+
+def no_frames_line(u_id, count):
+    return (f"dose video for patient {u_id}: no video with the confirmation request: "
+            f"{count} recent frames buffered, {dose_video.MIN_FRAMES} needed")
+
+
+def test_the_outlook_needs_the_consent_and_enough_fresh_frames(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
     consent(monkeypatch, False)
     fill(7, 8)
     assert asyncio.run(dose_video.clip_outlook(7)) == ("none:no_consent", [])
+    assert video_warnings(caplog) == []                                                 # the patient's choice
     consent(monkeypatch, True)
     video, frames = asyncio.run(dose_video.clip_outlook(7))
     assert video == "with_request" and len(frames) == 8 and all(data == b"jpeg" for _, data in frames)
+    assert video_warnings(caplog) == []
+    # Each lost video logs one WARNING with its reason: the fresh frames it found and the number needed
     assert asyncio.run(dose_video.clip_outlook(8)) == ("none:no_frames", [])          # nothing buffered for 8
+    assert video_warnings(caplog) == [no_frames_line(8, 0)]
     dose_video._buffers.clear()
     fill(7, dose_video.MIN_FRAMES - 1)
     assert asyncio.run(dose_video.clip_outlook(7)) == ("none:no_frames", [])          # too few
+    assert video_warnings(caplog) == [no_frames_line(7, dose_video.MIN_FRAMES - 1)]
     dose_video._buffers.clear()
     fill(7, 8, age=dose_video.STALE_FRAME_SECONDS + 1)
     assert asyncio.run(dose_video.clip_outlook(7)) == ("none:no_frames", [])          # not this dose's frames
+    assert video_warnings(caplog) == [no_frames_line(7, 0)]
 
 
 def test_the_outlook_takes_the_frames_of_the_detected_moment(monkeypatch):
@@ -123,8 +144,10 @@ def test_the_outlook_takes_the_frames_of_the_detected_moment(monkeypatch):
 
 
 def test_a_consent_that_cannot_be_read_never_fails_the_request(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
     consent(monkeypatch, RuntimeError("the pool is down"))
     assert asyncio.run(dose_video.clip_outlook(7)) == ("none:no_frames", [])
+    assert no_frames_line(7, 0) in caplog.text                                         # the frames decided: lost
     fill(7, 8)
     video, frames = asyncio.run(dose_video.clip_outlook(7))
     assert video == "with_request" and len(frames) == 8   # capture's _store reads the consent again before writing
@@ -353,8 +376,9 @@ def test_a_review_that_takes_too_long_is_left_to_finish_and_the_request_gets_its
     (True, dose_video.MIN_FRAMES - 1, "none:no_frames"),
     (True, 8, "with_request"),
 ])
-def test_the_request_knows_before_it_is_made_whether_a_clip_can_come(now, captures, asked, monkeypatch, consented,
-                                                                     frames, video):
+def test_the_request_knows_before_it_is_made_whether_a_clip_can_come(now, captures, asked, monkeypatch, caplog,
+                                                                     consented, frames, video):
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
     consent(monkeypatch, consented)
     fill(7, frames)
     b, _ = backend()
@@ -362,6 +386,7 @@ def test_the_request_knows_before_it_is_made_whether_a_clip_can_come(now, captur
     assert answer["status"] == "pending_confirmation" and answer["video"] == video
     assert asked[0]["video"] == video                                    # in the evidence the request was made with
     assert captures == ([(7, [2], 8)] if video == "with_request" else [])
+    assert video_warnings(caplog) == ([no_frames_line(7, frames)] if video == "none:no_frames" else [])
 
 
 # ── the robot's own request: /api/device/tasks/{id}/confirmation ──
@@ -371,8 +396,9 @@ def test_the_request_knows_before_it_is_made_whether_a_clip_can_come(now, captur
     (True, 0, "none:no_frames"),
     (True, 8, "with_request"),
 ])
-def test_the_robots_request_carries_the_same_video_values(env, captures, monkeypatch, consented, frames,
+def test_the_robots_request_carries_the_same_video_values(env, captures, monkeypatch, caplog, consented, frames,
                                                           video):
+    caplog.set_level(logging.WARNING, logger=dose_video.log.name)
     consent(monkeypatch, consented)
     fill(7, frames)
     response = env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
@@ -380,6 +406,7 @@ def test_the_robots_request_carries_the_same_video_values(env, captures, monkeyp
     assert response.status_code == 200
     assert env.confirmations[-1]["evidence"] == {"said_done": True, "video": video}   # the robot's own keys kept
     assert captures == ([(7, [101], 8)] if video == "with_request" else [])
+    assert video_warnings(caplog) == ([no_frames_line(7, frames)] if video == "none:no_frames" else [])
 
 
 def test_the_robots_request_without_evidence_still_says_where_the_video_is(env, captures, monkeypatch):

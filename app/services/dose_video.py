@@ -135,7 +135,8 @@ async def clip_outlook(u_id: int, *, event_started_at: float | None = None) -> t
     capture() once the request exists.
 
     Never raises, so a request is never lost to it: a consent that cannot be read leaves the answer to the frames,
-    which are buffered only for sessions that started with the consent, and _store reads it again before writing."""
+    which are buffered only for sessions that started with the consent, and _store reads it again before writing.
+    NO_FRAMES is a lost video and logs one WARNING; NO_CONSENT is the patient's choice and logs nothing."""
     frames = clip_frames(u_id, time.monotonic(), event_started_at)
     try:
         if not await enabled(u_id):
@@ -144,6 +145,8 @@ async def clip_outlook(u_id: int, *, event_started_at: float | None = None) -> t
         log.warning("dose video for patient %s: the consent could not be read (%s); the buffered frames decide",
                     u_id, type(error).__name__)
     if len(frames) < MIN_FRAMES:
+        log.warning("dose video for patient %s: no video with the confirmation request: "
+                    "%d recent frames buffered, %d needed", u_id, len(frames), MIN_FRAMES)
         return NO_FRAMES, []
     return WITH_REQUEST, frames
 
