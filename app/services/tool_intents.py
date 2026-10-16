@@ -105,8 +105,12 @@ AGAIN = (re.compile(r"再跳一?(次|下|遍)|再來一(次|遍)"
 # 停 in any form (「停」, 「停下來」, 「停止」, 「好了，停」, 「你可以停下來嗎」, 「暫停」, 「你要不要停下來」), 「不要再跳了」,
 # 「別跳了」, 「不跳了」, a clause that ends with 不要跳, 別跳 or 不要再跳 (and 了, 啦 or nothing: 「不要再跳啦」), "stop"
 # ("please stop", "Reachy, stop"); 「夠了」, 「夠啦」 and "enough" only as a whole clause (「日希，夠了」). Each clause is
-# read by itself (stops), so 「停，不要跳了」 and 「不要，停下來」 are stops
-STOP_WORDS = (re.compile(r"停|(不要|別|不用|不)再?跳了|(不要|別|不用)再?(繼續)?跳(了|啦)?$|^((夠了|夠啦)(吧|啦)?)+$"),
+# read by itself (stops), so 「停，不要跳了」 and 「不要，停下來」 are stops. The clause-end form is never the 不要 of a
+# 要不要 question (「你要不要繼續跳」, 「要不要再跳」 ask whether Reachy wants to go on; round 3 review), but 不要不要
+# is still a no (「不要不要跳了」): _NOT_ASKED
+_NOT_ASKED = r"(?<!(?<!不)要)"
+STOP_WORDS = (re.compile(r"停|(不要|別|不用|不)再?跳了|" + _NOT_ASKED + r"(不要|別|不用)再?(繼續)?跳(了|啦)?$"
+                         r"|^((夠了|夠啦)(吧|啦)?)+$"),
               re.compile(r"(?<![a-z])stop(?![a-z])|^(ok |okay )?(enough|that's enough)( now| please)?$"))
 # 「好了」 and 「好啦」 as a whole clause only while a dance actually runs (stops' `dancing`): while a dance request only
 # waits for the backstop, 「好了，開始跳吧」 agrees to it (round 3; 「我吃好了」 is never a stop)
@@ -115,8 +119,9 @@ OKAY_WORDS = re.compile(r"^((好了|好啦|夠了|夠啦)(吧|啦)?)+$")
 # 「不要停止跳舞」 and "don't stop dancing" are no stop either): 「不要停」, 「別停」, 「不停」, 「跳個不停」, 「停不下來」,
 # 「停不了」, 「停車」, 「停電」, 「停藥」, 「我不想停」, "non-stop", "can't stop laughing", "bus stop" (「停不要跳了」 is a
 # stop: only 「停不下」, 「停不了」, 「停不住」 and 「停不得」 say "can't stop"). Round 3: 要不要停 asks to stop (「你要不要停
-# 下來」), and so do the complaints 還沒停 and 還不停 (「你怎麼還沒停」, 「你還不停」)
-NOT_STOP = (re.compile(r"(?<!要)不要停|不用停|別停|(?<!還)沒有?停|不想停|(?<!還)不停"
+# 下來」), and so do the complaints 還沒停 and 還不停 (「你怎麼還沒停」, 「你還不停」); 「不要不要停」 is still "no, don't
+# stop" (_NOT_ASKED, round 3 review)
+NOT_STOP = (re.compile(_NOT_ASKED + r"不要停|不用停|別停|(?<!還)沒有?停|不想停|(?<!還)不停"
                        r"|停(不[下了住得]|車|電|水|留|課|班|工|業|靠|經|藥|用|頓)"),
             re.compile(r"(?<![a-z])(don't|dont|do not|never|not|can't|cannot|couldn't|won't|wouldn't|didn't|non) stop"
                        r"(?![a-z])|(?<![a-z])stop (by|over)(?![a-z])|(?<![a-z])bus stop(?![a-z])"))
@@ -237,14 +242,23 @@ def _compact_at(spaced: str, index: int) -> int:
 def _dance_end(text: str, danced: bool = False) -> int:
     """Where the last dance request of the words ends, as a position in the turn's compact form (the clauses'
     compact forms joined), or -1 without one: the dance PATTERNS, a whole clause that asks (DANCE_CLAUSE), and after a
-    dance in this chat (`danced`) 「再跳一次」 or the dance asked to go on (AGAIN)."""
+    dance in this chat (`danced`) 「再跳一次」 or the dance asked to go on (AGAIN). A dance form that starts inside a
+    "don't dance" stop phrase (PATTERNS["stop_dance"], as stops reads it: NOT_STOP removed first) is part of that
+    stop, never a request: 「你不要再跳舞給我看了」 holds 跳舞給我看, which hid the stop (round 3 review)."""
     forms = _forms(text)
     compact = "".join(clause for clause, _, _ in forms)
     spaced = " ".join(words for _, words, _ in forms if words)
+    stops_at = [range(offset + match.start(), offset + match.end()) for clause, _, offset in forms
+                for match in PATTERNS["stop_dance"][0].finditer(_blank(NOT_STOP[0], clause))]
+
+    def request(start: int) -> bool:
+        return not any(start in span for span in stops_at)
+
     again = AGAIN if danced else ()
-    ends = [match.end() for pattern in PATTERNS["dance"] + again[:1] for match in pattern.finditer(compact)]
+    ends = [match.end() for pattern in PATTERNS["dance"] + again[:1] for match in pattern.finditer(compact)
+            if request(match.start())]
     ends += [_compact_at(spaced, match.end()) for pattern in PATTERNS["dance"] + again[1:]
-             for match in pattern.finditer(spaced)]
+             for match in pattern.finditer(spaced) if request(_compact_at(spaced, match.start()))]
     ends += [offset + len(clause) for clause, _, offset in forms if DANCE_CLAUSE.fullmatch(clause)]
     return max(ends, default=-1)
 

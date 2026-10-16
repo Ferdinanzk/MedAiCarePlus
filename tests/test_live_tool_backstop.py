@@ -356,19 +356,26 @@ STOPS = ["停", "停下來", "停止", "不要跳了", "不要再跳了", "別�
          # round 3: 要不要停 holds no 「不要停」; a clause that ends with 不要跳, 別跳 or 不要再跳 (and 了, 啦 or nothing);
          # 好啦 and 夠啦 beside 好了 and 夠了; the complaints 「你怎麼還沒停」 and 「你還不停」
          "你要不要停下來", "要不要停一下", "不要跳", "別跳", "不要再跳", "不要再跳啦", "你不要繼續跳了", "好啦", "夠啦",
-         "你怎麼還沒停", "你還不停"]
+         "你怎麼還沒停", "你還不停",
+         # round 3 review: 不要不要 is still a "no", so 「不要不要跳了」 stops
+         "不要不要跳了"]
 # 「好了」 and 「好啦」 as a whole clause are a stop only while a dance actually runs: while a dance request only waits
 # for the backstop, 「好了，開始跳吧」 is the patient agreeing to it (round 3)
 OKAYS = ["好了", "好了好了", "好啦"]
 # ... and these at any time, dancing or not
 ALWAYS_STOPS = ["stop dancing", "不要跳舞了", "停止跳舞", "Reachy, please stop dancing", "停，不要跳舞了",
-                "不要，停止跳舞"]
+                "不要，停止跳舞",
+                # round 3 review: the 跳舞給我看 inside a "don't dance" is no dance request after it
+                "你不要再跳舞給我看了", "不用跳舞給我看啦", "別跳舞給我看", "不要跳舞給我看了"]
 # Never a stop: "don't stop", "non-stop" and other kinds of stop
 NOT_STOPS = ["不要停", "停車", "停電", "不停", "不要停，繼續跳", "你跳個不停", "停車場在哪裡", "昨天停電了", "別停",
              "我停不下來", "我想停藥", "不要停止跳舞", "don't stop", "don't stop dancing", "I can't stop laughing",
              "the bus stop", "non-stop", "我吃好了", "停不了", "我真的停不住",
              # round 3: the patient's own wish, not a stop
-             "我不想停", "我還不想停"]
+             "我不想停", "我還不想停",
+             # round 3 review: a 要不要 question asks whether Reachy wants to go on (「不要不要停」: "no, no, don't
+             # stop")
+             "你要不要繼續跳", "要不要再跳", "你要不要跳", "不要不要停"]
 
 
 @pytest.mark.parametrize("words", STOPS + ALWAYS_STOPS)
@@ -443,6 +450,15 @@ def test_a_stop_that_names_dancing_is_a_stop_dancing_or_not(words):
 def test_dont_stop_and_other_kinds_of_stop_are_never_a_stop(words):
     assert tool_intents.detect(words, dancing=True) != "stop_dance"
     assert tool_intents.detect(words) != "stop_dance"
+    assert not tool_intents.stops(words, dancing=True, danced=True)
+    assert not tool_intents.stops(words, waiting=True)
+
+
+@pytest.mark.parametrize("words", ["你要不要繼續跳", "要不要再跳", "你要不要跳", "你要不要跳舞給我看"])
+def test_a_question_whether_reachy_wants_to_dance_is_never_a_stop(words):
+    # 要不要…跳 holds 不要…跳 (round 3 review): the clause-end form read 「你要不要繼續跳」 as a stop
+    assert not tool_intents.stops(words, dancing=True, danced=True)
+    assert not tool_intents.stops(words, waiting=True, danced=True)
 
 
 @pytest.mark.parametrize("fragments", [["不要再跳了"], ["日希，", "停下來"], ["Reachy,", " stop"], ["please stop"],
@@ -638,12 +654,33 @@ def test_keep_dancing_after_a_stop_ends_the_hold_and_dances(world):
     async def scenario():
         relay, running, link = await _with_tools(world, clock=world.clock)
         await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        before = len(world.clients[-1].commentaries)
         await _live(world, _said("停"))
         assert link.stops == 1
         await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)   # well inside the stop's hold
         await _live(world, _said("繼續跳"), _sound(), _reachy("好"))
         await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
         assert link.dances == [("simple_nod", 2), (None, 2)]
+        # the stop's line still waited: the patient asked to dance again, so only the dance is said (round 3 review)
+        assert world.clients[-1].commentaries[before:] == [live_session.INTENT_LINES["dance"]["zh-TW"]]
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_dont_dance_for_me_any_more_stops_the_dance_and_no_dance_follows(world):
+    # 「你不要再跳舞給我看了」 holds 跳舞給我看 inside its "don't dance": read as the last dance request of the words, it
+    # hid the stop, the dance went on and the backstop started a second one (round 3 review)
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})   # GPT-Live's dance runs
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said("你不要再跳舞給我看了"))
+        assert link.stops == 1
+        await _live(world, _sound(), _reachy("好"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
+        assert link.stops == 1 and link.dances == [("simple_nod", 2)]
+        assert world.clients[-1].commentaries[before:] == [live_session.INTENT_LINES["stop_dance"]["zh-TW"]]
         await _end(world, running)
 
     asyncio.run(scenario())

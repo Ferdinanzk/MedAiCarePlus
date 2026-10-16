@@ -1617,9 +1617,13 @@ class LiveRelay:
             return
         self._intent_turn_read = True
         mark = self._requests_mark
+        if kind == "dance":
+            # the patient asks to dance again: a stop's line still waiting is stale (round 3 review: 「停」, then
+            # 「繼續跳」 had GPT-Live told Reachy stopped as the new dance started), so only the dance is said
+            self._stop = None
         if kind == "dance" and self.tools.dance_asked():
-            # the patient asks to dance again: a stop's hold is over, and a dance GPT-Live asked for during it (before
-            # its transcript held these words) was refused, so only a call from now on is GPT-Live's own
+            # a stop's hold is over, and a dance GPT-Live asked for during it (before its transcript held these
+            # words) was refused, so only a call from now on is GPT-Live's own
             mark = (self.client, len(self._requests()))
         self._intent = {"kind": kind, "at": now, "words": words.strip(), "mark": mark, "reply_at": None}
 
