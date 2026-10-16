@@ -16,9 +16,9 @@ language, and runs the tool when GPT-Live has not asked for it in time.
   itself, so a "don't" never reaches across a comma (「不要，停下來」 is a stop).
 - "took_medicine" is the patient's own word that the medicine is taken (「我吃完藥了」, "I took my medicine"): GPT-Live
   praised it itself and it often never reached record_medication_taken (agent tool fixes, Task 4, Oct 2026). It is
-  read clause by clause and must start and end its clause, never for another person, another time, a plan, a
-  condition, a belief or a doubt, someone else's words, a negation, a question, food, running out, an extra dose or
-  words that take it back, whichever clause of the turn holds them (took_medicine below).
+  a closed whole-turn match (claims_intake, round 3): the turn, without the call name and the fillers, is nothing but
+  one plain first-person finished intake that names the medicine, with one closing word after it at most (再見,
+  謝謝, "thanks"). Anything else in the turn is GPT-Live's own delegation to answer.
 - `TOOLS` names the delegated calls that satisfy an intent (GPT-Live asked for one of them itself).
 """
 
@@ -30,9 +30,9 @@ INTENTS = ("stop_dance", "took_medicine", "dance", "look", "time", "search")
 TOOLS = {"dance": ("dance",), "stop_dance": ("stop_dance",),
          "look": ("describe_view", "camera", "identify_medicine", "verify_medication"),
          "time": ("get_current_time",), "search": ("search_web",),
-         # GPT-Live's backend took the claim: its completion flow or the camera workflow's steps
-         "took_medicine": ("check_medication_due", "get_medication_schedule", "get_pill_intake_result",
-                           "record_medication_taken")}
+         # GPT-Live's backend took the claim: its completion flow's due check or record (reading the schedule records
+         # nothing, so it no longer drops a claim nobody recorded; round 3)
+         "took_medicine": ("check_medication_due", "record_medication_taken")}
 # A search request about these is another tool's (medicine, weather, time, reminders), never a web search
 NOT_SEARCH = re.compile(r"藥|药|天氣|天气|幾點|几点|時間|时间|提醒|家人|吃飯|medicine|medication|pill|weather|time|remind|family")
 
@@ -104,139 +104,94 @@ NOT_STOP = (re.compile(r"(不要|不用|別|沒有?|不)停|停(不[下了住得
             re.compile(r"(?<![a-z])(don't|dont|do not|never|not|can't|cannot|couldn't|won't|wouldn't|didn't|non) stop"
                        r"(?![a-z])|(?<![a-z])stop (by|over)(?![a-z])|(?<![a-z])bus stop(?![a-z])"))
 _PUNCTUATION = re.compile(r"(?:[^\w\s]|_)+")
-# The patient's own intake, done (took_medicine), as one whole clause (compact, Traditional): 我 with at most an
-# "already" word before 吃 (我吃完藥了, 我已經吃藥了, 我吃了藥); no subject, with 完/過/好/掉 or 已經/剛 (吃完藥了,
-# 已經吃藥了; never 「吃藥了」, "medicine time!" said to someone); or the medicine first (藥吃了, 我把藥吃完了; never
-# 「把藥吃了」, an order, and 吃完了 only after 我把: 「藥吃完了」 and 「我的藥吃完了」 say it ran out). Each form with what
-# makes it done (on the claim's own words, `claim`: 「我也吃藥」 is a habit and 「我有吃藥」 can be "I'm on medication";
-# None: the form says it). The claim starts its clause, after at most a call name or a filler (_LEAD: 「日希我吃完藥了」),
-# so a condition, a plan, a belief, a doubt or someone else's words in front never fit (如果我吃完藥了, 等我吃完藥了,
-# 我以為我吃完藥了, 我不確定我吃過藥了, 他說我吃完藥了), nor does another person (他, 我媽媽). It ends its clause, a
-# sentence particle at most: 「我吃完藥了再跟你說」 and 「我吃完藥就去睡覺」 are plans, 「我吃藥了嗎」 a question. The same words
-# split by the transcript's commas are read with the clauses around the claim (claims_intake).
-_LEAD =r"^(日希|瑞希|瑞奇|reachy|richy|rishi|嗯|對|好|喔|哦|欸|我跟你說|跟你說|你知道)*"
-_ALREADY = r"(已經|剛剛|剛才|剛|有|都|也)*"
+# The patient's own intake, done (took_medicine): a CLOSED whole-turn match (round 3 of 17 Oct 2026). Three review
+# rounds each found phrases an open-ended reader got wrong (conditions across a comma, other people, clock times such
+# as 「我吃過藥了，八點吃的」, retractions, transcript fragments that dropped a real claim for good), and that set never
+# ends. So a turn is a claim only when, once the call name and the fillers around each clause are dropped (CLAIM_LEAD,
+# CLAIM_TRAIL), nothing is left but one plain first-person finished intake that names the medicine (CLAIM_ZH,
+# CLAIM_EN), with at most one closing word after it (CLOSING_ZH, CLOSING_EN). Anything else in the turn (another
+# clause, a time, a person, a question, a plan, a doubt) is no backstop claim, and GPT-Live's own delegation (the
+# tools prompt) answers it: a false claim files a request for the current dose and makes overdose protection refuse
+# the real one for up to 2 h, while a missed one only leaves GPT-Live's own call as the path.
+CLAIM_LEAD = re.compile(r"^(?:\s*(?:日希|瑞希|瑞奇|嗯|喔|哦|欸|誒|啊|呀|好|對|那個|我跟你說|跟你說"
+                        r"|(?:reachy|richy|rishi|um|uh|oh|okay|ok|well|so|yes|yeah)(?![a-z'])))+")
+CLAIM_TRAIL = re.compile(r"(?:\s*(?:日希|瑞希|瑞奇|嗯|喔|哦|欸|誒|啊|呀"
+                         r"|(?<![a-z'])(?:reachy|richy|rishi|um|uh|oh|okay|ok)))+$")
 _PILLS = r"(藥|藥物|藥丸|藥片)"
-_MEDICINE = r"(今天的|這次的|我的)?" + _PILLS
+_JUST = r"(已經|剛剛|剛才|剛|有)*"
 _SINCE = r"(已經|剛剛|剛才|剛|有)?"
-_ENDS = r"了?(啦|喔|哦|囉|呀|啊|耶)?$"
-TOOK = ((re.compile(_LEAD + r"(?P<claim>我" + _ALREADY + r"吃(完|過|好|掉)?了?" + _MEDICINE + _ENDS + ")"),
-         re.compile(r"已經|剛|完|過|好|掉|了")),
-        (re.compile(_LEAD + r"(?P<claim>" + _ALREADY + r"吃(完|過|好|掉)?了?" + _MEDICINE + _ENDS + ")"),
-         re.compile(r"已經|剛|完|過|好|掉")),
-        (re.compile(_LEAD + r"(?P<claim>((我把?)?" + _PILLS + r"我?" + _SINCE + r"吃(了|過了|好了|掉了)|我把" + _PILLS + _SINCE
-                    + r"吃完了)(啦|喔|哦|囉|呀|啊|耶)?$)"),
-         None))
-TOOK_EN = re.compile(r"^((yes|yeah|ok|okay|oh|so|well|and|reachy|richy|rishi) )*i( have|'ve)?( already| just)? "
-                     r"(took|taken|had|finished taking) (my|the) "
-                     r"(medicine|medicines|medication|medications|pills?|meds|tablets?)( already| now| just now)?$")
-# A claim that names another time is left to GPT-Live (the due check would read today's current dose), and so is one
-# its clause asks about. Read on the claim's clause and on every clause before it: 「早上，我吃過藥了」,
-# "Yesterday, I took my medicine", 「是不是，我吃完藥了」
-NOT_TOOK = re.compile(r"昨|前天|明天|早上|上午|中午|下午|晚上|凌晨|睡前|點|等一下|待會|是不是|有沒有|是否|yesterday|tomorrow"
-                      r"|last night|this morning|this afternoon|this evening|tonight|o'?clock")
-# A clause after it that puts the intake at another day or part of the day: 「我吃過藥了，早上吃的」, "I took my medicine,
-# last night" (not 有點 or 等一下: 「我吃完藥了，就是有點累」 stays a claim)
-EARLIER = re.compile(r"昨|前天|早上|上午|中午|下午|晚上|凌晨"
-                     r"|(?<![a-z])(yesterday|last night|this morning|this afternoon|this evening)(?![a-z])")
-# A clause that only asks the one before it back: 「我吃完藥了，對不對？」
-TAG = re.compile(r"^(對不對|對吧|對嗎|是不是|是吧|是嗎|沒錯吧|好嗎|right|correct|didn't i|haven't i|isn't it)$")
-# A clause after it that makes it a time or a condition, as without the transcript's comma: 「我吃完藥了，再跟你說」,
-# 「我吃完藥了，就去睡覺」 (never 再見, 就是, 就這樣)
-THEN = re.compile(r"^(再|就|才)(?!見|會|是|這樣)")
-# A word anywhere in a clause before it that makes it a condition, a belief, a doubt or someone else's words:
-# 「如果，我吃完藥了」, 「如果明天，我吃完藥了」, 「我以為昨天，我吃完藥了」, 「他說，我吃完藥了」 (never 我跟你說, a filler)
-HEDGE = re.compile(r"如果|要是|假如|萬一|等|以為|不記得|不確定|不知道|忘記|忘了|覺得|好像|可能|應該|也許|大概"
-                   r"|(?<!跟你)(?<!告訴你)說|(?<![a-z])(if|when|thought|think|guess|maybe|not sure|don't know"
-                   r"|don't remember|forgot|said|says)(?![a-z])")
-# A clause before it that names someone other than the patient: 「我先生啊，已經吃過藥了」, 「她呢，吃完藥了」
-OTHER = re.compile(r"他|她|媽|爸|先生|老公|老婆|太太|丈夫|妻子|兒子|女兒|孫|爺爺|奶奶|阿公|阿嬤|外公|外婆|哥哥|弟弟|姊姊|姐姐"
-                   r"|妹妹|叔叔|伯伯|阿伯|姑姑|阿姨|舅舅|朋友|鄰居|同學|小孩|孩子|家人|別人|大家"
-                   r"|(?<![a-z])(he|she|they|his|her|their|wife|husband|mom|mum|mother|dad|father|son|daughter|friend"
-                   r"|sister|brother|grandma|grandpa)(?![a-z])")
-# A claim without a subject of its own (「已經吃過藥了」, 「藥吃了」) follows only a call name or a filler: after a name
-# or anything else, the words may be about someone else (「小明，吃完藥了」)
-FILLER = re.compile(_LEAD + r"(啊|呀|啦|喔|哦|嘛|耶|欸|呢)*$")
-# A clause after it that takes it back: 「我吃完藥了，不對，我還沒吃」, 「…，騙你的」, "…, no wait, I didn't" (not food:
-# 「我吃完藥了，還沒吃早餐」 stays a claim)
-TAKEN_BACK = re.compile(r"不對|不是|沒有?吃(?!飯|東西|早餐|午餐|晚餐|點心)|騙你|開玩笑|說錯|記錯|搞錯"
-                        r"|(?<![a-z])(no wait|wait no|didn't|did not|haven't|have not|actually no|not yet|just kidding"
-                        r"|i'm kidding|i lied)(?![a-z])")
-# Words anywhere in the turn that make it no plain claim: an extra dose (「我吃完藥了，好像吃了兩次」: never praised,
-# conversation.LIVE_CLAIM_PRAISE, and left to GPT-Live and the safety checks; extra_dose) and running out
-# (「我把藥吃完了，要再去拿」). An extra dose is also a whole box or bottle (整盒, not 一整天), everything (全部都吃了,
-# "all my pills", read as no claim on purpose), a count above one (吃了五顆) and a later dose taken too (連明天的也吃了,
-# 晚上的也一起吃了)
-EXTRA_DOSE = re.compile(r"多吃|又吃|吃多了|吃太多|過量|重複吃|[兩二三四幾]次|[兩雙]倍"
-                        r"|整(盒|瓶|包|排|罐|袋|條)|全部都?(吃|吞)|通通都?吃"
-                        r"|([兩二三四五六七八九十幾][一二三四五六七八九十]*|[2-9]|[1-9]\d+)(顆|粒|包|片|錠)"
-                        r"|(盒|瓶|包|排|顆|粒|片)(的藥)?都吃|連.{0,8}?(也|都)(一起)?吃(了|掉|下去)"
-                        r"|(明天|晚上|下午|中午|早上|下一次|下次|下一餐)的.{0,6}?(也|一起|一併)都?吃"
-                        r"|(?<![a-z])(twice|two times|extra|too much|too many|double|overdose"
-                        r"|whole (bottle|box|pack|packet|strip)|all of them"
-                        r"|all (of )?(my|the) (pills?|tablets?|capsules?|meds|medicines?|medications?)"
-                        r"|(two|three|four|five|six|seven|eight|nine|ten|[2-9]|[1-9]\d+) (pills|tablets|capsules)"
-                        r"|(tomorrow|tonight)'s)(?![a-z])")
-RAN_OUT = re.compile(r"再去?拿|拿藥|領藥|買藥|沒藥了|沒有藥了|藥沒了|吃光|藥用完|(?<![a-z])(ran out|run out|refill)(?![a-z])")
+CLOSING_ZH = r"(再見|拜拜|謝謝|囉|啦)?"
+CLOSING_EN = r"(bye|goodbye|thanks|thank you)?"
+# The Chinese forms (compact), each with what makes it done in its own words (None: the form says it): 我 with at
+# most a "just" or "already" word before 吃 (我吃完藥了, 我已經吃藥了, 我剛剛吃藥了, 我吃了藥; never 「我有吃藥」, "I'm on
+# medication", nor 「我吃藥囉」, "I'm taking it now"); no subject, with 完/過/好/掉 or 已經/剛 (吃完藥了; never 「吃藥了」,
+# "medicine time!"); or the medicine first (藥吃了, 藥我吃過了, 我把藥吃完了; never 「把藥吃了」, an order, and 吃完了
+# only after 我把: 「藥吃完了」 and 「我的藥吃完了」 say it ran out). No 今天的: 「我吃完今天的藥了」 can be every dose of
+# the day
+CLAIM_ZH = tuple((re.compile(r"(?P<claim>" + form + r")" + CLOSING_ZH), done) for form, done in (
+    (r"我" + _JUST + r"吃(完|過|好|掉)?了?(這次的|我的)?" + _PILLS + r"了?", re.compile(r"已經|剛|完|過|好|掉|了")),
+    (_JUST + r"吃(完|過|好|掉)?了?(這次的|我的)?" + _PILLS + r"了?", re.compile(r"已經|剛|完|過|好|掉")),
+    (r"(我把?)?" + _PILLS + r"我?" + _SINCE + r"吃(了|過了|好了|掉了)|我把" + _PILLS + _SINCE + r"吃完了", None)))
+# "I took my medicine", "I've taken my pills", "I have had my meds", "I just took my medication", "I already took my
+# pills" (spaced), with one closing word at most
+CLAIM_EN = re.compile(r"i( have|'ve)?( already| just)? (took|taken|had|finished taking) (my|the) "
+                      r"(medicine|medicines|medication|medications|pills?|meds|tablets?)( already| now| just now)?"
+                      r"( (bye|goodbye|thanks|thank you))?")
 _CLAUSE_END = re.compile(r"([，,。.!！?？；;：:、…~～\n]+)")
 _ASKED = re.compile(r"[?？]")
+
+
+def _normal(text: str) -> str:
+    """The words in Traditional Chinese, lower case. Curly apostrophes are made straight first: the script
+    conversion turns ’ into 』, so "I’ve taken my pills" was never read."""
+    return _traditional(text.replace("’", "'").replace("‘", "'")).lower()
 
 
 def _prepare(text: str) -> tuple[str, str]:
     """(compact, spaced): the words in Traditional Chinese, lower case; compact without spaces or punctuation for
     the Chinese patterns, spaced (punctuation as spaces) for the English ones."""
-    converted = _traditional(text).lower().replace("’", "'")
+    converted = _normal(text)
     compact = re.sub(r"\s+", "", _PUNCTUATION.sub("", converted.replace("'", "")))
     spaced = re.sub(r"\s+", " ", re.sub(r"[^\w\s']+", " ", converted)).strip()
     return compact, spaced
 
 
-def extra_dose(text: str) -> bool:
-    """Whether the patient's words say they took it twice, took extra or took too much (EXTRA_DOSE)."""
-    compact, spaced = _prepare(text)
-    return bool(EXTRA_DOSE.search(compact) or EXTRA_DOSE.search(spaced))
-
-
-def takes_back(text: str) -> bool:
-    """Whether the patient's words take a claim back (TAKEN_BACK: 「不對，我還沒吃」, 「騙你的」, "no wait, I didn't")."""
-    return any(TAKEN_BACK.search(words) for words in _prepare(text))
-
-
-def _found(patterns: tuple, clauses: list) -> bool:
-    """Whether one of `patterns` is in one of `clauses` ((compact, spaced) pairs)."""
-    return any(pattern.search(words) for clause in clauses for words in clause for pattern in patterns)
+def _claim_words(text: str) -> tuple[str, str]:
+    """(compact, spaced): the turn as the claim reader sees it (_normal), each clause without the call name and the
+    fillers around it (CLAIM_LEAD, CLAIM_TRAIL; a clause of nothing else is dropped), the punctuation dropped."""
+    clauses = []
+    for clause in _CLAUSE_END.split(_normal(text))[::2]:
+        words = re.sub(r"\s+", " ", re.sub(r"[^\w\s']+|_", " ", clause)).strip()
+        words = CLAIM_TRAIL.sub("", CLAIM_LEAD.sub("", words)).strip()
+        if words:
+            clauses.append(words)
+    spaced = " ".join(clauses)
+    return re.sub(r"[\s']+", "", spaced), spaced
 
 
 def claims_intake(text: str) -> bool:
-    """Whether the patient says they took their medicine (took_medicine): a clause that fits a TOOK form or TOOK_EN
-    and is not asked (a question mark), read with every other clause of the turn, since the transcript's commas
-    come and go. No clause before it names another time or asks (NOT_TOOK), makes it a condition, a belief, a doubt or
-    someone else's words (HEDGE) or names another person (OTHER), and one without a subject of its own follows only
-    a call name or a filler (FILLER). No clause after it puts it at another time (EARLIER) or takes it back
-    (TAKEN_BACK), and the next one neither asks it back nor makes it a plan (TAG, THEN). Never in a turn that speaks
-    of an extra dose or of running out (EXTRA_DOSE, RAN_OUT)."""
-    if extra_dose(text) or any(RAN_OUT.search(words) for words in _prepare(text)):
+    """Whether the whole turn is the patient's word that they took their medicine (took_medicine): with the call
+    name and the fillers dropped, nothing but one plain first-person finished intake that names the medicine
+    (CLAIM_ZH, CLAIM_EN), and at most one closing word after it. Never with a question mark."""
+    if not text or not text.strip() or _ASKED.search(text):
         return False
-    parts = _CLAUSE_END.split(text)
-    clauses = [(_prepare(parts[i]), bool(_ASKED.search("".join(parts[i + 1:i + 2])))) for i in range(0, len(parts), 2)]
-    for index, ((compact, spaced), asked) in enumerate(clauses):
-        if asked or not compact or NOT_TOOK.search(compact) or NOT_TOOK.search(spaced):
-            continue
-        before = [words for words, _ in clauses[:index]]
-        later = [words for words, _ in clauses[index + 1:]]
-        after = later[0] if later else ("", "")
-        if (_found((NOT_TOOK, HEDGE, OTHER), before) or _found((EARLIER, TAKEN_BACK), later)
-                or any(TAG.search(words) for words in after) or THEN.search(after[0])):
-            continue
-        if TOOK_EN.search(spaced):
+    compact, spaced = _claim_words(text)
+    if CLAIM_EN.fullmatch(spaced):
+        return True
+    for form, done in CLAIM_ZH:
+        match = form.fullmatch(compact)
+        if match and (done is None or done.search(match.group("claim"))):
             return True
-        plain = all(FILLER.search(words[0]) for words in before)
-        for form, done in TOOK:
-            match = form.search(compact)
-            if (match and (done is None or done.search(match.group("claim")))
-                    and ("我" in match.group("claim") or plain)):
-                return True
     return False
+
+
+def closes(text: str) -> bool:
+    """Whether the patient's words say nothing but one closing word (CLOSING_ZH, CLOSING_EN: 再見, 拜拜, 謝謝, 囉, 啦,
+    bye, goodbye, thanks, thank you), or only fillers and the call name: words after a claim that leave it standing."""
+    if _ASKED.search(text or ""):
+        return False
+    compact, spaced = _claim_words(text or "")
+    return bool(re.fullmatch(CLOSING_ZH, compact) or re.fullmatch(CLOSING_EN, spaced))
 
 
 def stops(text: str, dancing: bool = False) -> bool:

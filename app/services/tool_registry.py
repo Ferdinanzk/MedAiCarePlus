@@ -902,7 +902,7 @@ class ToolRegistry:
         self._danced = False                                    # this chat had a dance
         self._stopped_at = float("-inf")                        # the last stop, while its hold lasts (dance_asked)
         self._starting = 0                                      # dance calls the robot has not answered yet
-        self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
+        self._intent_runs: dict[str | tuple, tuple[float, asyncio.Future]] = {}   # the backstop's runs (_shared_as)
         # FINISH_ON_CLOSE calls still running (hold), in the order they were held: (when, on the event loop's clock,
         # and the seconds their TIMEOUTS entries allow)
         self._held: dict[asyncio.Future, tuple[float, float]] = {}
@@ -976,13 +976,25 @@ class ToolRegistry:
     async def run_intent(self, name: str, args: dict) -> dict:
         """Run a tool for the relay's backstop (live_session, services/tool_intents.py): GPT-Live did not ask for it.
         A call GPT-Live makes for the same tool within INTENT_SHARE_SECONDS gets this run's answer instead of a
-        second run (a second dance, a second camera look). A FINISH_ON_CLOSE run (a claim's record) is held as it
-        starts, so the chat's end waits for every record of a claim (finish_wait)."""
+        second run (a second dance, a second camera look); for record_medication_taken, only a call for the same dose
+        (_shared_as). A FINISH_ON_CLOSE run (a claim's record) is held as it starts, so the chat's end waits for every
+        record of a claim (finish_wait)."""
         run = asyncio.ensure_future(self._run(name, args))
-        self._intent_runs[name] = (self.clock(), run)
+        self._intent_runs[self._shared_as(name, args)] = (self.clock(), run)
         if name in FINISH_ON_CLOSE:
             self.hold(run, name)
         return await asyncio.shield(run)
+
+    @staticmethod
+    def _shared_as(name: str, args) -> str | tuple:
+        """Which backstop run a call shares: the tool's, except record_medication_taken, which the claim of a slot
+        runs once per dose, so a call shares only the run of the same dose argument (round 3 of 17 Oct 2026:
+        GPT-Live's call for one dose got another dose's answer and was never filed). A call with no matching run
+        executes normally."""
+        if name != "record_medication_taken":
+            return name
+        dose = args.get("medication_id") if isinstance(args, dict) else None
+        return name, str(dose).strip() if dose else None
 
     def forget_intents(self) -> None:
         """A new patient turn: GPT-Live's next call is for new words ("dance again"), never the backstop's run. A stop
@@ -992,7 +1004,7 @@ class ToolRegistry:
         self._intent_runs = {"stop_dance": stop} if stop is not None else {}
 
     async def execute(self, name: str, args: dict | None) -> dict:
-        shared = self._intent_runs.get(name)
+        shared = self._intent_runs.get(self._shared_as(name, args))
         if shared is not None and self.clock() - shared[0] < INTENT_SHARE_SECONDS:
             log.info("live agent tool %s: the backstop's run answers it", name)
             return await asyncio.shield(shared[1])

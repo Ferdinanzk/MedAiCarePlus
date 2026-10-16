@@ -100,8 +100,8 @@ AFFECT_MOVE_GAP_SECONDS = 45.0
 # (LiveRelay._want_stop); only its line waits as long
 INTENT_REPLY_GRACE_SECONDS = 2.5
 INTENT_WAIT_SECONDS = 6.0
-# The patient's word that the medicine is taken (took_medicine) runs the due check first; only a dose it allows now
-# then gets record_medication_taken (_record_claim)
+# The patient's word that the medicine is taken (took_medicine) runs the due check first; then record_medication_taken
+# for each dose of the slot it allows now or refuses as a possible double dose (CLAIM_RECORDED, _record_claim)
 INTENT_TOOL = {"dance": ("dance", lambda words: {"dance": None, "repeat": None}),
                "stop_dance": ("stop_dance", lambda words: {}),
                "look": ("describe_view", lambda words: {"question": words[:300]}),
@@ -123,15 +123,14 @@ INTENT_LINES = {
                        "en": "I couldn't find the time for {place}; which city is it?"},
     "search": {"zh-TW": "我上網查了一下：{answer}", "en": "I searched the web: {answer}"},
     "search_failed": {"zh-TW": "我現在上網查不到，等一下再試試。", "en": "I can't search right now; let's try again later."},
-    # The patient's word that the medicine is taken: praise (gpt_live_config.CELEBRATION) only for a dose that stands as
-    # taken or waiting for family, and never "recorded" for the claim itself (family confirm it)
-    "took_medicine": {"zh-TW": "我已經請家人確認了。" + gpt_live_config.CELEBRATION["zh-TW"],
-                      "en": "I've asked your family to confirm it. " + gpt_live_config.CELEBRATION["en"]},
-    "took_medicine_taken": {"zh-TW": "我查了一下，這次的藥已經吃過了。" + gpt_live_config.CELEBRATION["zh-TW"],
-                            "en": "I checked: this dose is already taken. " + gpt_live_config.CELEBRATION["en"]},
-    "took_medicine_waiting": {"zh-TW": "我查了一下，這次的藥已經在等家人確認了。" + gpt_live_config.CELEBRATION["zh-TW"],
-                              "en": "I checked: this dose is already waiting for your family to confirm. "
-                                    + gpt_live_config.CELEBRATION["en"]},
+    # The patient's word that the medicine is taken: what happened, never praise (round 3 of 17 Oct 2026: the backstop
+    # runs no applause, and praise could land on a refused or doubled dose; GPT-Live's own path praises with the
+    # applause), and never "recorded" for the claim itself (family confirm it)
+    "took_medicine": {"zh-TW": "我已經請家人確認了。", "en": "I've asked your family to confirm it."},
+    "took_medicine_taken": {"zh-TW": "我查了一下，這次的藥已經記錄吃過了。",
+                            "en": "I checked: this dose is already recorded as taken."},
+    "took_medicine_waiting": {"zh-TW": "我查了一下，這次的藥已經在等家人確認了。",
+                              "en": "I checked: this dose is already waiting for your family to confirm."},
     "took_medicine_refused": {"zh-TW": "我查了一下，這次沒有記錄，因為{why}。",
                               "en": "I checked: this was not recorded, because {why}."},
     "took_medicine_none": {"zh-TW": "我查了一下，現在沒有要吃的藥，所以沒有記錄。",
@@ -150,10 +149,10 @@ CLAIM_REASONS = {
     "refused_expired": {"zh-TW": "這次的藥已經錯過了，請不要補吃", "en": "this dose was missed and must not be made up"},
 }
 # A claimed slot of several medicines whose outcomes differ (LiveRelay._claim_line): one sentence per outcome, with the
-# medicines' names; the praise (gpt_live_config.CELEBRATION) follows only when every medicine stands
+# medicines' names
 CLAIM_PARTS = {
     "asked": {"zh-TW": "我已經請家人確認{names}了。", "en": "I've asked your family to confirm {names}."},
-    "taken": {"zh-TW": "{names}已經吃過了。", "en": "{names}: already taken."},
+    "taken": {"zh-TW": "{names}已經記錄吃過了。", "en": "{names}: already recorded as taken."},
     "pending_confirmation": {"zh-TW": "{names}已經在等家人確認了。",
                              "en": "{names}: already waiting for your family to confirm."},
     "refused": {"zh-TW": "{names}這次沒有記錄，因為{why}。", "en": "{names}: not recorded, because {why}."},
@@ -161,9 +160,11 @@ CLAIM_PARTS = {
     "failed": {"zh-TW": "{names}現在記錄不了，請告訴家人您吃過了。",
                "en": "{names}: could not be recorded now; please tell your family you took it."},
 }
-# Said instead of the praise (gpt_live_config.CELEBRATION) when the patient said, while the claim ran, that they took it
-# twice, took extra or took too much (tool_intents.extra_dose): a doubled dose is never praised
-CLAIM_UNWELL = {"zh-TW": "如果覺得不舒服，請馬上告訴家人。", "en": "If you feel unwell, please tell your family right away."}
+# The doses of a claimed slot that go to record_medication_taken (round 3 of 17 Oct 2026, the 14 Oct rule that every
+# medication event reaches family): the ones the due check allows, and the ones it refuses as a possible double dose,
+# which the tool itself refuses, reports to family (the refused dose event, the double-dose alert) and answers with
+# its reason. The tool decides; a dose it refuses is never recorded as taken
+CLAIM_RECORDED = ("pending_allowed", "refused_too_soon", "refused_max_reached")
 # The relay's own voice (speak): the chat's live voice says a reminder; GPT-Live is told it was said
 SPEAK_WAIT_SECONDS = 15.0      # how long a line waits for GPT-Live's sound and the robot's playback to end
 SPEAK_CHUNK_BYTES = 3200       # 0.1 s of PCM16 16 kHz a frame (the robot's socket takes at most 1 MiB)
@@ -591,14 +592,16 @@ class LiveRelay:
         # The tool backstop (services/tool_intents.py): the patient's tool request GPT-Live has yet to ask for
         self._intent: dict | None = None             # {kind, at, words, mark, reply_at}
         self._intent_turn_read = False               # the open patient turn already gave a request
-        # The patient's word that the medicine is taken (took_medicine) waits in a slot of its own, so that another
-        # request (「跳舞給我看」 in the same turn or the next) never replaces it: a lost claim is a dose left pending
-        self._claim: dict | None = None              # {kind, at, words, mark, reply_at}, as _intent
+        # The patient's word that the medicine is taken (took_medicine) waits in a slot of its own, so that no other
+        # request replaces it. It is decided at dispatch on its whole turn and on the patient's later turns (`turn` and
+        # `later`, the patient's _Group objects, read again then: _claim_stands), and while it runs (_claim_run) the
+        # patient's words after it cancel the records not yet started
+        self._claim: dict | None = None              # {kind, at, words, mark, reply_at, turn, later}
+        self._claim_run: dict | None = None          # the claim whose due check and records run now
         self._claim_turn_read = False                # the open patient turn already gave a claim
         # A stop runs at once (_want_stop); its slot waits only to tell GPT-Live what it did, as _intent does
         self._stop: dict | None = None               # {kind, at, words, mark, reply_at, run}
         self._stop_turn_read = False                 # the open patient turn already gave a stop
-        self._extra_dose_at: float | None = None     # when the patient last spoke of an extra dose (tool_intents)
         self._requests_mark: tuple = (None, 0)       # (client, how many tools it had asked for) at the turn's start
         self._intent_tasks: set = set()                   # the backstop's runs (_run_intent) still going, but a
                                                           # claim of a dose, which the tool registry holds
@@ -1567,9 +1570,13 @@ class LiveRelay:
         return list(getattr(self.client, "requested", None) or ())
 
     def _new_request_turn(self) -> None:
-        """A new patient turn: its words may ask for a tool again, and GPT-Live's next calls are for it."""
+        """A new patient turn: its words may ask for a tool again, and GPT-Live's next calls are for it. A claim of a
+        dose waiting or running reads this turn's words too (_claim_stands)."""
         self._intent_turn_read = self._claim_turn_read = self._stop_turn_read = False
         self._requests_mark = (self.client, len(self._requests()))
+        for claim in (self._claim, self._claim_run):
+            if claim is not None:
+                claim["later"].append(self._patient)
         if self.tools is not None:
             self.tools.forget_intents()
 
@@ -1591,7 +1598,7 @@ class LiveRelay:
         self._want_stop(words, now)
         if self._hit_at is not None:
             return
-        self._want_claim(words, now)
+        self._want_claim(now)
         if self._intent_turn_read:
             return
         kind = tool_intents.detect(words, dancing=self._dance_may_run(), danced=self.tools.danced(), claims=False)
@@ -1630,34 +1637,27 @@ class LiveRelay:
         self._stop = {"kind": "stop_dance", "at": now, "words": words.strip(), "mark": self._requests_mark,
                       "reply_at": None, "run": run}
 
-    def _want_claim(self, words: str, now: float) -> None:
-        """The patient's word that the medicine is taken (took_medicine), noted once per turn in _claim, which no other
-        request replaces. It is read again as the turn's words come in: 「我吃完藥了」 that goes on 「再跟你說」 or
-        「，不對，我還沒吃」 is no claim, and is dropped. A claim still waiting from an earlier turn is dropped by words
-        that take it back (「不對，我還沒吃」). Words of an extra dose (「我好像吃了兩次」) drop a claim still waiting,
-        from this turn or an earlier one, and keep the praise from one already running (_run_intent). A claim already
-        waiting stays when a later turn claims again: its grace counts from the first."""
-        claim = self._claim
-        if tool_intents.extra_dose(words):
-            self._extra_dose_at = now
-            if claim is not None:
-                self._claim = None
-                log.info("live chat %s: the patient speaks of an extra dose; no claim of a dose", self.conversation_id)
-            return
-        if claim is not None and not self._claim_turn_read and tool_intents.takes_back(words):
-            self._claim = claim = None
-            log.info("live chat %s: the patient took the claim of a dose back", self.conversation_id)
-        if self._claim_turn_read:
-            if claim is not None and not tool_intents.claims_intake(words):
-                self._claim = None
-                log.info("live chat %s: the patient's words went on; no claim of a dose", self.conversation_id)
-            return
-        if not tool_intents.claims_intake(words):
+    def _want_claim(self, now: float) -> None:
+        """The patient's word that the medicine is taken (took_medicine): noted once per turn, in _claim, which no
+        other request replaces, as soon as the turn so far is a closed-form claim (tool_intents.claims_intake). It is
+        only noted here: the claim is decided at dispatch (_claim_stands), on the whole turn and on what the patient
+        said after it, so a fragment that briefly reads as no claim ([我吃完藥了][，再][見]) never drops it for good.
+        A claim already waiting or running stays when a later turn claims again: its grace counts from the first."""
+        if (self._claim_turn_read or self._claim is not None or self._claim_run is not None
+                or not tool_intents.claims_intake(self._patient.text)):
             return
         self._claim_turn_read = True
-        if claim is None:
-            self._claim = {"kind": "took_medicine", "at": now, "words": words.strip(), "mark": self._requests_mark,
-                           "reply_at": None}
+        self._claim = {"kind": "took_medicine", "at": now, "words": self._patient.text.strip(),
+                       "mark": self._requests_mark, "reply_at": None, "turn": self._patient, "later": []}
+
+    def _claim_stands(self, claim: dict) -> bool:
+        """Whether a claim of a dose still stands: its whole turn (every fragment so far) is still a closed-form claim,
+        and each later turn of the patient's is nothing but a closing word (tool_intents.closes: 「謝謝」, 「再見」) or
+        the same claim again. Any other words drop it before its due check, and cancel its records not yet started
+        after."""
+        return (tool_intents.claims_intake(claim["turn"].text)
+                and all(tool_intents.closes(group.text) or tool_intents.claims_intake(group.text)
+                        for group in claim["later"]))
 
     def _intent_due(self, now: float) -> None:
         """The ticker, for the request waiting (_intent), the claim of a dose waiting (_claim) and the stop that ran
@@ -1672,7 +1672,7 @@ class LiveRelay:
 
     def _intent_settled(self, intent: dict, now: float) -> bool:
         """Whether a waiting request is settled: safety decided, GPT-Live asked for its tool, or it is overdue and its
-        tool now runs."""
+        tool now runs. A claim of a dose is decided then, on its whole turn and the words after it (_claim_stands)."""
         if self._risk is not None or self.outcome is not None:
             return True
         if self._asked_since(intent["mark"], intent["kind"]):
@@ -1682,6 +1682,10 @@ class LiveRelay:
                else intent["at"] + INTENT_WAIT_SECONDS)
         if now < due or self._hit_at is not None:
             return False
+        if intent["kind"] == "took_medicine" and not self._claim_stands(intent):
+            log.info("live chat %s: the patient's words are no plain claim of a dose any more; GPT-Live's own "
+                     "delegation answers them", self.conversation_id)
+            return True
         if "run" not in intent:
             log.info("live chat %s: GPT-Live did not call a tool for the patient's request (%s); the relay runs %s",
                      self.conversation_id, intent["kind"], INTENT_TOOL[intent["kind"]][0])
@@ -1691,10 +1695,16 @@ class LiveRelay:
             # cuts it between the due check and the record, and the companion's quiet pause waits for it. Held for
             # its due check and first record; each record is held again as it starts (ToolRegistry.run_intent)
             self.tools.hold(task, "check_medication_due", "record_medication_taken")
+            self._claim_run = intent   # the patient's words from now on are read against it (_new_request_turn)
+            task.add_done_callback(lambda _: self._claim_ran(intent))
             return True
         self._intent_tasks.add(task)
         task.add_done_callback(self._intent_tasks.discard)
         return True
+
+    def _claim_ran(self, claim: dict) -> None:
+        if self._claim_run is claim:
+            self._claim_run = None
 
     async def _run_intent(self, intent: dict) -> None:
         """Run the request's tool (ToolRegistry.run_intent: a late call of GPT-Live's for it shares this run; a stop's
@@ -1706,7 +1716,7 @@ class LiveRelay:
             run = intent.get("run")
             result = await run if run is not None else await self.tools.run_intent(name, arguments(intent["words"]))
             if kind == "took_medicine":
-                result = await self._record_claim(result)
+                result = await self._record_claim(result, intent)
                 name = result.get("tool") or name
             log.info("live chat %s: backstop %s: %s", self.conversation_id, name,
                      "ok" if result.get("ok") else result.get("error"))
@@ -1714,9 +1724,6 @@ class LiveRelay:
                     or self._asked_since(intent["mark"], kind)):
                 return   # safety decides first; GPT-Live asked for the tool meanwhile, so it says the answer itself
             line = self._intent_line(kind, result)
-            if kind == "took_medicine" and self._extra_dose_at is not None and self._extra_dose_at >= intent["at"]:
-                # an extra dose spoken of while the claim ran: what stands is said without the praise
-                line = line.replace(gpt_live_config.CELEBRATION[self.language], CLAIM_UNWELL[self.language])
             if line and self.client is not None and not self._live_closed:
                 await self.client.commentary(line)
         except LiveError:
@@ -1724,29 +1731,42 @@ class LiveRelay:
         except Exception:
             log.exception("live chat %s: the %s backstop failed", self.conversation_id, kind)
 
-    async def _record_claim(self, due: dict) -> dict:
-        """The patient's word that the medicine is taken (took_medicine), once the due check answered `due`: a request
-        to family (record_medication_taken on the patient's word) for every dose of the slot the check allows now
-        (pending_allowed), one after the other, so no medicine of the slot is left pending for a missed-dose reminder,
-        and nothing for any other dose, so a refused dose is never recorded. The result carries `outcomes`, one
-        (status, medicine) per dose recorded and per dose the check refused (the slot's summary when nothing was
-        recorded): asked, a due check status (taken, pending_confirmation, refused_*, skipped, none) or failed."""
+    async def _record_claim(self, due: dict, claim: dict) -> dict:
+        """The patient's word that the medicine is taken (took_medicine), once the due check answered `due`:
+        record_medication_taken on the patient's word, one after the other, for every dose of the slot the check
+        allows now or refuses as a possible double dose (CLAIM_RECORDED: the tool refuses such a dose itself and tells
+        family), so no medicine of the slot is left pending for a missed-dose reminder; nothing for any other dose.
+        The result carries `outcomes`, one (status, medicine) per dose of the slot (the slot's summary when it lists
+        none): a record's answer (asked, taken, pending_confirmation, skipped, refused_*, failed) or the dose's own
+        status. Words of the patient's after the due check started (_claim_stands) cancel the records not yet started,
+        and then only the records made are said (`partial`; nothing when none was)."""
         answer = due.get("result") if due.get("ok") and isinstance(due.get("result"), dict) else {}
         log.info("live chat %s: the patient says the medicine is taken; the due check: %s", self.conversation_id,
                  answer.get("status") or due.get("error"))
         doses = [dose for dose in answer.get("doses") or () if isinstance(dose, dict)]
-        allowed = [dose for dose in doses if dose.get("status") == "pending_allowed" and dose.get("medication_id")]
-        if not allowed:
-            return {**due, "outcomes": [(answer.get("status") or "failed", answer.get("med_name"))]}
-        records = [await self.tools.run_intent("record_medication_taken",
-                                               {"medication_id": dose["medication_id"], "patient_confirmed": True})
-                   for dose in allowed]
-        outcomes = [(self._recorded(record), dose.get("med_name")) for dose, record in zip(allowed, records)]
-        outcomes += [(dose["status"], dose.get("med_name")) for dose in doses
-                     if str(dose.get("status")).startswith("refused_")]
+        if not doses:
+            outcomes = [(answer.get("status") or "failed", answer.get("med_name"))]
+            return {**due, "outcomes": outcomes if self._claim_stands(claim) else []}
+        outcomes, records, cancelled = [], [], False
+        for dose in doses:
+            if dose.get("status") not in CLAIM_RECORDED or not dose.get("medication_id"):
+                outcomes.append((dose.get("status") or "failed", dose.get("med_name"), False))
+                continue
+            cancelled = cancelled or not self._claim_stands(claim)
+            if cancelled:
+                continue
+            record = await self.tools.run_intent("record_medication_taken",
+                                                 {"medication_id": dose["medication_id"], "patient_confirmed": True})
+            records.append(record)
+            outcomes.append((self._recorded(record), dose.get("med_name"), True))
+        partial = cancelled or not self._claim_stands(claim)
+        if partial:
+            log.info("live chat %s: the patient said more after the claim of a dose; %d of its records made, the rest "
+                     "cancelled", self.conversation_id, len(records))
         failed = next((record for record in records if not record.get("ok")), None)
-        return {"ok": failed is None, "tool": "record_medication_taken",
-                "error": failed.get("error") if failed else None, "outcomes": outcomes}
+        return {"ok": failed is None, "tool": "record_medication_taken" if records else "check_medication_due",
+                "error": failed.get("error") if failed else None, "partial": partial,
+                "outcomes": [(status, name) for status, name, recorded in outcomes if recorded or not partial]}
 
     @staticmethod
     def _recorded(record: dict) -> str:
@@ -1760,14 +1780,17 @@ class LiveRelay:
             return dose_status.REFUSED.get(answer.get("reason"), "refused_not_due")
         return str(status).removeprefix("already_") if status else "failed"
 
-    def _claim_line(self, result: dict) -> str:
-        """What GPT-Live says about the patient's claim (_record_claim's outcomes). One medicine, or several with the
-        same outcome: family asked, already taken or already waiting for family (each praised), or not recorded and
-        why. Several with different outcomes: each outcome with its medicines' names (CLAIM_PARTS), and the praise
-        only when every one stands as taken or waiting for family."""
+    def _claim_line(self, result: dict) -> str | None:
+        """What GPT-Live says about the patient's claim (_record_claim's outcomes), never praise: one medicine, or
+        several with the same outcome, gets family asked, already recorded as taken, already waiting for family, or
+        not recorded and why; several with different outcomes, or the records made before the patient's later words
+        cancelled the rest (`partial`), get each outcome with its medicines' names (CLAIM_PARTS). Nothing without an
+        outcome."""
         language, outcomes = self.language, result["outcomes"]
+        if not outcomes:
+            return None
         statuses = list(dict.fromkeys(status for status, _ in outcomes))
-        if len(statuses) == 1:
+        if len(statuses) == 1 and not result.get("partial"):
             status = statuses[0]
             if status in CLAIM_REASONS:
                 return INTENT_LINES["took_medicine_refused"][language].format(why=CLAIM_REASONS[status][language])
@@ -1783,8 +1806,6 @@ class LiveRelay:
                     else "not_recorded" if status in ("none", "skipped") else "failed")
             parts.append(CLAIM_PARTS[part][language].format(
                 names=names, why=CLAIM_REASONS.get(status, {}).get(language, "")))
-        if all(status in ("asked", "taken", "pending_confirmation") for status in statuses):
-            parts.append(gpt_live_config.CELEBRATION[language])
         return ("" if language == "zh-TW" else " ").join(parts)
 
     def _intent_line(self, kind: str, result: dict) -> str | None:
