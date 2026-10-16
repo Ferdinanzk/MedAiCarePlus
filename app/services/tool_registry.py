@@ -529,6 +529,26 @@ class ServerCareBackend:
         if state is None:
             return {"session_id": watch["id"], "result": "uncertain", "state": "no_camera_session",
                     "confidence": None, "recorded": False, "evidence": {}}
+        result = self._read_watch(watch, state)
+        if result["result"] in ("uncertain", "not_taken") and result["state"] != "candidate":
+            self._report_watch(watch, result, state)   # a candidate is still being judged: wait for its verdict
+        # The watch's last reading: a record that settles the watch without naming it falls back on it (_reading_now)
+        watch["reading"] = {"result": result["result"], "confidence": result.get("confidence")}
+        return result
+
+    def _reading_now(self, watch: dict) -> dict:
+        """What a watch reads at this moment, for a record that settles it without naming it ({result, confidence}):
+        its result now (_read_watch, nothing reported), else, with no camera session to read, its last reading, else
+        not_read_yet (round 4 of 17 Oct 2026: the last reading GPT-Live asked for could be a stale still_monitoring)."""
+        state = self._session()
+        if state is None:
+            return watch.get("reading") or {"result": "not_read_yet", "confidence": None}
+        result = self._read_watch(watch, state)
+        return {"result": result["result"], "confidence": result.get("confidence")}
+
+    def _read_watch(self, watch: dict, state) -> dict:
+        """The watch's result from the camera session `state` now, with the detector's evidence; nothing is reported
+        or kept (get_pill_intake_result does that)."""
         now = self.monotonic()
         latest = state.latest_detector if isinstance(state.latest_detector, dict) else {}
         base = {"session_id": watch["id"], "identity": state.public()["identity_status"],
@@ -558,10 +578,6 @@ class ServerCareBackend:
                 result = {**answer("not_taken", "timeout", None, False), "confidence": 0.0}
             else:
                 result = answer("still_monitoring", "watching", None, False)
-        if result["result"] in ("uncertain", "not_taken") and result["state"] != "candidate":
-            self._report_watch(watch, result, state)   # a candidate is still being judged: wait for its verdict
-        # The watch's last reading: a record that settles the watch without naming it tells family what it was
-        watch["reading"] = {"result": result["result"], "confidence": result.get("confidence")}
         return result
 
     def _report_watch(self, watch: dict, result: dict, state) -> None:
@@ -657,9 +673,9 @@ class ServerCareBackend:
         exactly this dose is settled whether or not the call names it (_watch_for): the watch is spent, and once the
         request is made its review waiting its grace is dropped and the clip goes with the request (a refusal or a
         dose answered already_* makes no request, and the review goes on). A watch settled without being named
-        authorises nothing, but its last reading (camera_watch: its result and confidence, or not_read_yet) goes into
-        the request's evidence, so family see when the camera disagrees with the patient's word. A dose no longer
-        open answers its state (ALREADY)."""
+        authorises nothing, but its result at that moment (camera_watch: its result and confidence, read then; with no
+        camera session its last reading, else not_read_yet: _reading_now) goes into the request's evidence, so family
+        see when the camera disagrees with the patient's word. A dose no longer open answers its state (ALREADY)."""
         # The detector's verdict counts only for the watch the call names (session_id): a watch started for an
         # earlier dose never authorises a later one, and the patient's word alone is judged now (started_at None)
         intake = None
@@ -720,7 +736,7 @@ class ServerCareBackend:
                     "emotion": self._emotion_now(),
                     "video": video}
         if settled is not None:   # dose_confirmation._request_messages says what the camera read
-            evidence["camera_watch"] = settled.get("reading") or {"result": "not_read_yet", "confidence": None}
+            evidence["camera_watch"] = self._reading_now(settled)
         source = "patient_claim" if patient_confirmed else "degraded"
 
         async def work(conn):
