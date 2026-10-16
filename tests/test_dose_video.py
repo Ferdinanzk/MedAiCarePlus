@@ -607,7 +607,7 @@ class ConfirmConn:
         return self.contacts
 
 
-def _run_send(monkeypatch, conn):
+def _run_send(monkeypatch, conn, request_id=None):
     enqueued, linked = [], []
 
     async def link_messages(conn, video_id, base, contacts):
@@ -622,7 +622,8 @@ def _run_send(monkeypatch, conn):
     from app.services import outbox
     monkeypatch.setattr(dose_video, "link_messages", link_messages)
     monkeypatch.setattr(outbox, "enqueue", enqueue)
-    count = asyncio.run(dose_video.send_with_confirmation(conn, "vid", 1, [4], "https://x.trycloudflare.com"))
+    count = asyncio.run(dose_video.send_with_confirmation(conn, "vid", 1, [4], "https://x.trycloudflare.com",
+                                                          request_id=request_id))
     return count, enqueued, linked
 
 
@@ -639,6 +640,40 @@ def test_clip_goes_with_an_open_confirmation_request(monkeypatch):
 def test_clip_without_an_open_request_or_contacts_waits_for_the_taken_message(monkeypatch):
     assert _run_send(monkeypatch, ConfirmConn(request=False)) == (0, [], [])
     assert _run_send(monkeypatch, ConfirmConn(contacts=())) == (0, [], [])
+
+
+class RequestsConn(ConfirmConn):
+    """Patient 1's confirmation requests (each {confirmation_id, intk_ids, created_at, resolution}), read as
+    send_with_confirmation reads them: one request by its id, or the newest open one of the doses."""
+
+    def __init__(self, requests):
+        super().__init__()
+        self.requests = requests
+
+    async def fetchrow(self, query, *args):
+        assert "resolution IS NULL" in query
+        if "dc.confirmation_id = $1::uuid" in query:
+            found = [r for r in self.requests if r["confirmation_id"] == args[0] and r["resolution"] is None]
+        else:
+            assert args[0] == 1
+            found = sorted((r for r in self.requests if set(r["intk_ids"]) & set(args[1]) and r["resolution"] is None),
+                           key=lambda r: r["created_at"], reverse=True)
+        return {"created_at": found[0]["created_at"], "name": "Aisha"} if found else None
+
+
+def test_a_kept_clip_goes_only_with_its_own_request_while_that_request_is_open(monkeypatch):
+    """Round 4 (R4.12): with request_id (retry_unsent's kept clip) the clip goes only while that very request is open,
+    never under a newer open request of the same dose (round 3, F1.10: family got older footage under a new request).
+    A version that ignored request_id and took the newest open request passed every test before this one."""
+    own = {"confirmation_id": str(uuid.uuid4()), "intk_ids": [4], "created_at": NOW - datetime.timedelta(hours=1),
+           "resolution": "confirmed"}                              # answered: the clip was made for it
+    newer = {"confirmation_id": str(uuid.uuid4()), "intk_ids": [4], "created_at": NOW, "resolution": None}
+    conn = RequestsConn([own, newer])
+    assert _run_send(monkeypatch, conn, request_id=own["confirmation_id"]) == (0, [], [])
+    assert _run_send(monkeypatch, conn, request_id=str(uuid.uuid4())) == (0, [], [])   # an unknown request
+    own["resolution"] = None                                      # its own request still open: it goes
+    count, enqueued, linked = _run_send(monkeypatch, conn, request_id=own["confirmation_id"])
+    assert count == 1 and linked == [("vid", [34])] and enqueued[0]["dedupe_key"] == "dose_video:vid:34"
 
 
 def test_store_sends_a_new_clip_with_the_request(monkeypatch, tmp_path):
