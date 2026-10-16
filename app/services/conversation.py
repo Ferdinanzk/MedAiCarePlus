@@ -128,6 +128,13 @@ RISK_PATTERNS = {
 
 # The praise line the patient must hear once today's medicine is taken (spec 2026-10-12, medication status handling).
 PRAISE = {"zh-TW": "您越來越健康了！", "en": "You are getting healthier and healthier!"}
+# The text chat praises the patient's own word that the medicine is taken. A live chat with the agent's tools gets
+# LIVE_CLAIM_PRAISE instead (reply_prompt, tools=True).
+CLAIM_PRAISE = {
+    "zh-TW": "長者自己說吃完藥了，也照這樣稱讚他。可是他說吃了兩次、多吃了或吃太多時，不要稱讚。",
+    "en": ("When the patient says they finished their medicine, praise them the same way, but never when they say "
+           "they took it twice, took extra or took too much. "),
+}
 # Medication status (tool get_today_dose_status, services/dose_status.py) and the warm companion mode. The tool's
 # statuses are named as the model sees them in its answer. Overdose protection decides what may be encouraged: a
 # refused dose is never encouraged, and saying "I finished" is praised but never called recorded (it is a claim).
@@ -139,8 +146,8 @@ MEDICATION_RULES = {
         + PRAISE["zh-TW"] + "」。"
         "pending_confirmation 也表示長者已經吃過藥了，只是還在等家人確認；一樣熱情稱讚、拍拍手，並說「"
         + PRAISE["zh-TW"] + "」，但不要說已經記錄好了。"
-        "長者自己說吃完藥了，也照這樣稱讚他。可是他說吃了兩次、多吃了或吃太多時，不要稱讚。"
-        "pending_allowed 表示藥還沒吃、現在可以吃：溫柔、有耐心地鼓勵他去吃，暖暖地提醒按時吃藥是在照顧自己的身體；"
+        + CLAIM_PRAISE["zh-TW"]
+        + "pending_allowed 表示藥還沒吃、現在可以吃：溫柔、有耐心地鼓勵他去吃，暖暖地提醒按時吃藥是在照顧自己的身體；"
         "不要命令、催促或說教，同一次聊天最多提兩次。"
         "refused_too_soon、refused_max_reached、refused_not_due 表示現在不能吃，refused_expired 表示這次錯過了、不要補吃："
         "這些時候絕對不要鼓勵他吃藥，可以溫和地說現在先不用吃。"
@@ -156,8 +163,7 @@ MEDICATION_RULES = {
         "them with real enthusiasm and applaud them, for example \"A big round of applause for you!\", and you must "
         "say \"" + PRAISE["en"] + "\" pending_confirmation also means the patient has already taken it and family "
         "is still confirming: praise and applaud the same way and say \"" + PRAISE["en"] + "\", but never say it "
-        "was recorded. When the patient says they finished their medicine, praise them the same way, but never "
-        "when they say they took it twice, took extra or took too much. pending_allowed means it is not taken yet "
+        "was recorded. " + CLAIM_PRAISE["en"] + "pending_allowed means it is not taken yet "
         "and may be taken now: gently and patiently encourage them, warmly reminding them that taking it looks "
         "after their health; never bossy, demanding or preachy, and at most twice in one chat. refused_too_soon, "
         "refused_max_reached and refused_not_due mean it must not be taken now, and refused_expired means this "
@@ -194,6 +200,18 @@ DOSE_STATUS_SOURCE = {
 LIVE_DOSE_STATUS_SOURCE = {
     "zh-TW": "要知道今天的服藥狀態，就交給後端查，不要猜。",
     "en": "to know today's dose status, delegate it to the backend; never guess. ",
+}
+# What replaces CLAIM_PRAISE with the agent's tools: the claim goes to the backend (record_medication_taken asks family
+# to confirm it, under overdose protection) and is praised only after its answer. Told to praise it itself, GPT-Live
+# answered 「我吃完藥了」 with praise and the claim often never reached the tool (agent tool fixes, Task 4, Oct 2026).
+LIVE_CLAIM_PRAISE = {
+    "zh-TW": ("長者自己說吃完藥了，先交給後端處理，不要自己先稱讚；等後端回覆已經請家人確認、已經吃過或正在等家人確認，"
+              "才照這樣稱讚他。後端說沒有記錄時，不要稱讚，照後端說的原因溫和地告訴他。"
+              "他說吃了兩次、多吃了或吃太多時，也不要稱讚。"),
+    "en": ("When the patient says they finished their medicine, delegate it to the backend first and do not praise it "
+           "yourself; praise them the same way only once its answer says family were asked to confirm, or the dose was "
+           "already taken or is waiting for family. When it says the dose was not recorded, never praise: gently give "
+           "the reason it gave. Never praise when they say they took it twice, took extra or took too much. "),
 }
 # Examples for conversational tone. Weather details in the example are illustrative: the live answer must follow
 # context_info's current forecast above and must never reuse the example's drizzle when today's data differs.
@@ -630,10 +648,12 @@ def reply_prompt(language: str, tools: bool = False) -> str:
     """SYSTEM_PROMPT plus today's background. The background comes from data already in the process (fetched by
     the checkin_background job) and local tables only, so a reply never waits on the network for it; if it breaks,
     the reply goes out without it. `tools`: for a live chat with the agent's tools, whose backend looks the dose
-    status and the weather up (LIVE_DOSE_STATUS_SOURCE, LIVE_TOOLS_BACKGROUND_RULES)."""
+    status and the weather up and takes the patient's word that the medicine is taken (LIVE_DOSE_STATUS_SOURCE,
+    LIVE_CLAIM_PRAISE, LIVE_TOOLS_BACKGROUND_RULES)."""
     system = SYSTEM_PROMPT[language]
     if tools:
-        system = system.replace(DOSE_STATUS_SOURCE[language], LIVE_DOSE_STATUS_SOURCE[language])
+        system = (system.replace(DOSE_STATUS_SOURCE[language], LIVE_DOSE_STATUS_SOURCE[language])
+                  .replace(CLAIM_PRAISE[language], LIVE_CLAIM_PRAISE[language]))
     try:
         block = context_info.background(language, started=tools)
     except Exception:

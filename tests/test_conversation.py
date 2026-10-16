@@ -260,6 +260,37 @@ def test_a_live_chat_with_tools_gets_a_prompt_that_sends_lookups_to_the_backend(
         assert "delegate to the backend" in tools and "The time now" in conversation.LIVE_TOOLS_BACKGROUND_RULES["en"]
 
 
+# The text chat praises the patient's own word that the medicine is taken (spec 2026-10-12); with the agent's tools
+# GPT-Live kept that rule and praised 「我吃完藥了」 itself, so the claim often never reached record_medication_taken
+# (agent tool fixes, Task 4). Its prompt now hands the claim to the backend and praises only after the answer.
+CLAIM_PRAISED = {"zh-TW": "長者自己說吃完藥了，也照這樣稱讚他。可是他說吃了兩次、多吃了或吃太多時，不要稱讚。",
+                 "en": "When the patient says they finished their medicine, praise them the same way, but never when "
+                       "they say they took it twice, took extra or took too much."}
+
+
+@pytest.mark.parametrize("language", ["zh-TW", "en"])
+def test_with_tools_gpt_live_hands_a_medicine_claim_to_the_backend_and_praises_only_after_its_answer(monkeypatch,
+                                                                                                      language):
+    _on_day(monkeypatch, 2026, 10, 14, 10, 0)
+    plain, tools = conversation.reply_prompt(language), conversation.reply_prompt(language, tools=True)
+    assert CLAIM_PRAISED[language] in conversation.SYSTEM_PROMPT[language] and CLAIM_PRAISED[language] in plain
+    assert CLAIM_PRAISED[language] not in tools
+    assert conversation.LIVE_CLAIM_PRAISE[language] in tools
+    if language == "zh-TW":
+        assert "長者自己說吃完藥了，先交給後端" in tools and "後端回覆" in tools and "沒有記錄時，不要稱讚" in tools
+        assert "吃了兩次、多吃了或吃太多時，也不要稱讚" in tools
+    else:
+        assert "delegate it to the backend first" in tools and "only once its answer" in tools
+        assert "not recorded, never praise" in tools and "took it twice, took extra or took too much" in tools
+
+
+def test_the_text_chats_prompt_keeps_its_own_praise_rule():
+    # the tools prompt's sentence is a replacement, never added to the text chat's rules
+    for language in ("zh-TW", "en"):
+        assert conversation.CLAIM_PRAISE[language].strip() == CLAIM_PRAISED[language]
+        assert conversation.LIVE_CLAIM_PRAISE[language] not in conversation.SYSTEM_PROMPT[language]
+
+
 def test_the_reply_never_waits_on_the_network_for_its_background(monkeypatch):
     fetches = _on_day(monkeypatch, 2026, 10, 3, 15, 0)
     _model_answers(monkeypatch, "下午好，今天過得怎麼樣？")
