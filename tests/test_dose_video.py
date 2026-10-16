@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import sys
 import types
 import uuid
@@ -548,11 +549,15 @@ def test_job_sends_the_text_then_each_clip(monkeypatch):
     assert any("taken_notified = TRUE" in query for query, _ in conn.executed) and deleted == []
 
 
-def test_job_without_a_public_link_sends_text_only_and_deletes_the_clip(monkeypatch):
+def test_job_without_a_public_link_sends_text_only_and_deletes_the_clip(monkeypatch, caplog):
+    monkeypatch.setattr(dose_video, "no_link_reason", lambda: dose_video.TUNNEL_DOWN)
     conn = JobConn([_dose()], [{"id": 3, "line_id": "U3", "name": "aisha"}], [{"video_id": "vid", "intk_ids": [5]}])
     enqueued, deleted = _run_job(monkeypatch, conn, base_url=None)
     assert [item["kind"] for item in enqueued] == ["taken_confirmation"]
     assert "📹" not in enqueued[0]["messages"][0]["text"] and deleted == [("vid", "no_public_link")]
+    # A lost video says why, once.
+    lost = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "vid" in r.getMessage()]
+    assert lost == ["dose video vid for intakes [5] deleted: no public link (tunnel not answering)"]
 
 
 def test_job_waits_for_the_batch_window_and_respects_the_switch(monkeypatch):

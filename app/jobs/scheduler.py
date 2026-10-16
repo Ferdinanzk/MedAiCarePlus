@@ -19,7 +19,7 @@ def start_scheduler():
     from app.jobs.dose_confirmation_job import run_dose_confirmation_maintenance
     from app.jobs.conversation_retention_job import purge_old_transcripts
     from app.jobs.after_chat_job import run_after_chat_sweep
-    from app.services.dose_video import cleanup as delete_finished_dose_videos
+    from app.services.dose_video import maintain as maintain_dose_videos
     from app.services.context_info import refresh as refresh_checkin_background
     from app.services.reminders import sweep as sweep_reminders
 
@@ -71,8 +71,8 @@ def start_scheduler():
         id="conversation_retention",
         replace_existing=True,
     )
-    scheduler.add_job(
-        delete_finished_dose_videos,
+    scheduler.add_job(   # deletes finished clips, then sends clips kept unsent for lack of a public link
+        maintain_dose_videos,
         IntervalTrigger(minutes=2),
         id="dose_videos",
         replace_existing=True,

@@ -173,7 +173,8 @@ async def public_link() -> None:
         base = None
         reason = f"{type(error).__name__}"
     else:
-        reason = "PUBLIC_BASE_URL unset and the LINE tunnel is down (scripts/line-tunnel.ps1): family get no videos"
+        reason = (f"{dose_video.no_link_reason()} (scripts/line-tunnel.ps1 points LINE's webhook at this server): "
+                  f"family get no videos")
     stage = _report.get("line", {})
     detail = stage.get("detail", "").split(";")[0]   # the token line, without an earlier public-link verdict
     if base:

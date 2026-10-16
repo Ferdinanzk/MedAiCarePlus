@@ -9,7 +9,8 @@ taken_confirmation_job sends the clip with the "dose taken" message. LINE has no
 video message pointing at their own link (/api/media/line/<token>.mp4), and their LINE app downloads the clip from
 this server through the LINE tunnel. cleanup() deletes the files once every recipient's app has the whole clip or
 LINE reports it played to the end (after GRACE), MAX_AGE after sending in any case, at once when consent is
-withdrawn, and when a clip is never sent. The dose_video rows stay, without media, as a record.
+withdrawn, and when a clip is never sent. The dose_video rows stay, without media, as a record. A clip of a dose
+waiting for family that found no public link is sent by the same job once a link answers (retry_unsent).
 """
 
 import asyncio
@@ -60,6 +61,17 @@ BASE_URL_RETRY_SECONDS = 60
 TOKEN_BYTES = 32                # secrets.token_urlsafe(32): 43 characters
 TOKEN_LENGTH = 43
 TRACKING_PREFIX = "dv-"
+# Made once per process, the shape of a real link token, so the LINE proxy forwards it as it forwards a family
+# member's video; only this server answers it (api_dose_video). Never stored, never logged.
+PROBE_TOKEN = secrets.token_urlsafe(TOKEN_BYTES)
+PROBE_MARKER = b"medcare dose video link ok"
+
+# Why there is no public link (public_base_url), as the WARNINGs say it.
+NO_LINE_TOKEN = "no LINE token"
+WEBHOOK_ERROR = "LINE webhook endpoint error"
+TUNNEL_DOWN = "tunnel not answering"
+OTHER_SERVER = "tunnel reaches another server"
+NOT_HTTPS = "PUBLIC_BASE_URL is not https"
 
 
 # ── frames held in memory ──
@@ -169,6 +181,9 @@ async def _store(u_id: int, intk_ids: list[int], source: str, frames: list) -> N
             await insert_clip(conn, video_id, u_id, intk_ids, source, info)
             if base_url is not None:
                 await send_with_confirmation(conn, video_id, u_id, intk_ids, base_url)
+        if base_url is None:   # the dose_videos job sends it once a link answers (retry_unsent)
+            log.warning("dose video %s for intakes %s kept unsent: no public link (%s)", video_id, intk_ids,
+                        no_link_reason())
     except Exception:
         log.exception("dose video for intakes %s failed", intk_ids)
         if video_id is not None:
@@ -261,39 +276,71 @@ def encode(frames: list[tuple[float, bytes]], mp4_path: Path, preview_path: Path
 # ── the public address LINE downloads from ──
 
 _base_url: tuple[float, str | None] | None = None
+_link_reason: str | None = None   # why the last check found no public link; None when it found one
+_link_checked = False
 
 
-def _webhook_base_url() -> str | None:
-    """https://<host> of the LINE webhook (the tunnel scripts/line-tunnel.ps1 set up), if it answers."""
+def _webhook_base_url() -> tuple[str | None, str | None]:
+    """(https://<host> of the LINE webhook, None) when that address reaches this server, else (None, why).
+
+    Two computers can share one LINE bot, whose one webhook address leads to whichever of them ran
+    scripts/line-tunnel.ps1 last. So the probe asks for this server's own PROBE_TOKEN, the way a family member's LINE
+    app asks for a clip (through the tunnel and the LINE proxy): only a 200 with PROBE_MARKER is this server. A 404 is
+    the proxy or another computer's server; a 5xx (Cloudflare's 530 for a tunnel that restarted) or no answer is a
+    tunnel that is down."""
     if not config.LINE_CHANNEL_ACCESS_TOKEN:
-        return None
-    response = requests.get(config.LINE_WEBHOOK_ENDPOINT_URL, timeout=3,
-                            headers={"Authorization": f"Bearer {config.LINE_CHANNEL_ACCESS_TOKEN}"})
-    if response.status_code != 200:
-        return None
-    parts = urlsplit(str(response.json().get("endpoint") or ""))
+        return None, NO_LINE_TOKEN
+    try:
+        response = requests.get(config.LINE_WEBHOOK_ENDPOINT_URL, timeout=3,
+                                headers={"Authorization": f"Bearer {config.LINE_CHANNEL_ACCESS_TOKEN}"})
+        endpoint = str(response.json().get("endpoint") or "") if response.status_code == 200 else ""
+    except (requests.RequestException, ValueError):
+        endpoint = ""
+    parts = urlsplit(endpoint)
     if parts.scheme != "https" or not parts.netloc:
-        return None
+        return None, WEBHOOK_ERROR
     base = f"https://{parts.netloc}"
-    # A tunnel that restarted has a new address; the old one answers 5xx (Cloudflare 530) or not at all.
-    probe = requests.get(f"{base}/api/media/line/probe", timeout=3, allow_redirects=False)
-    return base if probe.status_code < 500 else None
+    try:
+        probe = requests.get(f"{base}/api/media/line/{PROBE_TOKEN}.jpg", timeout=3, allow_redirects=False)
+    except requests.RequestException:   # its text holds the probe's address: never logged
+        return None, TUNNEL_DOWN
+    if probe.status_code >= 500:
+        return None, TUNNEL_DOWN
+    if probe.status_code != 200 or probe.content != PROBE_MARKER:
+        return None, OTHER_SERVER
+    return base, None
+
+
+def _note(base: str | None, reason: str | None) -> None:
+    """One log line when the link's state or reason changes, never on every check."""
+    global _link_reason, _link_checked
+    if reason is not None and (reason != _link_reason or not _link_checked):
+        log.warning("dose videos: no public link (%s); clips of doses waiting for family stay unsent until one "
+                    "answers", reason)
+    elif reason is None and _link_reason is not None:
+        log.info("dose videos: the public link %s answers again", base)
+    _link_reason, _link_checked = reason, True
+
+
+def no_link_reason() -> str | None:
+    """Why the last check found no public link (for the WARNING of a clip held back or lost); None when it found one."""
+    return _link_reason
 
 
 async def public_base_url() -> str | None:
     global _base_url
     if config.PUBLIC_BASE_URL:
-        return config.PUBLIC_BASE_URL if config.PUBLIC_BASE_URL.startswith("https://") else None
+        base = config.PUBLIC_BASE_URL if config.PUBLIC_BASE_URL.startswith("https://") else None
+        _note(base, None if base else NOT_HTTPS)
+        return base
     now = time.monotonic()
     if _base_url is not None:
         checked, base = _base_url
         if now - checked < (BASE_URL_CACHE_SECONDS if base else BASE_URL_RETRY_SECONDS):
             return base
-    try:
-        base = await asyncio.get_running_loop().run_in_executor(None, _webhook_base_url)
-    except (requests.RequestException, ValueError):
-        base = None
+    base, reason = await asyncio.get_running_loop().run_in_executor(None, _webhook_base_url)
     _base_url = (now, base)
+    _note(base, reason)
     return base
 
 
@@ -462,6 +509,50 @@ async def cleanup(now: datetime | None = None) -> int:
         if not buffer.frames or time.monotonic() - buffer.frames[-1][0] > BUFFER_SECONDS:
             _buffers.pop(u_id, None)
     return deleted
+
+
+async def retry_unsent(now: datetime | None = None) -> int:
+    """A clip _store kept unsent for lack of a public link goes out once a link answers, while the family request it
+    belongs with is still open and the clip is younger than UNSENT_MAX_AGE. A clip whose request was answered or
+    expired is left to the deletion rules. Returns how many clips were sent."""
+    now = now or datetime.now(timezone.utc)
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT v.video_id, v.u_id, v.intk_ids FROM dose_video v "
+            "WHERE v.deleted_at IS NULL AND v.sent_at IS NULL AND v.created_at > $1 "
+            "AND EXISTS (SELECT 1 FROM dose_confirmation dc WHERE dc.u_id = v.u_id AND dc.intk_ids && v.intk_ids "
+            "AND dc.resolution IS NULL) ORDER BY v.created_at", now - UNSENT_MAX_AGE)
+    base_url = await public_base_url() if rows else None   # asked outside a connection: it may take seconds
+    if base_url is None:
+        return 0
+    sent = 0
+    async with get_pool().acquire() as conn:
+        for row in rows:
+            video_id, intk_ids = str(row["video_id"]), list(row["intk_ids"])
+            try:
+                if not await enabled(row["u_id"]):
+                    continue   # cleanup deletes it
+                async with conn.transaction():
+                    # Locked and checked again: sending marks it sent (link_messages), and the outbox's dedupe key
+                    # stops a second message for the same clip and contact.
+                    if await conn.fetchval("SELECT video_id FROM dose_video WHERE video_id = $1::uuid "
+                                           "AND deleted_at IS NULL AND sent_at IS NULL FOR UPDATE", video_id) is None:
+                        continue
+                    contacts = await send_with_confirmation(conn, video_id, row["u_id"], intk_ids, base_url)
+                if contacts:
+                    sent += 1
+                    log.info("dose video %s for intakes %s sent late, now that a public link answers", video_id,
+                             intk_ids)
+            except Exception:
+                log.exception("dose video %s for intakes %s: sending it late failed", video_id, intk_ids)
+    return sent
+
+
+async def maintain(now: datetime | None = None) -> None:
+    """The dose_videos job (every 2 min): the deletions first, so a clip that must go is never sent, then the clips
+    kept unsent for lack of a link."""
+    await cleanup(now)
+    await retry_unsent(now)
 
 
 def _remove_orphans(live: set[str]) -> None:

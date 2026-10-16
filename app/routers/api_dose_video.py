@@ -4,10 +4,14 @@
 in the path is the only key, one per recipient, and works only while the clip exists. It is the only part of this
 router the LINE tunnel proxy forwards (scripts/line-webhook/nginx.conf). FastAPI's FileResponse has no Range
 support in this Starlette version, and LINE's player needs it, so ranges are served here.
+
+The one other name served is this process's probe (dose_video.PROBE_TOKEN + .jpg): a short marker that tells
+dose_video.public_base_url() the public link reaches this very server, not another computer's.
 """
 
 import asyncio
 import re
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
@@ -22,6 +26,7 @@ _RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 _TYPES = {"mp4": "video/mp4", "jpg": "image/jpeg"}
 _HEADERS = {"Accept-Ranges": "bytes", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex"}
+_PROBE_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex"}
 
 
 def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
@@ -46,6 +51,8 @@ def _read(path) -> bytes:
 @media_router.api_route("/line/{name}", methods=["GET", "HEAD"], include_in_schema=False)
 async def line_media(name: str, request: Request):
     match = _NAME.fullmatch(name)
+    if match and match.group(2) == "jpg" and secrets.compare_digest(match.group(1), dose_video.PROBE_TOKEN):
+        return Response(dose_video.PROBE_MARKER, media_type="text/plain", headers=_PROBE_HEADERS)
     opened = await dose_video.open_link(*match.groups()) if match else None
     if opened is None:
         raise HTTPException(404, "Not Found")
