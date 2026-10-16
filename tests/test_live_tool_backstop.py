@@ -1412,6 +1412,79 @@ def test_the_chats_end_lets_a_claim_already_running_reach_family(world):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("ending", ["goodbye", "medicine"])
+def test_a_claim_still_in_its_grace_reaches_family_when_the_chat_ends(world, ending):
+    # Round 4 (R4.2): 「我吃完藥了，再見」 with a silent GPT-Live ends the chat 3 s after the goodbye turn closed, and the
+    # robot can end it for medicine 2 s after the claim: both came before the claim's 6 s grace, and the claim was
+    # dropped. A claim that still stands is now run at once, held like a running claim; nothing is said (GPT-Live is
+    # closed)
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        before = len(world.clients[-1].commentaries)
+        if ending == "goodbye":
+            await _live(world, _said("我吃完藥了，再見"))
+            await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.1)       # the goodbye turn closes
+            await _step(world, relay, live_session.GOODBYE_GRACE_SECONDS + 0.1)  # GPT-Live said nothing: the end
+            assert relay.outcome is not None and relay.outcome.reason == "goodbye"
+        else:
+            await _live(world, _said("我吃完藥了"))
+            await _step(world, relay, 2.0)
+            world.robot.inbox.put_nowait({"type": "end", "reason": "medicine"})
+        assert world.clock.now - 1000.0 < live_session.INTENT_WAIT_SECONDS    # the claim's grace is not over
+        await _over(world, running)
+        assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None)]
+        assert world.db.chat()["end_reason"] == ending
+        assert len(world.clients[-1].commentaries) == before
+
+    asyncio.run(scenario())
+
+
+def test_a_tick_between_the_end_and_the_wrap_up_never_drops_the_claim(world):
+    # The robot's end is read outside the handler lock: a timer handled before the wrap-up takes the lock sees the
+    # outcome decided, and must leave the claim to the wrap-up
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, 2.0)
+        await relay._handler_lock.acquire()                 # a timer is being handled
+        world.robot.inbox.put_nowait({"type": "end", "reason": "medicine"})
+        await relay_chat._settle()
+        assert relay.outcome is not None and relay.outcome.reason == "medicine"
+        world.clock.now += 0.1
+        await relay._tick()
+        relay._handler_lock.release()
+        await _over(world, running)
+        assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None)]
+
+    asyncio.run(scenario())
+
+
+def test_a_claim_still_in_its_grace_is_dropped_when_the_chat_ends_on_a_risk(world, monkeypatch):
+    # The risk path stops everything: no request to family on the patient's word then
+    async def scenario():
+        async def classify_risk(history, language, late=False):
+            latest = next(turn["text"] for turn in reversed(history) if turn["role"] == "patient")
+            kind = "overdose" if latest == "我吃完藥了" else None
+            return kind, {"risk_ms": 1, "risk_result": kind or "none", "risk_attempts": []}
+
+        async def enqueue_to_contacts(conn, u_id, **kwargs):
+            return 1
+
+        monkeypatch.setattr(live_session.conversation, "classify_risk", classify_risk)
+        monkeypatch.setattr(live_session.conversation.outbox, "enqueue_to_contacts", enqueue_to_contacts)
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.1)   # the turn closes; layer 2 finds a risk
+        await _over(world, running)
+        assert relay.outcome.reason == "risk" and world.db.chat()["end_reason"] == "risk"
+        assert backend.calls == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("language", ["zh-TW", "en"])
 def test_every_claim_line_is_said_in_both_languages_and_never_praises(language):
     # Round 3 (F2.2): the backstop never runs the applause and never praises (praise could land on a refused or
