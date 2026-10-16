@@ -73,8 +73,9 @@ TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medic
             "set_reminder": 10.0, "cancel_reminder": 6.0}
 # Closing GPT-Live (an ending, a companion pause) never cuts these short: a dose request, a note to family or an alert
 # GPT-Live asked for runs to its end within its TIMEOUTS entry (agent_bridge.AgentLiveClient.close), while the other
-# tools are cancelled. The companion's quiet pause waits while one runs (ToolRegistry.finishing), and the chat's end
-# waits for them before the tools close, at most FINISH_WAIT_SECONDS (the client runs its calls one at a time)
+# tools are cancelled. The companion's quiet pause waits while one runs (ToolRegistry.finishing) and for GPT-Live's
+# answer after it (finished_at, live_session.LiveRelay._tool_answer_due), and the chat's end waits for them before the
+# tools close, at most FINISH_WAIT_SECONDS (the client runs its calls one at a time)
 FINISH_ON_CLOSE = ("record_medication_taken", "notify_family", "emergency_alert")
 FINISH_WAIT_SECONDS = sum(TIMEOUTS[name] for name in FINISH_ON_CLOSE)
 # A dose dose_confirmation.create found no longer open (NothingToConfirm) is answered by its state then
@@ -880,25 +881,32 @@ class ServerCareBackend:
 class ToolRegistry:
     """Validate, dispatch, time-limit and serialise the tools. execute(name, args) and run_intent never raise."""
 
-    def __init__(self, robot: RobotLink, backend: ServerCareBackend, *, clock=time.time):
-        self.robot, self.backend, self.clock = robot, backend, clock
+    def __init__(self, robot: RobotLink, backend: ServerCareBackend, *, clock=time.time, monotonic=time.monotonic):
+        self.robot, self.backend, self.clock, self.monotonic = robot, backend, clock, monotonic
         self._frame: FrameState | None = None
         self._handlers = {name: getattr(self, name) for name in TOOL_NAMES}
         self._dance_at = float("-inf")                          # when the last dance started
         self._danced = False                                    # this chat had a dance
         self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
         self._held: set[asyncio.Future] = set()                 # FINISH_ON_CLOSE calls still running (hold)
+        self.finished_at = float("-inf")                        # when the last held call ended (monotonic)
 
     def hold(self, run: asyncio.Future) -> None:
         """A FINISH_ON_CLOSE call (a record, a note to family or an alert) that closing GPT-Live leaves to finish
-        (agent_bridge.AgentLiveClient): the companion's quiet pause waits for it (finishing), and so does the chat's
-        end (close)."""
+        (agent_bridge.AgentLiveClient): the companion's quiet pause waits for it (finishing), then gives GPT-Live time
+        to start its answer (finished_at, on the relay's clock: make_registry passes it as `monotonic`), and the
+        chat's end waits for it (close)."""
         self._held.add(run)
-        run.add_done_callback(self._held.discard)
+        run.add_done_callback(self._release)
+
+    def _release(self, run: asyncio.Future) -> None:
+        self._held.discard(run)
+        self.finished_at = self.monotonic()
 
     def finishing(self) -> bool:
-        """Whether a held call (a record, a note to family or an alert) is still running."""
-        return any(not run.done() for run in self._held)
+        """Whether a held call (a record, a note to family or an alert) is still running. A call that has just ended
+        counts until its done callback stamped finished_at, so no moment falls between the two."""
+        return bool(self._held)
 
     async def close(self) -> None:
         """The chat is over: a held call still running finishes first (at most FINISH_WAIT_SECONDS; a record settles
