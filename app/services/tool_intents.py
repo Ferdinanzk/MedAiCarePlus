@@ -49,13 +49,19 @@ _MODAL = r"(可以|能|會|能不能|可不可以|會不會|要不要)"
 _SEE = r"(看到|看得到|看的到|看不到|看見|看得見|看的見|看不見|看清楚)"
 _ASK = r"(嗎|麼|呢|嘛|沒|不)"
 _START = r"(?:^|(?<=\s))"   # a clause's start: the forms without a subject (「可以跳舞嗎」), never 「他會跳舞嗎」
+# A 不要 that is no "don't": never the 不要 of a 要不要 question (「你要不要繼續跳」, 「要不要再跳舞」 ask whether Reachy
+# wants to go on; round 3 review, and round 4 for the always-on 「不要再跳舞」), but 不要不要 is still a no
+# (「不要不要跳了」, 「不要不要跳」)
+_NOT_ASKED = r"(?<!(?<!不)要)"
 # Patterns on the compact text (Traditional, lower case, no spaces or punctuation) and on the spaced text (punctuation
 # as spaces, so a clause starts after a space); a form without a subject must start its clause.
 PATTERNS = {
-    "stop_dance": (re.compile(r"(停止|不要再?|別再?|不用再?)跳舞|跳舞停"), re.compile(r"(?<![a-z])stop dancing")),
+    "stop_dance": (re.compile(r"(停止|" + _NOT_ASKED + r"不要再?|別再?|不用再?)跳舞|跳舞停"),
+                   re.compile(r"(?<![a-z])stop dancing")),
     "dance": (
-        re.compile(_YOU + _MODAL + r"?(幫我|給我|為我|來)?" + _DANCE + r"(?!的|得|了|過|跳)"),  # 你可以跳舞 (not 你跳舞跳得好)
-        re.compile(_START + r"(要不要|能不能|可不可以|會不會)(幫我|給我|為我)?" + _DANCE),   # 要不要跳個舞
+        re.compile(_YOU + r"(" + _MODAL + r"再?)?(幫我|給我|為我|來)?" + _DANCE + r"(?!的|得|了|過|跳)"),  # 你可以跳舞,
+        # 你要不要再跳舞 (not 你跳舞跳得好)
+        re.compile(_START + r"(要不要|能不能|可不可以|會不會)再?(幫我|給我|為我)?" + _DANCE),   # 要不要(再)跳個舞
         re.compile(_START + r"(可以|能|會)(幫我|給我|為我)?" + _DANCE + _ASK),              # 可以跳舞嗎
         re.compile(_DANCE + r"給(我|我們)看"),                                        # 跳舞給我看
         re.compile(r"再跳一(支|段|個)舞|再來一(支|段|個)舞"),                             # 再跳一支舞
@@ -112,7 +118,6 @@ AGAIN = (re.compile(r"再跳一?(次|下|遍)|再來一(次|遍)"
 # read by itself (stops), so 「停，不要跳了」 and 「不要，停下來」 are stops. The clause-end form is never the 不要 of a
 # 要不要 question (「你要不要繼續跳」, 「要不要再跳」 ask whether Reachy wants to go on; round 3 review), but 不要不要
 # is still a no (「不要不要跳了」): _NOT_ASKED
-_NOT_ASKED = r"(?<!(?<!不)要)"
 STOP_WORDS = (re.compile(r"停|(不要|別|不用|不)再?跳了|" + _NOT_ASKED + r"(不要|別|不用)再?(繼續)?跳(了|啦)?$"
                          r"|^((夠了|夠啦)(吧|啦)?)+$"),
               re.compile(r"(?<![a-z])stop(?![a-z])|^(ok |okay )?(enough|that's enough)( now| please)?$"))
