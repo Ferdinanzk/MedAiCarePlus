@@ -173,8 +173,12 @@ def test_a_consent_read_that_hangs_counts_as_unreadable_within_its_time_limit(mo
 
 def test_a_record_has_time_for_a_review_being_made_beside_its_database_calls():
     """Round 3 (F1.6): record_medication_taken may wait REVIEW_WAIT_SECONDS for a review being made, beside its two
-    database calls (DB_TIMEOUT_SECONDS each), inside its TIMEOUTS entry: the entry was raised by that wait."""
-    assert tool_registry.TIMEOUTS["record_medication_taken"] == 10.0 + tool_registry.REVIEW_WAIT_SECONDS == 15.0
+    database calls (DB_TIMEOUT_SECONDS each), inside its TIMEOUTS entry: the entry was raised by that wait. Round 4
+    (R4.5): the consent read (dose_video.CONSENT_READ_SECONDS) has its own bound too, so the worst case is 20 s, not
+    the 15 s the entry allowed."""
+    assert tool_registry.TIMEOUTS["record_medication_taken"] == (
+        2 * tool_registry.DB_TIMEOUT_SECONDS + dose_video.CONSENT_READ_SECONDS + tool_registry.REVIEW_WAIT_SECONDS)
+    assert tool_registry.TIMEOUTS["record_medication_taken"] == 20.0
 
 
 def test_capture_makes_the_clip_from_the_frames_it_is_given(monkeypatch):

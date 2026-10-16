@@ -68,8 +68,10 @@ TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medic
             "describe_view": OCR_SECONDS + 6.0,
             "verify_prescription": 6.0, "get_medication_schedule": 6.0, "check_medication_due": 6.0,
             "start_pill_intake_detection": 6.0, "get_pill_intake_result": 3.0,
-            # two database calls and the consent read (dose_video.clip_outlook), plus a review being made (5 s)
-            "record_medication_taken": 10.0 + REVIEW_WAIT_SECONDS,
+            # its worst case: two database calls (_db), the consent read (dose_video.clip_outlook, within
+            # CONSENT_READ_SECONDS) and a review being made (_review_carried_clip, at most REVIEW_WAIT_SECONDS)
+            "record_medication_taken": (2 * DB_TIMEOUT_SECONDS + dose_video.CONSENT_READ_SECONDS
+                                        + REVIEW_WAIT_SECONDS),
             "get_current_emotion": 8.0, "get_emotion_history": 6.0, "trigger_antenna_emote": 6.0, "remember": 8.0,
             "get_patient_memory": 8.0, "notify_family": 8.0, "emergency_alert": 12.0,
             "get_weather": 30.0,   # the geocoder (spaced 1.1 s) and Open-Meteo, 12 s and 15 s each at most
