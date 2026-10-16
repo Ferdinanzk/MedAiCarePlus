@@ -1010,11 +1010,12 @@ class LiveRelay:
         the rest; in companion mode while paused too), and the endings: goodbye, silence and limit here,
         access_withdrawn and access_unverified from the re-check. In companion mode silence and limit end nothing: a
         running stretch pauses instead (_pause), never while a screening hit settles: QUIET_PAUSE_SECONDS after the
-        patient's last speech once GPT-Live's sound has ended and no record, note to family or alert still runs or
-        ended less than INTENT_WAIT_SECONDS ago (_tool_answer_due); once it is STRETCH_MAX_SECONDS old, at the patient's
-        turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended and no
-        answer still owed to them: _armed); and once it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and
-        GPT-Live are doing."""
+        patient's last speech once GPT-Live's sound has ended and no record, note to family or alert, nor a step of the
+        medication workflow (a label check, a watch's result, a due check; tool_registry.MEDICATION_TOOLS), still runs
+        or ended less than INTENT_WAIT_SECONDS ago (_tool_answer_due); once it is STRETCH_MAX_SECONDS old, at the
+        patient's turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended,
+        no answer still owed to them, _armed, and the same wait for those calls; round 4 of 17 Oct 2026); and once it
+        is STRETCH_HARD_MAX_SECONDS old, whatever the patient, GPT-Live and the tools are doing."""
         now = self.clock()
         if self._hit_at is not None and now - self._heard_at >= CONFIRM_SECONDS:
             await self._confirm()
@@ -1049,7 +1050,8 @@ class LiveRelay:
                 if stretch >= STRETCH_HARD_MAX_SECONDS:
                     await self._pause("stretch_hard_max")
                 elif (stretch >= STRETCH_MAX_SECONDS and self._patient is None and self._segment is None
-                      and not self._armed and now - self._last_patient_at > TURN_GAP_SECONDS):
+                      and not self._armed and now - self._last_patient_at > TURN_GAP_SECONDS
+                      and not self._tool_answer_due(now)):
                     await self._pause("stretch_max")
                 elif (now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None
                       and not self._tool_answer_due(now)):
