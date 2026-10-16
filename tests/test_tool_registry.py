@@ -982,11 +982,15 @@ class LoadingRobot(Robot):
         return {"status": "cancelled", "dance": stopped} if stopped else {"status": "idle"}
 
 
+async def _settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
 async def _dance_loading(registry):
     """GPT-Live's dance call, which the robot has not answered yet: it still loads the move."""
     asked = asyncio.ensure_future(registry.execute("dance", {"dance": None, "repeat": None}))
-    for _ in range(10):
-        await asyncio.sleep(0)                             # the call reaches the robot, which loads the move
+    await _settle()                                        # the call reaches the robot, which loads the move
     return asked
 
 
@@ -1001,7 +1005,9 @@ def test_a_stop_while_the_robot_still_loads_the_dance_stops_it_once_it_starts():
         waiting = r.dancing()
         stop = await r.execute("stop_dance", {})
         robot.loaded.set()                                 # the move starts after the stop
-        return robot, waiting, stop, await asked, r.dancing()
+        dance = await asked
+        await _settle()                                    # the second stop runs as a task of its own (round 3)
+        return robot, waiting, stop, dance, r.dancing()
 
     robot, waiting, stop, dance, dancing = asyncio.run(run())
     assert waiting and not dancing
@@ -1033,3 +1039,122 @@ def test_a_stop_with_no_dance_waiting_for_its_answer_says_what_the_robot_said():
         return await r.execute("stop_dance", {})
 
     assert asyncio.run(run())["result"] == {"status": "idle"}
+
+
+# ── round 3 of 17 Oct 2026 (Task 5's review) ──
+
+def test_a_dance_the_robot_refuses_is_no_dance_running():
+    # Before, dancing() stayed true for 25 s, and a bare 「好了」 sent stop_dance to an idle robot and started the hold
+    class Refusing(Robot):
+        async def dance(self, name, repeat):
+            raise ToolError("dance_failed: gestures off")
+
+    async def run():
+        r = ToolRegistry(Refusing(), backend()[0], clock=Clock())
+        return await r.execute("dance", {"dance": None, "repeat": None}), r.dancing()
+
+    answer, dancing = asyncio.run(run())
+    assert answer == {"ok": False, "tool": "dance", "error": "dance_failed: gestures off"} and not dancing
+
+
+def test_a_dance_that_fails_after_a_later_dance_was_called_leaves_that_one_running():
+    class Replaced(Robot):
+        def __init__(self):
+            super().__init__()
+            self.gate, self.calls = asyncio.Event(), 0
+
+        async def dance(self, name, repeat):
+            self.calls += 1
+            if self.calls == 1:
+                await self.gate.wait()
+                raise ToolError("dance_failed: replaced")
+            return await super().dance(name, repeat)
+
+    async def run():
+        clock, robot = Clock(), Replaced()
+        r = ToolRegistry(robot, backend()[0], clock=clock)
+        first = asyncio.ensure_future(r.execute("dance", {"dance": None, "repeat": None}))
+        await _settle()
+        clock.now += 1.0
+        second = await r.execute("dance", {"dance": "simple_nod", "repeat": 1})
+        robot.gate.set()
+        return await first, second, r.dancing()
+
+    first, second, dancing = asyncio.run(run())
+    assert first["error"] == "dance_failed: replaced" and second["ok"] and dancing
+
+
+class SecondStop(LoadingRobot):
+    """A robot whose second stop (the one sent again once the dance answers) fails, or answers only after `late`."""
+
+    def __init__(self, fail=False, late=0.0):
+        super().__init__()
+        self.fail, self.late, self.stops = fail, late, 0
+
+    async def stop_dance(self):
+        self.stops += 1
+        if self.stops == 1:
+            return await super().stop_dance()
+        self.emotes.append("stop_dance")
+        if self.fail:
+            raise ToolError("stop_dance_failed: robot_did_not_answer")
+        await asyncio.sleep(self.late)
+        stopped, self.running = self.running, None
+        return {"status": "cancelled", "dance": stopped}
+
+
+async def _stop_while_loading(robot, load=True):
+    r = ToolRegistry(robot, backend()[0], clock=Clock())
+    asked = await _dance_loading(r)
+    await r.execute("stop_dance", {})
+    if load:
+        robot.loaded.set()                                 # the move starts after the stop
+    dance = await asked
+    await _settle()
+    return dance
+
+
+@pytest.mark.parametrize("robot", [SecondStop(fail=True), SecondStop(late=0.5)], ids=["fails", "late"])
+def test_the_second_stops_error_or_lateness_never_replaces_stopped_by_patient(monkeypatch, robot):
+    # It runs as a task of its own: before, it ran inside the dance's own time limit, so a late or failed second stop
+    # made the dance answer tool_timeout or stop_dance_failed, and the backstop said "I can't dance right now"
+    monkeypatch.setitem(tool_registry.TIMEOUTS, "dance", 0.2)
+    dance = asyncio.run(_stop_while_loading(robot))
+    assert dance == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert robot.emotes[:3] == ["stop_dance", "dance:None:2", "stop_dance"]
+
+
+def test_a_dance_that_fails_after_a_stop_came_during_its_load_sends_the_stop_again():
+    class FailingLoad(LoadingRobot):
+        async def dance(self, name, repeat):
+            await self.loaded.wait()
+            raise ToolError("dance_failed: robot_did_not_answer")
+
+    robot = FailingLoad()
+    dance = asyncio.run(_stop_while_loading(robot))
+    assert dance == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert robot.emotes == ["stop_dance", "stop_dance"]
+
+
+def test_a_dance_that_times_out_after_a_stop_came_during_its_load_sends_the_stop_again(monkeypatch):
+    monkeypatch.setitem(tool_registry.TIMEOUTS, "dance", 0.05)
+    robot = LoadingRobot()                                 # it never answers the dance
+    dance = asyncio.run(_stop_while_loading(robot, load=False))
+    assert dance == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert robot.emotes == ["stop_dance", "stop_dance"]
+
+
+def test_gpt_lives_dance_calls_answered_stopped_by_patient_are_counted():
+    # GPT-Live says Reachy stopped when its dance is refused so (BACKEND_INSTRUCTION): the relay's stop line is then
+    # not said as well. The backstop's own dances are not counted
+    async def run():
+        r = ToolRegistry(Robot(), backend()[0], clock=Clock())
+        await r.execute("dance", {"dance": None, "repeat": None})
+        await r.execute("stop_dance", {})
+        before = r.stops_told
+        await r.run_intent("dance", {"dance": None, "repeat": None})
+        backstop = r.stops_told
+        await r.execute("dance", {"dance": None, "repeat": None})
+        return before, backstop, r.stops_told
+
+    assert asyncio.run(run()) == (0, 0, 1)
