@@ -904,7 +904,9 @@ def test_an_extra_dose_said_in_the_next_turn_drops_a_claim_still_waiting(world):
 
 @pytest.mark.parametrize("words", ["不對，我還沒吃", "騙你的", "No wait, I didn't take it",
                                    # round 3: any other words before the due check starts drop it, not only these
-                                   "今天天氣很好", "我八點吃的", "我想一下"])
+                                   "今天天氣很好", "我八點吃的", "我想一下",
+                                   # a word that can answer GPT-Live's question is no closing word, alone or with one
+                                   "對", "好", "嗯", "yes", "ok", "是的", "對，謝謝", "好，謝謝", "Yes, thanks"])
 def test_a_claim_taken_back_in_the_next_turn_is_dropped(world, words):
     # 「我吃完藥了」, a pause, then 「不對，我還沒吃」 before the backstop's grace ran out: no request to family
     async def scenario():
@@ -923,7 +925,7 @@ def test_a_claim_taken_back_in_the_next_turn_is_dropped(world, words):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("words", ["謝謝", "拜拜", "嗯", "Thanks!", "我吃完藥了"])
+@pytest.mark.parametrize("words", ["謝謝", "拜拜", "Thanks!", "我吃完藥了", "日希，再見", "Thank you, Reachy"])
 def test_a_closing_word_or_the_same_claim_in_the_next_turn_keeps_the_claim(world, words):
     async def scenario():
         backend = Backend()
@@ -938,6 +940,39 @@ def test_a_closing_word_or_the_same_claim_in_the_next_turn_keeps_the_claim(world
         await _end(world, running)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("answer", ["對", "對啊", "嗯", "yes", "yeah", "對，謝謝"])
+def test_an_answer_to_gpt_lives_question_drops_the_claim(world, answer):
+    # Round 3 review: 「我吃過藥了」, GPT-Live asks 「是昨天晚上吃的嗎？」 and the patient answers 「對」 within the grace.
+    # A turn of only fillers kept the claim, so the backstop filed today's dose on last night's pill, and overdose
+    # protection then refused the real dose for up to 2 h
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃過藥了"), _sound(), _reachy("是昨天晚上吃的嗎？"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.2)    # the claim's turn closes; the grace is not over
+        await _live(world, _said(answer))                                  # the patient answers GPT-Live's question
+        await _step(world, relay, 1.5)                                     # the grace runs out
+        for _ in range(5):
+            await relay_chat._settle()
+        assert backend.calls == []
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("words, closing", [
+    ("謝謝", True), ("拜拜！", True), ("再見", True), ("Thanks!", True), ("goodbye", True), ("日希，再見", True),
+    ("謝謝日希", True), ("Thank you, Reachy.", True),
+    # nothing but fillers or the call name, a word that can answer a question (alone or before a closing word), more
+    # words, or a question: the claim does not stand on them
+    ("", False), ("嗯", False), ("對", False), ("好", False), ("yes", False), ("ok", False), ("okay", False),
+    ("yeah", False), ("日希", False), ("嗯，謝謝", False), ("對，謝謝", False), ("好，再見", False),
+    ("Yes, thanks", False), ("ok bye", False), ("謝謝？", False), ("是的", False),
+])
+def test_only_one_closing_word_leaves_a_claim_standing(words, closing):
+    assert tool_intents.closes(words) is closing
 
 
 def test_a_request_in_the_next_turn_runs_and_drops_the_claim_still_waiting(world):
@@ -1018,6 +1053,7 @@ def test_a_slot_with_a_refused_medicine_says_each_by_name_and_is_never_praised(w
     # round 3: words that arrive after the due check started cancel the records not yet started (an extra dose, a
     # doubt, anything else); a closing word does not
     ("我好像吃了兩次", []), ("等一下，我想一下", []), ("No wait", []), ("謝謝", ["dose-12", "dose-13"]),
+    ("對", []),   # an answer to a question of GPT-Live's, never a closing word (round 3 review)
 ])
 def test_words_after_the_due_check_started_cancel_the_records_not_yet_started(world, words, recorded):
     async def scenario():

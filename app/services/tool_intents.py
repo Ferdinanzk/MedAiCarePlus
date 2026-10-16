@@ -120,15 +120,16 @@ CLAIM_TRAIL = re.compile(r"(?:\s*(?:日希|瑞希|瑞奇|嗯|喔|哦|欸|誒|啊
 _PILLS = r"(藥|藥物|藥丸|藥片)"
 _JUST = r"(已經|剛剛|剛才|剛|有)*"
 _SINCE = r"(已經|剛剛|剛才|剛|有)?"
-CLOSING_ZH = r"(再見|拜拜|謝謝|囉|啦)?"
-CLOSING_EN = r"(bye|goodbye|thanks|thank you)?"
+CLOSING_ZH = r"(再見|拜拜|謝謝|囉|啦)"
+CLOSING_EN = r"(bye|goodbye|thanks|thank you)"
+_CALL_NAME = re.compile(r"日希|瑞希|瑞奇|(?<![a-z'])(?:reachy|richy|rishi)(?![a-z'])")
 # The Chinese forms (compact), each with what makes it done in its own words (None: the form says it): 我 with at
 # most a "just" or "already" word before 吃 (我吃完藥了, 我已經吃藥了, 我剛剛吃藥了, 我吃了藥; never 「我有吃藥」, "I'm on
 # medication", nor 「我吃藥囉」, "I'm taking it now"); no subject, with 完/過/好/掉 or 已經/剛 (吃完藥了; never 「吃藥了」,
 # "medicine time!"); or the medicine first (藥吃了, 藥我吃過了, 我把藥吃完了; never 「把藥吃了」, an order, and 吃完了
 # only after 我把: 「藥吃完了」 and 「我的藥吃完了」 say it ran out). No 今天的: 「我吃完今天的藥了」 can be every dose of
 # the day
-CLAIM_ZH = tuple((re.compile(r"(?P<claim>" + form + r")" + CLOSING_ZH), done) for form, done in (
+CLAIM_ZH = tuple((re.compile(r"(?P<claim>" + form + r")" + CLOSING_ZH + "?"), done) for form, done in (
     (r"我" + _JUST + r"吃(完|過|好|掉)?了?(這次的|我的)?" + _PILLS + r"了?", re.compile(r"已經|剛|完|過|好|掉|了")),
     (_JUST + r"吃(完|過|好|掉)?了?(這次的|我的)?" + _PILLS + r"了?", re.compile(r"已經|剛|完|過|好|掉")),
     (r"(我把?)?" + _PILLS + r"我?" + _SINCE + r"吃(了|過了|好了|掉了)|我把" + _PILLS + _SINCE + r"吃完了", None)))
@@ -186,12 +187,16 @@ def claims_intake(text: str) -> bool:
 
 
 def closes(text: str) -> bool:
-    """Whether the patient's words say nothing but one closing word (CLOSING_ZH, CLOSING_EN: 再見, 拜拜, 謝謝, 囉, 啦,
-    bye, goodbye, thanks, thank you), or only fillers and the call name: words after a claim that leave it standing."""
-    if _ASKED.search(text or ""):
+    """Whether the patient's words after a claim leave it standing: one closing word (CLOSING_ZH, CLOSING_EN: 再見,
+    拜拜, 謝謝, 囉, 啦, bye, goodbye, thanks, thank you), with at most the call name around it. Never words without a
+    closing word, and no filler is dropped here: 對, 好, 嗯, "yes" and "ok" can answer GPT-Live's question
+    (「我吃過藥了」, 「是昨天晚上吃的嗎？」, 「對」 or 「對，謝謝」), and the claim would then file today's dose on last
+    night's pill (round 3 review of 17 Oct 2026)."""
+    if not text or _ASKED.search(text):
         return False
-    compact, spaced = _claim_words(text or "")
-    return bool(re.fullmatch(CLOSING_ZH, compact) or re.fullmatch(CLOSING_EN, spaced))
+    compact, spaced = (_CALL_NAME.sub(" ", words) for words in _prepare(text))
+    return bool(re.fullmatch(CLOSING_ZH, compact.replace(" ", ""))
+                or re.fullmatch(CLOSING_EN, re.sub(r"\s+", " ", spaced).strip()))
 
 
 def stops(text: str, dancing: bool = False) -> bool:
