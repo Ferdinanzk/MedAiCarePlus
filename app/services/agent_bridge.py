@@ -237,7 +237,7 @@ class AgentLiveClient(LiveClient):
         if name in FINISH_ON_CLOSE:   # a record, a note to family or an alert: closing the session never cuts it short
             self._finishing.add(task)
             task.add_done_callback(self._finishing.discard)
-            self.registry.hold(task, name)
+            self.registry.hold(task, name, queued=True)   # its time counts once it runs (it may wait its turn)
 
     async def _run_call(self, delegation_id: str, call_id: str, name: str, arguments) -> None:
         """One delegated call: run it (serialised), then its output and `response.create` to GPT-Live. A session that

@@ -400,7 +400,7 @@ class GatedRegistry:
         self.gates = {name: asyncio.Event() for name in gated}
         self.started, self.finished, self.held = [], [], []
 
-    def hold(self, run, *names):
+    def hold(self, run, *names, queued=False):
         self.held.append(run)
 
     async def execute(self, name, args):
@@ -530,6 +530,56 @@ def test_the_chats_end_waits_for_every_held_call_not_one_of_each_kind(monkeypatc
     bound = asyncio.run(run())
     assert order == ["recorded dose-1", "recorded dose-2", "watch reported"]
     assert bound == pytest.approx(2.0, abs=0.05)    # 1 s for each record held, one after the other
+
+
+def test_a_held_calls_time_counts_from_when_it_starts_running_not_while_it_waits_its_turn(monkeypatch):
+    """Round 4 (R4.9): finish_wait counted a held call's time from when it was held, but GPT-Live's client runs its
+    calls one at a time (AgentLiveClient._tool_lock), and a record can wait behind a label check (verify_medication,
+    up to 36 s). Its time ran out in the queue, and the chat's end reported the watch unresolved while the record
+    still filed a request. Now its time counts from when it starts running."""
+    monkeypatch.setitem(tool_registry.TIMEOUTS, "record_medication_taken", 0.3)
+    order = []
+
+    class SlowLabel(SlowRecords):
+        async def verify_medication(self, jpeg, expected_medication):
+            await asyncio.sleep(0.5)                # the OCR
+            order.append("label checked")
+            return {"result": "match", "expected_medication": expected_medication}
+
+    async def run():
+        socket = FakeSocket(starts_only)
+        registry = ToolRegistry(Robot(), SlowLabel(order, 0.2))
+        c = client(socket, registry)
+        await c.start()
+        socket.push(call_event("verify_medication", '{"expected_medication": "Allegra"}', call_id="c1"))
+        socket.push(call_event("record_medication_taken", '{"medication_id": "dose-1", "patient_confirmed": true}',
+                               call_id="c2"))      # held at once, queued behind the label check
+        await _until(lambda: "label checked" in order, limit=2)
+        await asyncio.sleep(0.1)                    # the record runs; 0.6 s since it was held, past its 0.3 s
+        await c.close(wait=0.05)                    # the chat ends while it runs
+        await asyncio.wait_for(registry.close(), 3)
+
+    asyncio.run(run())
+    assert order == ["label checked", "recorded dose-1", "watch reported"]
+
+
+def test_a_held_call_not_started_when_the_chat_ends_is_bounded_from_then(monkeypatch):
+    """A held call still waiting its turn when the chat ends counts from then (the client's close cancels the other
+    tools, so it starts at once), after the held calls ahead of it; a call that never starts is waited for no longer
+    than its own time limit."""
+    monkeypatch.setitem(tool_registry.TIMEOUTS, "record_medication_taken", 0.2)
+
+    async def run():
+        registry = ToolRegistry(Robot(), SlowRecords([], 0.0))
+        never = asyncio.get_running_loop().create_future()
+        registry.hold(never, "record_medication_taken", queued=True)
+        await asyncio.sleep(0.3)                    # longer than its time limit, but it has not started
+        assert registry.finish_wait() == pytest.approx(0.2, abs=0.05)
+        began = asyncio.get_running_loop().time()
+        await asyncio.wait_for(registry.close(), 3)
+        return asyncio.get_running_loop().time() - began
+
+    assert asyncio.run(run()) == pytest.approx(0.2, abs=0.1)
 
 
 def test_a_claim_of_a_dose_holds_each_record_as_it_starts(monkeypatch):
