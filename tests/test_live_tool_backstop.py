@@ -1440,3 +1440,15 @@ def test_the_backends_completion_flow_records_before_it_applauds():
     record = flow[:flow.index('trigger_antenna_emote(preset="applaud_cheer")')]
     assert "once for every dose" in record and "doses" in record and "pending_allowed" in record
     assert "every dose stands" in applause and "name" in applause and "reason" in applause
+    # Round 4 (R4.1, the 14 Oct rule that every medication event reaches family): a dose refused as a possible double
+    # dose is recorded too (patient_confirmed true); the server refuses it, tells family and answers the reason, and
+    # it is never praised. Only the other refusals (not due, expired) and no dose due are left unrecorded
+    double = record[record.index("refused_too_soon"):]
+    assert "refused_max_reached" in double and "tells family" in double and "never praise" in double
+    assert record.index("patient_confirmed=true") < record.index("refused_too_soon")
+    words = " ".join(flow.split())
+    unrecorded = words[:words.index("do not record it:")]
+    unrecorded = unrecorded[unrecorded.rindex(".") + 1:]   # the sentence that says which doses are not recorded
+    assert "the status is refused" not in words
+    assert "refused_not_due" in unrecorded and "refused_expired" in unrecorded and "no dose" in unrecorded
+    assert "refused_too_soon" not in unrecorded and "refused_max_reached" not in unrecorded
