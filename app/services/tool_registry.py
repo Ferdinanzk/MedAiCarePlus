@@ -939,21 +939,24 @@ class ToolRegistry:
         self.stops_told = 0                                     # GPT-Live's dance calls answered stopped_by_patient
                                                                 # (execute): it says Reachy stopped (the relay's _told)
         self._intent_runs: dict[str | tuple, tuple[float, asyncio.Future]] = {}   # the backstop's runs (_shared_as)
-        # FINISH_ON_CLOSE calls still running (hold), in the order they were held: (when, on the event loop's clock,
-        # and the seconds their TIMEOUTS entries allow)
-        self._held: dict[asyncio.Future, tuple[float, float]] = {}
+        # FINISH_ON_CLOSE calls still running (hold), in the order they were held: [when it started running, on the
+        # event loop's clock (None: it still waits its turn), and the seconds its TIMEOUTS entries allow]
+        self._held: dict[asyncio.Future, list] = {}
         self._held_ended = float("-inf")                        # when the last held call ended (the loop's clock)
+        self._closing_at: float | None = None                   # when close() began (the loop's clock)
         self._steps: dict[object, float] = {}                   # MEDICATION_TOOLS calls running -> until (checking)
         self.finished_at = float("-inf")                        # when the last held call or medication step ended
                                                                 # (monotonic)
 
-    def hold(self, run: asyncio.Future, *names: str) -> None:
+    def hold(self, run: asyncio.Future, *names: str, queued: bool = False) -> None:
         """A FINISH_ON_CLOSE call (a record, a note to family or an alert) that closing GPT-Live leaves to finish
         (agent_bridge.AgentLiveClient), or the backstop's claim of a dose: the companion's quiet pause waits for it
         (finishing), then gives GPT-Live time to start its answer (finished_at, on the relay's clock: make_registry
         passes it as `monotonic`), and the chat's end waits for it (close). `names`: the tools it runs, whose
-        TIMEOUTS entries, counted from now, bound that wait (finish_wait)."""
-        self._held[run] = (run.get_loop().time(), sum(TIMEOUTS.get(name, 10.0) for name in names))
+        TIMEOUTS entries, counted from when it starts running, bound that wait (finish_wait): now, or with `queued`
+        (GPT-Live's call, which waits its turn behind the one running: AgentLiveClient runs them one at a time) when
+        it reaches execute."""
+        self._held[run] = [None if queued else run.get_loop().time(), sum(TIMEOUTS.get(name, 10.0) for name in names)]
         run.add_done_callback(self._release)
 
     def _release(self, run: asyncio.Future) -> None:
@@ -973,19 +976,26 @@ class ToolRegistry:
         return any(now < until for until in self._steps.values())
 
     def finish_wait(self) -> float:
-        """How long the held calls still running may yet take: each its TIMEOUTS entries, counted from when it was
-        held, one after the other in the order they were held (GPT-Live's client runs its calls one at a time, so a
-        call held behind another starts only when that one ends), and never from before the last one ended."""
+        """How long the held calls still running may yet take: each its TIMEOUTS entries, counted from when it
+        started running (round 4 of 17 Oct 2026: counted from when it was held, a record's time ran out while it
+        waited its turn behind a label check, verify_medication's 36 s), one after the other in the order they were
+        held (GPT-Live's client runs its calls one at a time, so a call held behind another starts only when that one
+        ends), and never from before the last one ended. A call that still waits its turn counts from when the one
+        ahead of it may end, and from when close() began at the earliest (the client's close cancels the tools that are
+        not held, so it starts then): a call that never starts is waited for no longer than its own entries."""
+        now = asyncio.get_running_loop().time()
+        since = now if self._closing_at is None else self._closing_at
         end = self._held_ended
-        for held_at, seconds in self._held.values():
-            end = max(end, held_at) + seconds
-        return max(0.0, end - asyncio.get_running_loop().time())
+        for started_at, seconds in self._held.values():
+            end = max(end, since if started_at is None else started_at) + seconds
+        return max(0.0, end - now)
 
     async def close(self) -> None:
         """The chat is over: the held calls still running finish first (a record settles its watch), bounded by
         finish_wait, which is read again whenever one ends or the bound passes, because a claim of a dose holds each
         record as it starts (run_intent); then the backend reports a watch left without a verdict
         (ServerCareBackend.close, within DB_TIMEOUT_SECONDS)."""
+        self._closing_at = asyncio.get_running_loop().time()
         while True:
             running = [run for run in self._held if not run.done()]
             wait = self.finish_wait()
@@ -1045,8 +1055,12 @@ class ToolRegistry:
         self._intent_runs = {"stop_dance": stop} if stop is not None else {}
 
     async def execute(self, name: str, args: dict | None) -> dict:
-        """GPT-Live's own call. A dance call answered stopped_by_patient is counted (stops_told): BACKEND_INSTRUCTION
-        has GPT-Live say Reachy stopped then, so the relay's stop line is not said as well (round 3 of 17 Oct 2026)."""
+        """GPT-Live's own call. A held call that waited its turn starts running now (hold, finish_wait). A dance call
+        answered stopped_by_patient is counted (stops_told): BACKEND_INSTRUCTION has GPT-Live say Reachy stopped then,
+        so the relay's stop line is not said as well (round 3 of 17 Oct 2026)."""
+        held = self._held.get(asyncio.current_task())
+        if held is not None and held[0] is None:
+            held[0] = asyncio.get_running_loop().time()
         shared = self._intent_runs.get(self._shared_as(name, args))
         if shared is not None and self.clock() - shared[0] < INTENT_SHARE_SECONDS:
             log.info("live agent tool %s: the backstop's run answers it", name)
