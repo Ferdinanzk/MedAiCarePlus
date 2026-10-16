@@ -611,6 +611,10 @@ class ServerCareBackend:
         outcome = task.result()
         return isinstance(outcome, dict) and outcome.get("video") is True
 
+    def watching(self) -> bool:
+        """Whether a watch is open: started (start_pill_intake_detection), neither settled by a record nor closed."""
+        return self._watch is not None
+
     def _watch_for(self, dose: dict) -> dict | None:
         """The open watch when it watches exactly this dose (the dose its medicine named when it started): a record
         settles it whether or not the call names it. Another dose of the same medicine never does, nor a watch
@@ -960,6 +964,11 @@ class ToolRegistry:
                 break
             await asyncio.wait(running, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
         await asyncio.wait_for(self.backend.close(), DB_TIMEOUT_SECONDS)
+
+    def watching(self) -> bool:
+        """Whether a camera watch is open (ServerCareBackend.watching): GPT-Live starting or reading it then takes the
+        patient's claim of a dose (live_session.LiveRelay._told)."""
+        return self.backend.watching()
 
     def dancing(self) -> bool:
         """Whether a dance started recently enough that it may still run (a bare "stop" then stops it)."""

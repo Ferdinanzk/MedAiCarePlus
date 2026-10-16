@@ -70,6 +70,10 @@ class Backend:
         self.records = records or {}
         self.calls: list[tuple] = []
         self.gate: asyncio.Event | None = None
+        self.watch = False   # a camera watch is open (ServerCareBackend.watching)
+
+    def watching(self):
+        return self.watch
 
     async def check_medication_due(self):
         self.calls.append(("check_medication_due",))
@@ -1068,11 +1072,14 @@ def test_gpt_lives_own_delegation_within_the_grace_means_no_second_run(world, to
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("tool", ["get_medication_schedule", "get_pill_intake_result"])
-def test_asking_the_schedule_is_no_delegation_of_the_claim(world, tool):
+@pytest.mark.parametrize("tool, watch", [("get_medication_schedule", False), ("get_pill_intake_result", False),
+                                         ("start_pill_intake_detection", False),
+                                         ("get_medication_schedule", True)])   # round 4: never, watch or not
+def test_asking_the_schedule_is_no_delegation_of_the_claim(world, tool, watch):
     # Round 3 (F2.7): reading the schedule records nothing, so it no longer drops a claim nobody recorded
     async def scenario():
         backend = Backend()
+        backend.watch = watch
         relay, running, link = await _with_tools(world, backend)
         await _live(world, _said("我吃完藥了"), _sound(), _reachy("好，我看一下"))
         world.clients[-1].requested.append(tool)
@@ -1081,6 +1088,27 @@ def test_asking_the_schedule_is_no_delegation_of_the_claim(world, tool):
             await relay_chat._settle()
         assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None)]
         await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool", ["start_pill_intake_detection", "get_pill_intake_result"])
+def test_while_a_camera_watch_is_open_gpt_lives_watch_calls_take_the_claim(world, tool):
+    # Round 4 (R4.4): a claim while GPT-Live runs the camera workflow (it starts or reads the watch) is GPT-Live's.
+    # Before, the backstop recorded on the patient's word and spent the watch, and GPT-Live's own record of the camera
+    # flow then got unknown_session
+    async def scenario():
+        backend = Backend()
+        backend.watch = True
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"), _sound(), _reachy("我用鏡頭看一下"))
+        world.clients[-1].requested.append(tool)
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 1)
+        for _ in range(5):
+            await relay_chat._settle()
+        assert backend.calls == [] and relay._claim is None
+        await _end(world, running)
+        assert backend.calls == []
 
     asyncio.run(scenario())
 

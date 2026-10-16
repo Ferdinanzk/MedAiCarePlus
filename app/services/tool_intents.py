@@ -36,6 +36,10 @@ TOOLS = {"dance": ("dance",), "stop_dance": ("stop_dance",),
          # GPT-Live's backend took the claim: its completion flow's due check or record (reading the schedule records
          # nothing, so it no longer drops a claim nobody recorded; round 3)
          "took_medicine": ("check_medication_due", "record_medication_taken")}
+# While a camera watch is open, GPT-Live starting or reading it takes the claim too (round 4 of 17 Oct 2026: the
+# backstop recorded on the patient's word and spent the watch GPT-Live was reading, and GPT-Live's own record of the
+# camera flow then got unknown_session); get_medication_schedule never does
+WATCH_TOOLS = ("start_pill_intake_detection", "get_pill_intake_result")
 # A search request about these is another tool's (medicine, weather, time, reminders), never a web search
 NOT_SEARCH = re.compile(r"藥|药|天氣|天气|幾點|几点|時間|时间|提醒|家人|吃飯|medicine|medication|pill|weather|time|remind|family")
 
