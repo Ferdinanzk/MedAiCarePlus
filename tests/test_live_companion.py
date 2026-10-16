@@ -114,7 +114,7 @@ def companion(safe, monkeypatch):
     monkeypatch.setattr(memory, "call_name", call_name)
     monkeypatch.setattr(memory, "pick_followup", pick_followup)
     monkeypatch.setattr(memory, "build_block", build_block)
-    monkeypatch.setattr(conversation, "reply_prompt", lambda language: f"REPLY PROMPT {language}")
+    monkeypatch.setattr(conversation, "reply_prompt", lambda language, tools=False: f"REPLY PROMPT {language}")
     return w
 
 

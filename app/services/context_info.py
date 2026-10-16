@@ -120,13 +120,30 @@ def lunar_date(day: date) -> tuple[str, str]:
             f"lunar {'leap ' if leap else ''}month {month}, day {lunar.getDay()}")
 
 
-def _date_line(now: datetime, language: str) -> str:
+# A live chat's instructions are built once per GPT-Live session and never refreshed, so there the line says it is
+# the session's start and that the time now is the backend's (14 Oct 2026: asked at 13:56, Reachy said 1:53, the
+# stretch's start). The text chat rebuilds its prompt every turn and keeps the "now" wording.
+STARTED = {"zh-TW": "這段對話開始時是{date}（{weekday}）{time}{lunar}。注意：這只是開始的時間，時間一直在走；"
+                    "對方問現在幾點、幾號或任何地方的時間，一律交給後端查即時時間，不要用這個時間回答。",
+           "en": "This conversation started on {weekday} {date} at {time} (local time){lunar}. Note: that is only the "
+                 "start; time has moved on since. For the time or date now, anywhere, delegate to the backend; never "
+                 "answer from this line."}
+
+
+def _date_line(now: datetime, language: str, started: bool = False) -> str:
     period_zh, period_en = time_of_day(now.hour)
     lunar_zh, lunar_en = _safely(lunar_date, now.date()) or ("", "")
     if language == "zh-TW":
+        if started:
+            return STARTED["zh-TW"].format(date=f"{now.year}年{now.month}月{now.day}日", weekday=WEEKDAYS["zh-TW"][now.weekday()],
+                                           time=f"{period_zh}{clock(now.hour, now.minute)}",
+                                           lunar=f"，{lunar_zh}" if lunar_zh else "")
         line = (f"現在是{now.year}年{now.month}月{now.day}日（{WEEKDAYS['zh-TW'][now.weekday()]}）"
                 f"{period_zh}{clock(now.hour, now.minute)}")
         return line + (f"，{lunar_zh}。" if lunar_zh else "。")
+    if started:
+        return STARTED["en"].format(date=f"{now.day} {MONTHS[now.month - 1]} {now.year}", weekday=WEEKDAYS["en"][now.weekday()],
+                                    time=f"{now:%H:%M} {period_en}", lunar=f"; {lunar_en}" if lunar_en else "")
     line = (f"It is {WEEKDAYS['en'][now.weekday()]} {now.day} {MONTHS[now.month - 1]} {now.year}, "
             f"{now:%H:%M} {period_en} (local time)")
     return line + (f"; {lunar_en}." if lunar_en else ".")
@@ -316,11 +333,12 @@ def _holiday_line(today: date, language: str) -> str:
 
 # ── the block and its refresh ──
 
-def background(language: str, now: datetime | None = None) -> str:
-    """The lines for the reply prompt: date and time, weather, holidays. Memory and local data only."""
+def background(language: str, now: datetime | None = None, started: bool = False) -> str:
+    """The lines for the reply prompt: date and time, weather, holidays. Memory and local data only. `started`: for
+    a live session's instructions, whose date line names the start, not the time now (STARTED)."""
     language = language if language in LANGUAGES else "en"
     now = (now or local_now()).astimezone(ZoneInfo(config.MEDCARE_TIMEZONE))
-    lines = [_date_line(now, language), _safely(_weather_line, now, language),
+    lines = [_date_line(now, language, started), _safely(_weather_line, now, language),
              _safely(_holiday_line, now.date(), language)]
     return "\n".join(line for line in lines if line)
 

@@ -137,26 +137,42 @@ def _unlink(video_id: str) -> None:
             log.warning("could not delete %s", path)
 
 
-async def _store(u_id: int, intk_ids: list[int], source: str, frames: list) -> None:
+async def make_clip(frames: list) -> tuple[str, dict]:
+    """Encode buffered frames into a new clip on disk: (video_id, encode info). The caller inserts the row."""
     video_id = str(uuid.uuid4())
+    mp4, preview = _paths(video_id)
+    try:
+        info = await asyncio.get_running_loop().run_in_executor(None, encode, frames, mp4, preview)
+    except Exception:
+        _unlink(video_id)
+        raise
+    return video_id, info
+
+
+async def insert_clip(conn, video_id: str, u_id: int, intk_ids: list[int], source: str, info: dict) -> None:
+    await conn.execute(
+        "INSERT INTO dose_video (video_id, u_id, intk_ids, source, frames, duration_ms, size_bytes) "
+        "VALUES ($1::uuid, $2, $3::int[], $4, $5, $6, $7)",
+        video_id, u_id, [int(i) for i in intk_ids], source if source in SOURCES else "browser",
+        info["frames"], info["duration_ms"], info["size_bytes"])
+
+
+async def _store(u_id: int, intk_ids: list[int], source: str, frames: list) -> None:
+    video_id = None
     try:
         if not await enabled(u_id):
             drop_buffer(u_id)
             return
-        mp4, preview = _paths(video_id)
-        info = await asyncio.get_running_loop().run_in_executor(None, encode, frames, mp4, preview)
+        video_id, info = await make_clip(frames)
         base_url = await public_base_url()   # before the transaction: it may ask LINE and the tunnel
         async with get_pool().acquire() as conn, conn.transaction():
-            await conn.execute(
-                "INSERT INTO dose_video (video_id, u_id, intk_ids, source, frames, duration_ms, size_bytes) "
-                "VALUES ($1::uuid, $2, $3::int[], $4, $5, $6, $7)",
-                video_id, u_id, intk_ids, source if source in SOURCES else "browser",
-                info["frames"], info["duration_ms"], info["size_bytes"])
+            await insert_clip(conn, video_id, u_id, intk_ids, source, info)
             if base_url is not None:
                 await send_with_confirmation(conn, video_id, u_id, intk_ids, base_url)
     except Exception:
         log.exception("dose video for intakes %s failed", intk_ids)
-        _unlink(video_id)
+        if video_id is not None:
+            _unlink(video_id)
 
 
 async def send_with_confirmation(conn, video_id: str, u_id: int, intk_ids: list[int], base_url: str) -> int:

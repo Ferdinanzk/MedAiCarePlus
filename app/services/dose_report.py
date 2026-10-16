@@ -46,3 +46,44 @@ def ai_estimate(score: float | None, evidence: dict | None, *, camera_used: bool
 
 FOOTNOTE_ZH = "（AI 只看得到手把東西送到嘴邊的動作，看不到藥丸本身。）"
 FOOTNOTE_EN = "(The AI sees hand-to-mouth movement only; it cannot see the pill itself.)"
+
+# The GPT-Live agent's verify_medication result (tool_registry.py): what the label text read says.
+VERIFICATION_WORDS = {
+    "match": ("標籤符合預期藥物", "the label matches the expected medicine"),
+    "no_match": ("⚠️ 標籤與預期藥物不符，可能拿錯藥", "⚠️ the label does not match the expected medicine: possibly the "
+                                                 "wrong medicine"),
+    "uncertain": ("無法辨識（沒有讀到標籤文字）", "could not be verified (no label text was read)"),
+}
+# The robot's or the server's facial-expression reading during the event: only a clear negative one is worth a
+# line to family; everyday expressions never change what is sent.
+NEGATIVE_EMOTIONS = {"sad": ("難過", "sad"), "angry": ("生氣", "angry"), "fear": ("害怕", "afraid"),
+                     "disgust": ("不舒服", "uncomfortable")}
+EMOTION_MIN = 0.5
+
+
+def verification_words(verification: dict | None) -> tuple[str, str] | None:
+    """(zh, en) for a verify_medication result dict ({result, expected_medication, names_read}), or None."""
+    if not isinstance(verification, dict):
+        return None
+    words = VERIFICATION_WORDS.get(verification.get("result"))
+    if words is None:
+        return None
+    zh, en = words
+    names = [str(n) for n in (verification.get("names_read") or []) if n][:3]
+    if names and verification.get("result") == "no_match":
+        zh += f"（讀到：{'、'.join(names)}）"
+        en += f" (read: {', '.join(names)})"
+    return zh, en
+
+
+def emotion_note(emotion: dict | None) -> tuple[str, str] | None:
+    """(zh, en) when the emotion reading is a clear negative one ({top, confidence}), else None."""
+    if not isinstance(emotion, dict):
+        return None
+    top, confidence = emotion.get("top"), number(emotion.get("confidence"))
+    words = NEGATIVE_EMOTIONS.get(str(top or "").lower())
+    if words is None or confidence is None or confidence < EMOTION_MIN:
+        return None
+    percent = round(confidence * 100)
+    return (f"😟 情緒：鏡頭判斷當時看起來{words[0]}（可能性 {percent}%），請多關心",
+            f"😟 Mood: the camera read the patient as {words[1]} at the time ({percent}%); a kind word may help")

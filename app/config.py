@@ -76,6 +76,9 @@ LINE_WEBHOOK_ENDPOINT_URL = "https://api.line.me/v2/bot/channel/webhook/endpoint
 # each clip from PUBLIC_BASE_URL (https). Empty = the address of the LINE webhook (scripts/line-tunnel.ps1 sets it).
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 DOSE_VIDEO_DIR  = Path(os.getenv("DOSE_VIDEO_DIR", "/tmp/medcare_dose_videos"))
+# Spoken medication prompts for the robot (services/med_clips.py): one WAV per medicine, position and language,
+# rendered once with OpenAI's speech API through the live voice connection and kept here.
+MED_CLIP_DIR    = Path(os.getenv("MED_CLIP_DIR", "/tmp/medcare_med_clips"))
 
 # ── Deployment mode, legal notice, consent (Phase 1) ─────────────────────────
 APP_ENV = os.getenv("APP_ENV", "dev").strip().lower()          # "dev" | "prod"
@@ -124,3 +127,14 @@ DEVICE_PORT = int(os.getenv("DEVICE_PORT", "8001"))   # never published or tunne
 # covers them yet. Off (the default), no live path is reachable: no card switch or section, no task flag, and the
 # robot's live WebSocket answers fallback.
 LIVE_VOICE_TEST = os.getenv("LIVE_VOICE_TEST", "").strip().lower() in ("1", "true", "yes")
+# The GPT-Live agent layer (services/gpt_live_config.py, agent_bridge.py, tool_registry.py): with LIVE_VOICE_TEST on,
+# GPT-Live delegates robot and care actions (camera, gestures, today's doses, the family confirmation request,
+# emotion, memory, family notes, the safety alert) to a Responses backend that calls the server's tools. Off (the
+# default), the live chat runs as before, without tools.
+LIVE_TOOLS = os.getenv("LIVE_TOOLS", "").strip().lower() in ("1", "true", "yes")
+# The Responses model the delegation uses (the reference agent's default; set it to the model OpenAI offers).
+LIVE_BACKEND_MODEL = os.getenv("LIVE_BACKEND_MODEL", "").strip() or "gpt-5.6-luna"
+# The agent's vision tools (verify_medication, identify_medicine, describe_view) read the robot's camera frame with
+# the prescription OCR's Gemini model: the frame leaves the server. Off (the default) those tools answer "vision_off"
+# and nothing leaves; no patient notice covers it yet, so turn it on only on a test installation.
+LIVE_VISION_CLOUD = os.getenv("LIVE_VISION_CLOUD", "").strip().lower() in ("1", "true", "yes")

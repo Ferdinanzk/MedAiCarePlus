@@ -34,9 +34,15 @@ services:
       LANDMARK_MODEL_DIR: /models/landmarks
       FRONTEND_URL: ${MEDCARE_FRONTEND_URL:-http://localhost:${WEB_PORT:-8080}}
       INTAKE_V1_COLLECT: "0"
+      # Rendered medicine/reminder voice clips and dose videos live on named volumes: a recreate (every .env change,
+      # every image rebuild) used to wipe them from /tmp and cost a speech-API render per clip
+      MED_CLIP_DIR: /var/medcare/clips
+      DOSE_VIDEO_DIR: /var/medcare/videos
     volumes:
       - ./models/face_recognition/face_gallery:/models/face_recognition/face_gallery
       - ./ledger:/ledger
+      - medclips:/var/medcare/clips
+      - dosevideos:/var/medcare/videos
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,3 +110,5 @@ services:
 
 volumes:
   pgdata:
+  medclips:
+  dosevideos:

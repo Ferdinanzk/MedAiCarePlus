@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.datastructures import Headers
 
-from app import config
+from app import config, startup_report
 from app.database import init_pool, close_pool
 from app.config import FRONTEND_URL
 from app.services.face_recognition_service import FaceRecognitionService
@@ -27,7 +27,7 @@ from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.services import ai_settings, ai_store
+from app.services import ai_settings, ai_store, reminders
 from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
@@ -43,17 +43,33 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    run_startup_checks()
-    await init_pool()
+    # Each stage logs one [STARTUP] line with the real reason when it fails (app/startup_report.py); GET /health
+    # carries the same report for scripts/medcare-boot.ps1, the host's boot script
+    startup_report.begin()
+    problems = run_startup_checks()
+    startup_report.mark("environment", True, startup_report.environment(problems))
+    try:
+        attempt = await init_pool()   # retried: postgres may still be starting after a reboot
+    except Exception as error:
+        startup_report.mark("database", False, f"{type(error).__name__}: {error}")
+        raise
+    startup_report.mark("database", True, f"postgres answered on attempt {attempt}; sql/init.sql applied")
     async with get_pool().acquire() as conn:
         await check_restore_state(conn)
         await ai_store.seed_from_env(conn)   # first start only; checks .env (check_ai_settings) before copying it
         await ai_store.fill_openrouter_keys_from_env(config.OPENROUTER_API_KEY)   # every start: keyless ones only
         ai_settings.set_current(await ai_store.load(conn))
+        unusable = []
         for job in ai_settings.JOBS:   # before check_ai_settings, which can stop a prod start
             if not ai_settings.job_usable(ai_settings.current(), job):
+                unusable.append(job)
                 log.warning("AI job %s has no usable model (a tested model whose connection has a key that can be "
                             "read), so it can't run; choose one on the Settings page's AI connections card", job)
+        startup_report.mark("ai_settings", not unusable, startup_report.ai_jobs(ai_settings.current(), unusable),
+                            warn=True)
+        live_status, live_detail = startup_report.gpt_live(ai_settings.current())
+        startup_report.mark("gpt_live", live_status == "ok", live_detail,
+                            pending=live_status in ("no_check", "check_failed"), warn=True)
         check_ai_settings(ai_settings.current())
         await register_documents(conn)   # after the AI settings: the notices name the services in use
     FaceRecognitionService.get_instance()
@@ -62,8 +78,27 @@ async def lifespan(app: FastAPI):
     LineService.get_instance()
     IntakeDetectionService.get_instance()
     LandmarkService.get_instance()
+    models = {name: bool(getattr(service, "_available", False)) for name, service in (
+        ("face_recognition", FaceRecognitionService), ("emotion", EmotionService), ("ocr", OCRService),
+        ("intake_detection", IntakeDetectionService), ("landmarks", LandmarkService))}
+    startup_report.mark("models", all(models.values()),
+                        ", ".join(f"{name} {'ok' if ok else 'MISSING'}" for name, ok in models.items()), warn=True)
     start_scheduler()
+    from app.jobs.scheduler import scheduler
+    jobs = [job.id for job in scheduler.get_jobs()]
+    startup_report.mark("scheduler", bool(jobs), f"{len(jobs)} jobs: {', '.join(jobs)}")
     await start_dispatcher()
+    startup_report.mark("outbox", True, "dispatcher started (rows left in 'sending' are re-queued)")
+    line_ready = bool(getattr(LineService, "_available", False))
+    startup_report.mark("line", line_ready,
+                        "channel token set" if line_ready else
+                        "LINE_CHANNEL_ACCESS_TOKEN is empty: no LINE messages go out", warn=True)
+    counts = await reminders.reload()   # pending reminders a previous process left: armed again (services/reminders.py)
+    startup_report.mark("reminders", counts is not None,
+                        (f"{counts['armed']} pending re-armed, {counts['expired']} expired (over "
+                         f"{reminders.LATE_FIRE_SECONDS // 60} min late), {counts['undelivered']} given up"
+                         if counts else "the start-up sweep failed (see the traceback above)"))
+    startup_report.finish_in_background(ai_settings.current(), live_status=live_status)
     yield
     await stop_dispatcher()
     stop_scheduler()
@@ -185,6 +220,7 @@ app.include_router(api_ai.router,            tags=["ai-connections"])
 @app.get("/health")
 async def health():
     """Health check for deployments."""
+    await startup_report.refresh_line()
     return {
         "status": "ok",
         "face_recognition": FaceRecognitionService._available,
@@ -193,6 +229,7 @@ async def health():
         "line": LineService._available,
         "intake_detection": IntakeDetectionService._available,
         "landmarks": LandmarkService._available,
+        "startup": startup_report.summary(),   # the [STARTUP] stages, for scripts/medcare-boot.ps1
     }
 
 

@@ -237,6 +237,29 @@ def test_the_background_rules_keep_the_model_honest():
     assert "Never give medical advice" in conversation.SYSTEM_PROMPT["en"]
 
 
+@pytest.mark.parametrize("language", ["zh-TW", "en"])
+def test_a_live_chat_with_tools_gets_a_prompt_that_sends_lookups_to_the_backend(monkeypatch, language):
+    _on_day(monkeypatch, 2026, 10, 14, 10, 0)
+    # the text chat's dose-status sentence is really in the rules, so the live prompt replaces it, not nothing
+    assert conversation.DOSE_STATUS_SOURCE[language] in conversation.SYSTEM_PROMPT[language]
+    plain, tools = conversation.reply_prompt(language), conversation.reply_prompt(language, tools=True)
+    assert plain.startswith(conversation.SYSTEM_PROMPT[language] + "\n\n" + conversation.BACKGROUND_RULES[language])
+    assert "get_today_dose_status" not in tools and conversation.LIVE_DOSE_STATUS_SOURCE[language] in tools
+    assert conversation.LIVE_TOOLS_BACKGROUND_RULES[language] in tools
+    assert conversation.BACKGROUND_RULES[language] not in tools
+    assert "不能上網或查資料" not in tools and "cannot look anything up" not in tools
+    # the live date line names the session's start and sends the time now to the backend (14 Oct 2026: asked at
+    # 13:56, Reachy said the stretch's start, 1:53); the text chat, rebuilt every turn, keeps "now"
+    if language == "zh-TW":
+        assert "現在是2026年10月14日（星期三）早上10點整" in plain
+        assert "這段對話開始時是2026年10月14日（星期三）早上10點整，農曆九月初五" in tools and "現在是2026" not in tools
+        assert "交給後端查即時時間" in tools and "問現在幾點、今天幾號、星期幾" in conversation.LIVE_TOOLS_BACKGROUND_RULES["zh-TW"]
+    else:
+        assert "It is Wednesday 14 October 2026, 10:00 in the morning" in plain
+        assert "This conversation started on Wednesday 14 October 2026 at 10:00 in the morning" in tools
+        assert "delegate to the backend" in tools and "The time now" in conversation.LIVE_TOOLS_BACKGROUND_RULES["en"]
+
+
 def test_the_reply_never_waits_on_the_network_for_its_background(monkeypatch):
     fetches = _on_day(monkeypatch, 2026, 10, 3, 15, 0)
     _model_answers(monkeypatch, "下午好，今天過得怎麼樣？")

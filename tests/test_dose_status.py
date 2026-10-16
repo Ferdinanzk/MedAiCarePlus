@@ -172,7 +172,7 @@ def _reply_post(monkeypatch, answers):
 
     monkeypatch.setattr(config, "OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(conversation, "_post", post)
-    monkeypatch.setattr(conversation, "reply_prompt", lambda language: conversation.SYSTEM_PROMPT[language])
+    monkeypatch.setattr(conversation, "reply_prompt", lambda language, tools=False: conversation.SYSTEM_PROMPT[language])
     return calls
 
 

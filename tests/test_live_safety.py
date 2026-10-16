@@ -85,7 +85,10 @@ def _blocked(world, *, flagged, quote, source, kind="self_harm", dedupe=None) ->
     line stored as the last turn; family alerted once; GPT-Live muted and closed; the conversation ended with reason
     risk and its after-chat work started once."""
     chat = world.db.chat()
-    assert world.robot.json()[1:] == [FLUSH, SAY, END_RISK] and world.robot.closed == 1000
+    # Body language (`express`, services/affect.py) is not part of the safety protocol: an earlier sad turn may
+    # have set a posture
+    assert [m for m in world.robot.json()[1:] if m["type"] != "express"] == [FLUSH, SAY, END_RISK]
+    assert world.robot.closed == 1000
     assert _flagged(world) == flagged
     assert world.db.rows()[-1] == ("reachy", HELPLINE)
     assert world.db.turns[-1]["metrics"] == {"live": {"say": "risk", "risk_source": source}}
