@@ -580,10 +580,10 @@ class ServerCareBackend:
             event_started_at=getattr(state, "event_started_at", None) if result["state"] != "timeout" else None)
         result["family_notified"] = "queued"
 
-    def _cancel_watch_report(self) -> bool:
-        """Drop the watch's pending review message (its clip then goes with the confirmation request instead);
-        True when one was still waiting."""
-        watch = self._watch
+    def _cancel_watch_report(self, watch: dict | None = None) -> bool:
+        """Drop the pending review message of `watch` (the current watch by default; its clip then goes with the
+        confirmation request instead); True when one was still waiting."""
+        watch = self._watch if watch is None else watch
         task = watch.get("report_task") if watch else None
         if task is not None and not task.done():
             task.cancel()
@@ -591,17 +591,24 @@ class ServerCareBackend:
             return True
         return False
 
+    def _drop_review(self, watch: dict) -> None:
+        """A record of the watch's dose made its confirmation request: the review still in its grace is dropped, as
+        the request carries the clip. One being made meanwhile (dose_event.sending) is never cut half made."""
+        task = watch.get("report_task")
+        if task is not None and not task.done() and not dose_event.sending(task):
+            self._cancel_watch_report(watch)
+
     async def _review_carried_clip(self) -> bool:
         """Whether the current watch's review message (dose_event, after WATCH_REPORT_GRACE_SECONDS) went to family
-        with the clip, from the review task's outcome. A review still in its grace is dropped, so the clip goes with
-        the confirmation request instead; one already being made (dose_event.sending) is waited for, at most
-        REVIEW_WAIT_SECONDS, and never cut half made. A review cancelled, failed, sent without a clip or not finished
-        in time did not carry it."""
+        with the clip, from the review task's outcome. A review still in its grace did not: it is dropped only once the
+        request was made (_drop_review; round 4 of 17 Oct 2026: a dose already waiting for family, or refused, makes
+        no request, and the review must go on), so the clip goes with the request. One already being made
+        (dose_event.sending) is waited for, at most REVIEW_WAIT_SECONDS, and never cut half made. A review cancelled,
+        failed, sent without a clip or not finished in time did not carry it."""
         task = (self._watch or {}).get("report_task")
         if task is None:
             return False
         if not task.done() and not dose_event.sending(task):
-            self._cancel_watch_report()
             return False
         if not task.done():
             await asyncio.wait({task}, timeout=REVIEW_WAIT_SECONDS)   # never cancels it
@@ -647,8 +654,9 @@ class ServerCareBackend:
         patient's word (patient_confirmed) or the detector's taken result, or its confidence of at least
         DETECTOR_CONFIDENCE, from the watch session_id names. With the patient's word, a session_id that names no open
         watch (unknown, or spent by an earlier record) is no detector evidence, never an error. The open watch of
-        exactly this dose is settled whether or not the call names it (_watch_for): its review waiting its grace is
-        dropped, the watch is spent, and the clip goes with the request. A watch settled without being named
+        exactly this dose is settled whether or not the call names it (_watch_for): the watch is spent, and once the
+        request is made its review waiting its grace is dropped and the clip goes with the request (a refusal or a
+        dose answered already_* makes no request, and the review goes on). A watch settled without being named
         authorises nothing, but its last reading (camera_watch: its result and confidence, or not_read_yet) goes into
         the request's evidence, so family see when the camera disagrees with the patient's word. A dose no longer
         open answers its state (ALREADY)."""
@@ -685,7 +693,8 @@ class ServerCareBackend:
         recorded_at = schedule.current_time()
         # The clip of the moment goes with the confirmation request (dose_video.capture), unless the watch's review
         # message already carried it (its outcome says so): a report still waiting its grace is dropped in favour of
-        # the request. That is the watch the call names, else the open watch of this dose (16 Oct 2026: a record
+        # the request once the request is made (_drop_review; with no request, a refusal or a dose answered already_*,
+        # it goes on). That is the watch the call names, else the open watch of this dose (16 Oct 2026: a record
         # without session_id left it open, so its review and a second clip went out beside the request). What the
         # request says about its video is known before it is made (dose_video.clip_outlook).
         named = self._watch if intake is not None else None
@@ -756,6 +765,8 @@ class ServerCareBackend:
                     "reason": body.get("detail"), "reply": body.get("reply"), "family_asked": False,
                     "family_notified": "queued"}
         if outcome.get("status") == "pending_confirmation":
+            if watch is not None:
+                self._drop_review(watch)   # the request carries the clip now; a dose answered already_* makes none
             if frames:
                 # The clip rides with the request (dose_video.send_with_confirmation); consent is re-checked there
                 dose_video.capture(self.u_id, [number], frames=frames)

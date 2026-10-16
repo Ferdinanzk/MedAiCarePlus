@@ -121,6 +121,52 @@ def test_a_record_without_session_id_settles_the_open_watch_of_the_same_dose(now
     assert [report["kind"] for report in reports] == ["intake"]   # the chat's end reports no unresolved watch
 
 
+def test_a_record_drops_the_watchs_review_only_once_its_request_is_made(now, camera, reports, captures,
+                                                                         monkeypatch):
+    """Round 4 (R4.6): the review waiting its grace is dropped after the request was made, never before it."""
+    when_asked = []
+
+    async def create(conn, **kwargs):
+        when_asked.append(reports[0]["task"].cancelled())
+        return "req-1"
+    monkeypatch.setattr(dose_confirmation, "create", create)
+    b, _ = backend(monotonic=lambda: 100.0)
+    watched_uncertain(b, camera)
+    answer = asyncio.run(b.record_medication_taken("dose-2", True))
+    assert answer["status"] == "pending_confirmation" and answer["video"] == "with_request"
+    assert when_asked == [False]                 # still waiting while the request was made
+    assert reports[0]["task"].cancelled() and len(captures) == 1 and b._watch is None
+
+
+@pytest.mark.parametrize("outcome", ["already_waiting", "refused"])
+def test_a_record_that_makes_no_request_lets_the_watchs_review_go_on(now, camera, reports, captures, monkeypatch,
+                                                                     outcome):
+    """Round 4 (R4.6): a dose already waiting for family (NothingToConfirm) or refused makes no request, so the watch's
+    review (its reading and clip) still goes to family. Before, the record dropped it first, and family never saw
+    what the camera read."""
+    b, conn = backend(monotonic=lambda: 100.0)
+    watched_uncertain(b, camera)
+    if outcome == "already_waiting":
+        async def create(conn, **kwargs):
+            raise dose_confirmation.NothingToConfirm("No pending or missed dose to confirm")
+        conn.intakes[2]["intake_stats"] = "pending_confirmation"      # another path asked family meanwhile
+    else:
+        async def create(conn, **kwargs):
+            raise tool_registry.schedule.DoseRefused("dose_too_soon", intk_id=2)
+
+        async def no_alert(refused):
+            pass
+        monkeypatch.setattr(tool_registry.dose_safety, "alert_after", no_alert)
+        monkeypatch.setattr(tool_registry.dose_safety, "refusal_body",
+                            lambda refused: {"detail": "dose_too_soon", "reply": "太早了"})
+    monkeypatch.setattr(dose_confirmation, "create", create)
+    answer = asyncio.run(b.record_medication_taken("dose-2", True))
+    assert answer["status"] == {"already_waiting": "already_pending_confirmation", "refused": "refused"}[outcome]
+    assert not reports[0]["task"].cancelled() and captures == []    # the review goes on, with its clip
+    assert [report["kind"] for report in reports] == (["intake"] if outcome == "already_waiting"
+                                                      else ["intake", "refused"])
+
+
 def test_a_record_of_another_dose_of_the_watched_medicine_leaves_the_watch_alone(now, camera, reports, captures,
                                                                                 asked):
     """Round 3 (F1.1): the same medicine is not the same dose. Before, names_match on the medicine settled the watch of
