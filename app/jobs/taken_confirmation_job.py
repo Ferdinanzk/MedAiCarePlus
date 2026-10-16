@@ -8,6 +8,7 @@ missed-dose job's. Every message goes through the notification outbox.
 
 import datetime
 import json
+import logging
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,8 @@ from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
 from app.jobs.missed_dose_job import _slot_key
 from app.services import dose_report, dose_video, outbox
+
+log = logging.getLogger(__name__)
 
 # A batch is sent once this many minutes have passed since its earliest dose, so pills taken close together (it
 # takes time to swallow several) make ONE message, and later ones start the next batch.
@@ -153,6 +156,8 @@ async def check_taken_confirmations():
                 if videos and base_url is None:   # LINE can't download from us now: nobody will get these clips
                     for video in videos:
                         await dose_video.delete_video(conn, str(video["video_id"]), "no_public_link")
+                        log.warning("dose video %s for intakes %s deleted: no public link (%s)", video["video_id"],
+                                    video["intk_ids"], dose_video.no_link_reason())
                     videos = []
                 if not contacts:
                     await dose_video.discard(conn, u_id, intk_ids, "no_recipients")

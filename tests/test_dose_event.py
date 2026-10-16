@@ -147,14 +147,17 @@ def test_without_the_video_consent_or_frames_the_text_still_goes_and_says_why(wo
     assert "沒有影片：當時沒有鏡頭畫面" in world.sent[0]["messages"][0]["text"] and world.clips == []
 
 
-def test_without_a_public_link_the_clip_is_dropped_and_the_text_goes_alone(world, monkeypatch):
+def test_without_a_public_link_the_clip_is_dropped_and_the_text_goes_alone(world, monkeypatch, caplog):
     monkeypatch.setattr(dose_event, "_clock", lambda: 1000.0 + 11 * 0.2)
+    monkeypatch.setattr(dose_video, "no_link_reason", lambda: "tunnel reaches another server")
     _buffer()
     world.base_url = None
     result = asyncio.run(dose_event.report(7, kind="unresolved", dedupe="watch:x", intk_ids=[2],
                                            intake="still_monitoring", event_time="10/14 08:05"))
     assert result["video"] is False and ("unlink", "vid-1") in world.links
     assert len(world.sent[0]["messages"]) == 1 and "對話結束時還在觀察" in world.sent[0]["messages"][0]["text"]
+    # The lost clip's WARNING says why.
+    assert "no public link for the clip (tunnel reaches another server)" in caplog.text
 
 
 def test_nobody_to_tell_sends_nothing_and_a_failure_never_raises(world, monkeypatch):
