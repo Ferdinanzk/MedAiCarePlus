@@ -41,7 +41,7 @@ from collections import defaultdict
 
 from app.services import gpt_live_config
 from app.services.live_client import LiveClient, LiveError
-from app.services.tool_registry import ServerCareBackend, ToolError, ToolRegistry
+from app.services.tool_registry import FINISH_ON_CLOSE, ServerCareBackend, ToolError, ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +173,7 @@ class AgentLiveClient(LiveClient):
         self.language = language
         self.backend_model = backend_model
         self._tool_tasks: set[asyncio.Task] = set()
+        self._finishing: set[asyncio.Task] = set()            # FINISH_ON_CLOSE calls: close() lets them finish
         self._tool_lock = asyncio.Lock()
         self._results: dict[str, dict] = {}                  # call_id -> result (a repeated call is not run twice)
         self._history: dict[str, list[str]] = defaultdict(list)   # delegation_id -> tool names, in order
@@ -235,6 +236,10 @@ class AgentLiveClient(LiveClient):
                                                   item.get("arguments")), name=f"live-tool-{name}")
         self._tool_tasks.add(task)
         task.add_done_callback(self._tool_tasks.discard)
+        if name in FINISH_ON_CLOSE:   # a record, a note to family or an alert: closing the session never cuts it short
+            self._finishing.add(task)
+            task.add_done_callback(self._finishing.discard)
+            self.registry.hold(task)
 
     async def _run_call(self, delegation_id: str, call_id: str, name: str, arguments) -> None:
         """One delegated call: run it (serialised), then its output and `response.create` to GPT-Live. A session that
@@ -286,13 +291,16 @@ class AgentLiveClient(LiveClient):
                 f"backend finishes.")
 
     async def close(self, wait: float = 2.0) -> float | None:
+        """Close the session. The tool calls still running are cancelled, except a record, a note to family or an
+        alert (FINISH_ON_CLOSE, also one still waiting its turn): it runs to its end within its tool_registry.TIMEOUTS
+        entry, and its result, with no session to go to, is dropped. The registry holds it (ToolRegistry.hold)."""
         await self._cancel_tool_tasks()
         usage = await super().close(wait)
         await self._cancel_tool_tasks()   # a call that slipped in while the close waited (_on_delegated guards too)
         return usage
 
     async def _cancel_tool_tasks(self) -> None:
-        tasks = list(self._tool_tasks)
+        tasks = [task for task in self._tool_tasks if task not in self._finishing]
         for task in tasks:
             task.cancel()
         if tasks:

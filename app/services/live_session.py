@@ -48,7 +48,8 @@ robot gets {"type": "not_seen"}). A stretch is a new GPT-Live session, started w
 instructions plus companion_note (Reachy already greeted; the last HISTORY_TURNS stored turns quoted as transcript
 data); the pre-roll goes first (at up to PRE_ROLL_SEND_SPEED times real time: GPT-Live drops a faster burst), then
 the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
-transcript of it, or the robot's speech signals) once GPT-Live's sound has ended, or, once the stretch is
+transcript of it, or the robot's speech signals) once GPT-Live's sound has ended and no record, note to family or
+alert still runs (tool_registry.FINISH_ON_CLOSE), or, once the stretch is
 STRETCH_MAX_SECONDS old, the patient's next turn gap (STRETCH_HARD_MAX_SECONDS at the latest, a reply cut with a
 flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient's words screened and grouped,
 OpenAI's cut-off judged), the open turns are stored and the robot gets {"type": "paused"}. A
@@ -77,7 +78,7 @@ from app import config
 from app.database import get_pool
 from app.services import (affect, after_chat, agent_bridge, ai_settings, consent_service, conversation,
                           device_auth, gpt_live_config, memory, monitor_service, reachy_tasks, reminders,
-                          tool_intents)
+                          tool_intents, tool_registry)
 from app.services.live_client import LiveClient, LiveError
 
 log = logging.getLogger(__name__)
@@ -572,7 +573,10 @@ class LiveRelay:
             if self.tools is not None:
                 self.tools.robot.close()   # a tool still waiting for the robot's answer fails now
                 try:
-                    await asyncio.wait_for(self.tools.close(), DB_TIMEOUT_SECONDS)   # a watch left open: family told
+                    # A record, a note to family or an alert still running finishes first; then a watch left open
+                    # is reported to family (ToolRegistry.close)
+                    await asyncio.wait_for(self.tools.close(),
+                                           tool_registry.FINISH_WAIT_SECONDS + DB_TIMEOUT_SECONDS)
                 except Exception:
                     log.exception("live chat %s: the tools did not close cleanly", self.conversation_id)
 
@@ -943,7 +947,8 @@ class LiveRelay:
         the rest; in companion mode while paused too), and the endings: goodbye, silence and limit here,
         access_withdrawn and access_unverified from the re-check. In companion mode silence and limit end nothing: a
         running stretch pauses instead (_pause), never while a screening hit settles: QUIET_PAUSE_SECONDS after the
-        patient's last speech once GPT-Live's sound has ended; once it is STRETCH_MAX_SECONDS old, at the patient's
+        patient's last speech once GPT-Live's sound has ended and no record, note to family or alert still runs
+        (ToolRegistry.finishing: its answer then reaches GPT-Live); once it is STRETCH_MAX_SECONDS old, at the patient's
         turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended and no
         answer still owed to them: _armed); and once it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and
         GPT-Live are doing."""
@@ -983,7 +988,8 @@ class LiveRelay:
                 elif (stretch >= STRETCH_MAX_SECONDS and self._patient is None and self._segment is None
                       and not self._armed and now - self._last_patient_at > TURN_GAP_SECONDS):
                     await self._pause("stretch_max")
-                elif now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None:
+                elif (now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None
+                      and not (self.tools is not None and self.tools.finishing())):
                     await self._pause("quiet")
         elif now - self._last_patient_at >= SILENCE_END_SECONDS:
             self._finish("end", "silence")
