@@ -73,6 +73,13 @@ TUNNEL_DOWN = "tunnel not answering"
 OTHER_SERVER = "tunnel reaches another server"
 NOT_HTTPS = "PUBLIC_BASE_URL is not https"
 
+# Where a family confirmation request's video is: its evidence "video", decided before the request is made
+# (clip_outlook; dose_confirmation._request_messages renders it).
+WITH_REQUEST = "with_request"     # the request's own clip follows it (capture, then send_with_confirmation)
+SENT_EARLIER = "sent_earlier"     # the agent's review message of the same moment carried the clip
+NO_CONSENT = "none:no_consent"    # "Dose videos for family" is off for this patient
+NO_FRAMES = "none:no_frames"      # fewer than MIN_FRAMES recent frames buffered
+
 
 # ── frames held in memory ──
 
@@ -121,16 +128,41 @@ def clip_frames(u_id: int, now: float, event_started_at: float | None = None) ->
     return [frame for frame in buffer.frames if frame[0] >= start]
 
 
-def capture(u_id: int, intk_ids: list[int], *, event_started_at: float | None = None) -> bool:
+async def clip_outlook(u_id: int, *, event_started_at: float | None = None) -> tuple[str, list]:
+    """Whether a clip can go with a family confirmation request, known before the request is made so that its text
+    tells the truth: (WITH_REQUEST, the frames of the moment, taken now) when the dose-video consent is current and
+    at least MIN_FRAMES fresh frames are buffered, else (NO_CONSENT, []) or (NO_FRAMES, []). Give the frames to
+    capture() once the request exists.
+
+    Never raises, so a request is never lost to it: a consent that cannot be read leaves the answer to the frames,
+    which are buffered only for sessions that started with the consent, and _store reads it again before writing."""
+    frames = clip_frames(u_id, time.monotonic(), event_started_at)
+    try:
+        if not await enabled(u_id):
+            return NO_CONSENT, []
+    except Exception as error:
+        log.warning("dose video for patient %s: the consent could not be read (%s); the buffered frames decide",
+                    u_id, type(error).__name__)
+    if len(frames) < MIN_FRAMES:
+        return NO_FRAMES, []
+    return WITH_REQUEST, frames
+
+
+def capture(u_id: int, intk_ids: list[int], *, event_started_at: float | None = None,
+            frames: list | None = None) -> bool:
     """Make the clip for a dose just recorded (or sent to a caregiver) in the background.
 
-    The frames are taken now, before anything else can arrive; consent is checked again before anything is
-    written. False when there is nothing to make.
+    The frames are taken now, before anything else can arrive, unless the caller took them already (`frames`, from
+    clip_outlook before its request was made); consent is checked again before anything is written. False when
+    there is nothing to make.
     """
-    frames = clip_frames(u_id, time.monotonic(), event_started_at)
+    if frames is None:
+        frames = clip_frames(u_id, time.monotonic(), event_started_at)
     if len(frames) < MIN_FRAMES:
         return False
-    source = _buffers[u_id].source
+    # Frames given by the caller may outlive their buffer (dropped when consent is withdrawn: _store then writes
+    # nothing); they came from the robot's stream, the only source that takes them early
+    source = _buffers[u_id].source if u_id in _buffers else "reachy"
     task = asyncio.get_running_loop().create_task(_store(u_id, [int(i) for i in intk_ids], source, frames))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)

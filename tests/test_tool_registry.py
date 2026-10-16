@@ -164,6 +164,15 @@ def quiet_events(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def video_consent(monkeypatch):
+    """The patient has dose videos on (dose_video.clip_outlook reads it before a request); no frames are buffered."""
+    async def enabled(u_id):
+        return True
+    monkeypatch.setattr(tool_registry.dose_video, "enabled", enabled)
+    monkeypatch.setattr(tool_registry.dose_video, "_buffers", {})
+
+
+@pytest.fixture(autouse=True)
 def vision_on(monkeypatch):
     """The vision tools read frames with the OCR's model only with config.LIVE_VISION_CLOUD (one test turns it off)."""
     monkeypatch.setattr(tool_registry.config, "LIVE_VISION_CLOUD", True)
@@ -487,13 +496,14 @@ def test_record_medication_taken_stores_the_detectors_result_and_asks_family(now
     assert answer == {"status": "pending_confirmation", "medication_id": "dose-2", "medication_name": "Allegra",
                       "request_id": "req-1", "family_asked": True, "recorded_at": "2026-10-12T20:15:00+08:00",
                       "session_id": started["session_id"], "detector_result": "taken", "detector_confidence": 0.81,
-                      "source": "degraded", "video": "none"}   # no buffered frames here: no clip with the request
+                      "source": "degraded", "video": "none:no_frames"}   # no buffered frames: no clip, and why
     u_id, task_id, ids, source, evidence, started_at = asked[0]
     assert (u_id, task_id, ids, source, started_at) == (7, None, [2], "degraded", at(20, 15))
     assert evidence["session_id"] == started["session_id"] and evidence["detector_result"] == "taken"
     assert evidence["confidence"] == 0.81 and evidence["detector_evidence"] == {"dwell": {"dwell": 6}}
     assert evidence["recorded_at"] == "2026-10-12T20:15:00+08:00" and evidence["patient_confirmed"] is False
     assert evidence["landmark_fps"] == 2.0 and evidence["degraded"] is True
+    assert evidence["video"] == "none:no_frames"   # the request itself says it comes without a video
 
 
 def test_record_medication_taken_with_the_patients_word_and_a_dose_id(now, monkeypatch):

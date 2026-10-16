@@ -53,9 +53,11 @@ DEFAULT_WATCH_SECONDS = 30
 NAME_MIN_PARTIAL = 3             # a label name containing the expected name (or the reverse) matches from this length
 # Medication events to family (dose_event.py): a verification that did not match is reported at most once per
 # expected medicine and result in this long; a watch's uncertain or empty result waits this long before its report
-# goes, so a record_medication_taken that follows at once sends the clip with the confirmation request instead
+# goes, so a record_medication_taken that follows at once sends the clip with the confirmation request instead; a
+# review already being made when the record comes is waited for (at most REVIEW_WAIT_SECONDS), never cut half made
 VERIFICATION_REPORT_GAP_SECONDS = 120.0
 WATCH_REPORT_GRACE_SECONDS = 12.0
+REVIEW_WAIT_SECONDS = 5.0
 VERIFICATION_MEMORY_SECONDS = 600.0   # a label check this recent is quoted with the dose's events
 DANCE_ACTIVE_SECONDS = 25.0      # a dance started this recently may still run (4 repeats of the longest 5 s move)
 INTENT_SHARE_SECONDS = 8.0       # GPT-Live asking for a tool the relay's backstop ran this recently gets that run
@@ -566,6 +568,28 @@ class ServerCareBackend:
             return True
         return False
 
+    async def _review_carried_clip(self) -> bool:
+        """Whether the current watch's review message (dose_event, after WATCH_REPORT_GRACE_SECONDS) went to family
+        with the clip, from the review task's outcome. A review still in its grace is dropped, so the clip goes with
+        the confirmation request instead; one already being made (dose_event.sending) is waited for, at most
+        REVIEW_WAIT_SECONDS, and never cut half made. A review cancelled, failed, sent without a clip or not finished
+        in time did not carry it."""
+        task = (self._watch or {}).get("report_task")
+        if task is None:
+            return False
+        if not task.done() and not dose_event.sending(task):
+            self._cancel_watch_report()
+            return False
+        if not task.done():
+            await asyncio.wait({task}, timeout=REVIEW_WAIT_SECONDS)   # never cancels it
+            if not task.done():
+                log.info("live agent: the watch's review message is still being made; the request gets its own clip")
+                return False
+        if task.cancelled() or task.exception() is not None:
+            return False
+        outcome = task.result()
+        return isinstance(outcome, dict) and outcome.get("video") is True
+
     async def close(self) -> None:
         """The chat is over: a watch still open with no result reported goes to family as unresolved, with the clip
         (the agent never got to a verdict, so nobody else would tell them)."""
@@ -611,11 +635,15 @@ class ServerCareBackend:
         number = parse_id(dose["medication_id"])[1]
         recorded_at = schedule.current_time()
         # The clip of the moment goes with the confirmation request (dose_video.capture), unless the watch's review
-        # message already carried it: a report still waiting its grace is dropped in favour of the request
+        # message already carried it (its outcome says so): a report still waiting its grace is dropped in favour of
+        # the request. What the request says about its video is known before it is made (dose_video.clip_outlook).
         watch = self._watch if intake is not None else None
-        if watch is not None:
-            self._cancel_watch_report()
-        clip_sent_earlier = bool(watch and watch.get("reported") is not None)
+        clip_sent_earlier = watch is not None and await self._review_carried_clip()
+        state = self._session()
+        event_started_at = getattr(state, "event_started_at", None) if (state is not None and intake is not None
+                                                                         and intake.get("state") != "timeout") else None
+        video, frames = ((dose_video.SENT_EARLIER, []) if clip_sent_earlier
+                         else await dose_video.clip_outlook(self.u_id, event_started_at=event_started_at))
         evidence = {"source": "live_agent", "conversation_id": self.conversation_id,
                     "session_id": intake["session_id"] if intake and intake.get("session_id") else session_id,
                     "recorded_at": _local(recorded_at), "patient_confirmed": bool(patient_confirmed),
@@ -628,14 +656,14 @@ class ServerCareBackend:
                     "verification": ((watch.get("verification") if watch else None)
                                      or self._verification_for(medication_name or dose["med_name"])),
                     "emotion": self._emotion_now(),
-                    "video": "sent_earlier" if clip_sent_earlier else None}
+                    "video": video}
         source = "patient_claim" if patient_confirmed else "degraded"
 
         async def work(conn):
             try:
                 request_id = await dose_confirmation.create(
                     conn, u_id=self.u_id, task_id=self.task_id, intk_ids=[number], source=source,
-                    evidence=evidence, started_at=self._watch["started_at"] if intake is not None else None)
+                    evidence=evidence, started_at=watch["started_at"] if watch is not None else None)
             except schedule.DoseRefused as refused:
                 return refused
             except ValueError:
@@ -650,9 +678,6 @@ class ServerCareBackend:
                     "source": source}
 
         outcome = await self._db(work)
-        state = self._session()
-        event_started_at = getattr(state, "event_started_at", None) if (state is not None and intake is not None
-                                                                         and intake.get("state") != "timeout") else None
         if isinstance(outcome, schedule.DoseRefused):
             body = dose_safety.refusal_body(outcome)
             try:
@@ -672,16 +697,15 @@ class ServerCareBackend:
             return {"status": "refused", "medication_id": dose["medication_id"], "medication_name": dose["med_name"],
                     "reason": body.get("detail"), "reply": body.get("reply"), "family_asked": False,
                     "family_notified": "queued"}
-        if outcome.get("status") == "pending_confirmation" and not clip_sent_earlier:
-            # The clip rides with the request (dose_video.send_with_confirmation); consent is re-checked there
-            outcome["video"] = "with_request" if dose_video.capture(self.u_id, [number],
-                                                                     event_started_at=event_started_at) else "none"
-        elif outcome.get("status") == "pending_confirmation":
-            outcome["video"] = "sent_earlier"
+        if outcome.get("status") == "pending_confirmation":
+            if frames:
+                # The clip rides with the request (dose_video.send_with_confirmation); consent is re-checked there
+                dose_video.capture(self.u_id, [number], frames=frames)
+            outcome["video"] = video
         if watch is not None:
             watch["reported"] = watch.get("reported") or {"result": outcome.get("status")}
-        if intake is not None:
-            self._watch = None   # the watch's verdict is spent: it never authorises a second record
+            if self._watch is watch:
+                self._watch = None   # the watch's verdict is spent: it never authorises a second record
         return outcome
 
     # ── emotion ──────────────────────────────────────────────────────────

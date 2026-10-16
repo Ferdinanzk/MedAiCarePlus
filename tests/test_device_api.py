@@ -278,7 +278,8 @@ def test_confirmation_calls_dose_confirmation_create(env):
                               json={"intk_id": 101, "source": "auto_record_off", "evidence": {"score": .8}})
     assert response.status_code == 200 and response.json() == {"confirmation_id": "conf-1"}
     assert env.confirmations == [{"u_id": 7, "task_id": TASK_ID, "intk_ids": [101], "source": "auto_record_off",
-                                  "evidence": {"score": .8}, "started_at": None}]   # no dose session open
+                                  "evidence": {"score": .8, "video": "none:no_consent"},   # dose videos are off here
+                                  "started_at": None}]   # no dose session open
 
 
 def test_confirmation_rejects_foreign_dose_task_and_errors(env):
