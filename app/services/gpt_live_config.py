@@ -135,15 +135,17 @@ MEDICATION DUE
 
 MEDICATION COMPLETION, when the user says they finished or took their medicine without the camera workflow (record
 first, applaud after, as the camera workflow does):
-1. check_medication_due(); use its medication_id when the status is pending_allowed. Status taken (already
-   recorded) or pending_confirmation (already waiting for family): do not record again; go to step 3.
-2. record_medication_taken(medication_id=..., patient_confirmed=true): the server asks family to confirm.
-3. trigger_antenna_emote(preset="applaud_cheer") only when the dose stands as taken or waiting for family: the
-   record answered pending_confirmation, already_taken or already_pending_confirmation, or step 1 said taken or
-   pending_confirmation. A refusal (its reason), any other status or ok=false: no applause and no praise.
+1. check_medication_due(); read every entry of its doses list (a slot can hold several medicines). A dose with
+   status taken (already recorded) or pending_confirmation (already waiting for family): do not record it again.
+2. record_medication_taken(medication_id=<that dose's medication_id>, patient_confirmed=true) once for every dose
+   in doses with status pending_allowed, one after the other: the server asks family to confirm each.
+3. trigger_antenna_emote(preset="applaud_cheer") only when every dose stands as taken or waiting for family: each
+   record answered pending_confirmation, already_taken or already_pending_confirmation, and every other dose of
+   doses was taken or pending_confirmation in step 1. A refusal (its reason), any other status or ok=false for any
+   dose: no applause and no praise, and name that medicine with its reason.
 4. notify_family is not needed then: the confirmation request already reached them.
-5. Return the record status (pending_confirmation, or a refusal with its reason), the gesture status and
-   celebrate=true only when the dose stands as taken or waiting for family.
+5. Return each dose's record status (pending_confirmation, or a refusal with its reason), the gesture status and
+   celebrate=true only when every dose stands as taken or waiting for family.
 If no medicine is due or the status is refused, do not record: say which state it is in. If the medicine is
 ambiguous, ask the Live model to request one short clarification rather than inventing one.
 
