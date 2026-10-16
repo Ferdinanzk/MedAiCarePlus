@@ -962,26 +962,74 @@ def test_the_relays_stop_is_shared_across_the_patients_next_turn_until_a_dance_s
     assert robot.emotes == ["dance:None:2", "stop_dance", "dance:None:2", "stop_dance"]
 
 
-def test_a_dance_the_robot_has_not_answered_yet_may_already_run():
-    # The robot answers a dance as the move starts (on its first dance it reads the library from disk first): a stop
-    # said meanwhile is a stop, and a stop sent meanwhile is not undone when the answer comes
+class LoadingRobot(Robot):
+    """The real robot (medcare-reachy-bridge reachy_hardware.start_move): a dance call loads the move off the event
+    loop (from disk on the first dance), then starts it and answers. A stop that comes while it loads finds no move,
+    answers idle, and the move starts after it."""
+
+    def __init__(self):
+        super().__init__()
+        self.loaded, self.running = asyncio.Event(), None
+
+    async def dance(self, name, repeat):
+        await self.loaded.wait()
+        self.running = name or "side_to_side_sway"
+        return await super().dance(name, repeat)
+
+    async def stop_dance(self):
+        self.emotes.append("stop_dance")
+        stopped, self.running = self.running, None
+        return {"status": "cancelled", "dance": stopped} if stopped else {"status": "idle"}
+
+
+async def _dance_loading(registry):
+    """GPT-Live's dance call, which the robot has not answered yet: it still loads the move."""
+    asked = asyncio.ensure_future(registry.execute("dance", {"dance": None, "repeat": None}))
+    for _ in range(10):
+        await asyncio.sleep(0)                             # the call reaches the robot, which loads the move
+    return asked
+
+
+def test_a_stop_while_the_robot_still_loads_the_dance_stops_it_once_it_starts():
+    # A stop said while the robot loads the move is a stop (dancing counts from the call). The robot answers it idle
+    # and starts the move after it, so the stop goes to the robot again when the dance answers, and the stop's answer
+    # says the dance was stopped (Task 5 fix round: the robot went on dancing and GPT-Live heard idle)
     async def run():
-        robot, answer = Robot(), asyncio.Event()
-        dance = robot.dance
-
-        async def slow(name, repeat):
-            await answer.wait()
-            return await dance(name, repeat)
-
-        robot.dance = slow
+        robot = LoadingRobot()
         r = ToolRegistry(robot, backend()[0], clock=Clock())
-        asked = asyncio.ensure_future(r.execute("dance", {"dance": None, "repeat": None}))
-        for _ in range(10):
-            await asyncio.sleep(0)                         # the call reaches the robot and waits for its answer
+        asked = await _dance_loading(r)
         waiting = r.dancing()
-        await r.execute("stop_dance", {})
-        answer.set()
-        await asked
-        return waiting, r.dancing()
+        stop = await r.execute("stop_dance", {})
+        robot.loaded.set()                                 # the move starts after the stop
+        return robot, waiting, stop, await asked, r.dancing()
 
-    assert asyncio.run(run()) == (True, False)
+    robot, waiting, stop, dance, dancing = asyncio.run(run())
+    assert waiting and not dancing
+    assert robot.emotes == ["stop_dance", "dance:None:2", "stop_dance"] and robot.running is None
+    assert dance == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert stop["ok"] and stop["result"]["status"] == "cancelled"
+
+
+def test_a_dance_asked_for_again_while_the_first_still_loads_is_not_stopped():
+    # 「停」 then 「再跳一次」 before the robot answered the first dance: the patient wants a dance after all
+    async def run():
+        robot = LoadingRobot()
+        r = ToolRegistry(robot, backend()[0], clock=Clock())
+        asked = await _dance_loading(r)
+        await r.execute("stop_dance", {})
+        r.dance_asked()
+        robot.loaded.set()
+        return robot, await asked
+
+    robot, dance = asyncio.run(run())
+    assert dance["ok"] and dance["result"]["status"] == "started"
+    assert robot.emotes == ["stop_dance", "dance:None:2"] and robot.running == "side_to_side_sway"
+
+
+def test_a_stop_with_no_dance_waiting_for_its_answer_says_what_the_robot_said():
+    async def run():
+        robot = LoadingRobot()
+        r = ToolRegistry(robot, backend()[0], clock=Clock())
+        return await r.execute("stop_dance", {})
+
+    assert asyncio.run(run())["result"] == {"status": "idle"}

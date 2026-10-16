@@ -891,6 +891,7 @@ class ToolRegistry:
         self._dance_at = float("-inf")                          # when the last dance started
         self._danced = False                                    # this chat had a dance
         self._stopped_at = float("-inf")                        # the last stop, while its hold lasts (dance_asked)
+        self._starting = 0                                      # dance calls the robot has not answered yet
         self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
         self._held: set[asyncio.Future] = set()                 # FINISH_ON_CLOSE calls still running (hold)
         self.finished_at = float("-inf")                        # when the last held call ended (monotonic)
@@ -1071,7 +1072,9 @@ class ToolRegistry:
     async def dance(self, dance: str | None = None, repeat: int | None = None) -> dict:
         """One of the robot's recorded dances, started on the robot (its motion worker) and answered at once;
         DEFAULT_DANCE_REPEAT moves without a repeat. Refused while a stop's hold lasts (STOP_HOLD_SECONDS). It may run
-        from the call on (dancing): the robot answers as the move starts."""
+        from the call on (dancing): the robot answers as the move starts. The robot loads the move first (off its event
+        loop, from disk on the first dance), and a stop that reaches it meanwhile finds no move, answers idle, and the
+        move starts after it: such a stop is sent again when the dance answers, and the dance is stopped_by_patient."""
         if dance is not None and dance not in DANCES:
             raise ToolError("unknown_dance")
         times = DEFAULT_DANCE_REPEAT if repeat is None else int(repeat)
@@ -1081,19 +1084,33 @@ class ToolRegistry:
             log.info("[TOOL] dance refused: the patient asked to stop %.1f s ago", self.clock() - self._stopped_at)
             raise ToolError("stopped_by_patient")
         log.info("[TOOL] dance called: %s x%d", dance or "any", times)
-        self._dance_at = self.clock()
+        called_at = self._dance_at = self.clock()
         self._intent_runs.pop("stop_dance", None)   # a stop GPT-Live asks for now is for this dance
-        result = await self.robot.dance(dance, times)
+        self._starting += 1
+        try:
+            result = await self.robot.dance(dance, times)
+        finally:
+            self._starting -= 1
         self._danced = True
+        if self._stopped_at >= called_at:   # a stop came while the robot started the move (dance_asked clears it)
+            log.info("[TOOL] dance started after the patient's stop: stopping it again")
+            await self.robot.stop_dance()
+            raise ToolError("stopped_by_patient")
         return result
 
     async def stop_dance(self) -> dict:
         """Stop the robot's dance. A dance asked for in the next STOP_HOLD_SECONDS is refused (dance), and so is
-        GPT-Live's late call for a dance the relay's backstop ran before the stop, which no longer shares that run."""
+        GPT-Live's late call for a dance the relay's backstop ran before the stop, which no longer shares that run.
+        While a dance call waits for the robot's answer, the robot answers idle (it still loads the move), but that
+        dance is stopped as it starts (dance): the answer is then cancelled, with `starting` true."""
         log.info("[TOOL] stop_dance called")
         self._dance_at, self._stopped_at = float("-inf"), self.clock()
         self._intent_runs.pop("dance", None)
-        return await self.robot.stop_dance()
+        starting = self._starting > 0
+        result = await self.robot.stop_dance()
+        if starting and isinstance(result, dict) and result.get("status") == "idle":
+            return {"status": "cancelled", "dance": None, "starting": True}
+        return result
 
     async def play_emotion(self, emotion: str, posture: str | None = None) -> dict:
         """One of the robot's recorded emotion moves, with a posture to hold after it (the live chat's `express`)."""
