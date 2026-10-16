@@ -181,9 +181,11 @@ DANCE
   question to answer with yes: call dance at once. "Dance for me" or "dance!": dance=null
   (the robot picks one it did not dance last). A mood ("a happy dance", "something gentle"): pick the move whose
   description fits. "Another dance" / "dance again": a different move than the last answer's. repeat 1-4 (the
-  moves last 2-5 s; null means 1). The answer is status started with the move's name: say it is dancing, then
-  keep chatting; never claim a dance that returned ok=false or an error.
+  moves last 2-5 s; null means 2, so the patient has time to stop it). The answer is status started with the
+  move's name: say it is dancing, then keep chatting; never claim a dance that returned ok=false or an error.
 - stop_dance() when asked to stop; its answer says cancelled (a dance was stopped) or idle (none was running).
+- A dance asked for within seconds of a stop, before the patient asks to dance again, is refused with
+  stopped_by_patient: the patient has just asked Reachy to stop, so say it has stopped; do not try again.
 
 TIME
 - get_current_time(place) for every question about the time, the date or the weekday, now or anywhere: it reads the
@@ -263,6 +265,9 @@ DANCES = {
     "yeah_nod": "An emphatic two-part yeah nod using transient motions.",
 }
 MAX_DANCE_REPEAT = 4
+# A dance with no repeat plays this many moves (4-10 s), so a patient who says stop has time to (agent tool fixes,
+# Task 5: one move of 2-5 s was often over before the stop reached the robot)
+DEFAULT_DANCE_REPEAT = 2
 # Pollen's recorded emotion moves the play_emotion tool may ask for (the SDK's pollen-robotics/reachy-mini-emotions-
 # library on the robot, 85 moves; these fit a care conversation), name -> the library's description, shortened.
 # Reachy's everyday body language does not go through this tool: the relay reads the patient's words itself
@@ -436,11 +441,13 @@ TOOLS_SCHEMA: list[dict] = [
     _tool("dance",
           "Make the physical Reachy Mini perform one of its recorded dances (the SDK's dance library on the robot). "
           "Non-blocking: the answer (status started, dance, repeat, available) comes as the move starts. "
-          "Moves: " + "; ".join(f"{name}: {text}" for name, text in DANCES.items()),
+          "Refused with stopped_by_patient when the patient asked Reachy to stop moments ago and has not asked to "
+          "dance again. Moves: " + "; ".join(f"{name}: {text}" for name, text in DANCES.items()),
           {"dance": {"type": ["string", "null"], "enum": [*DANCES, None],
                      "description": "The move to perform; null lets the robot pick one it did not dance last."},
            "repeat": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_DANCE_REPEAT,
-                      "description": "How many times in a row (null: once)."}},
+                      "description": f"How many times in a row (null: {DEFAULT_DANCE_REPEAT}, so there is time "
+                                     "to stop it)."}},
           ["dance", "repeat"]),
     _tool("stop_dance", "Stop the dance the robot is performing now. Answers cancelled, or idle when none runs."),
     _tool("play_emotion",

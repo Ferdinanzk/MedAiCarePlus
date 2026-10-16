@@ -1,5 +1,6 @@
-"""The live relay's tool backstop (services/live_session.py with services/tool_intents.py): a clear request to dance,
-to stop or to look runs its tool when GPT-Live has not asked for it in time, and GPT-Live is told what happened.
+"""The live relay's tool backstop (services/live_session.py with services/tool_intents.py): a clear request to dance
+or to look runs its tool when GPT-Live has not asked for it in time, and GPT-Live is told what happened; a stop runs
+at once, and no dance starts after it (agent tool fixes, Task 5).
 The regression case is the chat of 14 Oct 2026 at 10:04 (「你可以看到我嗎」 got 「我現在看不到你」, 「你可以跳舞嗎」 got
 「可以啊，我現在就跳，你想看嗎？」, no tool either time). The patient's own word that the medicine is taken
 (「我吃完藥了」) is such a request too (agent tool fixes, Task 4): GPT-Live praised it itself and the claim often never
@@ -12,7 +13,7 @@ import types
 import pytest
 
 from app import config
-from app.services import gpt_live_config, live_session, tool_intents
+from app.services import gpt_live_config, live_session, tool_intents, tool_registry
 from app.services.tool_registry import ToolError, ToolRegistry
 from tests import test_live_relay_chat as relay_chat
 from tests.test_live_relay_chat import _begin, _live, _over, _reachy, _said, _sound, _step
@@ -95,10 +96,11 @@ class Backend:
         pass
 
 
-async def _with_tools(world, backend=None):
+async def _with_tools(world, backend=None, clock=None):
+    """`clock`: the registry's clock (world.clock, for its dance and stop timings); the real clock by default."""
     relay, running = await _begin(world)
     link = Link()
-    relay.tools = ToolRegistry(link, backend or Backend())
+    relay.tools = ToolRegistry(link, backend or Backend(), **({"clock": clock} if clock else {}))
     world.clients[-1].requested = []   # what GPT-Live asked for (agent_bridge.AgentLiveClient.requested)
     return relay, running, link
 
@@ -121,7 +123,7 @@ def test_can_you_dance_dances_when_gpt_live_only_asks_back(world):
         await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS - 0.5)
         assert link.dances == []                           # GPT-Live still has time to ask for it itself
         await _step(world, relay, 1.0)
-        assert link.dances == [(None, 1)]                  # the robot dances: a move it picks
+        assert link.dances == [(None, 2)]                  # the robot dances: a move it picks
         assert world.clients[-1].commentaries[-1] == live_session.INTENT_LINES["dance"]["zh-TW"]
         await _end(world, running)
 
@@ -135,15 +137,15 @@ def test_gpt_lives_own_dance_call_leaves_the_backstop_out_and_a_late_one_shares_
         world.clients[-1].requested.append("dance")        # GPT-Live delegated the dance, which runs
         await relay.tools.execute("dance", {"dance": None, "repeat": None})
         await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 1)
-        assert link.dances == [(None, 1)] and relay._intent is None   # no second one from the backstop
+        assert link.dances == [(None, 2)] and relay._intent is None   # no second one from the backstop
         commentaries = list(world.clients[-1].commentaries)
 
         await _step(world, relay, 3.0)                     # the next turn: GPT-Live says it but asks for nothing
         await _live(world, _said("再跳一次"), _sound(), _reachy("好，再跳一次"))
         await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
-        assert link.dances == [(None, 1), (None, 1)]       # 「再跳一次」 after a dance: another
+        assert link.dances == [(None, 2), (None, 2)]       # 「再跳一次」 after a dance: another
         late = await relay.tools.execute("dance", {"dance": None, "repeat": None})   # its delegation, late
-        assert late["ok"] and link.dances == [(None, 1), (None, 1)]   # one dance for the turn, not two
+        assert late["ok"] and link.dances == [(None, 2), (None, 2)]   # one dance for the turn, not two
         assert world.clients[-1].commentaries == commentaries + [live_session.INTENT_LINES["dance"]["zh-TW"]]
         await _end(world, running)
 
@@ -207,7 +209,7 @@ def test_the_line_waits_out_a_screening_hold(world):
         relay._hit_at = None                               # cleared: the request still runs
         relay._intent_due(later)
         await relay_chat._settle()
-        assert link.dances == [(None, 1)] and len(world.clients[-1].commentaries) == before + 1
+        assert link.dances == [(None, 2)] and len(world.clients[-1].commentaries) == before + 1
         await _end(world, running)
 
     asyncio.run(scenario())
@@ -330,7 +332,193 @@ def test_a_new_turn_lets_gpt_live_dance_again_after_a_backstop_dance():
         await registry.execute("dance", {"dance": "simple_nod", "repeat": None})
         return link.dances
 
-    assert asyncio.run(scenario()) == [(None, 1), ("simple_nod", 1)]
+    assert asyncio.run(scenario()) == [(None, 2), ("simple_nod", 2)]
+
+
+# ── stop_dance stops at once (agent tool fixes, Task 5): on 16 Oct 2026 Reachy did not stop. A stop reached the robot
+# 2-6 s after the word, while a dance of one move lasts 2-5 s, common stop words were missed, and a dance still waiting
+# for the backstop started after the stop ──
+
+# While a dance may still run, a stop phrase anywhere in the patient's words is a stop
+STOPS = ["停", "停下來", "停止", "不要跳了", "不要再跳了", "別跳了", "不跳了", "好了，停", "日希，停下來", "你停下來",
+         "瑞希停下來", "你不要跳了", "停停停", "停一下", "先停一下", "可以停了", "你可以停下來嗎", "暫停",
+         "stop", "please stop", "Reachy, stop", "stop it", "okay stop", "can you stop", "stop now please",
+         "that's enough, stop", "夠了", "好了", "好了好了"]
+# ... and these at any time, dancing or not
+ALWAYS_STOPS = ["stop dancing", "不要跳舞了", "停止跳舞", "Reachy, please stop dancing"]
+# Never a stop: "don't stop", "non-stop" and other kinds of stop
+NOT_STOPS = ["不要停", "停車", "停電", "不停", "不要停，繼續跳", "你跳個不停", "停車場在哪裡", "昨天停電了", "別停",
+             "我停不下來", "我想停藥", "不要停止跳舞", "don't stop", "don't stop dancing", "I can't stop laughing",
+             "the bus stop", "non-stop", "我吃好了"]
+
+
+@pytest.mark.parametrize("words", STOPS + ALWAYS_STOPS)
+def test_while_a_dance_may_run_a_stop_phrase_anywhere_in_the_words_is_a_stop(words):
+    assert tool_intents.detect(words, dancing=True) == "stop_dance"
+
+
+@pytest.mark.parametrize("words", STOPS)
+def test_with_no_dance_running_a_bare_stop_phrase_is_no_stop(words):
+    assert tool_intents.detect(words) is None
+
+
+@pytest.mark.parametrize("words", ALWAYS_STOPS)
+def test_a_stop_that_names_dancing_is_a_stop_dancing_or_not(words):
+    assert tool_intents.detect(words) == "stop_dance"
+
+
+@pytest.mark.parametrize("words", NOT_STOPS)
+def test_dont_stop_and_other_kinds_of_stop_are_never_a_stop(words):
+    assert tool_intents.detect(words, dancing=True) != "stop_dance"
+    assert tool_intents.detect(words) != "stop_dance"
+
+
+@pytest.mark.parametrize("fragments", [["不要再跳了"], ["日希，", "停下來"], ["Reachy,", " stop"], ["please stop"],
+                                       ["你", "不要跳了"], ["好了，停"], ["你停下來"]])
+def test_a_stop_reaches_the_robot_at_the_fragment_that_holds_it(world, fragments):
+    # GPT-Live's reply and the backstop's grace are not waited for: a dance of two moves lasts 4-10 s
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})   # GPT-Live's dance runs
+        await _live(world, *[_said(fragment) for fragment in fragments[:-1]])
+        assert link.stops == 0
+        await _live(world, _said(fragments[-1]))           # no relay step, nothing from GPT-Live
+        assert link.stops == 1 and not relay.tools.dancing()
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_the_stop_runs_even_while_a_screening_hit_settles(world):
+    # A screening hit holds the other requests; a dance that goes on helps nobody, so the stop still runs
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        relay._hit_at = world.clock.now
+        await _live(world, _said("停"))
+        assert link.stops == 1
+        relay._hit_at = None
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_gpt_lives_own_stop_call_shares_the_relays_stop_even_after_the_patients_next_turn(world):
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said("不要再跳了"))
+        assert link.stops == 1
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)
+        await _live(world, _said("謝謝你"))                 # the patient's next turn, before GPT-Live's call
+        world.clients[-1].requested.append("stop_dance")   # GPT-Live delegates the stop, late
+        late = await relay.tools.execute("stop_dance", {})
+        assert late == {"ok": True, "tool": "stop_dance", "result": {"status": "cancelled"}} and link.stops == 1
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
+        assert len(world.clients[-1].commentaries) == before   # GPT-Live says it itself
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_without_gpt_lives_call_it_is_told_the_dance_stopped_after_the_usual_grace(world):
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said("日希，停下來"))
+        assert link.stops == 1
+        await _live(world, _sound(), _reachy("好"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS - 0.5)
+        assert len(world.clients[-1].commentaries) == before   # GPT-Live may still ask for the stop itself
+        await _step(world, relay, 1.0)
+        assert world.clients[-1].commentaries[before:] == [live_session.INTENT_LINES["stop_dance"]["zh-TW"]]
+        assert link.stops == 1                             # the line says what the stop did: no second stop
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_stop_drops_a_dance_still_waiting_for_the_backstop(world):
+    # 「跳舞給我看」, GPT-Live says 「好，我來跳」 but does not delegate (the 14 Oct miss), then 「停」 before the
+    # backstop's grace ran out: the waiting dance makes the bare 停 a stop, and that dance never starts
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await _live(world, _said("跳舞給我看"))
+        await _step(world, relay, 0.5)
+        await _live(world, _sound(), _reachy("好，我來跳"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.1)   # a new turn, inside the dance's grace
+        assert relay._intent is not None and relay._intent["kind"] == "dance"
+        await _live(world, _said("停"))
+        assert link.stops == 1 and relay._intent is None
+        for _ in range(20):
+            await _step(world, relay, 0.5)
+        assert link.dances == []
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_no_dance_starts_after_a_stop(world):
+    # The backstop danced; the patient says 停; GPT-Live's delegated dance for the first turn arrives late (the probe
+    # of 16 Oct started a second dance after the stop), and GPT-Live asks for another one on its own: both refused
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await _live(world, _said("跳舞給我看"), _sound(), _reachy("好，我來跳"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
+        assert link.dances == [(None, 2)]                  # the backstop danced
+        await _live(world, _said("停"))
+        assert link.stops == 1
+        late = await relay.tools.execute("dance", {"dance": None, "repeat": None})
+        assert late == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+        await _step(world, relay, tool_registry.STOP_HOLD_SECONDS - 1.0)
+        again = await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": 1})
+        assert again == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+        assert link.dances == [(None, 2)]
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("delegated", [True, False])
+def test_a_new_dance_request_after_the_stop_dances_again(world, delegated):
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        await _live(world, _said("不要再跳了"))
+        assert link.stops == 1
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)   # well inside the stop's hold
+        await _live(world, _said("再跳一次"), _sound(), _reachy("好"))
+        if delegated:                                      # GPT-Live asks for the dance itself
+            world.clients[-1].requested.append("dance")
+            again = await relay.tools.execute("dance", {"dance": None, "repeat": None})
+            assert again["ok"] and again["result"]["status"] == "started"
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
+        assert link.dances == [("simple_nod", 2), (None, 2)]   # one dance for the request, either way
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_dance_gpt_live_asked_for_before_the_words_came_does_not_swallow_the_request(world):
+    # GPT-Live can answer before its transcript of the patient is complete: its dance call, refused because the stop's
+    # hold was still on, came before the relay read 「跳舞給我看」. The backstop then dances.
+    async def scenario():
+        relay, running, link = await _with_tools(world, clock=world.clock)
+        await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})
+        await _live(world, _said("不要再跳了"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)
+        await _live(world, _said("日希"))                   # the next turn begins
+        world.clients[-1].requested.append("dance")
+        early = await relay.tools.execute("dance", {"dance": None, "repeat": None})
+        assert early["error"] == "stopped_by_patient"
+        await _live(world, _said("，跳舞給我看"), _sound(), _reachy("好"))
+        await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)
+        assert link.dances == [("simple_nod", 2), (None, 2)]
+        await _end(world, running)
+
+    asyncio.run(scenario())
 
 
 # ── the patient's own word that the medicine is taken (took_medicine; agent tool fixes, Task 4) ──
@@ -597,7 +785,7 @@ def test_a_request_in_the_next_turn_never_replaces_a_claim_still_waiting(world):
         await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)   # GPT-Live said nothing: both are due
         for _ in range(5):
             await relay_chat._settle()
-        assert link.dances == [(None, 1)]
+        assert link.dances == [(None, 2)]
         assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None)]
         said = world.clients[-1].commentaries
         assert live_session.INTENT_LINES["dance"]["zh-TW"] in said
@@ -615,7 +803,7 @@ def test_a_claim_and_a_request_in_one_turn_both_run(world):
         await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
         for _ in range(5):
             await relay_chat._settle()
-        assert link.dances == [(None, 1)]
+        assert link.dances == [(None, 2)]
         assert [call[0] for call in backend.calls] == ["check_medication_due", "record_medication_taken"]
         await _end(world, running)
 

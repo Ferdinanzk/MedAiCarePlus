@@ -9,8 +9,10 @@ language, and runs the tool when GPT-Live has not asked for it in time.
 - `detect(text, dancing)` -> "dance", "stop_dance", "look", "time", "search", "took_medicine" or None: plain
   request forms only, in Traditional Chinese (the transcript may come in either script) or English. Talking about
   dancing or about something seen (「我年輕的時候很喜歡跳舞」, 「我昨天看到一隻狗」), a question about someone else
-  (「他會跳舞嗎」) and a compliment (「你跳舞跳得很好」) are no request. "Stop" alone counts only while a dance runs, and
-  「再跳一次」 only after a dance.
+  (「他會跳舞嗎」) and a compliment (「你跳舞跳得很好」) are no request. 「再跳一次」 counts only after a dance.
+- `stops(text, dancing)`: 「不要跳舞了」 or "stop dancing" at any time, and while a dance may still run a stop phrase
+  anywhere in the words (「不要再跳了」, 「日希，停下來」, "Reachy, stop"; agent tool fixes, Task 5), never "don't
+  stop" or another kind of stop (「不要停」, 「不停」, 「停車」, 「停電」).
 - "took_medicine" is the patient's own word that the medicine is taken (「我吃完藥了」, "I took my medicine"): GPT-Live
   praised it itself and it often never reached record_medication_taken (agent tool fixes, Task 4, Oct 2026). It is
   read clause by clause and must start and end its clause, never for another person, another time, a plan, a
@@ -86,9 +88,18 @@ PATTERNS = {
 }
 # 「再跳一次」 by itself (also "jump again") is a dance only after one in this chat (the relay asks the registry)
 AGAIN = re.compile(r"再跳一?(次|下|遍)|再來一(次|遍)")
-# "Stop" by itself is a stop only while a dance runs (the relay asks the tool registry)
-STOP_WORDS = (re.compile(r"^(停|停下|停下來|停止|好了|夠了|不要跳了|別跳了|不用跳了)(吧|啦|了)?$"),
-              re.compile(r"^(ok |okay )?(stop|enough|that's enough)( it| now| please)?$"))
+# While a dance may still run (the relay asks the tool registry and its own waiting request), a stop phrase anywhere in
+# the patient's words is a stop (agent tool fixes, Task 5: 「不要再跳了」, 「日希，停下來」 and "Reachy, stop" were missed):
+# 停 in any form (「停」, 「停下來」, 「停止」, 「好了，停」, 「你可以停下來嗎」, 「暫停」), 「不要再跳了」, 「別跳了」, 「不跳了」,
+# "stop" ("please stop", "Reachy, stop"); 「好了」, 「夠了」 and "enough" only by themselves (「我吃好了」 is no stop)
+STOP_WORDS = (re.compile(r"停|(不要|別|不用|不)再?跳了|^((好了|夠了)(吧|啦)?)+$"),
+              re.compile(r"(?<![a-z])stop(?![a-z])|^(ok |okay )?(enough|that's enough)( now| please)?$"))
+# ... but never "don't stop" or another kind of stop, removed from the words before any stop pattern reads them (so
+# 「不要停止跳舞」 and "don't stop dancing" are no stop either): 「不要停」, 「別停」, 「不停」, 「跳個不停」, 「停不下來」,
+# 「停車」, 「停電」, 「停藥」, "non-stop", "can't stop laughing", "bus stop"
+NOT_STOP = (re.compile(r"(不要|不用|別|沒有?|不)停|停(不|車|電|水|留|課|班|工|業|靠|經|藥|用|頓)"),
+            re.compile(r"(?<![a-z])(don't|dont|do not|never|not|can't|cannot|couldn't|won't|wouldn't|didn't|non) stop"
+                       r"(?![a-z])|(?<![a-z])stop (by|over)(?![a-z])|(?<![a-z])bus stop(?![a-z])"))
 _PUNCTUATION = re.compile(r"(?:[^\w\s]|_)+")
 # The patient's own intake, done (took_medicine), as one whole clause (compact, Traditional): 我 with at most an
 # "already" word before 吃 (我吃完藥了, 我已經吃藥了, 我吃了藥); no subject, with 完/過/好/掉 or 已經/剛 (吃完藥了,
@@ -225,17 +236,34 @@ def claims_intake(text: str) -> bool:
     return False
 
 
+def stops(text: str, dancing: bool = False) -> bool:
+    """Whether the patient asks the dance to stop: 「不要跳舞了」 or "stop dancing" at any time (PATTERNS), and while a
+    dance may still run (`dancing`) a stop phrase anywhere in their words (STOP_WORDS), never "don't stop" or
+    another kind of stop (NOT_STOP)."""
+    if not text or not text.strip():
+        return False
+    compact, spaced = _prepare(text)
+    for pattern in NOT_STOP:
+        compact, spaced = pattern.sub(" ", compact), pattern.sub(" ", spaced)
+    if any(pattern.search(compact) or pattern.search(spaced) for pattern in PATTERNS["stop_dance"]):
+        return True
+    return dancing and bool(STOP_WORDS[0].search(compact) or STOP_WORDS[1].search(spaced))
+
+
 def detect(text: str, dancing: bool = False, danced: bool = False, claims: bool = True) -> str | None:
     """The tool request in the patient's words: "stop_dance", "took_medicine", "dance", "look", "time", "search", or
-    None. `dancing`: a dance runs now, so a bare "stop" (停, 夠了, stop) is a stop too; `danced`: this chat had a
-    dance, so 「再跳一次」 is another; `claims` False leaves the patient's word that the medicine is taken to the
-    caller (the relay reads it with claims_intake, beside any other request of the same words)."""
+    None. `dancing`: a dance may still run, so a stop phrase anywhere in the words (停, 不要再跳了, stop) is a stop
+    too (stops); `danced`: this chat had a dance, so 「再跳一次」 is another; `claims` False leaves the patient's word
+    that the medicine is taken to the caller (the relay reads it with claims_intake, beside any other request of the
+    same words)."""
     if not text or not text.strip():
         return None
     compact, spaced = _prepare(text)
-    if dancing and (STOP_WORDS[0].search(compact) or STOP_WORDS[1].search(spaced)):
-        return "stop_dance"
     for intent in INTENTS:
+        if intent == "stop_dance":
+            if stops(text, dancing):
+                return intent
+            continue
         if intent == "took_medicine":
             if claims and claims_intake(text):
                 return intent

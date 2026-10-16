@@ -39,8 +39,8 @@ from app.database import get_pool
 from app.services import (ai_settings, consent_service, conversation, current_time, dose_confirmation, dose_emotion,
                           dose_event, dose_safety, dose_status, dose_video, memory, monitor_service, outbox, reminders,
                           schedule, weather_lookup, web_search)
-from app.services.gpt_live_config import (DANCES, EMOTE_PRESETS, EMOTION_MOVES, MAX_DANCE_REPEAT, MEMORY_CATEGORIES,
-                                          POSTURES, SEVERITIES, TIME_SCOPES, TOOL_NAMES, URGENCIES)
+from app.services.gpt_live_config import (DANCES, DEFAULT_DANCE_REPEAT, EMOTE_PRESETS, EMOTION_MOVES, MAX_DANCE_REPEAT,
+                                          MEMORY_CATEGORIES, POSTURES, SEVERITIES, TIME_SCOPES, TOOL_NAMES, URGENCIES)
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +60,9 @@ WATCH_REPORT_GRACE_SECONDS = 12.0
 REVIEW_WAIT_SECONDS = 5.0
 VERIFICATION_MEMORY_SECONDS = 600.0   # a label check this recent is quoted with the dose's events
 DANCE_ACTIVE_SECONDS = 25.0      # a dance started this recently may still run (4 repeats of the longest 5 s move)
+# A dance asked for this soon after a stop, before the patient asks to dance again (dance_asked), is refused with
+# stopped_by_patient: GPT-Live's call for the words before the stop can come after it (agent tool fixes, Task 5)
+STOP_HOLD_SECONDS = 10.0
 INTENT_SHARE_SECONDS = 8.0       # GPT-Live asking for a tool the relay's backstop ran this recently gets that run
 TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medication": OCR_SECONDS + 6.0,
             "describe_view": OCR_SECONDS + 6.0,
@@ -887,6 +890,7 @@ class ToolRegistry:
         self._handlers = {name: getattr(self, name) for name in TOOL_NAMES}
         self._dance_at = float("-inf")                          # when the last dance started
         self._danced = False                                    # this chat had a dance
+        self._stopped_at = float("-inf")                        # the last stop, while its hold lasts (dance_asked)
         self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
         self._held: set[asyncio.Future] = set()                 # FINISH_ON_CLOSE calls still running (hold)
         self.finished_at = float("-inf")                        # when the last held call ended (monotonic)
@@ -924,6 +928,13 @@ class ToolRegistry:
         """Whether this chat had a dance (「再跳一次」 then asks for another)."""
         return self._danced
 
+    def dance_asked(self) -> bool:
+        """The patient asks to dance (the relay read it in their words): a stop's hold is over. Returns whether one
+        was still on (a dance asked for meanwhile was refused)."""
+        held = self.clock() - self._stopped_at < STOP_HOLD_SECONDS
+        self._stopped_at = float("-inf")
+        return held
+
     async def run_intent(self, name: str, args: dict) -> dict:
         """Run a tool for the relay's backstop (live_session, services/tool_intents.py): GPT-Live did not ask for it.
         A call GPT-Live makes for the same tool within INTENT_SHARE_SECONDS gets this run's answer instead of a
@@ -933,8 +944,11 @@ class ToolRegistry:
         return await asyncio.shield(run)
 
     def forget_intents(self) -> None:
-        """A new patient turn: GPT-Live's next call is for new words ("dance again"), never the backstop's run."""
-        self._intent_runs.clear()
+        """A new patient turn: GPT-Live's next call is for new words ("dance again"), never the backstop's run. A stop
+        stays shared until a dance starts (dance): GPT-Live's call for it can come after the patient spoke again, and
+        a second stop would answer idle."""
+        stop = self._intent_runs.get("stop_dance")
+        self._intent_runs = {"stop_dance": stop} if stop is not None else {}
 
     async def execute(self, name: str, args: dict | None) -> dict:
         shared = self._intent_runs.get(name)
@@ -1055,22 +1069,31 @@ class ToolRegistry:
         return await self.robot.emote(preset)
 
     async def dance(self, dance: str | None = None, repeat: int | None = None) -> dict:
-        """One of the robot's recorded dances, started on the robot (its motion worker) and answered at once."""
+        """One of the robot's recorded dances, started on the robot (its motion worker) and answered at once;
+        DEFAULT_DANCE_REPEAT moves without a repeat. Refused while a stop's hold lasts (STOP_HOLD_SECONDS). It may run
+        from the call on (dancing): the robot answers as the move starts."""
         if dance is not None and dance not in DANCES:
             raise ToolError("unknown_dance")
-        times = 1 if repeat is None else int(repeat)
+        times = DEFAULT_DANCE_REPEAT if repeat is None else int(repeat)
         if not 1 <= times <= MAX_DANCE_REPEAT:
             raise ToolError("repeat_out_of_range")
+        if self.clock() - self._stopped_at < STOP_HOLD_SECONDS:
+            log.info("[TOOL] dance refused: the patient asked to stop %.1f s ago", self.clock() - self._stopped_at)
+            raise ToolError("stopped_by_patient")
         log.info("[TOOL] dance called: %s x%d", dance or "any", times)
+        self._dance_at = self.clock()
+        self._intent_runs.pop("stop_dance", None)   # a stop GPT-Live asks for now is for this dance
         result = await self.robot.dance(dance, times)
-        self._dance_at, self._danced = self.clock(), True
+        self._danced = True
         return result
 
     async def stop_dance(self) -> dict:
+        """Stop the robot's dance. A dance asked for in the next STOP_HOLD_SECONDS is refused (dance), and so is
+        GPT-Live's late call for a dance the relay's backstop ran before the stop, which no longer shares that run."""
         log.info("[TOOL] stop_dance called")
-        result = await self.robot.stop_dance()
-        self._dance_at = float("-inf")
-        return result
+        self._dance_at, self._stopped_at = float("-inf"), self.clock()
+        self._intent_runs.pop("dance", None)
+        return await self.robot.stop_dance()
 
     async def play_emotion(self, emotion: str, posture: str | None = None) -> dict:
         """One of the robot's recorded emotion moves, with a posture to hold after it (the live chat's `express`)."""

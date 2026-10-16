@@ -36,11 +36,11 @@ def test_dance_and_stop_dance_go_to_the_robot_with_a_checked_move_and_repeat():
 
     robot, started, any_move, stopped, unknown, too_many = asyncio.run(run())
     assert started["ok"] and started["result"]["dance"] == "jackson_square" and started["result"]["repeat"] == 2
-    assert any_move["ok"] and any_move["result"]["dance"] == "side_to_side_sway" and any_move["result"]["repeat"] == 1
+    assert any_move["ok"] and any_move["result"]["dance"] == "side_to_side_sway" and any_move["result"]["repeat"] == 2
     assert stopped == {"ok": True, "tool": "stop_dance", "result": {"status": "idle"}}
     assert unknown == {"ok": False, "tool": "dance", "error": "unknown_dance"}
     assert too_many == {"ok": False, "tool": "dance", "error": "repeat_out_of_range"}
-    assert robot.emotes == ["dance:jackson_square:2", "dance:None:1", "stop_dance"]
+    assert robot.emotes == ["dance:jackson_square:2", "dance:None:2", "stop_dance"]
 
 
 def test_get_weather_runs_the_lookup_off_the_loop_with_the_chats_language(monkeypatch):
