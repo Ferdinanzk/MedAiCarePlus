@@ -902,6 +902,9 @@ class ToolRegistry:
         self._danced = False                                    # this chat had a dance
         self._stopped_at = float("-inf")                        # the last stop, while its hold lasts (dance_asked)
         self._starting = 0                                      # dance calls the robot has not answered yet
+        self._stopping: set[asyncio.Future] = set()             # stops sent again (_stop_again), each its own task
+        self.stops_told = 0                                     # GPT-Live's dance calls answered stopped_by_patient
+                                                                # (execute): it says Reachy stopped (the relay's _told)
         self._intent_runs: dict[str | tuple, tuple[float, asyncio.Future]] = {}   # the backstop's runs (_shared_as)
         # FINISH_ON_CLOSE calls still running (hold), in the order they were held: (when, on the event loop's clock,
         # and the seconds their TIMEOUTS entries allow)
@@ -1004,11 +1007,17 @@ class ToolRegistry:
         self._intent_runs = {"stop_dance": stop} if stop is not None else {}
 
     async def execute(self, name: str, args: dict | None) -> dict:
+        """GPT-Live's own call. A dance call answered stopped_by_patient is counted (stops_told): BACKEND_INSTRUCTION
+        has GPT-Live say Reachy stopped then, so the relay's stop line is not said as well (round 3 of 17 Oct 2026)."""
         shared = self._intent_runs.get(self._shared_as(name, args))
         if shared is not None and self.clock() - shared[0] < INTENT_SHARE_SECONDS:
             log.info("live agent tool %s: the backstop's run answers it", name)
-            return await asyncio.shield(shared[1])
-        return await self._run(name, args)
+            result = await asyncio.shield(shared[1])
+        else:
+            result = await self._run(name, args)
+        if name == "dance" and result.get("error") == "stopped_by_patient":
+            self.stops_told += 1
+        return result
 
     async def _run(self, name: str, args: dict | None) -> dict:
         if name not in MEDICATION_TOOLS:
@@ -1030,6 +1039,7 @@ class ToolRegistry:
         if not isinstance(args, dict):
             return {"ok": False, "tool": name, "error": "arguments_must_be_object"}
         args = {key: value for key, value in args.items() if value is not None}   # strict schemas send null
+        started = self.clock()
         try:
             inspect.signature(handler).bind(**args)   # missing or unexpected arguments fail fast
             result = await asyncio.wait_for(handler(**args), timeout=TIMEOUTS.get(name, 10.0))
@@ -1038,6 +1048,10 @@ class ToolRegistry:
             return {"ok": False, "tool": name, "error": f"invalid_arguments: {error}"}
         except asyncio.TimeoutError:
             log.warning("live agent tool %s timed out", name)
+            if name == "dance" and self._stopped_at >= started:
+                # the patient's stop came while the robot loaded the move: the dance sent it again (dance), and the
+                # answer is the stop's, never a failure the backstop would say (round 3 of 17 Oct 2026)
+                return {"ok": False, "tool": name, "error": "stopped_by_patient"}
             return {"ok": False, "tool": name, "error": "tool_timeout"}
         except ToolError as error:
             return {"ok": False, "tool": name, "error": str(error)}
@@ -1139,7 +1153,10 @@ class ToolRegistry:
         DEFAULT_DANCE_REPEAT moves without a repeat. Refused while a stop's hold lasts (STOP_HOLD_SECONDS). It may run
         from the call on (dancing): the robot answers as the move starts. The robot loads the move first (off its event
         loop, from disk on the first dance), and a stop that reaches it meanwhile finds no move, answers idle, and the
-        move starts after it: such a stop is sent again when the dance answers, and the dance is stopped_by_patient."""
+        move starts after it: such a stop is sent again when the dance answers, fails or times out (_stop_again, a task
+        of its own, so its error or lateness never changes this answer), and the dance is stopped_by_patient. A dance
+        the robot refuses or fails is no dance running (round 3 of 17 Oct 2026: dancing() stayed true for 25 s, and a
+        bare 「好了」 sent a stop to an idle robot and started the hold); one that times out may still start."""
         if dance is not None and dance not in DANCES:
             raise ToolError("unknown_dance")
         times = DEFAULT_DANCE_REPEAT if repeat is None else int(repeat)
@@ -1154,14 +1171,43 @@ class ToolRegistry:
         self._starting += 1
         try:
             result = await self.robot.dance(dance, times)
+        except Exception as error:
+            if self._dance_at == called_at:
+                self._dance_at = float("-inf")   # the robot refused or failed it (a later call may have changed it)
+            if self._stopped_at >= called_at:   # a stop came while the robot loaded the move
+                log.info("[TOOL] dance failed after the patient's stop (%s): stopping it again", error)
+                self._stop_again()
+                raise ToolError("stopped_by_patient") from None
+            raise
+        except asyncio.CancelledError:
+            if self._stopped_at >= called_at:   # timed out (TIMEOUTS) after the patient's stop: the move may still start
+                log.info("[TOOL] dance timed out after the patient's stop: stopping it again")
+                self._stop_again()
+            raise
         finally:
             self._starting -= 1
         self._danced = True
         if self._stopped_at >= called_at:   # a stop came while the robot started the move (dance_asked clears it)
             log.info("[TOOL] dance started after the patient's stop: stopping it again")
-            await self.robot.stop_dance()
+            self._stop_again()
             raise ToolError("stopped_by_patient")
         return result
+
+    def _stop_again(self) -> None:
+        """Send the robot the patient's stop again, for a dance a stop came during, as a task of its own within
+        TIMEOUTS['stop_dance']: its error or lateness is logged and never replaces the dance's stopped_by_patient
+        (round 3 of 17 Oct 2026: inside the dance's own time limit, a late or failed second stop made the dance answer
+        tool_timeout or stop_dance_failed, and the backstop said it could not dance right after the stop line)."""
+        async def stop() -> None:
+            try:
+                await asyncio.wait_for(self.robot.stop_dance(), TIMEOUTS["stop_dance"])
+            except Exception as error:
+                log.warning("[TOOL] the second stop of a dance the patient stopped failed: %s",
+                            error or type(error).__name__)
+
+        task = asyncio.ensure_future(stop())
+        self._stopping.add(task)
+        task.add_done_callback(self._stopping.discard)
 
     async def stop_dance(self) -> dict:
         """Stop the robot's dance. A dance asked for in the next STOP_HOLD_SECONDS is refused (dance), and so is
