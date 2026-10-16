@@ -343,13 +343,21 @@ def test_a_new_turn_lets_gpt_live_dance_again_after_a_backstop_dance():
 STOPS = ["停", "停下來", "停止", "不要跳了", "不要再跳了", "別跳了", "不跳了", "好了，停", "日希，停下來", "你停下來",
          "瑞希停下來", "你不要跳了", "停停停", "停一下", "先停一下", "可以停了", "你可以停下來嗎", "暫停",
          "stop", "please stop", "Reachy, stop", "stop it", "okay stop", "can you stop", "stop now please",
-         "that's enough, stop", "夠了", "好了", "好了好了"]
+         "that's enough, stop", "夠了", "好了", "好了好了",
+         # ... read clause by clause, so a "don't" of one clause never takes the stop of another (fix round 2):
+         # 「停，不要跳了」 read as one run of words lost 停 and the 不 of 不要跳了 to 「停不」 (「停不下來」), and
+         # 「不要，停下來」 read as 「不要停」
+         "停，不要跳了", "停！不要跳了", "不要，停下來", "不要！停！", "不，停", "停，不跳了", "好，停，不要跳了",
+         "停，不用了", "日希，夠了",
+         # ... and without the transcript's comma, 停 followed by 不要 or 不 is still a stop (「停不下來」 is not)
+         "停不要跳了", "停不跳了"]
 # ... and these at any time, dancing or not
-ALWAYS_STOPS = ["stop dancing", "不要跳舞了", "停止跳舞", "Reachy, please stop dancing"]
+ALWAYS_STOPS = ["stop dancing", "不要跳舞了", "停止跳舞", "Reachy, please stop dancing", "停，不要跳舞了",
+                "不要，停止跳舞"]
 # Never a stop: "don't stop", "non-stop" and other kinds of stop
 NOT_STOPS = ["不要停", "停車", "停電", "不停", "不要停，繼續跳", "你跳個不停", "停車場在哪裡", "昨天停電了", "別停",
              "我停不下來", "我想停藥", "不要停止跳舞", "don't stop", "don't stop dancing", "I can't stop laughing",
-             "the bus stop", "non-stop", "我吃好了"]
+             "the bus stop", "non-stop", "我吃好了", "停不了", "我真的停不住"]
 
 
 @pytest.mark.parametrize("words", STOPS + ALWAYS_STOPS)
@@ -374,7 +382,8 @@ def test_dont_stop_and_other_kinds_of_stop_are_never_a_stop(words):
 
 
 @pytest.mark.parametrize("fragments", [["不要再跳了"], ["日希，", "停下來"], ["Reachy,", " stop"], ["please stop"],
-                                       ["你", "不要跳了"], ["好了，停"], ["你停下來"]])
+                                       ["你", "不要跳了"], ["好了，停"], ["你停下來"], ["不要，", "停下來"],
+                                       ["停，不要跳了"], ["不，", "停"]])
 def test_a_stop_reaches_the_robot_at_the_fragment_that_holds_it(world, fragments):
     # GPT-Live's reply and the backstop's grace are not waited for: a dance of two moves lasts 4-10 s
     async def scenario():
