@@ -566,7 +566,7 @@ def test_a_refused_or_already_taken_dose_is_reported_never_recorded(now, monkeyp
     assert len(alerts) == 1
 
     async def nothing_open(conn, **kw):
-        raise ValueError("No pending or missed dose to confirm")
+        raise dose_confirmation.NothingToConfirm("No pending or missed dose to confirm")
     monkeypatch.setattr(dose_confirmation, "create", nothing_open)
     answer = asyncio.run(b.record_medication_taken("dose-1", True))
     assert answer["status"] == "already_taken" and answer["family_asked"] is False
@@ -747,7 +747,10 @@ def test_a_stale_watch_never_authorises_a_record_without_its_session_id(now, cam
     answer = asyncio.run(b.record_medication_taken("dose-2", True))     # the patient's word, judged now
     assert answer["source"] == "patient_claim" and asked == [("patient_claim", None, None, None)]
     with pytest.raises(ToolError, match="unknown_session"):
-        asyncio.run(b.record_medication_taken("dose-2", True, session_id="nope"))
+        asyncio.run(b.record_medication_taken("dose-2", False, session_id="nope"))
+    # with the patient's word an unknown watch is no detector evidence, never an error (tests/test_record_taken.py)
+    again = asyncio.run(b.record_medication_taken("dose-2", True, session_id="nope"))
+    assert again["source"] == "patient_claim" and asked[1] == ("patient_claim", None, None, None)
 
 
 def test_family_notes_are_capped_and_never_repeated_in_a_conversation(monkeypatch):

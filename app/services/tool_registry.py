@@ -71,6 +71,15 @@ TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medic
             "dance": 12.0, "stop_dance": 6.0, "play_emotion": 12.0,
             "get_current_time": 3.0, "search_web": web_search.TIMEOUT + 4.0,   # measured 6-12 s (14 Oct 2026)
             "set_reminder": 10.0, "cancel_reminder": 6.0}
+# Closing GPT-Live (an ending, a companion pause) never cuts these short: a dose request, a note to family or an alert
+# GPT-Live asked for runs to its end within its TIMEOUTS entry (agent_bridge.AgentLiveClient.close), while the other
+# tools are cancelled. The companion's quiet pause waits while one runs (ToolRegistry.finishing), and the chat's end
+# waits for them before the tools close, at most FINISH_WAIT_SECONDS (the client runs its calls one at a time)
+FINISH_ON_CLOSE = ("record_medication_taken", "notify_family", "emergency_alert")
+FINISH_WAIT_SECONDS = sum(TIMEOUTS[name] for name in FINISH_ON_CLOSE)
+# A dose dose_confirmation.create found no longer open (NothingToConfirm) is answered by its state then
+ALREADY = {"taken": "already_taken", "skipped": "already_skipped",
+           "pending_confirmation": "already_pending_confirmation"}
 MEMORY_KIND = {"preference": "like", "routine": "routine", "event": "event", "person": "person"}
 NOTE_KIND = "live_agent_note"    # notification_outbox.kind of a notify_family message
 NOTE_LIMIT = 3                   # notify_family messages one conversation may send (the model never loops on it)
@@ -590,6 +599,18 @@ class ServerCareBackend:
         outcome = task.result()
         return isinstance(outcome, dict) and outcome.get("video") is True
 
+    def _watch_for(self, dose: dict) -> dict | None:
+        """The open watch when it watches this dose: the same dose, or a medicine whose name matches (names_match)
+        the one the watch was started for. A record settles it whether or not the call names it."""
+        watch = self._watch
+        if watch is None:
+            return None
+        watched = watch.get("dose") or {}
+        if watched.get("medication_id") == dose["medication_id"]:
+            return watch
+        names = (watched.get("med_name"), watch.get("medication_name"))
+        return watch if any(name and names_match(name, dose["med_name"]) for name in names) else None
+
     async def close(self) -> None:
         """The chat is over: a watch still open with no result reported goes to family as unresolved, with the clip
         (the agent never got to a verdict, so nobody else would tell them)."""
@@ -610,10 +631,21 @@ class ServerCareBackend:
         the time, the detector's result and confidence and the session id). The dose: medication_id (a dose id, or a
         medicine id resolved to today's dose), else medication_name resolved to today's dose. Confirmation: the
         patient's word (patient_confirmed) or the detector's taken result, or its confidence of at least
-        DETECTOR_CONFIDENCE, from the watch session_id names (the current one when None)."""
+        DETECTOR_CONFIDENCE, from the watch session_id names. With the patient's word, a session_id that names no open
+        watch (unknown, or spent by an earlier record) is no detector evidence, never an error. The open watch of the
+        same dose is settled whether or not the call names it (_watch_for): its review waiting its grace is dropped,
+        the watch is spent, and the clip goes with the request. A dose no longer open answers its state (ALREADY)."""
         # The detector's verdict counts only for the watch the call names (session_id): a watch started for an
         # earlier dose never authorises a later one, and the patient's word alone is judged now (started_at None)
-        intake = await self.get_pill_intake_result(session_id) if session_id else None
+        intake = None
+        if session_id:
+            try:
+                intake = await self.get_pill_intake_result(session_id)
+            except ToolError as error:
+                if str(error) != "unknown_session" or not patient_confirmed:
+                    raise
+                log.info("live agent: record_medication_taken named a watch that is not open (unknown or spent); "
+                         "the patient's word counts, with no detector evidence")
         detector_sure = intake is not None and (
             intake.get("result") == "taken"
             or (intake.get("confidence") is not None and intake["confidence"] >= DETECTOR_CONFIDENCE))
@@ -636,8 +668,11 @@ class ServerCareBackend:
         recorded_at = schedule.current_time()
         # The clip of the moment goes with the confirmation request (dose_video.capture), unless the watch's review
         # message already carried it (its outcome says so): a report still waiting its grace is dropped in favour of
-        # the request. What the request says about its video is known before it is made (dose_video.clip_outlook).
-        watch = self._watch if intake is not None else None
+        # the request. That is the watch the call names, else the open watch of this dose (16 Oct 2026: a record
+        # without session_id left it open, so its review and a second clip went out beside the request). What the
+        # request says about its video is known before it is made (dose_video.clip_outlook).
+        named = self._watch if intake is not None else None
+        watch = named or self._watch_for(dose)
         clip_sent_earlier = watch is not None and await self._review_carried_clip()
         state = self._session()
         event_started_at = getattr(state, "event_started_at", None) if (state is not None and intake is not None
@@ -645,7 +680,7 @@ class ServerCareBackend:
         video, frames = ((dose_video.SENT_EARLIER, []) if clip_sent_earlier
                          else await dose_video.clip_outlook(self.u_id, event_started_at=event_started_at))
         evidence = {"source": "live_agent", "conversation_id": self.conversation_id,
-                    "session_id": intake["session_id"] if intake and intake.get("session_id") else session_id,
+                    "session_id": intake.get("session_id") if intake else None,
                     "recorded_at": _local(recorded_at), "patient_confirmed": bool(patient_confirmed),
                     "detector_result": intake.get("result") if intake else None,
                     "detector_state": intake.get("state") if intake else None,
@@ -663,13 +698,16 @@ class ServerCareBackend:
             try:
                 request_id = await dose_confirmation.create(
                     conn, u_id=self.u_id, task_id=self.task_id, intk_ids=[number], source=source,
-                    evidence=evidence, started_at=watch["started_at"] if watch is not None else None)
+                    evidence=evidence, started_at=named["started_at"] if named is not None else None)
             except schedule.DoseRefused as refused:
                 return refused
-            except ValueError:
-                return {"status": "already_" + str(dose["status"] if dose["status"] in ("taken", "skipped")
-                                                   else "recorded"),
-                        "medication_id": dose["medication_id"], "medication_name": dose["med_name"],
+            except dose_confirmation.NothingToConfirm:
+                # Taken, skipped or waiting for family: its state says which. Any other error is an error
+                row = await conn.fetchrow(DOSE_SQL, self.u_id, number)
+                status = ALREADY.get(row["intake_stats"]) if row is not None else None
+                if status is None:
+                    raise ToolError("dose_changed_meanwhile")   # open again, or gone, since the request looked
+                return {"status": status, "medication_id": dose["medication_id"], "medication_name": dose["med_name"],
                         "family_asked": False}
             return {"status": "pending_confirmation", "medication_id": dose["medication_id"],
                     "medication_name": dose["med_name"], "request_id": request_id, "family_asked": True,
@@ -705,7 +743,7 @@ class ServerCareBackend:
         if watch is not None:
             watch["reported"] = watch.get("reported") or {"result": outcome.get("status")}
             if self._watch is watch:
-                self._watch = None   # the watch's verdict is spent: it never authorises a second record
+                self._watch = None   # the watch is settled: its verdict never authorises a second record
         return outcome
 
     # ── emotion ──────────────────────────────────────────────────────────
@@ -849,9 +887,25 @@ class ToolRegistry:
         self._dance_at = float("-inf")                          # when the last dance started
         self._danced = False                                    # this chat had a dance
         self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
+        self._held: set[asyncio.Future] = set()                 # FINISH_ON_CLOSE calls still running (hold)
+
+    def hold(self, run: asyncio.Future) -> None:
+        """A FINISH_ON_CLOSE call (a record, a note to family or an alert) that closing GPT-Live leaves to finish
+        (agent_bridge.AgentLiveClient): the companion's quiet pause waits for it (finishing), and so does the chat's
+        end (close)."""
+        self._held.add(run)
+        run.add_done_callback(self._held.discard)
+
+    def finishing(self) -> bool:
+        """Whether a held call (a record, a note to family or an alert) is still running."""
+        return any(not run.done() for run in self._held)
 
     async def close(self) -> None:
-        """The chat is over: the backend reports a watch left without a verdict (ServerCareBackend.close)."""
+        """The chat is over: a held call still running finishes first (at most FINISH_WAIT_SECONDS; a record settles
+        its watch), then the backend reports a watch left without a verdict (ServerCareBackend.close)."""
+        running = [run for run in self._held if not run.done()]
+        if running:
+            await asyncio.wait(running, timeout=FINISH_WAIT_SECONDS)
         await self.backend.close()
 
     def dancing(self) -> bool:

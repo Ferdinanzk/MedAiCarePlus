@@ -62,6 +62,12 @@ _VIDEO_LINES = {
 _VIDEO_REMINDER_LINE = ("📹 影片請看稍早的訊息。", "📹 The video is in the earlier messages.")
 
 
+class NothingToConfirm(ValueError):
+    """create() found none of the listed doses pending or missed: each is already taken, skipped or waiting for
+    family. Its own class, so a caller reads only this as "already done", never any other ValueError (a database or
+    encoding error)."""
+
+
 # ── postback signing ──
 
 def _signature(action: str, object_id: str, answer: str, contact_id) -> str:
@@ -204,14 +210,14 @@ def _text(text: str) -> list[dict]:
 
 async def create(conn, *, u_id: int, task_id: str | None, intk_ids: list[int], source: str,
                  evidence: dict | None, started_at: datetime.datetime | None = None) -> str:
-    """Ask caregivers to confirm doses. Raises ValueError when no listed dose is pending or missed, and a
-    schedule.DoseRefused (nothing changed) when overdose protection refuses one: family must never be asked to
-    confirm a dose hours before its time, a second dose, or a missed one. Every source comes from the robot seeing a
-    hand-to-mouth event or the patient saying it is done, so the caller alerts family when the refusal is a suspected
-    double dose (dose_safety.alert_after, after this transaction rolled back), and the patient's sentence says the
-    dose was not recorded. `started_at` is when the robot's camera session for the dose began: due and not expired
-    are judged then (dose_safety.evaluate). A dose waiting here counts against the medicine's next one (R2/R3), so
-    the medication row is locked as on every recording path."""
+    """Ask caregivers to confirm doses. Raises NothingToConfirm (a ValueError) when no listed dose is pending or
+    missed, and a schedule.DoseRefused (nothing changed) when overdose protection refuses one: family must never be
+    asked to confirm a dose hours before its time, a second dose, or a missed one. Every source comes from the robot
+    seeing a hand-to-mouth event or the patient saying it is done, so the caller alerts family when the refusal is a
+    suspected double dose (dose_safety.alert_after, after this transaction rolled back), and the patient's sentence
+    says the dose was not recorded. `started_at` is when the robot's camera session for the dose began: due and not
+    expired are judged then (dose_safety.evaluate). A dose waiting here counts against the medicine's next one
+    (R2/R3), so the medication row is locked as on every recording path."""
     if source not in SOURCES:
         raise ValueError(f"Unknown confirmation source {source}")
     async with conn.transaction():
@@ -222,7 +228,7 @@ async def create(conn, *, u_id: int, task_id: str | None, intk_ids: list[int], s
             "ORDER BY i.intake_time_stamp, i.intk_id FOR UPDATE OF i",
             u_id, [int(i) for i in intk_ids])
         if not rows:
-            raise ValueError("No pending or missed dose to confirm")
+            raise NothingToConfirm("No pending or missed dose to confirm")
         now = schedule.current_time()
         notes_zh, notes_en = dose_safety.request_notes(
             await dose_safety.check(conn, u_id, [row["intk_id"] for row in rows], at=now, lock=True,
