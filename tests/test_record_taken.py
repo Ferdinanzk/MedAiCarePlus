@@ -681,6 +681,35 @@ def test_the_companions_quiet_pause_comes_once_gpt_live_leaves_a_finished_record
     asyncio.run(scenario())
 
 
+def test_the_stretch_max_pause_waits_for_a_held_call_too_but_the_hard_cap_still_pauses(companion):
+    """Round 4 (R4.8): past STRETCH_MAX_SECONDS the pause at the patient's turn gap ignored LiveRelay._tool_answer_due,
+    so it could close GPT-Live during verify_medication, a watch's polling or a record. It now waits as the quiet
+    pause does, and STRETCH_HARD_MAX_SECONDS still bounds the wait."""
+    async def scenario():
+        relay, running = await _start(companion)
+        await _speak(companion)
+        relay.tools = ToolRegistry(Link(), Backend(), monotonic=companion.clock)
+        for _ in range(29):                                   # the patient talks every 20 s: 580 s
+            await _step(companion, relay, 20)
+            await _live(companion, _said("還有"))
+        await _live(companion, _sound())                      # GPT-Live answers their last words
+        await _step(companion, relay, 0.5)
+        await _step(companion, relay, 1.25)                   # its sound ended, their turn is stored: a turn gap
+        record = asyncio.get_running_loop().create_future()
+        relay.tools.hold(record, "record_medication_taken")   # a record GPT-Live asked for still runs
+        await _step(companion, relay, 19.0)                   # 600.75 s: past STRETCH_MAX_SECONDS, at a turn gap
+        assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+        await _step(companion, relay, 59.15)                  # 659.9 s: still waiting for the record
+        assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+        await _step(companion, relay, 0.2)                    # STRETCH_HARD_MAX_SECONDS: paused anyway
+        assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
+        record.set_result({"ok": True})
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
 class LabelCheck(Backend):
     """A care backend whose label check (verify_medication: the OCR, up to 36 s) answers once the test opens it."""
 
