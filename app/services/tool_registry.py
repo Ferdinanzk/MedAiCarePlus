@@ -67,7 +67,9 @@ INTENT_SHARE_SECONDS = 8.0       # GPT-Live asking for a tool the relay's backst
 TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medication": OCR_SECONDS + 6.0,
             "describe_view": OCR_SECONDS + 6.0,
             "verify_prescription": 6.0, "get_medication_schedule": 6.0, "check_medication_due": 6.0,
-            "start_pill_intake_detection": 6.0, "get_pill_intake_result": 3.0, "record_medication_taken": 10.0,
+            "start_pill_intake_detection": 6.0, "get_pill_intake_result": 3.0,
+            # two database calls and the consent read (dose_video.clip_outlook), plus a review being made (5 s)
+            "record_medication_taken": 10.0 + REVIEW_WAIT_SECONDS,
             "get_current_emotion": 8.0, "get_emotion_history": 6.0, "trigger_antenna_emote": 6.0, "remember": 8.0,
             "get_patient_memory": 8.0, "notify_family": 8.0, "emergency_alert": 12.0,
             "get_weather": 30.0,   # the geocoder (spaced 1.1 s) and Open-Meteo, 12 s and 15 s each at most
@@ -78,9 +80,13 @@ TIMEOUTS = {"camera": 6.0, "identify_medicine": OCR_SECONDS + 6.0, "verify_medic
 # GPT-Live asked for runs to its end within its TIMEOUTS entry (agent_bridge.AgentLiveClient.close), while the other
 # tools are cancelled. The companion's quiet pause waits while one runs (ToolRegistry.finishing) and for GPT-Live's
 # answer after it (finished_at, live_session.LiveRelay._tool_answer_due), and the chat's end waits for them before the
-# tools close, at most FINISH_WAIT_SECONDS (the client runs its calls one at a time)
+# tools close, bounded by the calls actually held (ToolRegistry.finish_wait: the client runs its calls one at a time)
 FINISH_ON_CLOSE = ("record_medication_taken", "notify_family", "emergency_alert")
-FINISH_WAIT_SECONDS = sum(TIMEOUTS[name] for name in FINISH_ON_CLOSE)
+# The steps of the visual medication workflow: while GPT-Live's call of one runs (verify_medication's OCR takes up to
+# 36 s), and for a moment after it, the companion's quiet pause waits (ToolRegistry.checking), so GPT-Live is not
+# closed before it asks for record_medication_taken (agent_bridge counts the same tools as a medication context)
+MEDICATION_TOOLS = ("check_medication_due", "get_medication_schedule", "verify_prescription", "verify_medication",
+                    "start_pill_intake_detection", "get_pill_intake_result", "record_medication_taken")
 # A dose dose_confirmation.create found no longer open (NothingToConfirm) is answered by its state then
 ALREADY = {"taken": "already_taken", "skipped": "already_skipped",
            "pending_confirmation": "already_pending_confirmation"}
@@ -552,6 +558,8 @@ class ServerCareBackend:
                 result = answer("still_monitoring", "watching", None, False)
         if result["result"] in ("uncertain", "not_taken") and result["state"] != "candidate":
             self._report_watch(watch, result, state)   # a candidate is still being judged: wait for its verdict
+        # The watch's last reading: a record that settles the watch without naming it tells family what it was
+        watch["reading"] = {"result": result["result"], "confidence": result.get("confidence")}
         return result
 
     def _report_watch(self, watch: dict, result: dict, state) -> None:
@@ -604,16 +612,12 @@ class ServerCareBackend:
         return isinstance(outcome, dict) and outcome.get("video") is True
 
     def _watch_for(self, dose: dict) -> dict | None:
-        """The open watch when it watches this dose: the same dose, or a medicine whose name matches (names_match)
-        the one the watch was started for. A record settles it whether or not the call names it."""
+        """The open watch when it watches exactly this dose (the dose its medicine named when it started): a record
+        settles it whether or not the call names it. Another dose of the same medicine never does, nor a watch
+        whose medicine named no dose of today, nor one started without a medicine (no dose and no name)."""
         watch = self._watch
-        if watch is None:
-            return None
-        watched = watch.get("dose") or {}
-        if watched.get("medication_id") == dose["medication_id"]:
-            return watch
-        names = (watched.get("med_name"), watch.get("medication_name"))
-        return watch if any(name and names_match(name, dose["med_name"]) for name in names) else None
+        watched = (watch.get("dose") or {}).get("medication_id") if watch is not None else None
+        return watch if watched is not None and watched == dose["medication_id"] else None
 
     async def close(self) -> None:
         """The chat is over: a watch still open with no result reported goes to family as unresolved, with the clip
@@ -636,9 +640,12 @@ class ServerCareBackend:
         medicine id resolved to today's dose), else medication_name resolved to today's dose. Confirmation: the
         patient's word (patient_confirmed) or the detector's taken result, or its confidence of at least
         DETECTOR_CONFIDENCE, from the watch session_id names. With the patient's word, a session_id that names no open
-        watch (unknown, or spent by an earlier record) is no detector evidence, never an error. The open watch of the
-        same dose is settled whether or not the call names it (_watch_for): its review waiting its grace is dropped,
-        the watch is spent, and the clip goes with the request. A dose no longer open answers its state (ALREADY)."""
+        watch (unknown, or spent by an earlier record) is no detector evidence, never an error. The open watch of
+        exactly this dose is settled whether or not the call names it (_watch_for): its review waiting its grace is
+        dropped, the watch is spent, and the clip goes with the request. A watch settled without being named
+        authorises nothing, but its last reading (camera_watch: its result and confidence, or not_read_yet) goes into
+        the request's evidence, so family see when the camera disagrees with the patient's word. A dose no longer
+        open answers its state (ALREADY)."""
         # The detector's verdict counts only for the watch the call names (session_id): a watch started for an
         # earlier dose never authorises a later one, and the patient's word alone is judged now (started_at None)
         intake = None
@@ -676,7 +683,8 @@ class ServerCareBackend:
         # without session_id left it open, so its review and a second clip went out beside the request). What the
         # request says about its video is known before it is made (dose_video.clip_outlook).
         named = self._watch if intake is not None else None
-        watch = named or self._watch_for(dose)
+        settled = None if named is not None else self._watch_for(dose)   # the open watch of this dose, not named
+        watch = named or settled
         clip_sent_earlier = watch is not None and await self._review_carried_clip()
         state = self._session()
         event_started_at = getattr(state, "event_started_at", None) if (state is not None and intake is not None
@@ -696,6 +704,8 @@ class ServerCareBackend:
                                      or self._verification_for(medication_name or dose["med_name"])),
                     "emotion": self._emotion_now(),
                     "video": video}
+        if settled is not None:   # dose_confirmation._request_messages says what the camera read
+            evidence["camera_watch"] = settled.get("reading") or {"result": "not_read_yet", "confidence": None}
         source = "patient_claim" if patient_confirmed else "degraded"
 
         async def work(conn):
@@ -893,19 +903,26 @@ class ToolRegistry:
         self._stopped_at = float("-inf")                        # the last stop, while its hold lasts (dance_asked)
         self._starting = 0                                      # dance calls the robot has not answered yet
         self._intent_runs: dict[str, tuple[float, asyncio.Future]] = {}   # the relay's backstop runs (run_intent)
-        self._held: set[asyncio.Future] = set()                 # FINISH_ON_CLOSE calls still running (hold)
-        self.finished_at = float("-inf")                        # when the last held call ended (monotonic)
+        # FINISH_ON_CLOSE calls still running (hold), in the order they were held: (when, on the event loop's clock,
+        # and the seconds their TIMEOUTS entries allow)
+        self._held: dict[asyncio.Future, tuple[float, float]] = {}
+        self._held_ended = float("-inf")                        # when the last held call ended (the loop's clock)
+        self._steps: dict[object, float] = {}                   # MEDICATION_TOOLS calls running -> until (checking)
+        self.finished_at = float("-inf")                        # when the last held call or medication step ended
+                                                                # (monotonic)
 
-    def hold(self, run: asyncio.Future) -> None:
+    def hold(self, run: asyncio.Future, *names: str) -> None:
         """A FINISH_ON_CLOSE call (a record, a note to family or an alert) that closing GPT-Live leaves to finish
-        (agent_bridge.AgentLiveClient): the companion's quiet pause waits for it (finishing), then gives GPT-Live time
-        to start its answer (finished_at, on the relay's clock: make_registry passes it as `monotonic`), and the
-        chat's end waits for it (close)."""
-        self._held.add(run)
+        (agent_bridge.AgentLiveClient), or the backstop's claim of a dose: the companion's quiet pause waits for it
+        (finishing), then gives GPT-Live time to start its answer (finished_at, on the relay's clock: make_registry
+        passes it as `monotonic`), and the chat's end waits for it (close). `names`: the tools it runs, whose
+        TIMEOUTS entries, counted from now, bound that wait (finish_wait)."""
+        self._held[run] = (run.get_loop().time(), sum(TIMEOUTS.get(name, 10.0) for name in names))
         run.add_done_callback(self._release)
 
     def _release(self, run: asyncio.Future) -> None:
-        self._held.discard(run)
+        self._held.pop(run, None)
+        self._held_ended = run.get_loop().time()
         self.finished_at = self.monotonic()
 
     def finishing(self) -> bool:
@@ -913,13 +930,33 @@ class ToolRegistry:
         counts until its done callback stamped finished_at, so no moment falls between the two."""
         return bool(self._held)
 
+    def checking(self) -> bool:
+        """Whether a step of the medication workflow (MEDICATION_TOOLS: a label check, a watch's result, a record)
+        still runs, within its TIMEOUTS entry counted from its start: the companion's quiet pause waits for it."""
+        now = self.monotonic()
+        return any(now < until for until in self._steps.values())
+
+    def finish_wait(self) -> float:
+        """How long the held calls still running may yet take: each its TIMEOUTS entries, counted from when it was
+        held, one after the other in the order they were held (GPT-Live's client runs its calls one at a time, so a
+        call held behind another starts only when that one ends), and never from before the last one ended."""
+        end = self._held_ended
+        for held_at, seconds in self._held.values():
+            end = max(end, held_at) + seconds
+        return max(0.0, end - asyncio.get_running_loop().time())
+
     async def close(self) -> None:
-        """The chat is over: a held call still running finishes first (at most FINISH_WAIT_SECONDS; a record settles
-        its watch), then the backend reports a watch left without a verdict (ServerCareBackend.close)."""
-        running = [run for run in self._held if not run.done()]
-        if running:
-            await asyncio.wait(running, timeout=FINISH_WAIT_SECONDS)
-        await self.backend.close()
+        """The chat is over: the held calls still running finish first (a record settles its watch), bounded by
+        finish_wait, which is read again whenever one ends or the bound passes, because a claim of a dose holds each
+        record as it starts (run_intent); then the backend reports a watch left without a verdict
+        (ServerCareBackend.close, within DB_TIMEOUT_SECONDS)."""
+        while True:
+            running = [run for run in self._held if not run.done()]
+            wait = self.finish_wait()
+            if not running or wait <= 0:
+                break
+            await asyncio.wait(running, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait_for(self.backend.close(), DB_TIMEOUT_SECONDS)
 
     def dancing(self) -> bool:
         """Whether a dance started recently enough that it may still run (a bare "stop" then stops it)."""
@@ -939,9 +976,12 @@ class ToolRegistry:
     async def run_intent(self, name: str, args: dict) -> dict:
         """Run a tool for the relay's backstop (live_session, services/tool_intents.py): GPT-Live did not ask for it.
         A call GPT-Live makes for the same tool within INTENT_SHARE_SECONDS gets this run's answer instead of a
-        second run (a second dance, a second camera look)."""
+        second run (a second dance, a second camera look). A FINISH_ON_CLOSE run (a claim's record) is held as it
+        starts, so the chat's end waits for every record of a claim (finish_wait)."""
         run = asyncio.ensure_future(self._run(name, args))
         self._intent_runs[name] = (self.clock(), run)
+        if name in FINISH_ON_CLOSE:
+            self.hold(run, name)
         return await asyncio.shield(run)
 
     def forget_intents(self) -> None:
@@ -959,6 +999,19 @@ class ToolRegistry:
         return await self._run(name, args)
 
     async def _run(self, name: str, args: dict | None) -> dict:
+        if name not in MEDICATION_TOOLS:
+            return await self._call(name, args)
+        # A step of the medication workflow: the companion's quiet pause waits while it runs, at most its TIMEOUTS
+        # entry (checking), then gives GPT-Live time to take the next step (finished_at, as after a held call)
+        step = object()
+        self._steps[step] = self.monotonic() + TIMEOUTS.get(name, 10.0)
+        try:
+            return await self._call(name, args)
+        finally:
+            del self._steps[step]
+            self.finished_at = self.monotonic()
+
+    async def _call(self, name: str, args: dict | None) -> dict:
         handler = self._handlers.get(name)
         if handler is None:
             return {"ok": False, "tool": name, "error": "unknown_tool"}

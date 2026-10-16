@@ -121,14 +121,65 @@ def test_a_record_without_session_id_settles_the_open_watch_of_the_same_dose(now
     assert [report["kind"] for report in reports] == ["intake"]   # the chat's end reports no unresolved watch
 
 
-def test_a_record_of_another_dose_of_the_watched_medicine_settles_the_watch(now, camera, reports, captures, asked):
+def test_a_record_of_another_dose_of_the_watched_medicine_leaves_the_watch_alone(now, camera, reports, captures,
+                                                                                asked):
+    """Round 3 (F1.1): the same medicine is not the same dose. Before, names_match on the medicine settled the watch of
+    tonight's dose with a record of this morning's, and the watch's camera reading was lost."""
     doses = intakes()
     doses[1].update(intake_stats="missed", actual_intake_time=None)    # this morning's Allegra, never taken
     b, _ = backend(Conn(doses, MEDS), monotonic=lambda: 100.0)
-    watched_uncertain(b, camera)                                        # the watch is on tonight's dose, dose-2
-    answer = asyncio.run(b.record_medication_taken("dose-1", True))    # names_match on the medicine's name
+    session_id = watched_uncertain(b, camera)                           # the watch is on tonight's dose, dose-2
+    answer = asyncio.run(b.record_medication_taken("dose-1", True))
     assert answer["status"] == "pending_confirmation" and answer["medication_id"] == "dose-1"
-    assert reports[0]["task"].cancelled() and b._watch is None and len(captures) == 1
+    assert not reports[0]["task"].cancelled() and b._watch["id"] == session_id   # tonight's watch goes on
+    assert len(captures) == 1 and "camera_watch" not in asked[0]["evidence"]     # this morning's request has its clip
+
+
+@pytest.mark.parametrize("seen, reading", [
+    ("not_taken", {"result": "not_taken", "confidence": 0.0}),           # the watch timed out and saw nothing
+    ("uncertain", {"result": "uncertain", "confidence": 0.48}),          # a hand-to-mouth moment it was unsure of
+    ("never_read", {"result": "not_read_yet", "confidence": None}),      # GPT-Live never asked for the result
+])
+def test_a_record_that_settles_a_watch_tells_family_what_the_camera_read(now, camera, reports, captures, asked,
+                                                                          seen, reading):
+    """Round 3 (F1.1): the patient's word settles the watch of the same dose without naming it, and the watch's own
+    reading goes into the request's evidence, so family see when the camera disagrees with the patient."""
+    clock = [100.0]
+    b, _ = backend(monotonic=lambda: clock[0])
+    started = asyncio.run(b.start_pill_intake_detection(30, "Allegra"))
+    if seen == "not_taken":
+        clock[0] += 31                                                   # past the watch's 30 s
+        assert asyncio.run(b.get_pill_intake_result(started["session_id"]))["result"] == "not_taken"
+    elif seen == "uncertain":
+        camera.extra_events.append({"event_id": "e1", "decision": "uncertain", "confidence": 0.48, "evidence": {}})
+        assert asyncio.run(b.get_pill_intake_result(started["session_id"]))["result"] == "uncertain"
+    answer = asyncio.run(b.record_medication_taken("dose-2", True))
+    assert answer["status"] == "pending_confirmation" and b._watch is None
+    evidence = asked[0]["evidence"]
+    assert evidence["camera_watch"] == reading
+    assert evidence["detector_result"] is None and evidence["confidence"] is None   # its verdict authorised nothing
+    text = dose_confirmation._request_messages(
+        {"patient": "阿嬤", "meds": "Allegra", "slot": "10/12 20:00"}, "patient_claim", "conf-1", 34,
+        evidence=evidence)[0]["text"]
+    zh, en = {"not_taken": ("⚠️ 鏡頭觀察：沒有看到服藥動作，和本人說的不同"
+                            "（AI 判斷已服藥的可能性：0%（低））",
+                            "⚠️ Camera watch: no intake was seen, unlike what the patient said "
+                            "(AI estimate that it was taken: 0% (low))"),
+              "uncertain": ("鏡頭觀察：有手到嘴邊的動作，但 AI 不確定"
+                            "（AI 判斷已服藥的可能性：48%（不確定））",
+                            "Camera watch: a hand-to-mouth moment the AI was not sure of "
+                            "(AI estimate that it was taken: 48% (uncertain))"),
+              "never_read": ("鏡頭觀察：還沒有讀取結果", "Camera watch: its result was not read yet")}[seen]
+    assert zh in text and en in text
+
+
+def test_a_watch_started_without_a_medicine_is_never_settled_by_a_record(now, camera, reports, captures, asked):
+    """Round 3 (F1.2): a watch started with medication_name null has no dose and no name, so no record settles it."""
+    b, _ = backend(monotonic=lambda: 100.0)
+    session_id = watched_uncertain(b, camera, None)
+    answer = asyncio.run(b.record_medication_taken("dose-2", True))
+    assert answer["status"] == "pending_confirmation" and "camera_watch" not in asked[0]["evidence"]
+    assert not reports[0]["task"].cancelled() and b._watch["id"] == session_id
 
 
 def test_a_watch_never_read_is_settled_too_and_the_chats_end_reports_nothing(now, camera, reports, captures, asked):
@@ -264,7 +315,7 @@ class GatedRegistry:
         self.gates = {name: asyncio.Event() for name in gated}
         self.started, self.finished, self.held = [], [], []
 
-    def hold(self, run):
+    def hold(self, run, *names):
         self.held.append(run)
 
     async def execute(self, name, args):
@@ -332,7 +383,7 @@ def test_the_chats_end_waits_for_a_held_record_before_reporting_an_open_watch(no
             await gate.wait()
             return await registry.execute("record_medication_taken", dict(RECORD_ARGS))
         run = asyncio.ensure_future(record())
-        registry.hold(run)
+        registry.hold(run, "record_medication_taken")
         busy = registry.finishing()
         closing = asyncio.ensure_future(registry.close())
         await asyncio.sleep(0.01)
@@ -345,8 +396,78 @@ def test_the_chats_end_waits_for_a_held_record_before_reporting_an_open_watch(no
     assert busy is True and waited is True and still is False
     assert result["ok"] is True and result["result"]["status"] == "pending_confirmation"
     assert reports == []                                            # the record settled the watch first
-    assert tool_registry.FINISH_WAIT_SECONDS == sum(tool_registry.TIMEOUTS[name]
-                                                    for name in tool_registry.FINISH_ON_CLOSE)
+
+
+class SlowRecords:
+    """A care backend whose records take `seconds` each; it notes each record and when the chat's end reached it
+    (close: a watch left open would be reported to family then)."""
+
+    def __init__(self, order, seconds):
+        self.order, self.seconds = order, seconds
+
+    async def check_medication_due(self):
+        return {"status": "pending_allowed", "doses": []}
+
+    async def record_medication_taken(self, medication_id, patient_confirmed, medication_name, session_id):
+        await asyncio.sleep(self.seconds)
+        self.order.append(f"recorded {medication_id}")
+        return {"status": "pending_confirmation", "medication_id": medication_id}
+
+    async def close(self):
+        self.order.append("watch reported")
+
+
+def test_the_chats_end_waits_for_every_held_call_not_one_of_each_kind(monkeypatch):
+    """Round 3 (F1.3): FINISH_WAIT_SECONDS (10 + 8 + 12 s) assumed one held call of each kind. GPT-Live's client runs
+    its calls one at a time, so two records held together take two records' time, more than that fixed bound, and
+    the chat's end reported the watch unresolved while the second still ran. Now the wait is bounded from the calls
+    actually held: each one's TIMEOUTS entry, counted from when it was held, one after the other."""
+    for name, seconds in (("record_medication_taken", 1.0), ("notify_family", 0.1), ("emergency_alert", 0.1)):
+        monkeypatch.setitem(tool_registry.TIMEOUTS, name, seconds)
+    monkeypatch.setattr(tool_registry, "FINISH_WAIT_SECONDS", 1.2, raising=False)   # the old bound for these entries
+    order = []
+
+    async def run():
+        socket = FakeSocket(starts_only)
+        registry = ToolRegistry(Robot(), SlowRecords(order, 0.7))
+        c = client(socket, registry)
+        await c.start()
+        for number in (1, 2):                       # two records, together 1.4 s: past the old 1.2 s bound
+            socket.push(call_event("record_medication_taken",
+                                   f'{{"medication_id": "dose-{number}", "patient_confirmed": true}}',
+                                   call_id=f"c{number}"))
+        await _until(lambda: c.requested.count("record_medication_taken") == 2)
+        bound = registry.finish_wait()
+        await c.close(wait=0.05)                    # the chat ends while the first record runs
+        await asyncio.wait_for(registry.close(), 3)
+        return bound
+
+    bound = asyncio.run(run())
+    assert order == ["recorded dose-1", "recorded dose-2", "watch reported"]
+    assert bound == pytest.approx(2.0, abs=0.05)    # 1 s for each record held, one after the other
+
+
+def test_a_claim_of_a_dose_holds_each_record_as_it_starts(monkeypatch):
+    """Round 3 (F1.3): the backstop's claim of a dose is held for its due check and its first record; a slot of two
+    medicines records twice, and run_intent holds each record as it starts, so the chat's end waits for both."""
+    for name, seconds in (("check_medication_due", 0.1), ("record_medication_taken", 0.6)):
+        monkeypatch.setitem(tool_registry.TIMEOUTS, name, seconds)
+    order = []
+
+    async def run():
+        registry = ToolRegistry(Robot(), SlowRecords(order, 0.4))
+
+        async def claim():                          # live_session.LiveRelay._run_intent with _record_claim
+            await registry.run_intent("check_medication_due", {})
+            for number in (1, 2):
+                await registry.run_intent("record_medication_taken",
+                                          {"medication_id": f"dose-{number}", "patient_confirmed": True})
+        registry.hold(asyncio.ensure_future(claim()), "check_medication_due", "record_medication_taken")
+        await asyncio.sleep(0)
+        await asyncio.wait_for(registry.close(), 3)   # the chat ends at once: 0.7 s of claim, 0.8 s of records
+
+    asyncio.run(run())
+    assert order == ["recorded dose-1", "recorded dose-2", "watch reported"]
 
 
 def test_the_relays_end_waits_for_a_held_call_longer_than_a_database_call(world, monkeypatch):
@@ -364,12 +485,38 @@ def test_the_relays_end_waits_for_a_held_call_longer_than_a_database_call(world,
         async def record():
             await asyncio.sleep(0.2)
             order.append("record finished")
-        relay.tools.hold(asyncio.ensure_future(record()))
+        relay.tools.hold(asyncio.ensure_future(record()), "record_medication_taken")
         world.robot.inbox.put_nowait({"type": "end", "reason": "goodbye"})
         await asyncio.wait_for(running, 5)
 
     asyncio.run(scenario())
     assert order == ["record finished", "tools closed"]
+
+
+def test_the_patients_live_chat_slot_is_freed_before_the_held_calls_are_waited_for(world):
+    """Round 3 (F1.5): after the robot's side ended, the relay's finally waited for held calls (up to 35 s) while the
+    patient's live-chat slot (api_device._live_chats) stayed taken, so the patient's next live chat was refused with
+    4409. Now the relay says its chat is over (on_over) once GPT-Live is closed, before that wait."""
+    order = []
+
+    class Ending(Backend):
+        async def close(self):
+            order.append("tools closed")
+
+    async def scenario():
+        relay, running = await _begin(world)
+        relay.on_over = lambda: order.append(f"slot freed, GPT-Live closes {world.clients[-1].closes}")
+        relay.tools = ToolRegistry(Link(), Ending())
+
+        async def record():
+            await asyncio.sleep(0.2)
+            order.append("record finished")
+        relay.tools.hold(asyncio.ensure_future(record()), "record_medication_taken")
+        world.robot.inbox.put_nowait({"type": "end", "reason": "goodbye"})
+        await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+    assert order == ["slot freed, GPT-Live closes 1", "record finished", "tools closed"]
 
 
 def test_a_held_call_counts_as_finishing_until_its_end_is_stamped_on_the_relays_clock():
@@ -378,7 +525,7 @@ def test_a_held_call_counts_as_finishing_until_its_end_is_stamped_on_the_relays_
     async def main():
         registry = ToolRegistry(Robot(), types.SimpleNamespace(), monotonic=lambda: clock[0])
         run = asyncio.get_running_loop().create_future()
-        registry.hold(run)
+        registry.hold(run, "record_medication_taken")
         before = registry.finished_at
         run.set_result(None)
         just_done = registry.finishing()          # done, but its done callback (which stamps the time) has not run
@@ -405,7 +552,7 @@ async def _record_ran_through_a_quiet_spell(companion):
     await _speak(companion)
     relay.tools = ToolRegistry(Link(), Backend(), monotonic=companion.clock)
     record = asyncio.get_running_loop().create_future()
-    relay.tools.hold(record)
+    relay.tools.hold(record, "record_medication_taken")
     await _live(companion, _said("我吃完藥了"))
     await _step(companion, relay, 1.75)                       # the patient's turn is stored
     await _step(companion, relay, 40)                         # 40 s of quiet, but the record still runs
@@ -443,6 +590,63 @@ def test_the_companions_quiet_pause_comes_once_gpt_live_leaves_a_finished_record
         await _step(companion, relay, 0.2)                    # INTENT_WAIT_SECONDS passed with no answer: paused
         assert live_session.INTENT_WAIT_SECONDS == 6.0
         assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+class LabelCheck(Backend):
+    """A care backend whose label check (verify_medication: the OCR, up to 36 s) answers once the test opens it."""
+
+    def __init__(self):
+        super().__init__()
+        self.ocr = asyncio.Event()
+
+    async def verify_medication(self, jpeg, expected_medication):
+        await self.ocr.wait()
+        return {"result": "match", "expected_medication": expected_medication}
+
+
+async def _label_check_through_a_quiet_spell(companion):
+    """A companion stretch whose patient asked Reachy to check the medicine, then fell quiet for 33 s while GPT-Live's
+    verify_medication still ran: no pause meanwhile (round 3, F1.4: before, the pause closed GPT-Live at 30 s, before
+    it could ask for record_medication_taken)."""
+    relay, running = await _start(companion)
+    await _speak(companion)
+    backend = LabelCheck()
+    relay.tools = ToolRegistry(Link(), backend, monotonic=companion.clock)
+    call = asyncio.ensure_future(relay.tools.execute("verify_medication", {"expected_medication": "Allegra"}))
+    await _live(companion, _said("你幫我看這是不是我的藥"))
+    await _step(companion, relay, 1.75)                       # the patient's turn is stored
+    await _step(companion, relay, 33)                         # 33 s of quiet, but the label check still runs
+    assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+    return relay, running, backend, call
+
+
+def test_the_companions_quiet_pause_waits_for_a_medication_step_and_gpt_lives_next_move(companion):
+    async def scenario():
+        relay, running, backend, call = await _label_check_through_a_quiet_spell(companion)
+        backend.ocr.set()
+        assert (await call)["ok"] is True                     # the label check answered GPT-Live
+        await _step(companion, relay, 5.8)                    # GPT-Live may still ask for the next step
+        assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+        await _step(companion, relay, 0.3)                    # INTENT_WAIT_SECONDS with nothing: paused
+        assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+def test_the_quiet_pause_waits_for_a_medication_step_no_longer_than_its_own_time_limit(companion):
+    async def scenario():
+        relay, running, backend, call = await _label_check_through_a_quiet_spell(companion)
+        assert tool_registry.TIMEOUTS["verify_medication"] == 36.0
+        await _step(companion, relay, 1.5)                    # 36 s after it started: the bound has passed
+        assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
+        backend.ocr.set()
+        await call
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)
 

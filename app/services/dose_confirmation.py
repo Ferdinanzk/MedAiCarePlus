@@ -60,6 +60,16 @@ _VIDEO_LINES = {
 }
 # The reminder comes an hour after the request: a video that went with it is in the messages before
 _VIDEO_REMINDER_LINE = ("📹 影片請看稍早的訊息。", "📹 The video is in the earlier messages.")
+# What the GPT-Live agent's watch of the dose read when the patient's word settled it (evidence "camera_watch",
+# tool_registry.record_medication_taken), so family see when the camera disagrees with the patient
+_WATCH_WORDS = {
+    "taken": ("偵測到服藥動作", "an intake was detected"),
+    "uncertain": ("有手到嘴邊的動作，但 AI 不確定", "a hand-to-mouth moment the AI was not sure of"),
+    "not_taken": ("沒有看到服藥動作，和本人說的不同",
+                  "no intake was seen, unlike what the patient said"),
+    "still_monitoring": ("還在觀察，沒有結果", "still watching, with no result yet"),
+    "not_read_yet": ("還沒有讀取結果", "its result was not read yet"),
+}
 
 
 class NothingToConfirm(ValueError):
@@ -173,6 +183,16 @@ def _request_messages(details: dict, source: str, confirmation_id: str, contact_
     if words:
         extra_zh += f"藥物辨識：{words[0]}\n"
         extra_en += f"Medicine check: {words[1]}\n"
+    watch = evidence.get("camera_watch") if isinstance(evidence.get("camera_watch"), dict) else {}
+    seen = _WATCH_WORDS.get(str(watch.get("result")))
+    if seen:
+        score = dose_report.number(watch.get("confidence"))
+        found = dose_report.ai_estimate(score, None) if score is not None else None
+        mark = "⚠️ " if watch.get("result") == "not_taken" else ""
+        estimate_zh = f"（AI 判斷已服藥的可能性：{found['zh']}）" if found else ""
+        estimate_en = f" (AI estimate that it was taken: {found['en']})" if found else ""
+        extra_zh += f"{mark}鏡頭觀察：{seen[0]}{estimate_zh}\n"
+        extra_en += f"{mark}Camera watch: {seen[1]}{estimate_en}\n"
     mood = dose_report.emotion_note(evidence.get("emotion"))
     if mood:
         extra_zh += f"{mood[0]}\n"

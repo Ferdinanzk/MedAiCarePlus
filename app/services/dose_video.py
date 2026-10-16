@@ -58,6 +58,7 @@ UNSENT_MAX_AGE = timedelta(hours=4)    # a caregiver confirmation can take 2 h; 
 ORPHAN_MIN_AGE_SECONDS = 600    # a file with no row younger than this may still be getting its row
 BASE_URL_CACHE_SECONDS = 300
 BASE_URL_RETRY_SECONDS = 60
+CONSENT_READ_SECONDS = 5.0      # clip_outlook's consent read (about tool_registry.DB_TIMEOUT_SECONDS): then unreadable
 TOKEN_BYTES = 32                # secrets.token_urlsafe(32): 43 characters
 TOKEN_LENGTH = 43
 TRACKING_PREFIX = "dv-"
@@ -79,6 +80,10 @@ WITH_REQUEST = "with_request"     # the request's own clip follows it (capture, 
 SENT_EARLIER = "sent_earlier"     # the agent's review message of the same moment carried the clip
 NO_CONSENT = "none:no_consent"    # "Dose videos for family" is off for this patient
 NO_FRAMES = "none:no_frames"      # fewer than MIN_FRAMES recent frames buffered
+# The family request a clip `v` was made for: the newest request of its doses made before the clip (capture runs
+# once the request exists). A kept clip goes only with it (retry_unsent), and cleanup says why a clip is lost.
+OWN_REQUEST_SQL = ("SELECT {columns} FROM dose_confirmation dc WHERE dc.u_id = v.u_id AND dc.intk_ids && v.intk_ids "
+                   "AND dc.created_at <= v.created_at ORDER BY dc.created_at DESC LIMIT 1")
 
 
 # ── frames held in memory ──
@@ -134,12 +139,13 @@ async def clip_outlook(u_id: int, *, event_started_at: float | None = None) -> t
     at least MIN_FRAMES fresh frames are buffered, else (NO_CONSENT, []) or (NO_FRAMES, []). Give the frames to
     capture() once the request exists.
 
-    Never raises, so a request is never lost to it: a consent that cannot be read leaves the answer to the frames,
-    which are buffered only for sessions that started with the consent, and _store reads it again before writing.
-    NO_FRAMES is a lost video and logs one WARNING; NO_CONSENT is the patient's choice and logs nothing."""
+    Never raises, so a request is never lost to it: a consent that cannot be read (also within CONSENT_READ_SECONDS:
+    a slow database must not time the record out) leaves the answer to the frames, which are buffered only for
+    sessions that started with the consent, and _store reads it again before writing. NO_FRAMES is a lost video and
+    logs one WARNING; NO_CONSENT is the patient's choice and logs nothing."""
     frames = clip_frames(u_id, time.monotonic(), event_started_at)
     try:
-        if not await enabled(u_id):
+        if not await asyncio.wait_for(enabled(u_id), CONSENT_READ_SECONDS):
             return NO_CONSENT, []
     except Exception as error:
         log.warning("dose video for patient %s: the consent could not be read (%s); the buffered frames decide",
@@ -211,30 +217,36 @@ async def _store(u_id: int, intk_ids: list[int], source: str, frames: list) -> N
             drop_buffer(u_id)
             return
         video_id, info = await make_clip(frames)
-        base_url = await public_base_url()   # before the transaction: it may ask LINE and the tunnel
+        base_url, reason = await public_link()   # before the transaction: it may ask LINE and the tunnel
         async with get_pool().acquire() as conn, conn.transaction():
             await insert_clip(conn, video_id, u_id, intk_ids, source, info)
             if base_url is not None:
                 await send_with_confirmation(conn, video_id, u_id, intk_ids, base_url)
         if base_url is None:   # the dose_videos job sends it once a link answers (retry_unsent)
-            log.warning("dose video %s for intakes %s kept unsent: no public link (%s)", video_id, intk_ids,
-                        no_link_reason())
+            log.warning("dose video %s for intakes %s kept unsent: no public link (%s)", video_id, intk_ids, reason)
     except Exception:
         log.exception("dose video for intakes %s failed", intk_ids)
         if video_id is not None:
             _unlink(video_id)
 
 
-async def send_with_confirmation(conn, video_id: str, u_id: int, intk_ids: list[int], base_url: str) -> int:
+async def send_with_confirmation(conn, video_id: str, u_id: int, intk_ids: list[int], base_url: str,
+                                 request_id: str | None = None) -> int:
     """A clip of a dose that is waiting for a caregiver's answer goes out at once, right after the request, so the
     caregiver can watch it before answering, whatever the camera's frame rate was. Otherwise it waits for the
-    "dose taken" message. Returns how many contacts it was queued for."""
+    "dose taken" message. `request_id`: only while that request is open (a kept clip, retry_unsent); else the
+    newest open request of its doses (the one just made). Returns how many contacts it was queued for."""
     from app.services import dose_confirmation, outbox   # dose_confirmation -> intake_repository -> this module
 
-    request = await conn.fetchrow(
-        "SELECT dc.created_at, u.name FROM dose_confirmation dc JOIN \"user\" u ON u.u_id = dc.u_id "
-        "WHERE dc.u_id = $1 AND dc.intk_ids && $2::int[] AND dc.resolution IS NULL "
-        "ORDER BY dc.created_at DESC LIMIT 1", u_id, list(intk_ids))
+    if request_id is not None:
+        request = await conn.fetchrow(
+            "SELECT dc.created_at, u.name FROM dose_confirmation dc JOIN \"user\" u ON u.u_id = dc.u_id "
+            "WHERE dc.confirmation_id = $1::uuid AND dc.resolution IS NULL", str(request_id))
+    else:
+        request = await conn.fetchrow(
+            "SELECT dc.created_at, u.name FROM dose_confirmation dc JOIN \"user\" u ON u.u_id = dc.u_id "
+            "WHERE dc.u_id = $1 AND dc.intk_ids && $2::int[] AND dc.resolution IS NULL "
+            "ORDER BY dc.created_at DESC LIMIT 1", u_id, list(intk_ids))
     if request is None:
         return 0
     contacts = await dose_confirmation._eligible_contacts(conn, u_id)
@@ -329,9 +341,9 @@ def _webhook_base_url() -> tuple[str | None, str | None]:
         response = requests.get(config.LINE_WEBHOOK_ENDPOINT_URL, timeout=3,
                                 headers={"Authorization": f"Bearer {config.LINE_CHANNEL_ACCESS_TOKEN}"})
         endpoint = str(response.json().get("endpoint") or "") if response.status_code == 200 else ""
-    except (requests.RequestException, ValueError):
-        endpoint = ""
-    parts = urlsplit(endpoint)
+        parts = urlsplit(endpoint)   # a malformed address ("https://[x") raises ValueError
+    except (requests.RequestException, ValueError, AttributeError):   # AttributeError: JSON that is no object
+        return None, WEBHOOK_ERROR
     if parts.scheme != "https" or not parts.netloc:
         return None, WEBHOOK_ERROR
     base = f"https://{parts.netloc}"
@@ -358,8 +370,16 @@ def _note(base: str | None, reason: str | None) -> None:
 
 
 def no_link_reason() -> str | None:
-    """Why the last check found no public link (for the WARNING of a clip held back or lost); None when it found one."""
+    """Why the last check found no public link; None when it found one. Read it through public_link, with the
+    answer it explains: a later check (another clip, the job) may change it."""
     return _link_reason
+
+
+async def public_link() -> tuple[str | None, str | None]:
+    """(the public base URL, None), or (None, why there is none): the reason that went with this very answer, read
+    before anything else can run, for the WARNING of a clip held back or lost."""
+    base = await public_base_url()
+    return base, (None if base is not None else no_link_reason())
 
 
 async def public_base_url() -> str | None:
@@ -518,14 +538,17 @@ def delete_reason(row, consented: bool, now: datetime) -> str | None:
 
 async def cleanup(now: datetime | None = None) -> int:
     """Every few minutes: delete clips whose time is up (delete_reason), files without a live row, and buffers
-    no session has fed for a while. Returns how many clips were deleted."""
+    no session has fed for a while. A clip never sent within UNSENT_MAX_AGE is a lost video: one WARNING each, with
+    why (its own family request was closed, or no public link answered). Returns how many clips were deleted."""
     now = now or datetime.now(timezone.utc)
     deleted = 0
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT v.video_id, v.u_id, v.created_at, v.sent_at, v.expires_at, COUNT(l.link_id) AS links, "
+            "SELECT v.video_id, v.u_id, v.intk_ids, v.created_at, v.sent_at, v.expires_at, "
+            "COUNT(l.link_id) AS links, "
             "COUNT(l.link_id) FILTER (WHERE l.fetched_at IS NULL AND l.viewed_at IS NULL) AS waiting, "
-            "MAX(GREATEST(l.fetched_at, l.viewed_at)) AS last_done "
+            "MAX(GREATEST(l.fetched_at, l.viewed_at)) AS last_done, "
+            f"({OWN_REQUEST_SQL.format(columns='dc.resolution IS NULL')}) AS request_open "
             "FROM dose_video v LEFT JOIN dose_video_link l ON l.video_id = v.video_id "
             "WHERE v.deleted_at IS NULL GROUP BY v.video_id")
         consents: dict[int, bool] = {}
@@ -537,6 +560,10 @@ async def cleanup(now: datetime | None = None) -> int:
             if reason:
                 await delete_video(conn, str(row["video_id"]), reason)
                 deleted += 1
+                if reason == "not_sent":
+                    log.warning("dose video %s for intakes %s deleted unsent: %s", row["video_id"],
+                                list(row["intk_ids"]), "its family request was closed"
+                                if row["request_open"] is False else "no public link for 4 h")
             else:
                 kept.add(str(row["video_id"]))
     _remove_orphans(kept)
@@ -547,16 +574,17 @@ async def cleanup(now: datetime | None = None) -> int:
 
 
 async def retry_unsent(now: datetime | None = None) -> int:
-    """A clip _store kept unsent for lack of a public link goes out once a link answers, while the family request it
-    belongs with is still open and the clip is younger than UNSENT_MAX_AGE. A clip whose request was answered or
-    expired is left to the deletion rules. Returns how many clips were sent."""
+    """A clip _store kept unsent for lack of a public link goes out once a link answers, with the family request it
+    was made for (OWN_REQUEST_SQL), while that request is still open and the clip is younger than UNSENT_MAX_AGE.
+    A clip whose request was answered or expired is left to the deletion rules, even when a newer request for the
+    same dose is open: family must never get older footage under a new request. Returns how many clips were sent."""
     now = now or datetime.now(timezone.utc)
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT v.video_id, v.u_id, v.intk_ids FROM dose_video v "
-            "WHERE v.deleted_at IS NULL AND v.sent_at IS NULL AND v.created_at > $1 "
-            "AND EXISTS (SELECT 1 FROM dose_confirmation dc WHERE dc.u_id = v.u_id AND dc.intk_ids && v.intk_ids "
-            "AND dc.resolution IS NULL) ORDER BY v.created_at", now - UNSENT_MAX_AGE)
+            "SELECT v.video_id, v.u_id, v.intk_ids, r.confirmation_id FROM dose_video v "
+            f"CROSS JOIN LATERAL ({OWN_REQUEST_SQL.format(columns='dc.confirmation_id, dc.resolution')}) r "
+            "WHERE v.deleted_at IS NULL AND v.sent_at IS NULL AND v.created_at > $1 AND r.resolution IS NULL "
+            "ORDER BY v.created_at", now - UNSENT_MAX_AGE)
     base_url = await public_base_url() if rows else None   # asked outside a connection: it may take seconds
     if base_url is None:
         return 0
@@ -573,7 +601,8 @@ async def retry_unsent(now: datetime | None = None) -> int:
                     if await conn.fetchval("SELECT video_id FROM dose_video WHERE video_id = $1::uuid "
                                            "AND deleted_at IS NULL AND sent_at IS NULL FOR UPDATE", video_id) is None:
                         continue
-                    contacts = await send_with_confirmation(conn, video_id, row["u_id"], intk_ids, base_url)
+                    contacts = await send_with_confirmation(conn, video_id, row["u_id"], intk_ids, base_url,
+                                                            request_id=row["confirmation_id"])
                 if contacts:
                     sent += 1
                     log.info("dose video %s for intakes %s sent late, now that a public link answers", video_id,

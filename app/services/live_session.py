@@ -49,8 +49,9 @@ instructions plus companion_note (Reachy already greeted; the last HISTORY_TURNS
 data); the pre-roll goes first (at up to PRE_ROLL_SEND_SPEED times real time: GPT-Live drops a faster burst), then
 the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
 transcript of it, or the robot's speech signals) once GPT-Live's sound has ended and no record, note to family or
-alert still runs (tool_registry.FINISH_ON_CLOSE) or ended less than INTENT_WAIT_SECONDS ago (GPT-Live's answer to it
-may still start), or, once the stretch is
+alert (tool_registry.FINISH_ON_CLOSE) and no step of the medication workflow (tool_registry.MEDICATION_TOOLS, within
+its own time limit) still runs or ended less than INTENT_WAIT_SECONDS ago (GPT-Live's answer to it, or its next
+step, may still start), or, once the stretch is
 STRETCH_MAX_SECONDS old, the patient's next turn gap (STRETCH_HARD_MAX_SECONDS at the latest, a reply cut with a
 flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient's words screened and grouped,
 OpenAI's cut-off judged), the open turns are stored and the robot gets {"type": "paused"}. A
@@ -79,7 +80,7 @@ from app import config
 from app.database import get_pool
 from app.services import (affect, after_chat, agent_bridge, ai_settings, consent_service, conversation,
                           device_auth, dose_status, gpt_live_config, memory, monitor_service, reachy_tasks, reminders,
-                          tool_intents, tool_registry)
+                          tool_intents)
 from app.services.live_client import LiveClient, LiveError
 
 log = logging.getLogger(__name__)
@@ -607,6 +608,9 @@ class LiveRelay:
         self._speaking_until = float("-inf")         # the microphone goes to GPT-Live as silence until then
         self._speak_lock = asyncio.Lock()
         self._reminder: dict | None = None           # the reminder this chat's check-in task was made for
+        # Called once the chat is over and GPT-Live closed, before the held tool calls are waited for (run):
+        # api_device frees the patient's live-chat slot, so the next live chat is not refused meanwhile
+        self.on_over = None
 
     async def run(self) -> None:
         """The whole live chat; returns when it is over and never raises. GPT-Live is always closed at the end. A
@@ -624,13 +628,14 @@ class LiveRelay:
             for task in list(self._intent_tasks):
                 task.cancel()   # the chat is over: no backstop tool and no line for it (a claim of a dose is held)
             await self._close_live()
+            if self.on_over is not None:
+                self.on_over()   # the robot's side is over: a new live chat may start while held calls finish
             if self.tools is not None:
                 self.tools.robot.close()   # a tool still waiting for the robot's answer fails now
                 try:
                     # A record, a note to family or an alert still running finishes first; then a watch left open
-                    # is reported to family (ToolRegistry.close)
-                    await asyncio.wait_for(self.tools.close(),
-                                           tool_registry.FINISH_WAIT_SECONDS + DB_TIMEOUT_SECONDS)
+                    # is reported to family (ToolRegistry.close, bounded by the calls it holds)
+                    await self.tools.close()
                 except Exception:
                     log.exception("live chat %s: the tools did not close cleanly", self.conversation_id)
 
@@ -1051,12 +1056,14 @@ class LiveRelay:
             self._finish("end", "limit")
 
     def _tool_answer_due(self, now: float) -> bool:
-        """Whether GPT-Live may still owe the patient its answer to a record, a note to family or an alert: one still
-        runs (ToolRegistry.finishing), or one ended less than INTENT_WAIT_SECONDS ago (ToolRegistry.finished_at, on
-        this clock). When it ends, the call has just sent GPT-Live its output and response.create, and the answer's
-        sound cannot start at once; once it starts, _segment holds the quiet pause until it ends. With no answer by
-        then (INTENT_WAIT_SECONDS, the bound the backstop gives GPT-Live too), the pause may come."""
-        return self.tools is not None and (self.tools.finishing()
+        """Whether GPT-Live may still owe the patient its answer to a record, a note to family or an alert, or its
+        next step of the medication workflow: one still runs (ToolRegistry.finishing; a step of the workflow, such as
+        verify_medication's OCR or a watch's result, ToolRegistry.checking, within its own TIMEOUTS entry), or one
+        ended less than INTENT_WAIT_SECONDS ago (ToolRegistry.finished_at, on this clock). When it ends, the call has
+        just sent GPT-Live its output and response.create, and the answer's sound (or its next call) cannot start at
+        once; once the sound starts, _segment holds the quiet pause until it ends. With no answer by then
+        (INTENT_WAIT_SECONDS, the bound the backstop gives GPT-Live too), the pause may come."""
+        return self.tools is not None and (self.tools.finishing() or self.tools.checking()
                                            or now - self.tools.finished_at < INTENT_WAIT_SECONDS)
 
     async def _check_access(self) -> None:
@@ -1681,8 +1688,9 @@ class LiveRelay:
         task = asyncio.create_task(self._run_intent(intent))
         if intent["kind"] == "took_medicine":
             # A request to family, like GPT-Live's own record (tool_registry.FINISH_ON_CLOSE): the chat's end never
-            # cuts it between the due check and the record, and the companion's quiet pause waits for it
-            self.tools.hold(task)
+            # cuts it between the due check and the record, and the companion's quiet pause waits for it. Held for
+            # its due check and first record; each record is held again as it starts (ToolRegistry.run_intent)
+            self.tools.hold(task, "check_medication_due", "record_medication_taken")
             return True
         self._intent_tasks.add(task)
         task.add_done_callback(self._intent_tasks.discard)

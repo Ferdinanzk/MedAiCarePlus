@@ -149,15 +149,16 @@ async def check_taken_confirmations():
                 u_id)
             label = slot_label(slot)
             # Looked up before the transaction: it may ask LINE and the tunnel (a few seconds at worst).
-            base_url = (await dose_video.public_base_url()
-                        if contacts and await dose_video.has_unsent(conn, u_id, intk_ids) else None)
+            # The reason goes with the answer: a check made meanwhile (another clip) may find something else
+            base_url, no_link = ((await dose_video.public_link())
+                                 if contacts and await dose_video.has_unsent(conn, u_id, intk_ids) else (None, None))
             async with conn.transaction():
                 videos = await dose_video.unsent_videos(conn, u_id, intk_ids) if contacts else []
                 if videos and base_url is None:   # LINE can't download from us now: nobody will get these clips
                     for video in videos:
                         await dose_video.delete_video(conn, str(video["video_id"]), "no_public_link")
                         log.warning("dose video %s for intakes %s deleted: no public link (%s)", video["video_id"],
-                                    video["intk_ids"], dose_video.no_link_reason())
+                                    video["intk_ids"], no_link)
                     videos = []
                 if not contacts:
                     await dose_video.discard(conn, u_id, intk_ids, "no_recipients")

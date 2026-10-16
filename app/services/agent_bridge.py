@@ -41,7 +41,7 @@ from collections import defaultdict
 
 from app.services import gpt_live_config
 from app.services.live_client import LiveClient, LiveError
-from app.services.tool_registry import FINISH_ON_CLOSE, ServerCareBackend, ToolError, ToolRegistry
+from app.services.tool_registry import FINISH_ON_CLOSE, MEDICATION_TOOLS, ServerCareBackend, ToolError, ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +49,6 @@ CAMERA_SECONDS = 5.0    # the robot's frame must come within this (it captures a
 EMOTE_SECONDS = 5.0     # the robot's emote answer (it only queues the gesture)
 EMOTION_SECONDS = 4.0   # the robot's emotion report (its engine's last result; no model runs for it)
 DANCE_SECONDS = 10.0    # the robot's dance answer (it reads its dance library from disk on the first call, then queues)
-MEDICATION_TOOLS = ("check_medication_due", "get_medication_schedule", "verify_prescription", "verify_medication",
-                    "start_pill_intake_detection", "get_pill_intake_result", "record_medication_taken")
 # The events the Phase 2 spike measured (live_client.py): anything else is logged whole by AgentLiveClient._handle
 KNOWN_EVENTS = frozenset(("session.started", "session.output_audio.delta", "session.input_transcript.delta",
                           "session.output_transcript.delta", "session.input_audio.muted", "session.input_audio.unmuted",
@@ -239,7 +237,7 @@ class AgentLiveClient(LiveClient):
         if name in FINISH_ON_CLOSE:   # a record, a note to family or an alert: closing the session never cuts it short
             self._finishing.add(task)
             task.add_done_callback(self._finishing.discard)
-            self.registry.hold(task)
+            self.registry.hold(task, name)
 
     async def _run_call(self, delegation_id: str, call_id: str, name: str, arguments) -> None:
         """One delegated call: run it (serialised), then its output and `response.create` to GPT-Live. A session that
