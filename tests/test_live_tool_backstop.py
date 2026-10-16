@@ -19,15 +19,20 @@ from tests.test_live_relay_chat import _begin, _live, _over, _reachy, _said, _so
 
 world = relay_chat.world   # the harness's fixture, registered in this module too
 
-# check_medication_due's answers (ServerCareBackend.check_medication_due) and record_medication_taken's
+# check_medication_due's answers (ServerCareBackend.check_medication_due: the slot's summary, the first dose in that
+# state, and every dose of the slot) and record_medication_taken's
+DOSE = {"medication_id": "dose-12", "medication_name": "Allegra", "med_name": "Allegra", "scheduled_time": "08:00",
+        "taken_time": None, "status": "pending_allowed", "refusal": None}
+SECOND = {**DOSE, "medication_id": "dose-13", "medication_name": "Metformin", "med_name": "Metformin"}
 DUE_ALLOWED = {"status": "pending_allowed", "medication_id": "dose-12", "medication_name": "Allegra",
-               "med_name": "Allegra", "last_taken_time": None, "next_allowed_time": None, "doses": []}
+               "med_name": "Allegra", "last_taken_time": None, "next_allowed_time": None, "doses": [DOSE]}
 ASKED = {"status": "pending_confirmation", "medication_id": "dose-12", "medication_name": "Allegra",
          "request_id": "r-1", "family_asked": True, "source": "patient_claim"}
 
 
-def _due(status):
-    return {**DUE_ALLOWED, "status": status}
+def _due(status, *doses):
+    """The due check's answer for a slot whose summary is `status`: its doses as given, else Allegra in that state."""
+    return {**DUE_ALLOWED, "status": status, "doses": list(doses) or [{**DOSE, "status": status}]}
 
 
 class Link:
@@ -54,12 +59,14 @@ class Link:
 class Backend:
     u_id, conversation_id, language = 7, "c-1", "zh-TW"
 
-    def __init__(self, available=True, due=None, record=None):
+    def __init__(self, available=True, due=None, record=None, records=None):
         self.available, self.questions = available, []
         # the medication tools (tool_registry.ServerCareBackend): what the due check and the record answer (an
-        # exception is raised), and the calls in order; `gate`, when set, holds the due check until it is set
+        # exception is raised; `records`: a dose's own answer by its id), and the calls in order; `gate`, when set,
+        # holds the due check until it is set
         self.due = due if due is not None else DUE_ALLOWED
         self.record = record if record is not None else ASKED
+        self.records = records or {}
         self.calls: list[tuple] = []
         self.gate: asyncio.Event | None = None
 
@@ -73,9 +80,10 @@ class Backend:
 
     async def record_medication_taken(self, medication_id, patient_confirmed, medication_name, session_id):
         self.calls.append(("record_medication_taken", medication_id, patient_confirmed, medication_name, session_id))
-        if isinstance(self.record, Exception):
-            raise self.record
-        return dict(self.record)
+        answer = self.records.get(medication_id, self.record)
+        if isinstance(answer, Exception):
+            raise answer
+        return dict(answer)
 
     async def describe_view(self, jpeg, question):
         self.questions.append(question)
@@ -335,6 +343,8 @@ def test_a_new_turn_lets_gpt_live_dance_again_after_a_backstop_dance():
     "日希我吃完藥了", "嗯我吃過藥了", "對我已經吃藥了", "我跟你說我吃完藥了", "瑞希，我跟你說，我吃完藥了",
     "我把藥吃完了", "藥我吃過了",
     "我吃完藥了，再見", "我吃完藥了，就是有點累",   # a goodbye and "it's just that", not a "then"
+    "我一整天都很累，我吃完藥了",                  # a whole day, not a whole box
+    "我吃完藥了，還沒吃早餐", "我吃完藥了，吃了一顆",   # breakfast still to come; one pill
 ])
 def test_the_patients_own_finished_intake_is_a_claim(words):
     assert tool_intents.detect(words) == "took_medicine"
@@ -364,6 +374,21 @@ def test_the_patients_own_finished_intake_is_a_claim(words):
     # took extra: never praised, left to GPT-Live and the safety checks
     "我吃完藥了，又多吃了一次", "我吃完藥了，好像吃了兩次", "我吃完藥了，我吃太多了", "I took my medicine, I took it twice",
     "I took my medicine, and an extra pill",
+    # every clause before it counts, not only the one right before it, and not only at its end: another person
+    # (with a claim that has no subject of its own), another time, a condition, a belief, a question
+    "我先生啊，已經吃過藥了", "我媽媽，吃完藥了", "他，已經吃藥了", "我老公，剛剛吃藥了", "她呢，吃完藥了",
+    "早上，我吃過藥了", "今天早上，我吃過藥了", "昨天，我吃完藥了", "Yesterday, I took my medicine",
+    "Last night, I took my medicine", "This morning, I took my pills",
+    "如果明天，我吃完藥了，可以出去玩嗎", "我以為昨天，我吃完藥了", "是不是，我吃完藥了",
+    # a clause after it that puts the intake at another time
+    "我吃過藥了，早上吃的", "I took my medicine, last night",
+    # taken back later in the turn
+    "我吃完藥了，不對，我還沒吃", "我吃完藥了，喔不是，還沒吃", "我吃完藥了，騙你的", "I took my medicine, no wait, I didn't",
+    "I took my medicine, actually no",
+    # a whole box, everything, a count, a later dose taken too
+    "我吃完藥了，一整盒都吃了", "我吃完藥了，整瓶都吃了", "我吃完藥了，全部都吃了", "我吃完藥了，吃了五顆",
+    "我吃完藥了，連明天的也吃了", "我吃完藥了，晚上的也一起吃了", "I took my medicine, the whole bottle",
+    "I took my pills, all of them", "I took all my pills",
 ])
 def test_no_claim_for_another_person_the_future_a_negation_a_question_or_food(words):
     assert tool_intents.detect(words) is None
@@ -463,7 +488,7 @@ def test_gpt_lives_own_delegation_within_the_grace_means_no_second_run(world, to
         await _live(world, _said("我吃完藥了"), _sound(), _reachy("好，我幫你問問"))
         world.clients[-1].requested.append(tool)          # GPT-Live's backend took the claim
         await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 1)
-        assert backend.calls == [] and relay._intent is None
+        assert backend.calls == [] and relay._claim is None
         await _end(world, running)
 
     asyncio.run(scenario())
@@ -484,7 +509,8 @@ def test_gpt_lives_late_calls_share_the_backstops_runs_so_family_are_asked_once(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("words", ["我還沒吃藥", "他吃完藥了", "我等一下吃藥", "我吃藥了嗎"])
+@pytest.mark.parametrize("words", ["我還沒吃藥", "他吃完藥了", "我等一下吃藥", "我吃藥了嗎", "Yesterday, I took my medicine",
+                                   "我先生啊，已經吃過藥了", "早上，我吃過藥了"])
 def test_words_that_claim_no_intake_run_no_medicine_tool(world, words):
     async def scenario():
         backend = Backend()
@@ -501,6 +527,9 @@ def test_words_that_claim_no_intake_run_no_medicine_tool(world, words):
 @pytest.mark.parametrize("fragments, claimed", [
     (["我吃完藥了", "再跟你說"], False), (["我吃完藥了", "，今天好累"], True), (["我吃完藥了", "，再跟你說"], False),
     (["我吃完藥了", "，好像吃了兩次"], False), (["I took my medicine", ", I took it twice"], False),
+    (["我吃完藥了", "，不對，我還沒吃"], False), (["I took my medicine", ", no wait, I didn't"], False),
+    (["我吃完藥了", "，一整盒都吃了"], False), (["我吃完藥了", "，晚上的也一起吃了"], False),
+    (["I took my medicine", ", the whole bottle"], False), (["I took my pills", ", all of them"], False),
 ])
 def test_a_claim_is_judged_on_the_whole_turn_its_words_come_in(world, fragments, claimed):
     # GPT-Live's transcript of the patient comes in fragments: 「我吃完藥了」 alone reads as a claim, but the turn
@@ -526,13 +555,106 @@ def test_an_extra_dose_said_in_the_next_turn_drops_a_claim_still_waiting(world):
         relay, running, link = await _with_tools(world, backend)
         await _live(world, _said("我吃完藥了"))
         await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)    # the turn closes; the claim still waits
-        assert relay._intent is not None and relay._intent["kind"] == "took_medicine"
+        assert relay._claim is not None and relay._claim["kind"] == "took_medicine"
         before = len(world.clients[-1].commentaries)
         await _live(world, _said("我好像吃了兩次"))
         await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
         for _ in range(5):
             await relay_chat._settle()
         assert backend.calls == [] and len(world.clients[-1].commentaries) == before
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("words", ["不對，我還沒吃", "騙你的", "No wait, I didn't take it"])
+def test_a_claim_taken_back_in_the_next_turn_is_dropped(world, words):
+    # 「我吃完藥了」, a pause, then 「不對，我還沒吃」 before the backstop's grace ran out: no request to family
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)    # the turn closes; the claim still waits
+        before = len(world.clients[-1].commentaries)
+        await _live(world, _said(words))
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
+        for _ in range(5):
+            await relay_chat._settle()
+        assert backend.calls == [] and len(world.clients[-1].commentaries) == before
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_request_in_the_next_turn_never_replaces_a_claim_still_waiting(world):
+    # 「我吃完藥了」, a pause, then 「跳舞給我看」 before the claim's grace ran out: the robot dances and family are asked
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了"))
+        await _step(world, relay, live_session.TURN_GAP_SECONDS + 0.5)    # the turn closes; the claim still waits
+        await _live(world, _said("跳舞給我看"))
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)   # GPT-Live said nothing: both are due
+        for _ in range(5):
+            await relay_chat._settle()
+        assert link.dances == [(None, 1)]
+        assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None)]
+        said = world.clients[-1].commentaries
+        assert live_session.INTENT_LINES["dance"]["zh-TW"] in said
+        assert live_session.INTENT_LINES["took_medicine"]["zh-TW"] in said
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_a_claim_and_a_request_in_one_turn_both_run(world):
+    async def scenario():
+        backend = Backend()
+        relay, running, link = await _with_tools(world, backend)
+        await _live(world, _said("我吃完藥了，跳舞給我看"))
+        await _step(world, relay, live_session.INTENT_WAIT_SECONDS + 0.5)
+        for _ in range(5):
+            await relay_chat._settle()
+        assert link.dances == [(None, 1)]
+        assert [call[0] for call in backend.calls] == ["check_medication_due", "record_medication_taken"]
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+def test_every_allowed_dose_of_the_slot_is_asked_for(world):
+    # A slot with two medicines, both allowed: 「我吃完藥了」 asks family about each, so neither is left pending for a
+    # missed-dose reminder about a medicine the patient said they took
+    async def scenario():
+        backend = Backend(due=_due("pending_allowed", DOSE, SECOND))
+        relay, running = await _claim(world, backend)
+        assert backend.calls == [("check_medication_due",), ("record_medication_taken", "dose-12", True, None, None),
+                                 ("record_medication_taken", "dose-13", True, None, None)]
+        assert world.clients[-1].commentaries[-1] == live_session.INTENT_LINES["took_medicine"]["zh-TW"]
+        await _end(world, running)
+
+    asyncio.run(scenario())
+
+
+REFUSED_TOO_SOON = {"status": "refused", "reason": "dose_too_soon", "reply": "現在還不能吃", "family_asked": False}
+
+
+@pytest.mark.parametrize("due, records, recorded", [
+    # the record refuses the second medicine (it became too soon meanwhile)
+    (_due("pending_allowed", DOSE, SECOND), {"dose-13": REFUSED_TOO_SOON}, ["dose-12", "dose-13"]),
+    # the due check already refuses it: only the first is recorded
+    (_due("pending_allowed", DOSE, {**SECOND, "status": "refused_too_soon"}), {}, ["dose-12"]),
+])
+def test_a_slot_with_a_refused_medicine_says_each_by_name_and_is_never_praised(world, due, records, recorded):
+    async def scenario():
+        backend = Backend(due=due, records=records)
+        relay, running = await _claim(world, backend)
+        assert [call[1] for call in backend.calls[1:]] == recorded
+        line = world.clients[-1].commentaries[-1]
+        assert line == (live_session.CLAIM_PARTS["asked"]["zh-TW"].format(names="Allegra")
+                        + live_session.CLAIM_PARTS["refused"]["zh-TW"].format(
+                            names="Metformin", why=live_session.CLAIM_REASONS["refused_too_soon"]["zh-TW"]))
+        assert gpt_live_config.CELEBRATION["zh-TW"] not in line
         await _end(world, running)
 
     asyncio.run(scenario())
@@ -597,6 +719,9 @@ def test_every_claim_line_is_said_in_both_languages_and_praises_only_a_dose_that
         line = live_session.INTENT_LINES[key][language].format(why="x")
         assert (gpt_live_config.CELEBRATION[language] in line) == (key in praised)
     assert all(reason[language] for reason in live_session.CLAIM_REASONS.values())
+    for part in live_session.CLAIM_PARTS.values():   # one medicine of several, by name: never praised by itself
+        line = part[language].format(names="Allegra", why="x")
+        assert "Allegra" in line and gpt_live_config.CELEBRATION[language] not in line
     unwell = live_session.CLAIM_UNWELL[language]   # what replaces the praise when the patient says they took extra
     assert unwell and gpt_live_config.CELEBRATION[language] not in unwell
 
