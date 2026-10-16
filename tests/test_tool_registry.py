@@ -883,3 +883,105 @@ def test_set_and_cancel_reminder_go_to_the_reminder_service_with_the_patient_and
                             "day": None, "language": "zh-TW", "conversation_id": "c-1"})]
     assert asyncio.run(registry.execute("cancel_reminder", {"reminder_id": None}))["result"]["count"] == 1
     assert cancelled == [(7, None)]
+
+
+# ── dances and stops (agent tool fixes, Task 5: on 16 Oct 2026 Reachy did not stop) ──
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_a_dance_without_repeat_plays_two_moves_so_there_is_time_to_stop_it():
+    robot = Robot()
+    answer = asyncio.run(ToolRegistry(robot, backend()[0]).execute("dance", {"dance": None, "repeat": None}))
+    assert gpt_live_config.DEFAULT_DANCE_REPEAT == 2
+    assert answer["ok"] and answer["result"]["repeat"] == 2 and robot.emotes == ["dance:None:2"]
+    (schema,) = [tool for tool in gpt_live_config.TOOLS_SCHEMA if tool["name"] == "dance"]
+    assert "null: 2" in schema["parameters"]["properties"]["repeat"]["description"]
+    assert "null means 2" in gpt_live_config.BACKEND_INSTRUCTION
+    assert "stopped_by_patient" in schema["description"] and "stopped_by_patient" in gpt_live_config.BACKEND_INSTRUCTION
+
+
+def test_a_dance_right_after_a_stop_is_refused_until_the_hold_ends_or_the_patient_asks_again():
+    async def run():
+        clock, robot = Clock(), Robot()
+        r = ToolRegistry(robot, backend()[0], clock=clock)
+        await r.execute("dance", {"dance": "simple_nod", "repeat": None})
+        await r.execute("stop_dance", {})
+        clock.now += tool_registry.STOP_HOLD_SECONDS - 0.1
+        held = await r.execute("dance", {"dance": None, "repeat": None})
+        unknown = await r.execute("dance", {"dance": "moonwalk", "repeat": None})   # still checked first
+        clock.now += 0.2
+        after_hold = await r.execute("dance", {"dance": None, "repeat": None})
+        await r.execute("stop_dance", {})
+        held_again = await r.execute("dance", {"dance": None, "repeat": None})
+        r.dance_asked()                                    # the patient asks to dance again
+        asked = await r.execute("dance", {"dance": "yeah_nod", "repeat": 1})
+        return robot, held, unknown, after_hold, held_again, asked
+
+    robot, held, unknown, after_hold, held_again, asked = asyncio.run(run())
+    assert held == held_again == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert unknown["error"] == "unknown_dance"
+    assert after_hold["ok"] and asked["ok"]
+    assert robot.emotes == ["dance:simple_nod:2", "stop_dance", "dance:None:2", "stop_dance", "dance:yeah_nod:1"]
+
+
+def test_a_stop_ends_the_backstops_shared_dance_so_gpt_lives_late_call_is_held():
+    async def run():
+        robot = Robot()
+        r = ToolRegistry(robot, backend()[0], clock=Clock())
+        await r.run_intent("dance", {"dance": None, "repeat": None})   # the relay's backstop danced
+        await r.execute("stop_dance", {})                               # GPT-Live's stop, same turn
+        late = await r.execute("dance", {"dance": None, "repeat": None})   # its dance call for the first words
+        return robot, late
+
+    robot, late = asyncio.run(run())
+    assert late == {"ok": False, "tool": "dance", "error": "stopped_by_patient"}
+    assert robot.emotes == ["dance:None:2", "stop_dance"]
+
+
+def test_the_relays_stop_is_shared_across_the_patients_next_turn_until_a_dance_starts():
+    async def run():
+        clock, robot = Clock(), Robot()
+        r = ToolRegistry(robot, backend()[0], clock=clock)
+        await r.execute("dance", {"dance": None, "repeat": None})
+        await r.run_intent("stop_dance", {})               # the relay's stop, at the patient's word
+        r.forget_intents()                                 # the patient's next turn
+        shared = await r.execute("stop_dance", {})         # GPT-Live's stop for the first words
+        r.dance_asked()
+        await r.execute("dance", {"dance": None, "repeat": None})   # a new dance
+        fresh = await r.execute("stop_dance", {})          # a stop for it stops it
+        return robot, shared, fresh
+
+    robot, shared, fresh = asyncio.run(run())
+    assert shared["ok"] and fresh["ok"]
+    assert robot.emotes == ["dance:None:2", "stop_dance", "dance:None:2", "stop_dance"]
+
+
+def test_a_dance_the_robot_has_not_answered_yet_may_already_run():
+    # The robot answers a dance as the move starts (on its first dance it reads the library from disk first): a stop
+    # said meanwhile is a stop, and a stop sent meanwhile is not undone when the answer comes
+    async def run():
+        robot, answer = Robot(), asyncio.Event()
+        dance = robot.dance
+
+        async def slow(name, repeat):
+            await answer.wait()
+            return await dance(name, repeat)
+
+        robot.dance = slow
+        r = ToolRegistry(robot, backend()[0], clock=Clock())
+        asked = asyncio.ensure_future(r.execute("dance", {"dance": None, "repeat": None}))
+        for _ in range(10):
+            await asyncio.sleep(0)                         # the call reaches the robot and waits for its answer
+        waiting = r.dancing()
+        await r.execute("stop_dance", {})
+        answer.set()
+        await asked
+        return waiting, r.dancing()
+
+    assert asyncio.run(run()) == (True, False)

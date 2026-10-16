@@ -93,9 +93,10 @@ HOLD_SECONDS = 0.5            # the start of every GPT-Live reply waits this lon
 # long before an everyday turn lifts it, and the robot plays at most one recorded emotion move per this many seconds
 AFFECT_HOLD_SECONDS = 20.0
 AFFECT_MOVE_GAP_SECONDS = 45.0
-# The tool backstop (services/tool_intents.py): a clear request to dance, to stop or to look runs its tool when GPT-Live
-# has not asked for it this long after its reply began (its own calls came within 1.2 s of its first words in the
-# 14 Oct 2026 probe), or this long after the request when it does not answer at all
+# The tool backstop (services/tool_intents.py): a clear request to dance or to look runs its tool when GPT-Live has
+# not asked for it this long after its reply began (its own calls came within 1.2 s of its first words in the
+# 14 Oct 2026 probe), or this long after the request when it does not answer at all. A stop runs at once
+# (LiveRelay._want_stop); only its line waits as long
 INTENT_REPLY_GRACE_SECONDS = 2.5
 INTENT_WAIT_SECONDS = 6.0
 # The patient's word that the medicine is taken (took_medicine) runs the due check first; only a dose it allows now
@@ -593,6 +594,9 @@ class LiveRelay:
         # request (「跳舞給我看」 in the same turn or the next) never replaces it: a lost claim is a dose left pending
         self._claim: dict | None = None              # {kind, at, words, mark, reply_at}, as _intent
         self._claim_turn_read = False                # the open patient turn already gave a claim
+        # A stop runs at once (_want_stop); its slot waits only to tell GPT-Live what it did, as _intent does
+        self._stop: dict | None = None               # {kind, at, words, mark, reply_at, run}
+        self._stop_turn_read = False                 # the open patient turn already gave a stop
         self._extra_dose_at: float | None = None     # when the patient last spoke of an extra dose (tool_intents)
         self._requests_mark: tuple = (None, 0)       # (client, how many tools it had asked for) at the turn's start
         self._intent_tasks: set = set()                   # the backstop's runs (_run_intent) still going, but a
@@ -1026,7 +1030,7 @@ class LiveRelay:
                 and (self._access_check is None or self._access_check.done())):
             self._access_checked_at = now
             self._access_check = asyncio.create_task(self._check_access())
-        if self._intent is not None or self._claim is not None:
+        if self._intent is not None or self._claim is not None or self._stop is not None:
             self._intent_due(now)
         if self._goodbye_end_at is not None and now >= self._goodbye_end_at:
             self._finish("end", "goodbye")
@@ -1475,7 +1479,7 @@ class LiveRelay:
             opening = (not self.companion and self.opening_turn_id is not None and not self._opening_spoken
                        and self._patient is None and self._patient_turns == 0)
             self._reachy = _Group(first=now, last=now, opening=opening)
-            for intent in (self._intent, self._claim):
+            for intent in (self._intent, self._claim, self._stop):
                 if intent is not None and intent["reply_at"] is None:
                     intent["reply_at"] = now   # GPT-Live answers the request: its own tool call comes soon
         self._reachy.add(text, now)
@@ -1557,7 +1561,7 @@ class LiveRelay:
 
     def _new_request_turn(self) -> None:
         """A new patient turn: its words may ask for a tool again, and GPT-Live's next calls are for it."""
-        self._intent_turn_read = self._claim_turn_read = False
+        self._intent_turn_read = self._claim_turn_read = self._stop_turn_read = False
         self._requests_mark = (self.client, len(self._requests()))
         if self.tools is not None:
             self.tools.forget_intents()
@@ -1571,21 +1575,53 @@ class LiveRelay:
         return any(name in tool_intents.TOOLS[kind] for name in since)
 
     def _want_tool(self, words: str, now: float) -> None:
-        """The patient's words so far in this turn: a clear request to dance, to stop or to look is noted, once per
-        turn, and _intent_due runs its tool unless GPT-Live asks for it in time. The patient's word that the medicine
-        is taken is read beside it, in its own slot (_want_claim). Nothing during a screening hold or after a risk
-        decision, and nothing without the agent's tools."""
-        if self.tools is None or not self._with_tools() or self._risk is not None or self._hit_at is not None:
+        """The patient's words so far in this turn: a clear request to dance or to look is noted, once per turn, and
+        _intent_due runs its tool unless GPT-Live asks for it in time. A stop runs at once (_want_stop), and the
+        patient's word that the medicine is taken is read beside them, in its own slot (_want_claim). Nothing after a
+        risk decision, nothing but a stop during a screening hold, and nothing without the agent's tools."""
+        if self.tools is None or not self._with_tools() or self._risk is not None:
+            return
+        self._want_stop(words, now)
+        if self._hit_at is not None:
             return
         self._want_claim(words, now)
         if self._intent_turn_read:
             return
-        kind = tool_intents.detect(words, dancing=self.tools.dancing(), danced=self.tools.danced(), claims=False)
-        if kind is None:
-            return
+        kind = tool_intents.detect(words, dancing=self._dance_may_run(), danced=self.tools.danced(), claims=False)
+        if kind is None or kind == "stop_dance":
+            return   # a stop is _want_stop's
         self._intent_turn_read = True
-        self._intent = {"kind": kind, "at": now, "words": words.strip(), "mark": self._requests_mark,
-                        "reply_at": None}
+        mark = self._requests_mark
+        if kind == "dance" and self.tools.dance_asked():
+            # the patient asks to dance again: a stop's hold is over, and a dance GPT-Live asked for during it (before
+            # its transcript held these words) was refused, so only a call from now on is GPT-Live's own
+            mark = (self.client, len(self._requests()))
+        self._intent = {"kind": kind, "at": now, "words": words.strip(), "mark": mark, "reply_at": None}
+
+    def _dance_may_run(self) -> bool:
+        """Whether a dance may still run: one started recently (ToolRegistry.dancing), or one the patient asked for
+        that the backstop still waits to run (_intent)."""
+        return self.tools.dancing() or (self._intent is not None and self._intent["kind"] == "dance")
+
+    def _want_stop(self, words: str, now: float) -> None:
+        """A stop in the patient's words (tool_intents.stops: while a dance may still run, a stop phrase anywhere in
+        them) runs stop_dance at once, at the first fragment that holds it, once per turn: a dance of two moves lasts
+        4-10 s, and waiting for GPT-Live's reply cost 2-6 s (agent tool fixes, Task 5). A dance still waiting for the
+        backstop is dropped, and the tool registry refuses a dance asked for in the next STOP_HOLD_SECONDS
+        (tool_registry) until the patient asks to dance again. GPT-Live's own stop_dance call shares this run
+        (ToolRegistry.run_intent); without one, GPT-Live is told what the stop did after the usual grace (_stop, as
+        _intent). It runs during a screening hold too: a dance that goes on helps nobody."""
+        if self._stop_turn_read or not tool_intents.stops(words, dancing=self._dance_may_run()):
+            return
+        self._stop_turn_read = True
+        if self._intent is not None and self._intent["kind"] == "dance":
+            self._intent = None
+        log.info("live chat %s: the patient asks to stop dancing; the relay runs stop_dance now", self.conversation_id)
+        run = asyncio.ensure_future(self.tools.run_intent("stop_dance", {}))
+        self._intent_tasks.add(run)
+        run.add_done_callback(self._intent_tasks.discard)
+        self._stop = {"kind": "stop_dance", "at": now, "words": words.strip(), "mark": self._requests_mark,
+                      "reply_at": None, "run": run}
 
     def _want_claim(self, words: str, now: float) -> None:
         """The patient's word that the medicine is taken (took_medicine), noted once per turn in _claim, which no other
@@ -1617,12 +1653,15 @@ class LiveRelay:
                            "reply_at": None}
 
     def _intent_due(self, now: float) -> None:
-        """The ticker, for the request waiting (_intent) and the claim of a dose waiting (_claim): each is dropped once
-        GPT-Live asked for its tool, and its tool runs once it is overdue."""
+        """The ticker, for the request waiting (_intent), the claim of a dose waiting (_claim) and the stop that ran
+        (_stop): each is dropped once GPT-Live asked for its tool, and once it is overdue its tool runs (the stop's
+        line is said)."""
         if self._intent is not None and self._intent_settled(self._intent, now):
             self._intent = None
         if self._claim is not None and self._intent_settled(self._claim, now):
             self._claim = None
+        if self._stop is not None and self._intent_settled(self._stop, now):
+            self._stop = None
 
     def _intent_settled(self, intent: dict, now: float) -> bool:
         """Whether a waiting request is settled: safety decided, GPT-Live asked for its tool, or it is overdue and its
@@ -1636,8 +1675,9 @@ class LiveRelay:
                else intent["at"] + INTENT_WAIT_SECONDS)
         if now < due or self._hit_at is not None:
             return False
-        log.info("live chat %s: GPT-Live did not call a tool for the patient's request (%s); the relay runs %s",
-                 self.conversation_id, intent["kind"], INTENT_TOOL[intent["kind"]][0])
+        if "run" not in intent:
+            log.info("live chat %s: GPT-Live did not call a tool for the patient's request (%s); the relay runs %s",
+                     self.conversation_id, intent["kind"], INTENT_TOOL[intent["kind"]][0])
         task = asyncio.create_task(self._run_intent(intent))
         if intent["kind"] == "took_medicine":
             # A request to family, like GPT-Live's own record (tool_registry.FINISH_ON_CLOSE): the chat's end never
@@ -1649,12 +1689,14 @@ class LiveRelay:
         return True
 
     async def _run_intent(self, intent: dict) -> None:
-        """Run the request's tool (ToolRegistry.run_intent: a late call of GPT-Live's for it shares this run), then
-        have GPT-Live say what happened (commentary) unless it asked for the tool meanwhile and so says it itself."""
+        """Run the request's tool (ToolRegistry.run_intent: a late call of GPT-Live's for it shares this run; a stop's
+        ran at once, _want_stop), then have GPT-Live say what happened (commentary) unless it asked for the tool
+        meanwhile and so says it itself."""
         kind = intent["kind"]
         name, arguments = INTENT_TOOL[kind]
         try:
-            result = await self.tools.run_intent(name, arguments(intent["words"]))
+            run = intent.get("run")
+            result = await run if run is not None else await self.tools.run_intent(name, arguments(intent["words"]))
             if kind == "took_medicine":
                 result = await self._record_claim(result)
                 name = result.get("tool") or name
