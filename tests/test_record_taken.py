@@ -4,10 +4,11 @@ The read-only review of 16 Oct 2026 (probes in the session scratchpad) found fiv
 a dose went wrong:
 1. A record without session_id (the MEDICATION COMPLETION flow, or the patient's word) left the open watch of the same
    dose unsettled: its review message ("not recorded, please judge") and a second clip went to family beside the
-   request, or the chat's end reported the watch "unresolved". Now a record settles the open watch of the same dose
-   (the same dose, or names_match on the medicine's name) whether or not it names it: its pending review is
-   cancelled, the watch is spent and the clip goes with the request. The detector's verdict still authorises a record
-   only for the watch the call names.
+   request, or the chat's end reported the watch "unresolved". Now a record settles the open watch of exactly its
+   dose (round 3: never another dose of the same medicine) whether or not it names it: the watch is spent, and once
+   the request is made its pending review is cancelled and the clip goes with the request (round 4: a refusal or a
+   dose already waiting for family makes no request, and the review goes on). The detector's verdict still
+   authorises a record only for the watch the call names.
 2. patient_confirmed true with an unknown or spent session_id failed the record; now it counts as "no detector
    evidence" (logged at INFO). Without the patient's word it stays an error.
 3. A dose already waiting for family answered already_recorded; now already_pending_confirmation.
