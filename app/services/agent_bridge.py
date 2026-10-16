@@ -158,7 +158,7 @@ def make_registry(relay) -> ToolRegistry:
     """The relay's tool registry: the robot link over its WebSocket and the care backend for its patient and
     conversation (the conversation id is set once the row exists; the relay keeps it in step)."""
     backend = ServerCareBackend(relay.u_id, relay.conversation_id, relay.task_id, relay.language)
-    return ToolRegistry(RelayRobotLink(relay._to_robot), backend)
+    return ToolRegistry(RelayRobotLink(relay._to_robot), backend, monotonic=relay.clock)
 
 
 class AgentLiveClient(LiveClient):

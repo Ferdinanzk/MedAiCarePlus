@@ -15,7 +15,8 @@ a dose went wrong:
    database or encoding error is an error.
 5. Closing GPT-Live (a goodbye, a companion pause) cancelled a record still running; now a record, a note to family or
    an emergency alert runs to its end (each within its TIMEOUTS entry), the chat's end waits for it before the tools
-   close, and the companion's quiet pause waits while one runs. Other tools are cancelled as before.
+   close, and the companion's quiet pause waits while one runs, then INTENT_WAIT_SECONDS for GPT-Live's answer to
+   start (it waits for that answer's sound to end, as for any). Other tools are cancelled as before.
 """
 
 import asyncio
@@ -29,14 +30,16 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app.services import dose_confirmation, dose_event, dose_video, live_session, tool_registry   # noqa: E402
+from app.services import (agent_bridge, dose_confirmation, dose_event, dose_video, live_session,  # noqa: E402
+                          tool_registry)
 from app.services.tool_registry import ToolError, ToolRegistry   # noqa: E402
 from tests import test_tool_registry   # noqa: E402
 from tests.test_agent_bridge import call_event, client   # noqa: E402
 from tests.test_dose_confirmation import FakeDB   # noqa: E402
 from tests.test_live_client import FakeSocket, starts_only   # noqa: E402
 from tests.test_live_companion import PAUSED, _speak, _start, companion   # noqa: E402,F401 (companion: a fixture)
-from tests.test_live_relay_chat import _begin, _live, _over, _said, _step, world   # noqa: E402,F401 (world: a fixture)
+from tests.test_live_relay_chat import (_begin, _live, _over, _said, _settle, _sound, _step,  # noqa: E402
+                                        world)  # noqa: F401 (world is a fixture)
 from tests.test_live_safety import safe   # noqa: E402,F401 (a fixture)
 from tests.test_live_tool_backstop import Backend, Link   # noqa: E402
 from tests.test_tool_registry import MEDS, Conn, Robot, at, backend, intakes   # noqa: E402
@@ -369,19 +372,76 @@ def test_the_relays_end_waits_for_a_held_call_longer_than_a_database_call(world,
     assert order == ["record finished", "tools closed"]
 
 
-def test_the_companions_quiet_pause_waits_while_a_record_runs(companion):
+def test_a_held_call_counts_as_finishing_until_its_end_is_stamped_on_the_relays_clock():
+    clock = [1000.0]
+
+    async def main():
+        registry = ToolRegistry(Robot(), types.SimpleNamespace(), monotonic=lambda: clock[0])
+        run = asyncio.get_running_loop().create_future()
+        registry.hold(run)
+        before = registry.finished_at
+        run.set_result(None)
+        just_done = registry.finishing()          # done, but its done callback (which stamps the time) has not run
+        clock[0] = 1003.0
+        await asyncio.sleep(0)
+        return before, just_done, registry.finishing(), registry.finished_at
+
+    before, just_done, still, finished_at = asyncio.run(main())
+    assert before == float("-inf") and just_done is True
+    assert still is False and finished_at == 1003.0
+
+
+def test_the_relays_registry_stamps_held_calls_on_the_relays_clock():
+    relay = types.SimpleNamespace(u_id=7, conversation_id="c-1", task_id=None, language="zh-TW",
+                                  _to_robot=None, clock=lambda: 42.0)
+    assert agent_bridge.make_registry(relay).monotonic is relay.clock
+
+
+async def _record_ran_through_a_quiet_spell(companion):
+    """A companion stretch whose patient said they took their medicine, then 40 s of quiet while a record GPT-Live
+    asked for still runs (the camera workflow's 30 s watch): no pause meanwhile. The record then finishes, as
+    agent_bridge's _run_call does once it has sent GPT-Live the function_call_output and response.create."""
+    relay, running = await _start(companion)
+    await _speak(companion)
+    relay.tools = ToolRegistry(Link(), Backend(), monotonic=companion.clock)
+    record = asyncio.get_running_loop().create_future()
+    relay.tools.hold(record)
+    await _live(companion, _said("我吃完藥了"))
+    await _step(companion, relay, 1.75)                       # the patient's turn is stored
+    await _step(companion, relay, 40)                         # 40 s of quiet, but the record still runs
+    assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+    record.set_result({"ok": True})
+    await _settle()
+    await _step(companion, relay, 0.1)                        # GPT-Live's answer cannot have started yet
+    assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+    return relay, running
+
+
+def test_the_companions_quiet_pause_waits_for_a_record_and_then_for_gpt_lives_answer_to_be_heard(companion):
     async def scenario():
-        relay, running = await _start(companion)
-        await _speak(companion)
-        relay.tools = ToolRegistry(Link(), Backend())
-        record = asyncio.get_running_loop().create_future()
-        relay.tools.hold(record)
-        await _live(companion, _said("我吃完藥了"))
-        await _step(companion, relay, 1.75)                   # the patient's turn is stored
-        await _step(companion, relay, 40)                     # 40 s of quiet, but the record still runs
+        relay, running = await _record_ran_through_a_quiet_spell(companion)
+        await _step(companion, relay, 5.4)                    # 5.5 s after the record: GPT-Live answers
+        assert companion.clients[0].closes == 0
+        for _ in range(3):                                    # it speaks from 5.5 s to 6.5 s, past the window
+            await _live(companion, _sound())
+            await _step(companion, relay, 0.5)
         assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
-        record.set_result({"ok": True})
-        await _step(companion, relay, 0.1)                    # it finished: the pause comes now
+        assert len(companion.robot.audio()) == 3              # its answer reached the robot after its hold
+        await _step(companion, relay, 0.25)                   # its sound ended: the pause comes now
+        assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
+        companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
+        await _over(companion, running)
+
+    asyncio.run(scenario())
+
+
+def test_the_companions_quiet_pause_comes_once_gpt_live_leaves_a_finished_record_unanswered(companion):
+    async def scenario():
+        relay, running = await _record_ran_through_a_quiet_spell(companion)
+        await _step(companion, relay, 5.8)                    # 5.9 s after the record: still GPT-Live's to answer
+        assert companion.clients[0].closes == 0 and companion.robot.json("paused") == []
+        await _step(companion, relay, 0.2)                    # INTENT_WAIT_SECONDS passed with no answer: paused
+        assert live_session.INTENT_WAIT_SECONDS == 6.0
         assert companion.clients[0].closes == 1 and companion.robot.json("paused") == [PAUSED]
         companion.robot.inbox.put_nowait({"type": "end", "reason": "stopped"})
         await _over(companion, running)

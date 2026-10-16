@@ -49,7 +49,8 @@ instructions plus companion_note (Reachy already greeted; the last HISTORY_TURNS
 data); the pre-roll goes first (at up to PRE_ROLL_SEND_SPEED times real time: GPT-Live drops a faster burst), then
 the live microphone. QUIET_PAUSE_SECONDS without patient speech (GPT-Live's
 transcript of it, or the robot's speech signals) once GPT-Live's sound has ended and no record, note to family or
-alert still runs (tool_registry.FINISH_ON_CLOSE), or, once the stretch is
+alert still runs (tool_registry.FINISH_ON_CLOSE) or ended less than INTENT_WAIT_SECONDS ago (GPT-Live's answer to it
+may still start), or, once the stretch is
 STRETCH_MAX_SECONDS old, the patient's next turn gap (STRETCH_HARD_MAX_SECONDS at the latest, a reply cut with a
 flush) pauses it: GPT-Live is closed, what it still sent is handled (the patient's words screened and grouped,
 OpenAI's cut-off judged), the open turns are stored and the robot gets {"type": "paused"}. A
@@ -947,8 +948,8 @@ class LiveRelay:
         the rest; in companion mode while paused too), and the endings: goodbye, silence and limit here,
         access_withdrawn and access_unverified from the re-check. In companion mode silence and limit end nothing: a
         running stretch pauses instead (_pause), never while a screening hit settles: QUIET_PAUSE_SECONDS after the
-        patient's last speech once GPT-Live's sound has ended and no record, note to family or alert still runs
-        (ToolRegistry.finishing: its answer then reaches GPT-Live); once it is STRETCH_MAX_SECONDS old, at the patient's
+        patient's last speech once GPT-Live's sound has ended and no record, note to family or alert still runs or
+        ended less than INTENT_WAIT_SECONDS ago (_tool_answer_due); once it is STRETCH_MAX_SECONDS old, at the patient's
         turn gap (no open patient turn, their last words over TURN_GAP_SECONDS ago, GPT-Live's sound ended and no
         answer still owed to them: _armed); and once it is STRETCH_HARD_MAX_SECONDS old, whatever the patient and
         GPT-Live are doing."""
@@ -989,12 +990,21 @@ class LiveRelay:
                       and not self._armed and now - self._last_patient_at > TURN_GAP_SECONDS):
                     await self._pause("stretch_max")
                 elif (now - self._last_patient_at >= QUIET_PAUSE_SECONDS and self._segment is None
-                      and not (self.tools is not None and self.tools.finishing())):
+                      and not self._tool_answer_due(now)):
                     await self._pause("quiet")
         elif now - self._last_patient_at >= SILENCE_END_SECONDS:
             self._finish("end", "silence")
         elif now - self._started_at >= LIVE_MAX_SECONDS:
             self._finish("end", "limit")
+
+    def _tool_answer_due(self, now: float) -> bool:
+        """Whether GPT-Live may still owe the patient its answer to a record, a note to family or an alert: one still
+        runs (ToolRegistry.finishing), or one ended less than INTENT_WAIT_SECONDS ago (ToolRegistry.finished_at, on
+        this clock). When it ends, the call has just sent GPT-Live its output and response.create, and the answer's
+        sound cannot start at once; once it starts, _segment holds the quiet pause until it ends. With no answer by
+        then (INTENT_WAIT_SECONDS, the bound the backstop gives GPT-Live too), the pause may come."""
+        return self.tools is not None and (self.tools.finishing()
+                                           or now - self.tools.finished_at < INTENT_WAIT_SECONDS)
 
     async def _check_access(self) -> None:
         """Spec A2 and E1: what the text chat checks at every call (get_device, reachy_tasks.checkin_allowed), the
