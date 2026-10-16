@@ -683,14 +683,33 @@ def test_keep_dancing_after_a_stop_ends_the_hold_and_dances(world):
     asyncio.run(scenario())
 
 
-def test_dont_dance_for_me_any_more_stops_the_dance_and_no_dance_follows(world):
+# Round 4 (R4.11): more "don't dance" forms, Chinese and English; each names the dance, so it stops at any time
+DONT_DANCE = ["我不要你跳舞給我看", "please don't dance for me anymore", "don't dance", "不要繼續跳舞了",
+              "你不要再繼續跳舞了", "別繼續跳舞了", "Reachy, don't dance"]
+
+
+@pytest.mark.parametrize("words", DONT_DANCE)
+def test_dont_dance_is_a_stop_at_any_time_and_never_starts_a_dance(words):
+    for state in ({}, {"dancing": True}, {"waiting": True}, {"danced": True}, {"dancing": True, "danced": True}):
+        assert tool_intents.stops(words, **state)
+        assert tool_intents.detect(words, **state) == "stop_dance"
+        assert tool_intents.detect(words, stop=False, **state) is None   # the relay reads the other requests so
+
+
+@pytest.mark.parametrize("words", ["I don't dance", "we don't dance anymore", "you don't dance well"])
+def test_saying_who_does_not_dance_is_no_stop_while_nothing_dances(words):
+    assert not tool_intents.stops(words) and tool_intents.detect(words) is None
+
+
+@pytest.mark.parametrize("words", ["你不要再跳舞給我看了"] + DONT_DANCE)
+def test_dont_dance_for_me_any_more_stops_the_dance_and_no_dance_follows(world, words):
     # 「你不要再跳舞給我看了」 holds 跳舞給我看 inside its "don't dance": read as the last dance request of the words, it
     # hid the stop, the dance went on and the backstop started a second one (round 3 review)
     async def scenario():
         relay, running, link = await _with_tools(world, clock=world.clock)
         await relay.tools.execute("dance", {"dance": "simple_nod", "repeat": None})   # GPT-Live's dance runs
         before = len(world.clients[-1].commentaries)
-        await _live(world, _said("你不要再跳舞給我看了"))
+        await _live(world, _said(words))
         assert link.stops == 1
         await _live(world, _sound(), _reachy("好"))
         await _step(world, relay, live_session.INTENT_REPLY_GRACE_SECONDS + 0.5)

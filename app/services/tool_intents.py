@@ -10,8 +10,9 @@ language, and runs the tool when GPT-Live has not asked for it in time.
   request forms only, in Traditional Chinese (the transcript may come in either script) or English. Talking about
   dancing or about something seen (「我年輕的時候很喜歡跳舞」, 「我昨天看到一隻狗」), a question about someone else
   (「他會跳舞嗎」) and a compliment (「你跳舞跳得很好」) are no request. 「再跳一次」 counts only after a dance.
-- `stops(text, dancing, waiting, danced)`: 「不要跳舞了」 or "stop dancing" at any time, and while a dance runs or waits
-  for the backstop a stop phrase anywhere in a clause of the words (「不要再跳了」, 「日希，停下來」, 「停，不要跳了」,
+- `stops(text, dancing, waiting, danced)`: 「不要跳舞了」, "stop dancing" or "don't dance" at any time, and while a
+  dance runs or waits for the backstop a stop phrase anywhere in a clause of the words (「不要再跳了」, 「日希，停下來」,
+  「停，不要跳了」,
   "Reachy, stop"; agent tool fixes, Task 5), never "don't stop" or another kind of stop (「不要停」, 「不停」, 「停車」,
   「停電」, 「我不想停」). Each clause is read by itself, so a "don't" never reaches across a comma (「不要，停下來」 is a
   stop), and a stop phrase counts only after the last dance request of the words (「停一下，跳舞給我看」 asks for a
@@ -56,8 +57,12 @@ _NOT_ASKED = r"(?<!(?<!不)要)"
 # Patterns on the compact text (Traditional, lower case, no spaces or punctuation) and on the spaced text (punctuation
 # as spaces, so a clause starts after a space); a form without a subject must start its clause.
 PATTERNS = {
-    "stop_dance": (re.compile(r"(停止|" + _NOT_ASKED + r"不要再?|別再?|不用再?)跳舞|跳舞停"),
-                   re.compile(r"(?<![a-z])stop dancing")),
+    # 「不要跳舞了」, 「不要再跳舞」 and, round 4 of 17 Oct 2026, 「不要繼續跳舞了」, 「你不要再繼續跳舞了」, 「別繼續跳舞了」
+    # and 「我不要你跳舞給我看」; "stop dancing" and "don't dance" said to Reachy (a clause that starts with it: "please
+    # don't dance for me anymore", "Reachy, don't dance"; never "I don't dance")
+    "stop_dance": (re.compile(r"(停止|" + _NOT_ASKED + r"不要(你|妳|您)?再?(繼續)?|別再?(繼續)?|不用再?(繼續)?)跳舞|跳舞停"),
+                   re.compile(r"(?<![a-z])stop dancing"),
+                   re.compile(r"^((please|reachy|ok|okay|no|oh|now) )*(don't|dont|do not) dance(?![a-z])")),
     "dance": (
         re.compile(_YOU + r"(" + _MODAL + r"再?)?(幫我|給我|為我|來)?" + _DANCE + r"(?!的|得|了|過|跳)"),  # 你可以跳舞,
         # 你要不要再跳舞 (not 你跳舞跳得好)
@@ -271,12 +276,16 @@ def _dance_end(text: str, danced: bool = False) -> int:
     compact forms joined), or -1 without one: the dance PATTERNS, a whole clause that asks (DANCE_CLAUSE), and after a
     dance in this chat (`danced`) 「再跳一次」 or the dance asked to go on (AGAIN). A dance form that starts inside a
     "don't dance" stop phrase (PATTERNS["stop_dance"], as stops reads it: NOT_STOP removed first) is part of that
-    stop, never a request: 「你不要再跳舞給我看了」 holds 跳舞給我看, which hid the stop (round 3 review)."""
+    stop, never a request: 「你不要再跳舞給我看了」 holds 跳舞給我看, which hid the stop (round 3 review), and "please
+    don't dance for me anymore" holds "dance for me" (round 4)."""
     forms = _forms(text)
     compact = "".join(clause for clause, _, _ in forms)
     spaced = " ".join(words for _, words, _ in forms if words)
     stops_at = [range(offset + match.start(), offset + match.end()) for clause, _, offset in forms
                 for match in PATTERNS["stop_dance"][0].finditer(_blank(NOT_STOP[0], clause))]
+    stops_at += [range(offset + _compact_at(words, match.start()), offset + _compact_at(words, match.end()))
+                 for _, words, offset in forms for pattern in PATTERNS["stop_dance"][1:]
+                 for match in pattern.finditer(_blank(NOT_STOP[1], words))]
 
     def request(start: int) -> bool:
         return not any(start in span for span in stops_at)
