@@ -184,7 +184,11 @@ def test_a_record_of_another_dose_of_the_watched_medicine_leaves_the_watch_alone
 @pytest.mark.parametrize("seen, reading", [
     ("not_taken", {"result": "not_taken", "confidence": 0.0}),           # the watch timed out and saw nothing
     ("uncertain", {"result": "uncertain", "confidence": 0.48}),          # a hand-to-mouth moment it was unsure of
-    ("never_read", {"result": "not_read_yet", "confidence": None}),      # GPT-Live never asked for the result
+    # round 4 (R4.7): the watch's result at the record, also when GPT-Live never asked for it
+    ("never_read", {"result": "still_monitoring", "confidence": None}),
+    # with no camera session to read now: the last reading, else "not read yet"
+    ("camera_gone", {"result": "uncertain", "confidence": 0.48}),
+    ("camera_gone_never_read", {"result": "not_read_yet", "confidence": None}),
 ])
 def test_a_record_that_settles_a_watch_tells_family_what_the_camera_read(now, camera, reports, captures, asked,
                                                                           seen, reading):
@@ -196,9 +200,11 @@ def test_a_record_that_settles_a_watch_tells_family_what_the_camera_read(now, ca
     if seen == "not_taken":
         clock[0] += 31                                                   # past the watch's 30 s
         assert asyncio.run(b.get_pill_intake_result(started["session_id"]))["result"] == "not_taken"
-    elif seen == "uncertain":
+    elif seen in ("uncertain", "camera_gone"):
         camera.extra_events.append({"event_id": "e1", "decision": "uncertain", "confidence": 0.48, "evidence": {}})
         assert asyncio.run(b.get_pill_intake_result(started["session_id"]))["result"] == "uncertain"
+    if seen.startswith("camera_gone"):
+        camera.ended = True                                              # the chat's camera session is over
     answer = asyncio.run(b.record_medication_taken("dose-2", True))
     assert answer["status"] == "pending_confirmation" and b._watch is None
     evidence = asked[0]["evidence"]
@@ -207,16 +213,33 @@ def test_a_record_that_settles_a_watch_tells_family_what_the_camera_read(now, ca
     text = dose_confirmation._request_messages(
         {"patient": "阿嬤", "meds": "Allegra", "slot": "10/12 20:00"}, "patient_claim", "conf-1", 34,
         evidence=evidence)[0]["text"]
+    uncertain = ("鏡頭觀察：有手到嘴邊的動作，但 AI 不確定（AI 判斷已服藥的可能性：48%（不確定））",
+                 "Camera watch: a hand-to-mouth moment the AI was not sure of "
+                 "(AI estimate that it was taken: 48% (uncertain))")
     zh, en = {"not_taken": ("⚠️ 鏡頭觀察：沒有看到服藥動作，和本人說的不同"
                             "（AI 判斷已服藥的可能性：0%（低））",
                             "⚠️ Camera watch: no intake was seen, unlike what the patient said "
                             "(AI estimate that it was taken: 0% (low))"),
-              "uncertain": ("鏡頭觀察：有手到嘴邊的動作，但 AI 不確定"
-                            "（AI 判斷已服藥的可能性：48%（不確定））",
-                            "Camera watch: a hand-to-mouth moment the AI was not sure of "
-                            "(AI estimate that it was taken: 48% (uncertain))"),
-              "never_read": ("鏡頭觀察：還沒有讀取結果", "Camera watch: its result was not read yet")}[seen]
+              "uncertain": uncertain, "camera_gone": uncertain,
+              "never_read": ("鏡頭觀察：還在觀察，沒有結果", "Camera watch: still watching, with no result yet"),
+              "camera_gone_never_read": ("鏡頭觀察：還沒有讀取結果", "Camera watch: its result was not read yet")}[seen]
     assert zh in text and en in text
+
+
+def test_a_record_puts_the_watchs_result_at_that_moment_in_the_evidence_not_a_stale_reading(now, camera, reports,
+                                                                                            captures, asked):
+    """Round 4 (R4.7): camera_watch was the last reading GPT-Live asked for, which can be a stale "still watching".
+    The watch is read once while still watching, then ends without a sighting; the record that settles it reads the
+    watch again at that moment, and the evidence shows the final result."""
+    clock = [100.0]
+    b, _ = backend(monotonic=lambda: clock[0])
+    started = asyncio.run(b.start_pill_intake_detection(30, "Allegra"))
+    assert asyncio.run(b.get_pill_intake_result(started["session_id"]))["result"] == "still_monitoring"
+    clock[0] += 31                                                       # the watch ended, nothing seen
+    answer = asyncio.run(b.record_medication_taken("dose-2", True))
+    assert answer["status"] == "pending_confirmation" and b._watch is None
+    assert asked[0]["evidence"]["camera_watch"] == {"result": "not_taken", "confidence": 0.0}
+    assert reports == []                     # reading it for the record sends no review of its own
 
 
 def test_a_watch_started_without_a_medicine_is_never_settled_by_a_record(now, camera, reports, captures, asked):
