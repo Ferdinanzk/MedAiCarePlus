@@ -6,10 +6,15 @@ GPT-Live alone decides whether to hand a request to the agent's tools, and on 14
 to look must not depend on that, so the relay reads the patient's words itself, as it does for risk and body
 language, and runs the tool when GPT-Live has not asked for it in time.
 
-- `detect(text, dancing)` -> "dance", "stop_dance", "look" or None: plain request forms only, in Traditional Chinese
-  (the transcript may come in either script) or English. Talking about dancing or about something seen
-  (「我年輕的時候很喜歡跳舞」, 「我昨天看到一隻狗」), a question about someone else (「他會跳舞嗎」) and a compliment
-  (「你跳舞跳得很好」) are no request. "Stop" alone counts only while a dance runs, and 「再跳一次」 only after a dance.
+- `detect(text, dancing)` -> "dance", "stop_dance", "look", "time", "search", "took_medicine" or None: plain
+  request forms only, in Traditional Chinese (the transcript may come in either script) or English. Talking about
+  dancing or about something seen (「我年輕的時候很喜歡跳舞」, 「我昨天看到一隻狗」), a question about someone else
+  (「他會跳舞嗎」) and a compliment (「你跳舞跳得很好」) are no request. "Stop" alone counts only while a dance runs, and
+  「再跳一次」 only after a dance.
+- "took_medicine" is the patient's own word that the medicine is taken (「我吃完藥了」, "I took my medicine"): GPT-Live
+  praised it itself and it often never reached record_medication_taken (agent tool fixes, Task 4, Oct 2026). It is
+  read clause by clause and must end its clause, never for another person, another time, a plan, a negation, a
+  question or food (took_medicine below).
 - `TOOLS` names the delegated calls that satisfy an intent (GPT-Live asked for one of them itself).
 """
 
@@ -17,10 +22,13 @@ import re
 
 from app.services.conversation import _traditional
 
-INTENTS = ("stop_dance", "dance", "look", "time", "search")
+INTENTS = ("stop_dance", "took_medicine", "dance", "look", "time", "search")
 TOOLS = {"dance": ("dance",), "stop_dance": ("stop_dance",),
          "look": ("describe_view", "camera", "identify_medicine", "verify_medication"),
-         "time": ("get_current_time",), "search": ("search_web",)}
+         "time": ("get_current_time",), "search": ("search_web",),
+         # GPT-Live's backend took the claim: its completion flow or the camera workflow's steps
+         "took_medicine": ("check_medication_due", "get_medication_schedule", "get_pill_intake_result",
+                           "record_medication_taken")}
 # A search request about these is another tool's (medicine, weather, time, reminders), never a web search
 NOT_SEARCH = re.compile(r"藥|药|天氣|天气|幾點|几点|時間|时间|提醒|家人|吃飯|medicine|medication|pill|weather|time|remind|family")
 
@@ -81,6 +89,31 @@ AGAIN = re.compile(r"再跳一?(次|下|遍)|再來一(次|遍)")
 STOP_WORDS = (re.compile(r"^(停|停下|停下來|停止|好了|夠了|不要跳了|別跳了|不用跳了)(吧|啦|了)?$"),
               re.compile(r"^(ok |okay )?(stop|enough|that's enough)( it| now| please)?$"))
 _PUNCTUATION = re.compile(r"(?:[^\w\s]|_)+")
+# The patient's own intake, done (took_medicine), on one clause (compact, Traditional): 我 with at most an "already"
+# word before 吃 (我吃完藥了, 我已經吃藥了, 我吃了藥); no subject at the clause's start with 完/過/好/掉 or 已經/剛
+# (吃完藥了, 已經吃藥了; never 「吃藥了」, "medicine time!" said to someone); or the medicine first (藥吃了, 我把藥吃完了;
+# never 「把藥吃了」, an order). Each form with what makes it done (on the words it matched: 「我也吃藥」 is a habit and
+# 「我有吃藥」 can be "I'm on medication"; None: the form says it). The claim ends its clause, a sentence particle at
+# most: 「我吃完藥了再跟你說」 and 「我吃完藥就去睡覺」 are plans, 「我吃藥了嗎」 a question; another person (他, 我媽媽)
+# and 「我的藥吃完了」 (ran out) never fit the forms.
+_ALREADY = r"(已經|剛剛|剛才|剛|有|都|也)*"
+_MEDICINE = r"(今天的|這次的|我的)?(藥|藥物|藥丸|藥片)"
+_ENDS = r"了?(啦|喔|哦|囉|呀|啊|耶)?$"
+TOOK = ((re.compile(r"我" + _ALREADY + r"吃(完|過|好|掉)?了?" + _MEDICINE + _ENDS), re.compile(r"已經|剛|完|過|好|掉|了")),
+        (re.compile(r"^" + _ALREADY + r"吃(完|過|好|掉)?了?" + _MEDICINE + _ENDS), re.compile(r"已經|剛|完|過|好|掉")),
+        (re.compile(r"(^|我把?)(藥|藥物|藥丸|藥片)我?(已經|剛剛|剛才|剛|有)?吃(了|過了|好了|完了|掉了)(啦|喔|哦|囉|呀|啊|耶)?$"),
+         None))
+TOOK_EN = re.compile(r"^((yes|yeah|ok|okay|oh|so|well|and|reachy|richy|rishi) )*i( have|'ve)?( already| just)? "
+                     r"(took|taken|had|finished taking)( all)? (my|the) "
+                     r"(medicine|medicines|medication|medications|pills?|meds|tablets?)( already| now| just now)?$")
+# A claim that names another time is left to GPT-Live (the due check would read today's current dose), and so is one
+# its clause asks about
+NOT_TOOK = re.compile(r"昨|前天|明天|早上|上午|中午|下午|晚上|凌晨|睡前|點|等一下|待會|是不是|有沒有|是否|yesterday|tomorrow"
+                      r"|last night|this morning|this afternoon|this evening|tonight|o'?clock")
+# A clause that only asks the one before it back: 「我吃完藥了，對不對？」
+TAG = re.compile(r"^(對不對|對吧|對嗎|是不是|是吧|是嗎|沒錯吧|好嗎|right|correct|didn't i|haven't i|isn't it)$")
+_CLAUSE_END = re.compile(r"([，,。.!！?？；;：:、…~～\n]+)")
+_ASKED = re.compile(r"[?？]")
 
 
 def _prepare(text: str) -> tuple[str, str]:
@@ -92,15 +125,40 @@ def _prepare(text: str) -> tuple[str, str]:
     return compact, spaced
 
 
+def claims_intake(text: str) -> bool:
+    """Whether the patient says they took their medicine (took_medicine): a clause that fits a TOOK form or TOOK_EN,
+    names no other time (NOT_TOOK), is not asked (a question mark) and is not asked back by the next one (TAG)."""
+    parts = _CLAUSE_END.split(text)
+    clauses = [(_prepare(parts[i]), bool(_ASKED.search("".join(parts[i + 1:i + 2])))) for i in range(0, len(parts), 2)]
+    for index, ((compact, spaced), asked) in enumerate(clauses):
+        if asked or not compact or NOT_TOOK.search(compact) or NOT_TOOK.search(spaced):
+            continue
+        after = clauses[index + 1][0] if index + 1 < len(clauses) else ("", "")
+        if TAG.search(after[0]) or TAG.search(after[1]):
+            continue
+        if TOOK_EN.search(spaced):
+            return True
+        for form, done in TOOK:
+            match = form.search(compact)
+            if match and (done is None or done.search(match.group(0))):
+                return True
+    return False
+
+
 def detect(text: str, dancing: bool = False, danced: bool = False) -> str | None:
-    """The tool request in the patient's words: "stop_dance", "dance", "look", or None. `dancing`: a dance runs now,
-    so a bare "stop" (停, 夠了, stop) is a stop too; `danced`: this chat had a dance, so 「再跳一次」 is another."""
+    """The tool request in the patient's words: "stop_dance", "took_medicine", "dance", "look", "time", "search", or
+    None. `dancing`: a dance runs now, so a bare "stop" (停, 夠了, stop) is a stop too; `danced`: this chat had a
+    dance, so 「再跳一次」 is another."""
     if not text or not text.strip():
         return None
     compact, spaced = _prepare(text)
     if dancing and (STOP_WORDS[0].search(compact) or STOP_WORDS[1].search(spaced)):
         return "stop_dance"
     for intent in INTENTS:
+        if intent == "took_medicine":
+            if claims_intake(text):
+                return intent
+            continue
         if intent == "search" and (NOT_SEARCH.search(compact) or NOT_SEARCH.search(spaced)):
             continue   # 「幫我查一下我今天要吃什麼藥」 is the medicine tool's, 「查一下天氣」 the weather's
         if any(pattern.search(compact) or pattern.search(spaced) for pattern in PATTERNS[intent]):

@@ -78,7 +78,7 @@ from starlette.websockets import WebSocketDisconnect
 from app import config
 from app.database import get_pool
 from app.services import (affect, after_chat, agent_bridge, ai_settings, consent_service, conversation,
-                          device_auth, gpt_live_config, memory, monitor_service, reachy_tasks, reminders,
+                          device_auth, dose_status, gpt_live_config, memory, monitor_service, reachy_tasks, reminders,
                           tool_intents, tool_registry)
 from app.services.live_client import LiveClient, LiveError
 
@@ -98,11 +98,14 @@ AFFECT_MOVE_GAP_SECONDS = 45.0
 # 14 Oct 2026 probe), or this long after the request when it does not answer at all
 INTENT_REPLY_GRACE_SECONDS = 2.5
 INTENT_WAIT_SECONDS = 6.0
+# The patient's word that the medicine is taken (took_medicine) runs the due check first; only a dose it allows now
+# then gets record_medication_taken (_record_claim)
 INTENT_TOOL = {"dance": ("dance", lambda words: {"dance": None, "repeat": None}),
                "stop_dance": ("stop_dance", lambda words: {}),
                "look": ("describe_view", lambda words: {"question": words[:300]}),
                "time": ("get_current_time", lambda words: {"place": words[:80]}),
-               "search": ("search_web", lambda words: {"query": words[:300], "max_results": None})}
+               "search": ("search_web", lambda words: {"query": words[:300], "max_results": None}),
+               "took_medicine": ("check_medication_due", lambda words: {})}
 # What GPT-Live is asked to say (commentary) once the backstop ran the tool: it had said nothing of it, or worse
 INTENT_LINES = {
     "dance": {"zh-TW": "我開始跳舞了，跳給你看！", "en": "I'm dancing for you now!"},
@@ -118,6 +121,31 @@ INTENT_LINES = {
                        "en": "I couldn't find the time for {place}; which city is it?"},
     "search": {"zh-TW": "我上網查了一下：{answer}", "en": "I searched the web: {answer}"},
     "search_failed": {"zh-TW": "我現在上網查不到，等一下再試試。", "en": "I can't search right now; let's try again later."},
+    # The patient's word that the medicine is taken: praise (gpt_live_config.CELEBRATION) only for a dose that stands as
+    # taken or waiting for family, and never "recorded" for the claim itself (family confirm it)
+    "took_medicine": {"zh-TW": "我已經請家人確認了。" + gpt_live_config.CELEBRATION["zh-TW"],
+                      "en": "I've asked your family to confirm it. " + gpt_live_config.CELEBRATION["en"]},
+    "took_medicine_taken": {"zh-TW": "我查了一下，這次的藥已經吃過了。" + gpt_live_config.CELEBRATION["zh-TW"],
+                            "en": "I checked: this dose is already taken. " + gpt_live_config.CELEBRATION["en"]},
+    "took_medicine_waiting": {"zh-TW": "我查了一下，這次的藥已經在等家人確認了。" + gpt_live_config.CELEBRATION["zh-TW"],
+                              "en": "I checked: this dose is already waiting for your family to confirm. "
+                                    + gpt_live_config.CELEBRATION["en"]},
+    "took_medicine_refused": {"zh-TW": "我查了一下，這次沒有記錄，因為{why}。",
+                              "en": "I checked: this was not recorded, because {why}."},
+    "took_medicine_none": {"zh-TW": "我查了一下，現在沒有要吃的藥，所以沒有記錄。",
+                           "en": "I checked: no medicine is due now, so nothing was recorded."},
+    "took_medicine_failed": {"zh-TW": "我現在查不到吃藥的資料，所以沒有記錄，請告訴家人您吃過藥了。",
+                             "en": "I can't check your medicine right now, so it was not recorded; please tell your "
+                                   "family you took it."},
+}
+# Why a claimed dose was not recorded: the due check's refusal (dose_status), or the record's (its reason's status)
+CLAIM_REASONS = {
+    "refused_too_soon": {"zh-TW": "離上一次吃這個藥還太近；如果覺得不舒服，請告訴家人",
+                         "en": "it is too soon after the last dose; if you feel unwell, please tell your family"},
+    "refused_max_reached": {"zh-TW": "今天已經吃到最多次了；如果覺得不舒服，請告訴家人",
+                            "en": "today's most doses are already taken; if you feel unwell, please tell your family"},
+    "refused_not_due": {"zh-TW": "還沒到吃這次藥的時間", "en": "this dose is not due yet"},
+    "refused_expired": {"zh-TW": "這次的藥已經錯過了，請不要補吃", "en": "this dose was missed and must not be made up"},
 }
 # The relay's own voice (speak): the chat's live voice says a reminder; GPT-Live is told it was said
 SPEAK_WAIT_SECONDS = 15.0      # how long a line waits for GPT-Live's sound and the robot's playback to end
@@ -547,7 +575,8 @@ class LiveRelay:
         self._intent: dict | None = None             # {kind, at, words, mark, reply_at}
         self._intent_turn_read = False               # the open patient turn already gave a request
         self._requests_mark: tuple = (None, 0)       # (client, how many tools it had asked for) at the turn's start
-        self._intent_tasks: set = set()                   # the backstop's runs (_run_intent) still going
+        self._intent_tasks: set = set()                   # the backstop's runs (_run_intent) still going, but a
+                                                          # claim of a dose, which the tool registry holds
         # The relay's own voice (speak): a reminder said with the live voice as binary audio the robot plays
         self._robot_playing = False                  # the robot's `playing` / `idle` (its speaker makes sound)
         self._opening_played = False                 # the robot's first `playing`: the opening has been said
@@ -569,7 +598,7 @@ class LiveRelay:
             await self._after_failure()
         finally:
             for task in list(self._intent_tasks):
-                task.cancel()   # the chat is over: no backstop tool and no line for it
+                task.cancel()   # the chat is over: no backstop tool and no line for it (a claim of a dose is held)
             await self._close_live()
             if self.tools is not None:
                 self.tools.robot.close()   # a tool still waiting for the robot's answer fails now
@@ -1523,9 +1552,15 @@ class LiveRelay:
     def _want_tool(self, words: str, now: float) -> None:
         """The patient's words so far in this turn: a clear request to dance, to stop or to look is noted, once per
         turn, and _intent_due runs its tool unless GPT-Live asks for it in time. Nothing during a screening hold or
-        after a risk decision, and nothing without the agent's tools."""
-        if (self._intent_turn_read or self.tools is None or not self._with_tools() or self._risk is not None
-                or self._hit_at is not None):
+        after a risk decision, and nothing without the agent's tools. The patient's word that the medicine is taken
+        is read again as the turn's words come in: 「我吃完藥了」 that goes on 「再跟你說」 is a plan, and is dropped."""
+        if self.tools is None or not self._with_tools() or self._risk is not None or self._hit_at is not None:
+            return
+        if self._intent_turn_read:
+            intent = self._intent   # this turn's request, until it runs
+            if intent is not None and intent["kind"] == "took_medicine" and not tool_intents.claims_intake(words):
+                self._intent = None
+                log.info("live chat %s: the patient's words went on; no claim of a dose", self.conversation_id)
             return
         kind = tool_intents.detect(words, dancing=self.tools.dancing(), danced=self.tools.danced())
         if kind is None:
@@ -1552,6 +1587,11 @@ class LiveRelay:
         log.info("live chat %s: GPT-Live did not call a tool for the patient's request (%s); the relay runs %s",
                  self.conversation_id, intent["kind"], INTENT_TOOL[intent["kind"]][0])
         task = asyncio.create_task(self._run_intent(intent))
+        if intent["kind"] == "took_medicine":
+            # A request to family, like GPT-Live's own record (tool_registry.FINISH_ON_CLOSE): the chat's end never
+            # cuts it between the due check and the record, and the companion's quiet pause waits for it
+            self.tools.hold(task)
+            return
         self._intent_tasks.add(task)
         task.add_done_callback(self._intent_tasks.discard)
 
@@ -1562,6 +1602,9 @@ class LiveRelay:
         name, arguments = INTENT_TOOL[kind]
         try:
             result = await self.tools.run_intent(name, arguments(intent["words"]))
+            if kind == "took_medicine":
+                result = await self._record_claim(result)
+                name = result.get("tool") or name
             log.info("live chat %s: backstop %s: %s", self.conversation_id, name,
                      "ok" if result.get("ok") else result.get("error"))
             if (self._risk is not None or self.outcome is not None or self._hit_at is not None
@@ -1575,8 +1618,39 @@ class LiveRelay:
         except Exception:
             log.exception("live chat %s: the %s backstop failed", self.conversation_id, kind)
 
+    async def _record_claim(self, due: dict) -> dict:
+        """The patient's word that the medicine is taken (took_medicine), once the due check answered `due`: a request
+        to family (record_medication_taken on the patient's word) for the dose the check allows now (pending_allowed),
+        and nothing for any other answer, so a refused dose is never recorded. The record's result, else the check's."""
+        answer = due.get("result") if due.get("ok") and isinstance(due.get("result"), dict) else {}
+        log.info("live chat %s: the patient says the medicine is taken; the due check: %s", self.conversation_id,
+                 answer.get("status") or due.get("error"))
+        if answer.get("status") != "pending_allowed" or not answer.get("medication_id"):
+            return due
+        return await self.tools.run_intent("record_medication_taken",
+                                           {"medication_id": answer["medication_id"], "patient_confirmed": True})
+
+    def _claim_line(self, result: dict) -> str:
+        """What GPT-Live says about the patient's claim (_record_claim's result): family asked, already taken or
+        already waiting for family (each praised), or not recorded and why."""
+        answer = result.get("result") if result.get("ok") and isinstance(result.get("result"), dict) else {}
+        status = answer.get("status")
+        if result.get("tool") == "record_medication_taken":
+            if status == "pending_confirmation":
+                return INTENT_LINES["took_medicine"][self.language]
+            # the record's own answers, read as the due check's statuses
+            status = (dose_status.REFUSED.get(answer.get("reason"), "refused_not_due") if status == "refused"
+                      else str(status or "").removeprefix("already_"))
+        if status in CLAIM_REASONS:
+            return INTENT_LINES["took_medicine_refused"][self.language].format(why=CLAIM_REASONS[status][self.language])
+        key = {"taken": "took_medicine_taken", "pending_confirmation": "took_medicine_waiting",
+               "none": "took_medicine_none", "skipped": "took_medicine_none"}.get(status, "took_medicine_failed")
+        return INTENT_LINES[key][self.language]
+
     def _intent_line(self, kind: str, result: dict) -> str | None:
         """What GPT-Live is asked to say about the backstop's run, or None when there is nothing true to say."""
+        if kind == "took_medicine":
+            return self._claim_line(result)
         answer = result.get("result") if isinstance(result.get("result"), dict) else {}
         if kind == "dance":
             started = result.get("ok") and answer.get("status") == "started"
