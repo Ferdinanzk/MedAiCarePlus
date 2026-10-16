@@ -1699,9 +1699,13 @@ class LiveRelay:
 
     def _intent_settled(self, intent: dict, now: float) -> bool:
         """Whether a waiting request is settled: safety decided, GPT-Live asked for its tool, or it is overdue and its
-        tool now runs. A claim of a dose is decided then, on its whole turn and the words after it (_claim_stands)."""
-        if self._risk is not None or self.outcome is not None:
+        tool now runs. A claim of a dose is decided then, on its whole turn and the words after it (_claim_stands);
+        once the chat's outcome is decided it waits for the wrap-up, which runs it unless a risk was found
+        (_claim_at_end)."""
+        if self._risk is not None:
             return True
+        if self.outcome is not None:
+            return intent["kind"] != "took_medicine"
         if self._told(intent):
             log.info("live chat %s: GPT-Live asked for the %s tool itself (or was told the dance stopped)",
                      self.conversation_id, intent["kind"])
@@ -1717,6 +1721,25 @@ class LiveRelay:
         if "run" not in intent:
             log.info("live chat %s: GPT-Live did not call a tool for the patient's request (%s); the relay runs %s",
                      self.conversation_id, intent["kind"], INTENT_TOOL[intent["kind"]][0])
+        self._dispatch(intent)
+        return True
+
+    def _claim_at_end(self) -> None:
+        """The chat ends, for any reason but a risk, while a claim of a dose still waits for its grace (_claim): when
+        it still stands (_claim_stands) and GPT-Live did not take it itself (_told), it runs at once, held like a
+        running claim, so the chat's end waits for its due check and records (round 4 of 17 Oct 2026: 「我吃完藥了，
+        再見」 with a silent GPT-Live, or the robot ending for medicine 2 s after the claim, ended the chat before the
+        6 s grace and dropped the claim). Nothing is said of it: GPT-Live is closed."""
+        claim, self._claim = self._claim, None
+        if claim is None or self.tools is None or self._told(claim) or not self._claim_stands(claim):
+            return
+        log.info("live chat %s: the chat ends while the patient's claim of a dose waits; the relay runs it now",
+                 self.conversation_id)
+        self._dispatch(claim)
+
+    def _dispatch(self, intent: dict) -> None:
+        """Run a request's tool now (_run_intent). A claim of a dose is held by the tool registry; any other run is
+        one of _intent_tasks, which the chat's end cancels."""
         task = asyncio.create_task(self._run_intent(intent))
         if intent["kind"] == "took_medicine":
             # A request to family, like GPT-Live's own record (tool_registry.FINISH_ON_CLOSE): the chat's end never
@@ -1725,10 +1748,9 @@ class LiveRelay:
             self.tools.hold(task, "check_medication_due", "record_medication_taken")
             self._claim_run = intent   # the patient's words from now on are read against it (_new_request_turn)
             task.add_done_callback(lambda _: self._claim_ran(intent))
-            return True
+            return
         self._intent_tasks.add(task)
         task.add_done_callback(self._intent_tasks.discard)
-        return True
 
     def _claim_ran(self, claim: dict) -> None:
         if self._claim_run is claim:
@@ -2152,7 +2174,8 @@ class LiveRelay:
         the words heard (B1), a check of OpenAI's cut-off that _chat stopped before it answered blocks (B4: no answer
         is never a clear), and a block outranks the ending or the fallback decided (B3). In companion mode a stretch
         still running is closed and drained first (_drain_ending), so a risk in the patient's last words is found
-        before this. From here on a block only flags and alerts (block)."""
+        before this. From here on a block only flags and alerts (block). With no risk, a claim of a dose still in its
+        grace runs now (_claim_at_end)."""
         if self.companion and self._risk is None:
             await self._drain_ending()
         if self._hit_at is not None and self._risk is None:
@@ -2161,6 +2184,8 @@ class LiveRelay:
             log.warning("live chat %s: the check after OpenAI's cut-off was stopped; blocking", self.conversation_id)
             await self.block("content")
         self._wrapping = True
+        if self._risk is None:
+            self._claim_at_end()   # a claim of a dose still in its grace reaches family (round 4)
         if self._risk is not None:
             await self._end_blocked()
         elif self.outcome.kind == "fallback":
