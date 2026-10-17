@@ -315,3 +315,89 @@ def test_no_line_is_a_404_but_a_failing_lookup_is_not(env, monkeypatch):
     monkeypatch.setattr(voice_lines, "locate", broken)
     with pytest.raises(RuntimeError):   # a 500 on the robot, never a 404: the robot keeps its copy
         env.robot.get("/api/device/clips/line/opening")
+
+
+# ── rendered ahead: the fixed lines at startup, and again every 30 min ──
+
+def test_the_fixed_lines_are_rendered_ahead_once_and_the_failures_are_named(voice, tmp_path):
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 12   # 6 lines x 2 languages
+    for language in ("zh-TW", "en"):
+        kept = {p.name.rsplit("_", 1)[0] for p in (tmp_path / "lines" / language).iterdir()}
+        assert kept == set(voice_lines.FIXED_LINES)
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 12   # nothing missing now
+    found = asyncio.run(voice_lines.locate(None, "helpline", "en"))
+    found.path.unlink()                                               # one copy lost (a wiped volume)
+    voice.fail = RuntimeError("speech API answered 503")
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == ["helpline/en"] and len(voice.renders) == 13
+    voice.fail = None
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 14
+    voice.target = None
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 14   # nothing to do
+
+
+def test_the_startup_report_marks_the_voice_lines_stage_without_holding_up_the_summary(monkeypatch):
+    async def nothing():
+        pass
+    monkeypatch.setattr(startup_report, "network_and_clock", nothing)
+    monkeypatch.setattr(startup_report, "public_link", nothing)
+    logged = []   # the voice_lines stage as it stood each time the summary line was logged
+    monkeypatch.setattr(startup_report, "log_summary",
+                        lambda: logged.append(dict(startup_report.summary()["stages"]["voice_lines"])))
+    startup_report.begin()
+    assert "voice_lines" in startup_report.STAGES
+    monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: None)
+    asyncio.run(startup_report.finish(None, live_status="off"))
+    assert logged[-1]["ok"] and "no live voice target" in logged[-1]["detail"] and not startup_report._tasks
+    results = [[], ["helpline/en", "rest/zh-TW"]]
+    gate = {}
+
+    async def render_fixed_ahead():
+        await gate["release"].wait()   # the real renders take a while: 12, each up to two tries of med_clips.TIMEOUT
+        return results.pop(0)
+    monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: TARGET)
+    monkeypatch.setattr(voice_lines, "render_fixed_ahead", render_fixed_ahead)
+
+    async def scenario():
+        gate["release"] = asyncio.Event()
+        await startup_report.finish(None, live_status="ok")
+        # the summary is logged before the renders finish: the stage is still pending, its renders in the background
+        assert logged[-1]["pending"] and not logged[-1]["ok"] and "12 fixed lines" in logged[-1]["detail"]
+        assert startup_report._tasks
+        gate["release"].set()
+        await asyncio.gather(*startup_report._tasks)
+        return startup_report.summary()["stages"]["voice_lines"]   # the stage's final mark, after the renders
+
+    stage = asyncio.run(scenario())
+    assert stage["ok"] and not stage["pending"] and "12 fixed lines kept" in stage["detail"]
+    stage = asyncio.run(scenario())
+    assert not stage["ok"] and not stage["pending"] and "30 min" in stage["detail"]
+    assert "helpline/en, rest/zh-TW" in stage["detail"] and "sk-x" not in stage["detail"]
+    assert "voice_lines" in startup_report.summary()["degraded"] and len(logged) == 3   # one summary per finish
+    startup_report._report.clear()
+
+
+def test_the_missing_lines_are_tried_again_every_30_minutes(monkeypatch):
+    from app.jobs import scheduler as jobs
+    added = {}
+
+    class Scheduler:
+        def add_job(self, function, trigger, id, **kwargs):
+            added[id] = (function, trigger, kwargs)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(jobs, "scheduler", Scheduler())
+    jobs.start_scheduler()
+    function, trigger, kwargs = added["voice_lines"]
+    assert function is voice_lines.retry_missing and trigger.interval == timedelta(minutes=30)
+    assert voice_lines.LINES_RETRY_MINUTES == 30
+    assert kwargs["misfire_grace_time"] is None and kwargs["coalesce"] is True and kwargs["max_instances"] == 1
+    assert asyncio.iscoroutinefunction(function)   # it runs on the loop; each render is in a worker thread
+
+
+def test_the_retry_logs_what_is_still_missing(voice, caplog):
+    voice.fail = RuntimeError("speech API answered 503")
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(voice_lines.retry_missing())
+    assert "12 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text

@@ -57,6 +57,7 @@ _NUMBER = re.compile(r"\d{3,}")   # 119 and 1925 are read digit by digit; "24 �
 RATE = 16000                 # the robot's live player takes PCM16 mono 16 kHz; robot.play_clip takes it too
 TRIM_LEVEL = 0.003           # about -50 dBFS of full scale: the deploy tool's threshold for Matcha's clips ...
 TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the first sound
+LINES_RETRY_MINUTES = 30     # the scheduler tries the fixed lines still missing again this often (voice_lines job)
 
 _renders: dict[str, asyncio.Lock] = {}   # one lock per key, as med_clips: two requests never render the same line twice
 
@@ -244,3 +245,29 @@ async def line(u_id: int | None, line_id: str, language: str) -> tuple[bytes, st
     locate and fetch)."""
     found = await locate(u_id, line_id, language)
     return None if found is None else await fetch(found)
+
+
+# ── rendered ahead, never inside a robot's wait ──
+
+async def render_fixed_ahead() -> list[str]:
+    """Every fixed line in both languages, rendered when it is missing (startup_report's voice_lines stage, in the
+    background after the live Check; the voice_lines scheduler job every LINES_RETRY_MINUTES). Each render runs in a
+    worker thread (fetch). Returns the ids that could not be made, as "<line_id>/<language>"; [] without a live voice
+    target (nothing to render)."""
+    if ai_settings.live_target() is None:
+        return []
+    failed = []
+    for line_id in FIXED_LINES:
+        for language in LANGUAGES:
+            if await line(None, line_id, language) is None:
+                failed.append(f"{line_id}/{language}")
+    return failed
+
+
+async def retry_missing() -> None:
+    """The scheduler's job: the fixed lines still missing (a render that failed at startup, the API down) are tried
+    again while a live target exists; a line already kept costs one file check."""
+    failed = await render_fixed_ahead()
+    if failed:
+        log.warning("voice lines: %d fixed lines are still missing in the live voice (%s); tried again in %d min",
+                    len(failed), ", ".join(failed), LINES_RETRY_MINUTES)
