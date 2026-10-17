@@ -11,6 +11,7 @@ import sys
 import types
 import wave
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -115,10 +116,12 @@ def test_to_robot_wav_gives_pcm16_mono_16_khz_and_trims_the_leading_silence():
 
 
 def test_no_pause_in_a_kept_line_is_long_enough_for_the_robot_to_report_idle():
-    """The robot's live player (app 0.16.0, bridge/live.py) reports `idle` after 0.6 s of quiet 20 ms blocks (no
-    sample above 120), even inside its own line; the server then sends what waits for that idle (the reminder after
-    its lead-in) while the robot still drops audio for the line (whole-branch review of 17 Oct 2026). So every quiet
-    stretch after the first sound, the one at the end included, is cut to PAUSE_MAX_SECONDS; a shorter one stays."""
+    """The robot's live player (bridge/live.py) reports `idle` after 0.6 s of quiet 20 ms blocks (no sample above
+    120). A build before the whole-branch review of 17 Oct 2026 did so even inside its own line, and the server then
+    sent what waits for that idle (the reminder after its lead-in) while the robot still dropped audio for the line;
+    app 0.16.0 waits for its own line. As a second guard, and so a long pause never holds the reminder back, every
+    quiet stretch after the first sound, the one at the end included, is cut to PAUSE_MAX_SECONDS; a shorter one
+    stays."""
     sound, silence, hum = b"\x10\x27", b"\x00\x00", b"\x64\x00"   # level 10000, 0, and 100: still quiet to the robot
     # at 16 kHz: 0.3 s of sound, a 0.9 s pause, 0.3 s, a 0.2 s pause, 0.3 s, then 1.2 s of a faint hum at the end
     pcm = sound * 4800 + silence * 14400 + sound * 4800 + silence * 3200 + sound * 4800 + hum * 19200
@@ -289,6 +292,29 @@ def test_a_line_that_cannot_be_kept_is_a_warning_and_the_other_lines_still_rende
         asyncio.run(voice_lines.retry_missing())      # the scheduler's job: no exception, its one summary line
     assert "voice line medicine (en) could not be kept" in caplog.text and found.key not in caplog.text
     assert "7 fixed lines are still missing" in caplog.text and "medicine/en" in caplog.text
+
+
+def test_a_kept_line_that_cannot_be_read_is_a_warning_and_the_other_lines_still_render(voice, caplog, monkeypatch):
+    """A kept line that cannot be read (a permission or disk fault under MED_CLIP_DIR: is_file passes those on, and
+    read_bytes raises them) is one WARNING and None, like one that cannot be kept: never rendered over, and the
+    render-ahead pass goes on with the other lines."""
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == []   # every fixed line kept
+    renders = len(voice.renders)
+    read_bytes = Path.read_bytes
+
+    def refused(self):
+        if self.name.startswith("rest_"):
+            raise PermissionError(13, "refused by the test", str(self))   # its text holds the path, and so the key
+        return read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refused)
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(voice_lines.line(None, "rest", "zh-TW")) is None
+        assert asyncio.run(voice_lines.render_fixed_ahead()) == ["rest/zh-TW", "rest/en"]
+    assert len(voice.renders) == renders
+    assert "voice line rest (zh-TW) could not be read (PermissionError)" in caplog.text
+    keys = [voice_lines.key_for("rest", voice_lines.line_text("rest", lang), lang, "marin") for lang in ("zh-TW", "en")]
+    assert not any(key in caplog.text for key in keys)
 
 
 def test_fetch_gives_nothing_once_the_live_voice_target_is_gone(voice, caplog):
