@@ -299,6 +299,15 @@ working camera for `CAMERA_LOST_SECONDS` goes on as the text chat; the text chat
 withdrawn; once the server has ended a live chat, the robot never cuts its help line. See section 5 item 11 for the
 release gate.
 
+**Same voice (17 Oct 2026).** Reachy's own lines around a live chat (the greeting, the opening with the name, the
+reminder lead-in, the repeat line, the help line, the rest and medicine lines, the wind-down) are rendered once by the
+server in the live voice and kept (`services/voice_lines.py`, `GET /api/device/clips/line/{line_id}`); the relay names
+the copy to play beside the words (`clip` on `ready` and `say`). Design:
+`docs/superpowers/specs/2026-10-17-same-voice-design.md`; how it works: CLAUDE.md, "Same voice" in the live voice
+section. **Hearing them needs robot app 0.16.0** (medcare-reachy-bridge, its own plan): it keeps the copies and plays
+them, and falls back to its Matcha voice for any line it has no copy of. Robot app 0.15.0 keeps working with this server
+and ignores the new fields; nothing changes without `LIVE_VOICE_TEST=1` and a passing Check.
+
 **Real patients need Phase 2b first.** 2a has no patient notice or consent for live voice, no switch for patients, no
 daily cost limit, no reconnect, and no face check while GPT-Live is talking; its safety check reads only GPT-Live's own
 transcript (no second transcript and no echo guard on the server). Keep `LIVE_VOICE_TEST=0` on any installation a
