@@ -13,14 +13,19 @@ target exists (ai_settings.live_target, the medicine prompts' gate); the two per
 patient's check-in consent, because they carry the call name.
 """
 
+import asyncio
 import hashlib
 import io
 import logging
 import math
 import re
 import wave
+from dataclasses import dataclass
+from pathlib import Path
 
-from app.services import ai_settings, conversation, med_clips, memory
+from app import config
+from app.database import get_pool
+from app.services import ai_settings, consent_service, conversation, med_clips, memory, reachy_tasks
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +57,8 @@ _NUMBER = re.compile(r"\d{3,}")   # 119 and 1925 are read digit by digit; "24 å°
 RATE = 16000                 # the robot's live player takes PCM16 mono 16 kHz; robot.play_clip takes it too
 TRIM_LEVEL = 0.003           # about -50 dBFS of full scale: the deploy tool's threshold for Matcha's clips ...
 TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the first sound
+
+_renders: dict[str, asyncio.Lock] = {}   # one lock per key, as med_clips: two requests never render the same line twice
 
 
 def line_text(line_id: str, language: str, name: str | None = None) -> str | None:
@@ -146,3 +153,94 @@ def render_line(text: str, voice: str, api_key: str, instructions: str) -> bytes
     """The speech API (med_clips.render: two tries of med_clips.TIMEOUT), then the robot's format. Blocking: callers
     run it with asyncio.to_thread. Raises on failure; the key is never logged."""
     return to_robot_wav(med_clips.render(text, voice, api_key, instructions))
+
+
+def fixed_path(line_id: str, language: str, key: str) -> Path:
+    return config.MED_CLIP_DIR / "lines" / language / f"{line_id}_{key}.wav"
+
+
+def patient_path(u_id: int, line_id: str, key: str) -> Path:
+    """Beside the patient's medicine clips (med_clips.clip_path), so they go with the patient's folder."""
+    return config.MED_CLIP_DIR / str(int(u_id)) / f"line_{line_id}_{key}.wav"
+
+
+@dataclass(frozen=True)
+class Located:
+    """One line as it is keyed and kept: the route compares If-None-Match with `key` before fetch() renders."""
+    line_id: str
+    language: str   # folded: zh-TW or en
+    text: str       # the written words (the robot's speech_text); the spoken form is derived when rendering
+    voice: str
+    key: str
+    path: Path
+
+
+async def patient_name(u_id: int) -> tuple[bool, str | None]:
+    """Whether the per-patient lines may be made (the patient's check-in consent is current: the live chat's own
+    gate), and the name Reachy calls the patient (memory.call_name: their memory 'name' entry while memory is on,
+    else the Reachy card's call name, else the registered name)."""
+    state = await consent_service.get_state(u_id)
+    if not reachy_tasks.checkin_allowed(state):
+        return False, None
+    async with get_pool().acquire() as conn:
+        return True, await memory.call_name(conn, u_id, memory.consent_current(state))
+
+
+async def locate(u_id: int | None, line_id: str, language: str) -> Located | None:
+    """The line's words, key and place, without rendering: None without a live voice target, for an unknown id
+    (never a path lookup), or for a per-patient line without current check-in consent. `u_id` is read only for
+    the per-patient lines."""
+    target = ai_settings.live_target()
+    if target is None or not target.api_key or line_id not in LINE_IDS:
+        return None
+    lang = med_clips.language_of(language)
+    name = None
+    if line_id in PATIENT_LINES:
+        allowed, name = await patient_name(u_id)
+        if not allowed:
+            return None
+    text = line_text(line_id, lang, name)
+    voice = med_clips.voice_for(target)
+    key = key_for(line_id, text, lang, voice)
+    path = patient_path(u_id, line_id, key) if line_id in PATIENT_LINES else fixed_path(line_id, lang, key)
+    return Located(line_id, lang, text, voice, key, path)
+
+
+def _reason(error: Exception) -> str:
+    """What the log says went wrong: the speech API's status when it answered (med_clips.render's RuntimeError),
+    else the error's type. Never the words or the key."""
+    text = str(error)
+    return text if isinstance(error, RuntimeError) and text.startswith("speech API answered") else type(error).__name__
+
+
+async def fetch(found: Located) -> tuple[bytes, str] | None:
+    """(WAV bytes, key): the kept file, else rendered now (med_clips.TIMEOUT per try, one retry) and kept: `.part`
+    then rename, under the key's lock, like med_clips.clip. None when the live target is gone meanwhile or the
+    render failed: one WARNING with the line id, the language and the HTTP status or error type, never the key or
+    the words (the opening carries the patient's name). No negative cache: the next request tries again."""
+    lock = _renders.setdefault(found.key, asyncio.Lock())
+    async with lock:
+        if found.path.is_file():
+            return found.path.read_bytes(), found.key
+        target = ai_settings.live_target()
+        if target is None or not target.api_key:
+            return None
+        try:
+            data = await asyncio.to_thread(render_line, speech_input(found.line_id, found.text, found.language),
+                                           found.voice, target.api_key, instructions_for(found.line_id))
+        except Exception as error:
+            log.warning("voice line %s (%s) could not be rendered (%s)", found.line_id, found.language, _reason(error))
+            return None
+        found.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = found.path.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(found.path)
+        log.info("voice line %s (%s) rendered in the live voice (%d bytes)", found.line_id, found.language, len(data))
+        return data, found.key
+
+
+async def line(u_id: int | None, line_id: str, language: str) -> tuple[bytes, str] | None:
+    """The line in the live voice, (WAV bytes, key), from disk or rendered now; None when it cannot be made (see
+    locate and fetch)."""
+    found = await locate(u_id, line_id, language)
+    return None if found is None else await fetch(found)

@@ -129,3 +129,129 @@ def test_render_line_renders_with_the_lines_instructions_then_converts(monkeypat
     assert _samples(out)[1:] == (16000, 1)
     with pytest.raises(RuntimeError, match="speech API answered 502"):
         voice_lines.render_line("您好！", "broken", "sk-x", voice_lines.instructions_for("checkin_greeting"))
+
+
+# ── storage ──
+
+class _Pool:
+    """A pool whose connection is never used: memory.call_name is faked."""
+
+    def acquire(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def voice(monkeypatch, tmp_path):
+    """A live target (marin), a patient with check-in consent and the call name 王奶奶, the speech API faked
+    (`renders`: (text, voice, api_key, instructions) per call; `fail`: the error the next render raises)."""
+    monkeypatch.setattr(config, "MED_CLIP_DIR", tmp_path)
+    w = types.SimpleNamespace(renders=[], target=TARGET, fail=None, consent=dict(CHECKIN), name="王奶奶")
+
+    def render(text, voice, api_key, instructions=med_clips.INSTRUCTIONS):
+        w.renders.append((text, voice, api_key, instructions))
+        if w.fail is not None:
+            raise w.fail
+        return _streamed_wav(b"\x10\x27" * 2400, rate=24000)
+
+    async def get_state(u_id):
+        return w.consent
+
+    async def call_name(conn, u_id, memory_on):
+        return w.name
+
+    monkeypatch.setattr(med_clips, "render", render)
+    monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: w.target)
+    monkeypatch.setattr(consent_service, "get_state", get_state)
+    monkeypatch.setattr(memory, "call_name", call_name)
+    monkeypatch.setattr(voice_lines, "get_pool", lambda: _Pool())
+    voice_lines._renders.clear()
+    return w
+
+
+def test_a_fixed_line_is_rendered_once_per_key_and_kept_under_lines(voice, tmp_path):
+    first = asyncio.run(voice_lines.line(None, "rest", "zh-TW"))
+    again = asyncio.run(voice_lines.line(None, "rest", "zh-TW"))
+    assert first is not None and again == first and len(voice.renders) == 1
+    assert voice.renders[0] == ("我先休息一下，有需要再叫我喔。", "marin", "sk-x", voice_lines.instructions_for("rest"))
+    assert [p.name for p in (tmp_path / "lines" / "zh-TW").iterdir()] == [f"rest_{first[1]}.wav"]
+    assert _samples(first[0])[1:] == (16000, 1)
+    voice.target = ai_settings.LiveTarget("sk-x", "gpt-live-1", "coral")   # another voice: another key and file
+    other = asyncio.run(voice_lines.line(None, "rest", "zh-TW"))
+    assert other[1] != first[1] and len(voice.renders) == 2
+    assert len(list((tmp_path / "lines" / "zh-TW").iterdir())) == 2          # the old file stays (never deleted)
+    voice.target = TARGET
+    # the help line goes to the API in its spoken form, with its own instructions; the robot gets the written words
+    kept = asyncio.run(voice_lines.line(None, "helpline", "zh-TW"))
+    assert "一一九" in voice.renders[-1][0] and voice.renders[-1][3] == voice_lines.instructions_for("helpline")
+    found = asyncio.run(voice_lines.locate(None, "helpline", "zh-TW"))
+    assert found.text == conversation.HELPLINE["zh-TW"] and found.key == kept[1]
+    # and the key is the one the relay sends beside the words (expected_clip): the robot's copy matches
+    assert kept[1] == voice_lines.expected_clip("helpline", conversation.HELPLINE["zh-TW"], "zh-TW")["key"]
+
+
+def test_a_patients_line_needs_checkin_consent_and_follows_the_call_name(voice, tmp_path):
+    first = asyncio.run(voice_lines.line(7, "opening", "zh-TW"))
+    assert first is not None and voice.renders[-1][0] == OPENING_ZH
+    assert [p.name for p in (tmp_path / "7").iterdir()] == [f"line_opening_{first[1]}.wav"]
+    assert first[1] == voice_lines.expected_clip("opening", OPENING_ZH, "zh-TW")["key"]   # what `ready` carries
+    assert asyncio.run(voice_lines.line(7, "reminder_lead", "en")) is not None
+    assert voice.renders[-1][0] == "王奶奶, I'm here to remind you of something."
+    voice.name = "阿嬤"                                     # the call name changed: a new key, the old file stays
+    renamed = asyncio.run(voice_lines.line(7, "opening", "zh-TW"))
+    assert renamed[1] != first[1] and len(voice.renders) == 3
+    voice.name = None
+    assert asyncio.run(voice_lines.line(7, "reminder_lead", "zh-TW")) is not None
+    assert voice.renders[-1][0] == "我來提醒您一件事。"
+    voice.consent = {"core": CHECKIN["core"], "robot_camera": CHECKIN["robot_camera"]}   # check-in consent gone
+    assert asyncio.run(voice_lines.line(7, "opening", "zh-TW")) is None and len(voice.renders) == 4
+    assert asyncio.run(voice_lines.locate(7, "reminder_lead", "zh-TW")) is None
+    assert asyncio.run(voice_lines.line(7, "rest", "zh-TW")) is not None     # a fixed line needs no check-in consent
+
+
+def test_the_language_is_folded_and_only_the_known_lines_have_a_place(voice, tmp_path):
+    found = asyncio.run(voice_lines.locate(None, "rest", "en-GB"))
+    assert found == asyncio.run(voice_lines.locate(None, "rest", "en"))
+    assert found.path == tmp_path / "lines" / "en" / f"rest_{found.key}.wav"
+    assert asyncio.run(voice_lines.locate(None, "rest", "")).language == "zh-TW"
+    for line_id in ("../rest", "rest.wav", "REST", "med_10", ""):
+        assert asyncio.run(voice_lines.locate(None, line_id, "zh-TW")) is None
+    assert asyncio.run(voice_lines.locate(7, "opening", "en")).path == (
+        tmp_path / "7" / f"line_opening_{voice_lines.key_for('opening', OPENING_EN, 'en', 'marin')}.wav")
+
+
+def test_no_line_without_a_target_or_when_the_api_fails_and_the_log_never_has_the_words_or_the_key(voice, caplog):
+    voice.fail = RuntimeError("speech API answered 502")
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(voice_lines.line(7, "opening", "zh-TW")) is None
+        voice.fail = OSError("disk")
+        assert asyncio.run(voice_lines.line(None, "rest", "en")) is None
+    assert "voice line opening (zh-TW) could not be rendered (speech API answered 502)" in caplog.text
+    assert "voice line rest (en) could not be rendered (OSError)" in caplog.text
+    key = voice_lines.expected_clip("opening", OPENING_ZH, "zh-TW")["key"]
+    assert "王奶奶" not in caplog.text and key not in caplog.text and "sk-x" not in caplog.text
+    voice.fail = None
+    assert asyncio.run(voice_lines.line(7, "opening", "zh-TW")) is not None    # no negative cache: tried again
+    voice.target = None
+    assert asyncio.run(voice_lines.line(None, "rest", "zh-TW")) is None
+    voice.target = ai_settings.LiveTarget("", "gpt-live-1", "marin")
+    assert asyncio.run(voice_lines.line(None, "rest", "zh-TW")) is None
+
+
+def test_fetch_gives_nothing_once_the_live_voice_target_is_gone(voice):
+    found = asyncio.run(voice_lines.locate(None, "rest", "zh-TW"))
+    voice.target = None                       # the AI card's live section saved again: its Check cleared meanwhile
+    assert asyncio.run(voice_lines.fetch(found)) is None and voice.renders == []
+
+
+def test_two_fetches_of_one_line_at_once_render_it_once(voice):
+    async def scenario():
+        return await asyncio.gather(voice_lines.line(None, "wind_down", "en"), voice_lines.line(None, "wind_down", "en"))
+
+    first, second = asyncio.run(scenario())
+    assert first == second and first is not None and len(voice.renders) == 1
