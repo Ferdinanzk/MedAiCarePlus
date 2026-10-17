@@ -80,7 +80,7 @@ from app import config
 from app.database import get_pool
 from app.services import (affect, after_chat, agent_bridge, ai_settings, consent_service, conversation,
                           device_auth, dose_status, gpt_live_config, memory, monitor_service, reachy_tasks, reminders,
-                          tool_intents)
+                          tool_intents, voice_lines)
 from app.services.live_client import LiveClient, LiveError
 
 log = logging.getLogger(__name__)
@@ -777,8 +777,10 @@ class LiveRelay:
         self._sync_tools()
         log.info("live chat %s started for patient %s: companion, %s, voice %s; GPT-Live starts when the patient "
                  "speaks", conversation_id, self.u_id, target.model_id, target.voice)
-        await self.robot.send_json({"type": "ready", "conversation_id": conversation_id,
-                                    "speech_text": conversation.speech_text(self.opening, self.language)})
+        ready = {"type": "ready", "conversation_id": conversation_id,
+                 "speech_text": conversation.speech_text(self.opening, self.language)}
+        await self.robot.send_json(
+            self._with_clip(ready, "reminder_lead" if self._reminder is not None else "opening", self.opening))
         if self._reminder is not None:
             _in_background(self._say_reminder())
         return True
@@ -1319,8 +1321,8 @@ class LiveRelay:
         if not self._pre_roll or self.outcome is not None:
             return
         line = REPEAT_LINES[self.language]
-        await self._to_robot({"type": "say", "speech_text": conversation.speech_text(line, self.language),
-                              "reason": "repeat"})
+        await self._to_robot(self._with_clip({"type": "say", "speech_text": conversation.speech_text(line, self.language),
+                                              "reason": "repeat"}, "repeat", line))
 
     async def _pause(self, why: str) -> None:
         """End the running stretch, as a timer (_handler_lock). why: quiet, stretch_max or stretch_hard_max (_tick).
@@ -2120,8 +2122,9 @@ class LiveRelay:
         turns failing never costs the alert (it quotes the words block() was given); a failure after that still
         sends `end` with risk true (run, _after_failure)."""
         helpline = conversation.HELPLINE[self.language]
-        await self._to_robot({"type": "say", "speech_text": conversation.speech_text(helpline, self.language),
-                              "reason": "risk"})
+        await self._to_robot(self._with_clip({"type": "say",
+                                              "speech_text": conversation.speech_text(helpline, self.language),
+                                              "reason": "risk"}, "helpline", helpline))
         if self.client is not None and not self._live_closed:
             try:
                 await asyncio.wait_for(self.client.mute(), MUTE_WAIT_SECONDS)
@@ -2286,6 +2289,18 @@ class LiveRelay:
         return self._usage_before + (self._usage or 0.0)
 
     # ── the robot's connection ───────────────────────────────────────────────────────────────────────────────────
+
+    def _with_clip(self, message: dict, line_id: str, text: str) -> dict:
+        """Same voice (services/voice_lines.py): beside the words a companion robot says with its own voice, the id
+        and key of that line's copy in the live voice (voice_lines.expected_clip, the key the line route serves).
+        Robot app 0.16.0 plays its kept copy when the key matches, else Matcha now and it fetches the copy for next
+        time; 0.15.0 ignores the field. Nothing is added without a live voice target, and never for an older robot.
+        No render, no database: `ready` and `say` never wait."""
+        if self.companion:
+            clip = voice_lines.expected_clip(line_id, text, self.language)
+            if clip is not None:
+                message["clip"] = clip
+        return message
 
     async def _to_robot(self, message: dict) -> None:
         try:

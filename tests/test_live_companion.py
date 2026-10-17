@@ -25,7 +25,7 @@ _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
 from app import config  # noqa: E402
-from app.services import ai_settings, conversation, live_session, memory, monitor_service  # noqa: E402
+from app.services import ai_settings, conversation, live_session, memory, monitor_service, voice_lines  # noqa: E402
 from app.services.live_client import LiveError, LiveEvent  # noqa: E402
 from tests.test_live_relay_chat import (DEVICE, DEVICE_ID, LOUD, OPENING, TASK_ID, LiveDB, _live, _over,  # noqa: E402
                                         _pcm, _reachy, _said, _settle, _sound, _step, world)  # noqa: F401
@@ -38,6 +38,11 @@ TARGET = ai_settings.LiveTarget("sk-test-live-key-0000", "gpt-live-1", "marin")
 START = {"type": "start", "task_id": TASK_ID, "language": "zh-TW", "rate": 16000, "bridge_version": "0.9.0"}
 PAUSED = {"type": "paused"}
 NOT_SEEN = {"type": "not_seen"}
+# Same voice: the copies a companion robot plays for Reachy's lines (keys as the line route serves them for marin)
+OPENING_CLIP = {"id": "opening", "key": voice_lines.key_for("opening", OPENING, "zh-TW", "marin")}
+REPEAT_CLIP = {"id": "repeat", "key": voice_lines.key_for("repeat", live_session.REPEAT_LINES["zh-TW"], "zh-TW", "marin")}
+HELP_CLIP = {"id": "helpline", "key": voice_lines.key_for("helpline", HELPLINE, "zh-TW", "marin")}
+SAY_CLIP = {**SAY, "clip": HELP_CLIP}
 
 
 class CompanionDB(LiveDB):
@@ -152,7 +157,8 @@ def test_a_companion_start_is_paused_and_the_robot_says_the_opening(companion):
         chat = companion.db.chat()
         cid = chat["conversation_id"]
         assert companion.robot.json() == [{"type": "ready", "conversation_id": cid,
-                                           "speech_text": conversation.speech_text(OPENING, "zh-TW")}]
+                                           "speech_text": conversation.speech_text(OPENING, "zh-TW"),
+                                           "clip": OPENING_CLIP}]
         assert companion.robot.json()[0]["speech_text"] == "王奶奶，今天感觉怎么样？想跟我聊聊吗？"   # for Matcha
         assert (chat["mode"], chat["companion"], chat["model"], chat["task_id"]) == ("live", True, "gpt-live-1",
                                                                                    TASK_ID)
@@ -551,7 +557,7 @@ def test_the_hard_cap_pauses_a_patient_still_talking_and_their_queued_words_are_
         await _step(companion, relay, 0.4)                    # the hit settled: still a risk, blocked
         await _over(companion, running)
         chat = companion.db.chat()
-        assert companion.robot.json()[1:] == [FLUSH, FLUSH, PAUSED, SAY, END_RISK]
+        assert companion.robot.json()[1:] == [FLUSH, FLUSH, PAUSED, SAY_CLIP, END_RISK]
         assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True) and _flagged(companion) == [30]
         assert companion.alerts == [_alert(companion, words, 30)]
         assert len(companion.robot.audio()) == 2 and chat["live"]["stretches"] == 2
@@ -570,7 +576,7 @@ def test_openais_cut_off_still_queued_at_a_quiet_pause_is_judged_and_blocks(comp
         await _step(companion, relay, 28.25)                  # 30 s of quiet: paused, OpenAI's cut-off still queued
         await _over(companion, running)
         chat = companion.db.chat()
-        assert companion.robot.json()[1:] == [FLUSH, SAY, END_RISK]   # blocked: never `paused`
+        assert companion.robot.json()[1:] == [FLUSH, SAY_CLIP, END_RISK]   # blocked: never `paused`
         assert [check[0] for check in companion.checks] == [UNHEARD, UNHEARD]
         assert companion.db.turns[1]["metrics"]["live"]["risk_source"] == "content"
         assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True) and _flagged(companion) == [2]
@@ -638,7 +644,8 @@ def test_a_stretch_that_cannot_start_asks_the_patient_to_say_it_again(companion)
         await _speak(companion)
         await _over(companion, running)
         cid = companion.db.chat()["conversation_id"]
-        repeat = {"type": "say", "speech_text": "不好意思，我刚刚没听清楚，可以再说一次吗？", "reason": "repeat"}
+        repeat = {"type": "say", "speech_text": "不好意思，我刚刚没听清楚，可以再说一次吗？", "reason": "repeat",
+                  "clip": REPEAT_CLIP}
         assert repeat["speech_text"] == conversation.speech_text(live_session.REPEAT_LINES["zh-TW"], "zh-TW")
         # the robot asks for them again in its own voice, then today's text chat listens in the same conversation
         assert companion.robot.json()[1:] == [repeat, {"type": "fallback", "reason": "live_unavailable",
@@ -666,7 +673,7 @@ def test_a_robot_end_mid_stretch_still_screens_the_patients_last_words(companion
         assert companion.db.rows("patient") == [("patient", "今天我想自殺")] and _flagged(companion) == [2]
         assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True)
         assert companion.alerts == [_alert(companion, "今天我想自殺", 2)]
-        assert companion.robot.json()[1:] == [FLUSH, SAY, END_RISK]   # the help line, if the robot still listens
+        assert companion.robot.json()[1:] == [FLUSH, SAY_CLIP, END_RISK]   # the help line, if the robot still listens
         assert companion.db.rows()[-1] == ("reachy", HELPLINE) and client.closes == 1
 
     asyncio.run(scenario())
@@ -679,8 +686,22 @@ def test_the_patients_first_words_in_a_stretch_are_screened(companion):
         await _live(companion, _said("我想自殺"), _sound())   # GPT-Live's transcript of the pre-roll: a hit
         await _step(companion, relay, 0.5)                    # confirmed: blocked
         await _over(companion, running)
-        _blocked(companion, flagged=[2], quote="我想自殺", source="keyword")
+        _blocked(companion, flagged=[2], quote="我想自殺", source="keyword", clip=HELP_CLIP)
         assert companion.robot.audio() == [] and companion.db.chat()["live"]["stretches"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_say_carries_no_clip_once_the_live_voice_target_is_gone(companion, monkeypatch):
+    async def scenario():
+        relay, running = await _start(companion)
+        assert companion.robot.json("ready")[0]["clip"] == OPENING_CLIP
+        monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: None)   # the card's model saved again
+        await _speak(companion)                               # the stretch still starts: its target was kept at start
+        await _live(companion, _said("我想自殺"), _sound())
+        await _step(companion, relay, 0.5)
+        await _over(companion, running)
+        _blocked(companion, flagged=[2], quote="我想自殺", source="keyword")   # the help line, with no clip to name
 
     asyncio.run(scenario())
 
@@ -703,7 +724,7 @@ def test_nothing_restarts_after_a_risk_found_while_paused(companion):
         await _over(companion, running)
         assert len(companion.clients) == 1 and companion.seen_asked == [7]   # never started again, nor asked
         chat = companion.db.chat()
-        assert companion.robot.json()[1:] == [PAUSED, FLUSH, SAY, END_RISK]
+        assert companion.robot.json()[1:] == [PAUSED, FLUSH, SAY_CLIP, END_RISK]
         assert (chat["end_reason"], chat["risk_flag"]) == ("risk", True)
         assert companion.alerts == [_alert(companion, QUIET_RISK, 2)]
         assert companion.db.rows()[-1] == ("reachy", HELPLINE)
