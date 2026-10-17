@@ -243,6 +243,34 @@ def test_no_line_without_a_target_or_when_the_api_fails_and_the_log_never_has_th
     assert asyncio.run(voice_lines.line(None, "rest", "zh-TW")) is None
 
 
+def test_a_line_that_cannot_be_kept_is_a_warning_and_the_other_lines_still_render(voice, tmp_path, caplog):
+    """A storage error under MED_CLIP_DIR (whole-branch review of 17 Oct 2026) is one WARNING and None, like a
+    render that failed: it never stops the render-ahead pass, and the retry job ends with its one summary line."""
+    (tmp_path / "lines").mkdir()
+    (tmp_path / "lines" / "zh-TW").write_bytes(b"")   # a file where the zh-TW folder should be
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(voice_lines.line(None, "rest", "zh-TW")) is None
+        failed = asyncio.run(voice_lines.render_fixed_ahead())
+    assert failed == [f"{line_id}/zh-TW" for line_id in voice_lines.FIXED_LINES]   # every line was tried
+    assert sorted(p.name.rsplit("_", 1)[0] for p in (tmp_path / "lines" / "en").iterdir()) == sorted(
+        voice_lines.FIXED_LINES)                                                     # the English ones are kept
+    assert len(voice.renders) == 6                    # a folder that cannot be made costs no render
+    assert "voice line rest (zh-TW) could not be kept (FileExistsError)" in caplog.text
+    keys = [voice_lines.key_for(line_id, voice_lines.line_text(line_id, "zh-TW"), "zh-TW", "marin")
+            for line_id in voice_lines.FIXED_LINES]
+    assert not any(key in caplog.text for key in keys) and "sk-x" not in caplog.text
+    # the folder is there, but the file cannot be written (a directory where the .part file goes)
+    found = asyncio.run(voice_lines.locate(None, "medicine", "en"))
+    found.path.unlink()
+    found.path.with_suffix(".part").mkdir()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(voice_lines.fetch(found)) is None and len(voice.renders) == 7
+        asyncio.run(voice_lines.retry_missing())      # the scheduler's job: no exception, its one summary line
+    assert "voice line medicine (en) could not be kept" in caplog.text and found.key not in caplog.text
+    assert "7 fixed lines are still missing" in caplog.text and "medicine/en" in caplog.text
+
+
 def test_fetch_gives_nothing_once_the_live_voice_target_is_gone(voice):
     found = asyncio.run(voice_lines.locate(None, "rest", "zh-TW"))
     voice.target = None                       # the AI card's live section saved again: its Check cleared meanwhile
