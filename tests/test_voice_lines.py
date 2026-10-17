@@ -114,6 +114,26 @@ def test_to_robot_wav_gives_pcm16_mono_16_khz_and_trims_the_leading_silence():
         voice_lines.to_robot_wav(_streamed_wav(b"\x00\x00" * 1600, rate=16000))        # no sound at all: never kept
 
 
+def test_no_pause_in_a_kept_line_is_long_enough_for_the_robot_to_report_idle():
+    """The robot's live player (app 0.16.0, bridge/live.py) reports `idle` after 0.6 s of quiet 20 ms blocks (no
+    sample above 120), even inside its own line; the server then sends what waits for that idle (the reminder after
+    its lead-in) while the robot still drops audio for the line (whole-branch review of 17 Oct 2026). So every quiet
+    stretch after the first sound, the one at the end included, is cut to PAUSE_MAX_SECONDS; a shorter one stays."""
+    sound, silence, hum = b"\x10\x27", b"\x00\x00", b"\x64\x00"   # level 10000, 0, and 100: still quiet to the robot
+    # at 16 kHz: 0.3 s of sound, a 0.9 s pause, 0.3 s, a 0.2 s pause, 0.3 s, then 1.2 s of a faint hum at the end
+    pcm = sound * 4800 + silence * 14400 + sound * 4800 + silence * 3200 + sound * 4800 + hum * 19200
+    samples, rate, channels = _samples(voice_lines.to_robot_wav(_streamed_wav(pcm, rate=16000)))
+    keep = int(16000 * voice_lines.PAUSE_MAX_SECONDS)
+    assert voice_lines.PAUSE_MAX_SECONDS == 0.4 and (rate, channels) == (16000, 1)
+    assert len(samples) == 3 * 4800 + keep + 3200 + keep          # the long ones cut, the 0.2 s pause kept whole
+    assert samples[:4800] == (10000,) * 4800 and samples[-keep:] == (100,) * keep
+    longest = run = 0   # the robot's rule: 320-sample blocks, quiet when no sample is above 120, idle after 30
+    for start in range(0, len(samples), 320):
+        run = run + 1 if max(abs(s) for s in samples[start:start + 320]) <= 120 else 0
+        longest = max(longest, run)
+    assert longest < 30
+
+
 def test_render_line_renders_with_the_lines_instructions_then_converts(monkeypatch):
     renders = []
 

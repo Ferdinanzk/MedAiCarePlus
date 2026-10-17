@@ -57,6 +57,8 @@ _NUMBER = re.compile(r"\d{3,}")   # 119 and 1925 are read digit by digit; "24 å°
 RATE = 16000                 # the robot's live player takes PCM16 mono 16 kHz; robot.play_clip takes it too
 TRIM_LEVEL = 0.003           # about -50 dBFS of full scale: the deploy tool's threshold for Matcha's clips ...
 TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the first sound
+PAUSE_LEVEL = 120            # the robot's live player calls a 20 ms block with no sample above this quiet (ONSET_LEVEL)
+PAUSE_MAX_SECONDS = 0.4      # ... and says `idle` after 0.6 s of quiet, even inside its own line: no pause is longer
 LINES_RETRY_MINUTES = 30     # the scheduler tries the fixed lines still missing again this often (voice_lines job)
 
 _renders: dict[str, asyncio.Lock] = {}   # one lock per key, as med_clips: two requests never render the same line twice
@@ -124,8 +126,9 @@ def expected_clip(line_id: str, text: str, language: str) -> dict | None:
 def to_robot_wav(wav_bytes: bytes) -> bytes:
     """The speech API's WAV (24 kHz mono in practice; any PCM16 rate or channel count) as the robot keeps it: PCM16
     mono 16 kHz, the leading silence trimmed to about 10 ms below about -50 dBFS, as the deploy tool trims Matcha's
-    clips, so a kept line starts as promptly as a Matcha one. Raises ValueError for anything but 16-bit PCM
-    (normalize_wav) and for a WAV with no sound at all: silence where Reachy spoke before is never kept."""
+    clips, so a kept line starts as promptly as a Matcha one, and every pause after it cut to PAUSE_MAX_SECONDS
+    (_shorten_pauses). Raises ValueError for anything but 16-bit PCM (normalize_wav) and for a WAV with no sound at
+    all: silence where Reachy spoke before is never kept."""
     import numpy as np
     from scipy.signal import resample_poly
     with wave.open(io.BytesIO(med_clips.normalize_wav(wav_bytes)), "rb") as wav:
@@ -141,14 +144,30 @@ def to_robot_wav(wav_bytes: bytes) -> bytes:
     if not len(loud):
         raise ValueError("the WAV holds no sound")
     samples = samples[max(0, int(loud[0]) - int(RATE * TRIM_KEEP_SECONDS)):]
-    pcm = np.clip(np.round(samples * 32768.0), -32768, 32767).astype("<i2").tobytes()
+    pcm = _shorten_pauses(np.clip(np.round(samples * 32768.0), -32768, 32767).astype("<i2"))
     out = io.BytesIO()
     with wave.open(out, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(RATE)
-        wav.writeframes(pcm)
+        wav.writeframes(pcm.tobytes())
     return out.getvalue()
+
+
+def _shorten_pauses(pcm):
+    """Every quiet stretch after the first sound (no sample above PAUSE_LEVEL), the one at the end included, cut to
+    PAUSE_MAX_SECONDS. The robot's live player says `idle` after 0.6 s of quiet blocks even while its own line is
+    still queued, and the server then sends what waits for that idle (the reminder after its lead-in) while the
+    robot still drops audio for that line, so the reminder was lost (whole-branch review of 17 Oct 2026). Only
+    samples below about -48 dBFS are cut, so nothing that can be heard is lost."""
+    import numpy as np
+    keep = int(RATE * PAUSE_MAX_SECONDS)
+    sound = np.flatnonzero(np.abs(pcm.astype(np.int32)) > PAUSE_LEVEL)
+    bounds = np.append(sound, len(pcm))   # the stretch after the last sound ends where the line ends
+    wanted = np.ones(len(pcm), dtype=bool)
+    for at in np.flatnonzero(np.diff(bounds) - 1 > keep):
+        wanted[bounds[at] + 1 + keep:bounds[at + 1]] = False
+    return pcm[wanted]
 
 
 def render_line(text: str, voice: str, api_key: str, instructions: str) -> bytes:
