@@ -1,9 +1,10 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **12 October 2026, evening**, GitHub branch **`reachy-integration-0.3`** (section 8 is new in it;
-sections 6 and 7 came with `reachy-integration-0.2`; sections 1-5 describe `reachy-integration-0.1`, which both build
-on). **Start with [section 8](#8-what-was-finished-on-12-october-2026-evening) for what to do next.** No passwords, keys or tokens are written here;
-[step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
+Status as of **17 October 2026**, GitHub branch **`agent-tools-fixes`** (section 9 is new in it and builds on
+`feature/merged-live-dose-status`; section 8 came with `reachy-integration-0.3`, sections 6 and 7 with
+`reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
+[section 9](#9-what-was-finished-on-17-october-2026) for what to do next.** No passwords, keys or tokens are written
+here; [step 4.3](#43-create-env-and-put-in-the-credentials) says where each one goes.
 
 The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
 is out of date; the sections above it win where they disagree.
@@ -442,6 +443,99 @@ voice model (`gpt-live-1`, voice `marin`) on the OpenAI connection and press **C
 4. **Still to test on the robot:** the pause and restart (stay quiet 40 s, then ask about what was said), the rest
    ending (step away for 10 minutes), a medicine falling due during a chat, and a fallback (cut the PC's internet
    during a chat).
+
+## 9. What was finished on 17 October 2026
+
+`agent-tools-fixes` is `feature/merged-live-dose-status` (`d2a4a8b`, the 16 Oct merge of the live tools and the
+dose-status work made on another computer) plus the fixes for the GPT-Live agent tools the user's test sheet marked
+broken: `stop_dance`, `record_medication_taken` and the LINE video that never came. 29 commits, 27 files, about
+4,900 lines added (tests included). The plan is `docs/superpowers/plans/2026-10-16-agent-tool-fixes.md`; the rules
+the fixes follow are in `CLAUDE.md` ("Dose videos", "GPT-Live agent", "stop_dance stops at once", the backstop
+intents). The robot app was not changed: it is **0.15.0** from its own repository `Pearlyjam21/medcare-reachy-bridge`
+(branch `feature/merged-live-emotion`, `437b136`, the same files as the Hugging Face space's `main`); this
+repository's `reachy_app/` is an older copy (0.10.0).
+
+**Why the video never came.** Two computers were testing with **one LINE bot**. A LINE bot has one webhook address,
+and the server uses that address as the public link of its videos. The webhook pointed at the other computer's
+tunnel, and the old link check accepted that tunnel's own 404 as "working", so every video link on this computer
+led nowhere. The fix below makes the server prove the link reaches itself. Only one computer at a time can deliver
+videos and family answers: whoever tests runs `scripts/line-tunnel.ps1` first (it starts this computer's tunnel and
+points the bot's webhook at it).
+
+**Finished and tested**
+
+1. **Dose videos reach family or say why not.** The server checks its public link with a secret probe: a request
+   through the LINE webhook address must answer with this server's own marker. One WARNING names the reason when
+   the link is lost (no LINE token, webhook endpoint error, tunnel not answering, tunnel reaches another server,
+   `PUBLIC_BASE_URL` not https) and the `[STARTUP] line` stage shows it. A clip with no link is **kept, not dropped**,
+   and the `dose_videos` job sends it as soon as a link answers again, while its family request is still open and for
+   up to 4 hours (log: "sent late, now that a public link answers"). The family request says what is true about its
+   video: it comes with this message, it was sent earlier (only when that clip really went), or none and why (no
+   consent, no recent camera frames).
+2. **`record_medication_taken` never loses a legitimate request.** Closing GPT-Live (a goodbye or the companion's
+   quiet pause) lets a running record, family note or alert finish instead of cancelling it, and the pause waits for
+   the medication tools and for GPT-Live's answer after them. The order is now record first, applause after. A record
+   given without its camera session settles an open camera watch only for the exact same dose, and the watch's
+   camera reading (result and confidence, or "still watching") goes into the family request's evidence, so family
+   see when the camera disagrees with "I took it". The tool's time limit covers its worst case (20 s).
+3. **「我吃完藥了」 reaches the tool.** With tools on, GPT-Live's prompt delegates a medicine claim and praises only
+   after the server's answer (it also records every due dose of the slot and sends a claim on a too-soon or
+   max-reached dose, which the server refuses and reports to family with the double-dose alert). If GPT-Live does not
+   delegate within the usual grace, the relay's backstop does: it reads only a closed list of plain claims
+   (「我吃完藥了」, 「我吃過藥了」, 「我已經吃藥了」, "I took my medicine", ... optionally followed by one closing word), decided
+   on the whole turn at dispatch, dropped by any other words; it runs the due check, then the record for each due
+   dose, holds the chat open until they finish, and has GPT-Live say what happened without praise. Anything less
+   plain (a time, a person, a condition, a doubt, a retraction) is left to GPT-Live's own call.
+4. **`stop_dance` stops at once.** While a dance may run, a stop phrase anywhere in the patient's words (「停」,
+   「不要再跳了」, 「別跳」, 「好了」, 「你要不要停下來」, "stop", "don't dance", ...) makes the relay run `stop_dance` at the
+   first transcript fragment that holds it, without waiting for GPT-Live; GPT-Live's own later call shares that run.
+   A stop that lands while the robot is still loading the move is sent again when the move starts. After a stop,
+   a dance is refused for 10 s unless the patient asks again (「繼續跳」, 「再跳一次」, "keep dancing"). A dance with no
+   `repeat` plays 2 moves, so there is time to stop it. 「不要停」, 「停車」, 「停電」, 「要不要再跳舞」 are not stops.
+5. **Tests:** backend 2415 → **3147 passed** (`.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider`).
+   Two timing tests fail now and then under load and pass alone (`test_after_a_429_the_late_check_waits_before_asking_again`,
+   `test_dose_emotion.py::test_the_event_window_starts_when_the_detector_skips_approaching`).
+6. **Live test on the robot with the user (17 Oct 12:44-12:56)**, server built from `26bfae2`, robot app 0.15.0,
+   a test medicine made due with `PATCH /api/medications/{id}`, a check-in started with "Talk to Reachy now"'s task:
+   「我吃完藥了」 → `check_medication_due` (16 ms) → `record_medication_taken` (30 ms) → applause; the family request
+   arrived on LINE. 「不要再跳了」 → "the patient asks to stop dancing; the relay runs stop_dance now" (0 ms; GPT-Live's
+   own call shared it); 「繼續跳」 danced again; 再見 ended the chat. The video was **kept unsent** because the
+   Cloudflare quick tunnel had died minutes earlier ("tunnel not answering"); after `docker compose --profile line up
+   -d --force-recreate line-tunnel` and `scripts/line-tunnel.ps1`, the job sent it ("sent late") and the user received
+   it on LINE. So every path of the fixes, including the late send, ran on the real system.
+
+**Set up for the test on this computer** (on top of section 8): `.env` has `LIVE_TOOLS=1` (the agent layer) and
+`LIVE_VOICE_TEST=1`; `DEVICE_BIND` is the address the robot reaches (`192.168.137.1`, this PC's hotspot);
+`scripts/line-tunnel.ps1` was run here (so the shared bot's webhook points at this PC); the robot runs 0.15.0
+installed with `tools/deploy_to_robot.py` from the `medcare-reachy-bridge` repository (backup
+`~/.medcare_reachy/backup-20261016-231451.tgz` on the robot). The safety and after-chat model is still
+`google/gemini-2.5-flash-lite`, which OpenRouter retires on 20 Oct: pick another on the AI connections card.
+
+**Seen in the live test (not fixed)**
+
+- **A false "Reachy is offline" message to family.** After leasing the check-in task the robot opened its camera,
+  closed it 1.4 s later, and sent no heartbeat for 77 s; the server (`reachy_tasks.maintenance`, 60 s) re-queued the
+  task and sent the notice, then the robot leased the task again and the chat started. Two fixes are due: the
+  robot's silence after a failed camera start, and a "could not help with the medicines" notice for a chat task.
+- The family request promised "the video comes in the next message" although the link was already down: the
+  request's video outlook is computed before the clip is stored and the link checked. A known-down link should get
+  its own wording ("the video follows when the link is back").
+- The Cloudflare **quick** tunnel dies on its own (five addresses since 16 Oct); each death needs
+  `scripts/line-tunnel.ps1` again. A named tunnel would be stable.
+- **"Use webhook" is off** in the LINE Developers console for the test bot, so family answers never reach the server.
+- From the final reviews, minor and parked: no test pins that a held GPT-Live call's time counts from when it starts
+  running; a record answered `already_*` still spends an unread camera watch, so that watch's clip never reaches
+  family.
+
+**Next**
+
+1. **Same voice** (approved 17 Oct): Reachy's own lines around a live chat in GPT-Live's voice, rendered by the
+   server, with Matcha as the fallback; branch `same-voice` (made from this branch) and robot app 0.16.0. Design:
+   `docs/superpowers/specs/2026-10-17-same-voice-design.md` on that branch.
+2. **New agent tools** (approved 17 Oct): `go_to_sleep`, `volume_control`, `head_tracking`, `robot_status`, `forget`,
+   `move_head`, `sweep_look`, `stop_emotion` (`idle_do_nothing` skipped); after the same voice, robot app 0.17.0.
+3. The two defects above, and the remaining robot checks of section 8 (the pause and restart, the rest ending, a
+   fallback).
 
 ---
 
