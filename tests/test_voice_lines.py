@@ -401,3 +401,34 @@ def test_the_retry_logs_what_is_still_missing(voice, caplog):
     with caplog.at_level(logging.WARNING):
         asyncio.run(voice_lines.retry_missing())
     assert "12 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text
+
+
+# ── rendered ahead: the patient's lines ──
+
+def test_the_patients_lines_are_rendered_ahead_in_the_background(voice):
+    async def scenario():
+        task = voice_lines.render_ahead_for_patient(7)
+        assert task is not None
+        await task
+        assert voice_lines.render_ahead_for_patient(7) is not None   # kept already: no new render
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert sorted(text for text, *_ in voice.renders) == sorted([
+        OPENING_ZH, OPENING_EN, "王奶奶，我來提醒您一件事。", "王奶奶, I'm here to remind you of something."])
+    voice.target = None
+    assert voice_lines.render_ahead_for_patient(7) is None          # no live target: nothing, and no loop needed
+
+
+def test_a_render_ahead_that_fails_is_logged_and_never_raises(voice, caplog, monkeypatch):
+    async def broken(u_id):
+        raise RuntimeError("database down")   # the consent or name read failed (locate raises through line)
+    monkeypatch.setattr(voice_lines, "patient_name", broken)
+
+    async def scenario():
+        await voice_lines.render_ahead_for_patient(7)   # the task finishes without raising
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    assert "voice lines for patient 7: the render ahead failed (RuntimeError)" in caplog.text
+    assert voice.renders == [] and "database down" not in caplog.text

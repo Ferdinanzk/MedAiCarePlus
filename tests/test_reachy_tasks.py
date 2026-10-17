@@ -342,6 +342,16 @@ def test_checkin_task_has_no_dose_to_check(db):
     assert enqueue(db, reason="checkin", intk_ids=()) and db.due_checks == []
 
 
+def test_a_queued_task_renders_the_patients_lines_ahead(db, monkeypatch):
+    from app.services import voice_lines
+    ahead = []
+    monkeypatch.setattr(voice_lines, "render_ahead_for_patient", lambda u_id: ahead.append(u_id))
+    assert enqueue(db, reason="checkin", intk_ids=()) and ahead == [7]
+    assert enqueue(db) and ahead == [7, 7]                   # a dose task's slot ends with a check-in too
+    db.devices[7]["revoked"] = True
+    assert enqueue(db, slot=T0 + timedelta(hours=8)) is None and ahead == [7, 7]   # no task: nothing to render for
+
+
 # ── Lease, payload, restart recovery ─────────────────────────────────────────
 
 def test_lease_next_leases_oldest_queued_and_returns_payload(db):
@@ -911,6 +921,9 @@ def live_ready(db, monkeypatch):
     live = ai_settings.LiveSetting(2, "gpt-live-1", "marin", T0, 1180, None)
     monkeypatch.setattr(ai_settings, "_snapshot", ai_settings.Snapshot({2: openai}, {}, {}, live=live))
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", True)
+    from app.services import voice_lines
+    # the live flag's tests are not about the render-ahead: nothing is rendered here
+    monkeypatch.setattr(voice_lines, "render_ahead_for_patient", lambda u_id: None)
     db.consent[7] = CHECKIN_CONSENT
     return db
 

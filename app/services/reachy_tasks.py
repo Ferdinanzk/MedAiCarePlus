@@ -102,6 +102,17 @@ async def task_payload(conn, task) -> dict:
 
 async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at,
                               at=None) -> str | None:
+    """_enqueue (the task), then the patient's own lines in the live voice rendered ahead for the check-in the task
+    ends with (services/voice_lines.py; nothing without a live voice target)."""
+    task_id = await _enqueue(conn, u_id, slot_time, intk_ids, reason, expires_at, at)
+    if task_id is not None:
+        from app.services import voice_lines   # here, not at the top: voice_lines uses this module's consent gate
+        voice_lines.render_ahead_for_patient(u_id)
+    return task_id
+
+
+async def _enqueue(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at,
+                   at=None) -> str | None:
     """Open (or re-arm a queued) task for this slot inside the caller's transaction.
 
     Returns the open task id, or None when the patient has no active device or
