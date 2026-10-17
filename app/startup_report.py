@@ -10,7 +10,10 @@ as it goes (app/main.py), and `GET /health` carries the same report (`startup`) 
 `finish()` runs after the servers are up: the network probes (api.openai.com, api.line.me: reachable, and the clock
 skew from their Date header), the LINE public link, and, when the live voice model has a key but no passing Check
 (saving the AI card's live section clears it; a Check pressed while offline fails), the Check itself, retried a few
-times so a Wi-Fi that comes up after the stack does not leave GPT-Live off until someone presses the button.
+times so a Wi-Fi that comes up after the stack does not leave GPT-Live off until someone presses the button. Then
+the fixed lines Reachy says around a live chat are rendered ahead in the live voice, in the background
+(services/voice_lines.py): the voice_lines stage stays pending until they end, so the summary line never waits for
+them.
 """
 
 import asyncio
@@ -27,7 +30,7 @@ from app.services import ai_settings
 log = logging.getLogger("app.startup")
 
 STAGES = ("environment", "database", "ai_settings", "gpt_live", "models", "scheduler", "outbox", "line", "reminders",
-          "device_api", "network", "clock")
+          "device_api", "network", "clock", "voice_lines")
 PROBE_TIMEOUT = 4.0
 PROBES = {"openai": "https://api.openai.com/v1/models", "line": "https://api.line.me/v2/bot/info"}
 CLOCK_SKEW_WARN_SECONDS = 60.0
@@ -215,6 +218,43 @@ async def auto_check_live(snapshot) -> None:
         mark("gpt_live", False, f"the Check failed: {why}; check-ins use the text chat", warn=True)
 
 
+def voice_lines_stage() -> asyncio.Task | None:
+    """Reachy's own lines around a live chat, rendered ahead in the live voice (services/voice_lines.py), after the
+    live Check whatever its stored status, so a fresh start whose Check had been cleared still gets them. OK at once
+    without a live target (nothing to render). Otherwise pending at once, as gpt_live while its Check runs, and the
+    renders run in the background (kept in _tasks, as finish_in_background does): 12 renders one after another, each
+    up to two tries of med_clips.TIMEOUT, must never hold up the summary line. _render_voice_lines settles the stage."""
+    from app.services import ai_settings, voice_lines
+    if ai_settings.live_target() is None:
+        mark("voice_lines", True, "no live voice target: Reachy's own lines stay in the robot's own voice")
+        return None
+    total = len(voice_lines.FIXED_LINES) * len(voice_lines.LANGUAGES)
+    mark("voice_lines", False, f"rendering the {total} fixed lines ahead in the live voice, in the background; the "
+                               f"robot says them with its own voice until they are kept", pending=True, warn=True)
+    task = asyncio.get_running_loop().create_task(_render_voice_lines(total), name="startup-voice-lines")
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return task
+
+
+async def _render_voice_lines(total: int) -> None:
+    """The stage's background task: every fixed line rendered when missing, then the final mark: OK with every
+    fixed line kept, DEGRADED naming the lines that failed (the voice_lines scheduler job tries them again; the robot
+    says them with its own voice meanwhile)."""
+    from app.services import voice_lines
+    try:
+        failed = await voice_lines.render_fixed_ahead()
+    except Exception as error:
+        mark("voice_lines", False, f"the render ahead failed: {type(error).__name__}", warn=True)
+        return
+    if failed:
+        mark("voice_lines", False, f"{len(failed)} of {total} fixed lines could not be rendered in the live voice "
+                                   f"({', '.join(failed)}); the robot says them with its own voice meanwhile; tried "
+                                   f"again every {voice_lines.LINES_RETRY_MINUTES} min", warn=True)
+    else:
+        mark("voice_lines", True, f"{total} fixed lines kept in the live voice (both languages)")
+
+
 async def finish(snapshot, *, live_status: str) -> None:
     """After the servers are up: the probes, the public link, the automatic Check, then the summary line."""
     try:
@@ -230,6 +270,10 @@ async def finish(snapshot, *, live_status: str) -> None:
             await auto_check_live(snapshot)
         except Exception as error:
             mark("gpt_live", False, f"the automatic Check failed: {type(error).__name__}: {error}", warn=True)
+    try:
+        voice_lines_stage()   # pending at once; its renders run in the background and never hold up the summary line
+    except Exception as error:
+        mark("voice_lines", False, f"the render ahead could not start: {type(error).__name__}", warn=True)
     log_summary()
 
 

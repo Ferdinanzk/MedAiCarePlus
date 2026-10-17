@@ -22,6 +22,7 @@ def start_scheduler():
     from app.services.dose_video import maintain as maintain_dose_videos
     from app.services.context_info import refresh as refresh_checkin_background
     from app.services.reminders import sweep as sweep_reminders
+    from app.services.voice_lines import LINES_RETRY_MINUTES, retry_missing as retry_voice_lines
 
     scheduler.add_job(
         check_missed_doses,
@@ -103,6 +104,15 @@ def start_scheduler():
         sweep_reminders,
         IntervalTrigger(minutes=1),
         id="reminders",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=None,
+        coalesce=True,
+    )
+    scheduler.add_job(   # Reachy's own lines in the live voice: the fixed ones still missing are rendered again
+        retry_voice_lines,
+        IntervalTrigger(minutes=LINES_RETRY_MINUTES),
+        id="voice_lines",
         replace_existing=True,
         max_instances=1,
         misfire_grace_time=None,
