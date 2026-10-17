@@ -2,8 +2,8 @@
 
 Date: 17 Oct 2026. Repos: server `MedAiCarePlus` (branch to be made from `agent-tools-fixes` once it is merged, or
 on top of it) and robot app `medcare-reachy-bridge` (branch from `feature/merged-live-emotion` `437b136`, 0.15.0 →
-0.16.0). Read-only maps of today's code, with file:line for everything below: `samevoice/robot.md` and
-`samevoice/server.md` in this folder.
+0.16.0). Read-only maps of today's code, with file:line for everything below (line numbers as of 17 Oct 2026):
+`2026-10-17-same-voice-map-robot.md` and `2026-10-17-same-voice-map-server.md` beside this file.
 
 ## Intent and why
 
