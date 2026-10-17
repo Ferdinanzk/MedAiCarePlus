@@ -291,10 +291,14 @@ def test_a_line_that_cannot_be_kept_is_a_warning_and_the_other_lines_still_rende
     assert "7 fixed lines are still missing" in caplog.text and "medicine/en" in caplog.text
 
 
-def test_fetch_gives_nothing_once_the_live_voice_target_is_gone(voice):
+def test_fetch_gives_nothing_once_the_live_voice_target_is_gone(voice, caplog):
     found = asyncio.run(voice_lines.locate(None, "rest", "zh-TW"))
     voice.target = None                       # the AI card's live section saved again: its Check cleared meanwhile
-    assert asyncio.run(voice_lines.fetch(found)) is None and voice.renders == []
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(voice_lines.fetch(found)) is None and voice.renders == []
+        voice.target = ai_settings.LiveTarget("", "gpt-live-1", "marin")   # or its key is gone
+        assert asyncio.run(voice_lines.fetch(found)) is None and voice.renders == []
+    assert "could not be rendered" not in caplog.text   # fetch's own re-check, never a render that failed
 
 
 def test_two_fetches_of_one_line_at_once_render_it_once(voice):
