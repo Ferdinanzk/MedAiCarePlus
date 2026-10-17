@@ -1,6 +1,6 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **17 October 2026**, GitHub branch **`agent-tools-fixes`** (section 9 is new in it and builds on
+Status as of **17 October 2026**, GitHub branch **`tool-fixed-version-01`** (section 9 is new in it and builds on
 `feature/merged-live-dose-status`; section 8 came with `reachy-integration-0.3`, sections 6 and 7 with
 `reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
 [section 9](#9-what-was-finished-on-17-october-2026) for what to do next.** No passwords, keys or tokens are written
@@ -446,7 +446,7 @@ voice model (`gpt-live-1`, voice `marin`) on the OpenAI connection and press **C
 
 ## 9. What was finished on 17 October 2026
 
-`agent-tools-fixes` is `feature/merged-live-dose-status` (`d2a4a8b`, the 16 Oct merge of the live tools and the
+`tool-fixed-version-01` is `feature/merged-live-dose-status` (`d2a4a8b`, the 16 Oct merge of the live tools and the
 dose-status work made on another computer) plus the fixes for the GPT-Live agent tools the user's test sheet marked
 broken: `stop_dance`, `record_medication_taken` and the LINE video that never came. 29 commits, 27 files, about
 4,900 lines added (tests included). The plan is `docs/superpowers/plans/2026-10-16-agent-tool-fixes.md`; the rules
