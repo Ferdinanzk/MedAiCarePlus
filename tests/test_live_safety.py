@@ -17,7 +17,7 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app.services import after_chat, conversation, live_session, outbox  # noqa: E402
+from app.services import after_chat, ai_settings, conversation, live_session, outbox, voice_lines  # noqa: E402
 from app.services.live_client import LiveEvent  # noqa: E402
 from tests.test_live_relay_chat import (LOUD, OPENING, FakeLive, _begin, _live, _over, _pcm, _reachy,  # noqa: E402
                                         _said, _settle, _sound, _step, world)  # noqa: F401 (world is the fixture)
@@ -119,6 +119,24 @@ def test_a_screening_hit_holds_at_once_and_a_confirmed_hit_blocks_the_chat(safe)
         assert safe.db.rows() == [("reachy", OPENING), ("patient", "我真的不想活了"), ("reachy", HELPLINE)]
         assert safe.robot.audio() == []                        # nothing of GPT-Live's answer was heard
         assert safe.checks == []                               # a keyword turn never reaches the safety model
+
+    asyncio.run(scenario())
+
+
+def test_an_older_robots_help_line_never_names_a_copy_in_the_live_voice(safe, monkeypatch):
+    """Same voice (spec 2026-10-17, relay messages): `clip` goes to companion robots only. A 0.8.0 robot gets the
+    help line's `say` as before, even while a live voice target exists (whole-branch review of 17 Oct 2026)."""
+    monkeypatch.setattr(ai_settings, "live_target",
+                        lambda snapshot=None: ai_settings.LiveTarget("sk-x", "gpt-live-1", "marin"))
+
+    async def scenario():
+        relay, running = await _begin(safe)
+        assert relay.companion is False
+        await _live(safe, _said("我想自殺"), _sound())
+        await _step(safe, relay, 0.5)                          # confirmed: blocked
+        await _over(safe, running)
+        _blocked(safe, flagged=[2], quote="我想自殺", source="keyword")   # the plain SAY, with no `clip`
+        assert voice_lines.expected_clip("helpline", HELPLINE, "zh-TW") is not None   # a companion robot gets one
 
     asyncio.run(scenario())
 
