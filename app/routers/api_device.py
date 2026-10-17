@@ -13,7 +13,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, WebSocket
+from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile,
+                     WebSocket)
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.database import get_pool
@@ -244,19 +245,36 @@ async def dose_event_report(task_id: str, payload: DoseEventPayload, device: dic
     return {"event": dedupe, "queued": True}
 
 
+def _unchanged(request: Request, key: str) -> bool:
+    """If-None-Match names this key: the ETag as it was sent (quoted), a bare key or a weak W/ tag, one or several
+    separated by commas (RFC 9110). Then the robot's copy is current and only the headers go back."""
+    header = request.headers.get("if-none-match", "")
+    tags = [tag.strip().removeprefix("W/").strip('"') for tag in header.split(",")]
+    return key in tags
+
+
+def _wav_response(data: bytes | None, key: str) -> Response:
+    """A clip with its key in ETag (Cache-Control private: it is one patient's); 304 with the same headers and no
+    body when `data` is None."""
+    headers = {"ETag": f'"{key}"', "Cache-Control": "private"}
+    if data is None:
+        return Response(status_code=304, headers=headers)
+    return Response(content=data, media_type="audio/wav", headers=headers)
+
+
 @router.get("/clips/med/{med_id}")
-async def medication_clip(med_id: int, position: int = Query(1, ge=1, le=8), language: str = Query("zh-TW"),
-                          device: dict = Depends(get_device)):
+async def medication_clip(med_id: int, request: Request, position: int = Query(1, ge=1, le=8),
+                          language: str = Query("zh-TW"), device: dict = Depends(get_device)):
     """The spoken prompt for this patient's medicine in `position` of its slot (services/med_clips.py), as a WAV
-    with its key in ETag; 304 for a matching If-None-Match; 404 when there is none (the robot then says its
-    generic prompt)."""
+    with its key in ETag; 304 for a matching If-None-Match (the kept clip is read, never rendered again, when the
+    robot's copy is current); 404 when there is none (the robot then says its generic prompt)."""
     from app.services import med_clips
 
     found = await med_clips.clip(device["u_id"], med_id, position, language)
     if found is None:
         raise HTTPException(404, "No prompt clip for this medicine")
     data, key = found
-    return Response(content=data, media_type="audio/wav", headers={"ETag": f'"{key}"', "Cache-Control": "private"})
+    return _wav_response(None if _unchanged(request, key) else data, key)
 
 
 # ── Check-in conversations ───────────────────────────────────────────────────
