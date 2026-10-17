@@ -144,6 +144,9 @@ def test_a_checkin_task_made_for_a_reminder_opens_with_a_lead_in_then_says_it_af
         relay, running = await companion_chat._start(companion)
         ready = companion.robot.json("ready")[0]
         assert ready["speech_text"] == "王奶奶，我来提醒您一件事。"       # the lead-in, in the robot's voice
+        from app.services import voice_lines
+        assert ready["clip"] == {"id": "reminder_lead",
+                                 "key": voice_lines.key_for("reminder_lead", "王奶奶，我來提醒您一件事。", "zh-TW", "marin")}
         await _settle()
         assert _chunks(companion) == [] and taken == [rid]            # waits for the robot to say the opening
         companion.robot.inbox.put_nowait({"type": "playing"})

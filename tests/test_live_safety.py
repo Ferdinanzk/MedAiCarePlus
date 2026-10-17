@@ -80,14 +80,16 @@ def _alert(world, quote: str, turn, kind: str = "self_harm") -> tuple:
     return 7, "safety_alert", conversation.safety_alert_text("Pearl", quote, kind), f"safety_alert:{cid}:{turn}"
 
 
-def _blocked(world, *, flagged, quote, source, kind="self_harm", dedupe=None) -> None:
-    """Spec B3, once: flush, the help line in the robot's own voice, `end` with risk; the turns flagged and the help
-    line stored as the last turn; family alerted once; GPT-Live muted and closed; the conversation ended with reason
-    risk and its after-chat work started once."""
+def _blocked(world, *, flagged, quote, source, kind="self_harm", dedupe=None, clip=None) -> None:
+    """Spec B3, once: flush, the help line in the robot's own voice (for a companion robot with the id and key of
+    its copy in the live voice, `clip`), `end` with risk; the turns flagged and the help line stored as the last
+    turn; family alerted once; GPT-Live muted and closed; the conversation ended with reason risk and its after-chat
+    work started once."""
     chat = world.db.chat()
+    say = {**SAY, "clip": clip} if clip is not None else SAY
     # Body language (`express`, services/affect.py) is not part of the safety protocol: an earlier sad turn may
     # have set a posture
-    assert [m for m in world.robot.json()[1:] if m["type"] != "express"] == [FLUSH, SAY, END_RISK]
+    assert [m for m in world.robot.json()[1:] if m["type"] != "express"] == [FLUSH, say, END_RISK]
     assert world.robot.closed == 1000
     assert _flagged(world) == flagged
     assert world.db.rows()[-1] == ("reachy", HELPLINE)
