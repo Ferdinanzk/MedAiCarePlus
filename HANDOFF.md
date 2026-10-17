@@ -1,10 +1,10 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **17 October 2026, evening**, GitHub branch **`tool-fixed-version-02`** (section 10 is new in it: the
-same-voice work, stopped half way, and the design of the new agent tools; section 9 came with
+Status as of **17 October 2026, night**, GitHub branch **`tool-fixed-version-02`** (section 10 is new in it: the
+same-voice work, built and reviewed, and the design of the new agent tools; section 9 came with
 `tool-fixed-version-01`, which this branch builds on; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
 `reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
-[section 10](#10-the-same-voice-work-stopped-half-way-and-the-new-tools-design-17-october-2026-evening) for what to
+[section 10](#10-same-voice-built-and-reviewed-and-the-new-tools-design-17-october-2026-night) for what to
 do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
 where each one goes.
 
@@ -548,60 +548,68 @@ installed with `tools/deploy_to_robot.py` from the `medcare-reachy-bridge` repos
 3. The two defects above, and the remaining robot checks of section 8 (the pause and restart, the rest ending, a
    fallback).
 
-## 10. The same-voice work, stopped half way, and the new tools design (17 October 2026, evening)
+## 10. Same voice, built and reviewed, and the new tools design (17 October 2026, night)
 
 `tool-fixed-version-02` is `tool-fixed-version-01` (section 9, the agent tool fixes, tested on the robot) plus the
-first 11 of the 12 tasks of the **same voice** server plan, plus the **design of the new agent tools**. The user asked
-to stop the session here and push. Nothing of section 10 is deployed: the server on the test PC runs
-`tool-fixed-version-01`'s code, and the robot runs app 0.15.0.
+whole **same voice** work (all 12 tasks of the server plan and all 9 of the robot plan, then a whole-branch review of
+both repos and its fixes), plus the **design of the new agent tools**. The same voice is not yet heard on the robot:
+the listen test with the user (step 2 below) is what is left of it.
 
 **Same voice: what it is.** In a live chat GPT-Live answers in OpenAI's "marin" voice, but Reachy's own lines (the
 check-in greeting, the opening with the patient's name, the reminder lead-in, the "say it again" line, the help line,
-the rest and medicine lines, the wind-down) come from the robot's Matcha voice, and the user heard the jump. Now the
+the rest and medicine lines, the wind-down) came from the robot's Matcha voice, and the user heard the jump. Now the
 server renders each line once in the live voice (`gpt-4o-mini-tts`, the speech API the medicine prompts already use)
-and the robot keeps a copy and plays it, with Matcha as the fallback. Spec:
+and the robot (app **0.16.0**) keeps a copy and plays it, with Matcha as the fallback. Spec:
 `docs/superpowers/specs/2026-10-17-same-voice-design.md` (with two code maps beside it). Plans:
 `docs/superpowers/plans/2026-10-17-same-voice-server.md` (12 tasks) and `...-same-voice-robot.md` (9 tasks). Every
-task was done test first and reviewed by a second agent (spec and quality); no review found a blocking or important
-problem. Their minor notes are in `docs/superpowers/plans/2026-10-17-same-voice-review-notes.md`: read them before
-the whole-branch review.
+task was done test first and reviewed by a second agent (spec and quality); the per-task minor notes are in
+`docs/superpowers/plans/2026-10-17-same-voice-review-notes.md`.
+
+**The whole-branch review** (workflow `wf_2fad42b9-909`): four reviewers read both repos against the spec (spec,
+the server-robot contract, patient safety, test quality); two skeptics tried to refute each of their 24 findings;
+14 held (2 important, 12 minor) and 10 were dropped. The important one, found by two reviewers: a disk or permission
+fault on the robot's lines folder made `LineCache.kept()` raise, which could end a task without its greeting or turn
+a live chat with a help line into a text chat. Now it is logged once and the line is said by Matcha. The minor ones:
+`fetch` and its refresh could raise or strand lines on a failed delete; the server's render ahead stopped at a line
+it could not store or read; a pause of 0.6 s inside a kept line made the robot report `idle` mid-line, and a reminder
+sent on that idle was lost (fixed on both sides: the robot reports `idle` only once its own line is over, and the
+server cuts every pause to 0.4 s); README and protocol wording; and five missing tests. All were fixed test first,
+re-reviewed, and the re-review's three small leftovers were fixed too. Two robot timing tests that failed on the test
+PC (Python 3.11 on Windows reads `time.monotonic()` in 15.6 ms steps) now allow one clock tick.
 
 **Where each part stands**
 
-| Part | Done (reviewed) | Left | Where |
-|---|---|---|---|
-| Server | Tasks 1-11 of the server plan: `med_clips.render` takes instructions; the 304 on `/clips/med`; `services/voice_lines.py` (texts, spoken form, key, 16 kHz WAV, storage under `MED_CLIP_DIR`, per-patient lines behind check-in consent); `GET /api/device/clips/line/{line_id}` (200 / 304 / 404); the `clip` field on `ready` and `say`; render ahead at startup (`[STARTUP] voice_lines`), every 30 min, on a queued task and on a call-name change | **Task 12** (the CLAUDE.md and HANDOFF.md text for same voice, the whole suite) and the **whole-branch review** | this branch; backend **3174 passed** at `6a0cb4c` |
-| Robot app | Tasks 1-7 of the robot plan: `AppClient.line_clip`; `bridge/lines.py` `LineCache` (fetch, 304, 404 drops the copy, a bad WAV is refused, refresh in the background); the live chat plays the kept copy when the server's key matches, else Matcha; the rest and medicine lines from their copies; the check-in greeting from its copy before a live chat; no wind-down clip after a live goodbye | **Task 8** is one commit marked "WIP (not reviewed)" (wiring the cache into the runner and the service: it needs its review and the plan's last steps), **Task 9** (version **0.16.0**, the README, the full suite) and the **whole-branch review**. The app still says 0.15.0. | robot repo `medcare-reachy-bridge`, branch `tool-fixed-version-02` (`5125576`, on top of `feature/merged-live-emotion` `437b136`); **780 passed, 6 skipped**, one known timing flake. GitHub refused the push from the test PC (its account has no write access to `Pearlyjam21/medcare-reachy-bridge`), so the same files are on the **Hugging Face space** `pearlyjam21/medcare_reachy`, branch `tool-fixed-version-02` (`fb653db`, one commit on top of the space's `main`, which stays 0.15.0 so installs are unchanged). The space's branch `tool-fixed-version-01` is `main` itself (the app tested with section 9). |
-| New tools | The design: `docs/superpowers/specs/2026-10-17-new-tools-design.md` (eight tools: `go_to_sleep`, `volume_control`, `head_tracking`, `robot_status`, `forget`, `move_head`, `sweep_look`, `stop_emotion`; robot app 0.17.0), with the brief it started from and the raw research beside it. A builder read it cold; its five questions are answered at the end of the design ("The builder check and Claude's rulings"). | The **implementation plan** (after same voice is finished), then the build | this branch |
+| Part | State | Where |
+|---|---|---|
+| Server | Done and reviewed: `med_clips.render` takes instructions; the 304 on `/clips/med`; `services/voice_lines.py` (texts, spoken form, key, 16 kHz WAV with pauses cut to 0.4 s, storage under `MED_CLIP_DIR`, per-patient lines behind check-in consent); `GET /api/device/clips/line/{line_id}` (200 / 304 / 404); the `clip` field on `ready` and `say`; render ahead at startup (`[STARTUP] voice_lines`), every 30 min, on a queued task and on a call-name change; `CLAUDE.md` describes it | this branch; backend **3178 passed** at `2e9a378` |
+| Robot app 0.16.0 | Done and reviewed: `AppClient.line_clip`; `bridge/lines.py` `LineCache`; the live chat plays the kept copy when the server's key matches, else Matcha; the rest, medicine and wind-down lines and the check-in greeting from their copies; no wind-down after a live goodbye; the cache wired into the runner and the service (`LINES_DIR` = `~/.medcare_reachy/lines`); the README's "Same voice (0.16.0, test)" | robot repo `medcare-reachy-bridge`, branch `tool-fixed-version-02` (`4a3eaf3`, 13 commits on top of `feature/merged-live-emotion` `437b136`); **799 passed, 6 skipped** (two runs). GitHub refuses pushes from the test PC (its account has no write access to `Pearlyjam21/medcare-reachy-bridge`), so the same files are on the **Hugging Face space** `pearlyjam21/medcare_reachy`, branch `tool-fixed-version-02` (on top of the space's `main`, which stays 0.15.0 so installs from the app store are unchanged). The space's branch `tool-fixed-version-01` is `main` itself. |
+| New tools | The design: `docs/superpowers/specs/2026-10-17-new-tools-design.md` (eight tools: `go_to_sleep`, `volume_control`, `head_tracking`, `robot_status`, `forget`, `move_head`, `sweep_look`, `stop_emotion`; robot app 0.17.0), with the brief and the raw research beside it, and the builder check's rulings at its end. | The **implementation plan**, then the build | this branch |
 
 **How to continue, in order**
 
-1. **Get the code.** Server: `git fetch origin` and `git switch tool-fixed-version-02` (on the test PC the branch is
-   checked out in the git worktree `C:\Reachy_Mini\worktrees\MedAiCarePlus-same-voice`; its tests run with the main
-   checkout's interpreter, `C:\Reachy_Mini\repo\MedAiCarePlus\.venv\Scripts\python.exe -m pytest tests -q -p
-   no:cacheprovider`). Robot: on the test PC, `C:\Reachy_Mini\repo\medcare-reachy-bridge`, branch
-   `tool-fixed-version-02`; elsewhere, `git clone -b tool-fixed-version-02
-   https://huggingface.co/spaces/pearlyjam21/medcare_reachy` (or push the local branch to GitHub from a computer
-   whose account may write there). Its tests: `python -m pytest tests medcare_reachy/bridge/tests -q -p
-   no:cacheprovider` (on the test PC with the server's `.venv` interpreter; the plan's header has the exact line).
-2. **Robot Task 8:** review the WIP commit against Task 8 of the robot plan (`Wiring: the runner, the service and
-   LINES_DIR`), finish what the plan's steps still ask for, then **Task 9** (0.16.0 in `__init__.py` and
-   `pyproject.toml`, the README, the full suite).
-3. **Server Task 12:** the same-voice text in `CLAUDE.md`'s live voice section and here, and the whole suite
-   (`tests/test_live_voice_docs.py` checks that every name the docs quote exists in the code).
-4. **Whole-branch reviews** of both, against the spec; fix what they find.
-5. **Deploy and listen with the user.** Rebuild the server (`docker compose up -d --build app`), install the robot app
-   (`python tools/deploy_to_robot.py --host <robot-ip>` from the robot repo, then restart the app through the daemon),
-   and run one live check-in: the greeting, the opening with the name, the help line's numbers (119, 1925), the rest
-   or medicine line and the wind-down should all sound like GPT-Live. The spec's "Before release" lists what to
-   compare by ear. Only then push the robot app to the space's `main`, if the user wants it in the app store.
-6. **New tools:** write the implementation plan from the design (against the finished same-voice code), then build
-   it the same way (each task test first and reviewed).
+1. **Get the code.** Server: `git fetch origin` and `git switch tool-fixed-version-02`; its tests run with
+   `python -m pytest tests -q -p no:cacheprovider` (on the test PC with `C:\Reachy_Mini\repo\MedAiCarePlus\.venv`).
+   Robot: on the test PC, `C:\Reachy_Mini\repo\medcare-reachy-bridge`, branch `tool-fixed-version-02`; elsewhere,
+   `git clone -b tool-fixed-version-02 https://huggingface.co/spaces/pearlyjam21/medcare_reachy` (or push the local
+   branch to GitHub from a computer whose account may write there). Its tests: `python -m pytest tests
+   medcare_reachy/bridge/tests -q -p no:cacheprovider`.
+2. **Deploy and listen with the user** (the spec's "Before release"). Rebuild the server (`docker compose up -d
+   --build app`; the startup log's `[STARTUP] voice_lines` stage says when the fixed lines are rendered), install the
+   robot app (`python tools/deploy_to_robot.py --host <robot-ip>` from the robot repo, then restart the app through
+   the daemon; heartbeats then report `bridge_version` 0.16.0), and run one live check-in and one reminder check-in:
+   the greeting, the opening with the name, the reminder lead-in and the reminder after it, the help line's numbers
+   (119, 1925, digit by digit), the rest or medicine line and the wind-down should all sound like GPT-Live, with no
+   cut word where a pause was shortened. Only then push the robot app to the space's `main`, if the user wants it in
+   the app store.
+3. **New tools:** write the implementation plan from the design (against the finished same-voice code), then build
+   it the same way (each task test first and reviewed), on a new branch (`tool-fixed-version-03` is the next name).
 
 **Known and accepted in the same-voice design:** after the "say it again" line the server always falls back to the
 text chat, whose replies are still Matcha (v1 covers only the lines around a live chat); after the user changes the
-live voice, a fixed line can play once in the old voice before its copy is refreshed. Marin copies exist only while
-`LIVE_VOICE_TEST=1` and the live model's Check passed, as for the medicine prompts.
+live voice, a fixed line can play once in the old voice before its copy is refreshed; the per-patient copies (the
+opening and the reminder lead-in, which say the patient's name) stay under `MED_CLIP_DIR` after the account is
+deleted, as the medicine prompts do. Marin copies exist only while `LIVE_VOICE_TEST=1` and the live model's Check
+passed, as for the medicine prompts.
 
 **Still open from section 9:** the false "Reachy is offline" notice, the request's video wording when the link is
 already down, the Cloudflare quick tunnel dying, LINE "Use webhook" off, and the safety model retiring on 20 Oct. The
