@@ -58,7 +58,7 @@ RATE = 16000                 # the robot's live player takes PCM16 mono 16 kHz; 
 TRIM_LEVEL = 0.003           # about -50 dBFS of full scale: the deploy tool's threshold for Matcha's clips ...
 TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the first sound
 PAUSE_LEVEL = 120            # the robot's live player calls a 20 ms block with no sample above this quiet (ONSET_LEVEL)
-PAUSE_MAX_SECONDS = 0.4      # ... and says `idle` after 0.6 s of quiet, even inside its own line: no pause is longer
+PAUSE_MAX_SECONDS = 0.4      # ... and says `idle` after 0.6 s of quiet: no pause is that long (_shorten_pauses)
 LINES_RETRY_MINUTES = 30     # the scheduler tries the fixed lines still missing again this often (voice_lines job)
 
 _renders: dict[str, asyncio.Lock] = {}   # one lock per key, as med_clips: two requests never render the same line twice
@@ -156,10 +156,12 @@ def to_robot_wav(wav_bytes: bytes) -> bytes:
 
 def _shorten_pauses(pcm):
     """Every quiet stretch after the first sound (no sample above PAUSE_LEVEL), the one at the end included, cut to
-    PAUSE_MAX_SECONDS. The robot's live player says `idle` after 0.6 s of quiet blocks even while its own line is
-    still queued, and the server then sends what waits for that idle (the reminder after its lead-in) while the
-    robot still drops audio for that line, so the reminder was lost (whole-branch review of 17 Oct 2026). Only
-    samples below about -48 dBFS are cut, so nothing that can be heard is lost."""
+    PAUSE_MAX_SECONDS. The robot's live player says `idle` after 0.6 s of quiet blocks. A robot build before the
+    whole-branch review of 17 Oct 2026 (medcare-reachy-bridge 5f32461) said it even while its own line was still
+    queued, and the server then sent what waits for that idle (the reminder after its lead-in) while the robot still
+    dropped audio for that line, so the reminder was lost. App 0.16.0 waits for its own line to end; the cut is the
+    second guard, and keeps a long pause from holding the reminder back. Only samples below about -48 dBFS are cut,
+    so nothing that can be heard is lost."""
     import numpy as np
     keep = int(RATE * PAUSE_MAX_SECONDS)
     sound = np.flatnonzero(np.abs(pcm.astype(np.int32)) > PAUSE_LEVEL)
@@ -237,13 +239,18 @@ def _reason(error: Exception) -> str:
 async def fetch(found: Located) -> tuple[bytes, str] | None:
     """(WAV bytes, key): the kept file, else rendered now (med_clips.TIMEOUT per try, one retry) and kept: `.part`
     then rename, under the key's lock, like med_clips.clip. None when the live target is gone meanwhile, the render
-    failed or the line could not be kept (an OSError under MED_CLIP_DIR): one WARNING with the line id, the language
-    and the HTTP status or error type, never the key or the words (the opening carries the patient's name; the
-    error's own text holds the path, and so the key). No negative cache: the next request tries again."""
+    failed or the line could not be kept or read (an OSError under MED_CLIP_DIR): one WARNING with the line id, the
+    language and the HTTP status or error type, never the key or the words (the opening carries the patient's name;
+    the error's own text holds the path, and so the key). No negative cache: the next request tries again."""
     lock = _renders.setdefault(found.key, asyncio.Lock())
     async with lock:
-        if found.path.is_file():
-            return found.path.read_bytes(), found.key
+        try:   # is_file passes on a fault that is not "not found" (a permission or disk fault), as read_bytes does
+            if found.path.is_file():
+                return found.path.read_bytes(), found.key
+        except OSError as error:
+            log.warning("voice line %s (%s) could not be read (%s)", found.line_id, found.language,
+                        type(error).__name__)
+            return None
         target = ai_settings.live_target()
         if target is None or not target.api_key:
             return None
