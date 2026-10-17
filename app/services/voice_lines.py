@@ -217,9 +217,10 @@ def _reason(error: Exception) -> str:
 
 async def fetch(found: Located) -> tuple[bytes, str] | None:
     """(WAV bytes, key): the kept file, else rendered now (med_clips.TIMEOUT per try, one retry) and kept: `.part`
-    then rename, under the key's lock, like med_clips.clip. None when the live target is gone meanwhile or the
-    render failed: one WARNING with the line id, the language and the HTTP status or error type, never the key or
-    the words (the opening carries the patient's name). No negative cache: the next request tries again."""
+    then rename, under the key's lock, like med_clips.clip. None when the live target is gone meanwhile, the render
+    failed or the line could not be kept (an OSError under MED_CLIP_DIR): one WARNING with the line id, the language
+    and the HTTP status or error type, never the key or the words (the opening carries the patient's name; the
+    error's own text holds the path, and so the key). No negative cache: the next request tries again."""
     lock = _renders.setdefault(found.key, asyncio.Lock())
     async with lock:
         if found.path.is_file():
@@ -228,15 +229,25 @@ async def fetch(found: Located) -> tuple[bytes, str] | None:
         if target is None or not target.api_key:
             return None
         try:
+            found.path.parent.mkdir(parents=True, exist_ok=True)   # first: a folder that cannot be made costs no render
+        except OSError as error:
+            log.warning("voice line %s (%s) could not be kept (%s)", found.line_id, found.language,
+                        type(error).__name__)
+            return None
+        try:
             data = await asyncio.to_thread(render_line, speech_input(found.line_id, found.text, found.language),
                                            found.voice, target.api_key, instructions_for(found.line_id))
         except Exception as error:
             log.warning("voice line %s (%s) could not be rendered (%s)", found.line_id, found.language, _reason(error))
             return None
-        found.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = found.path.with_suffix(".part")
-        tmp.write_bytes(data)
-        tmp.replace(found.path)
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(found.path)
+        except OSError as error:
+            log.warning("voice line %s (%s) could not be kept (%s)", found.line_id, found.language,
+                        type(error).__name__)
+            return None
         log.info("voice line %s (%s) rendered in the live voice (%d bytes)", found.line_id, found.language, len(data))
         return data, found.key
 
