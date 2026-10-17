@@ -102,3 +102,23 @@ def test_no_clip_without_a_medicine_a_key_or_when_the_api_fails(api, caplog):
     api.fail = True
     assert asyncio.run(med_clips.clip(7, 10, 1, "zh-TW")) is None and api.renders[-1][2] == "sk-x"
     assert "could not be rendered" in caplog.text and "sk-x" not in caplog.text
+
+
+def test_render_sends_the_instructions_it_is_given_and_the_medicine_ones_by_default(monkeypatch):
+    posted = []
+
+    class Answer:
+        status_code = 200
+        content = _streamed_wav(b"\0\0" * 24)
+
+    def post(url, timeout, headers, json):
+        posted.append((url, headers["Authorization"], json))
+        return Answer()
+
+    monkeypatch.setattr(med_clips.requests, "post", post)
+    med_clips.render("請現在吃第一種藥，Adapalene。", "marin", "sk-x")
+    med_clips.render("您好！我來找您聊聊天。", "marin", "sk-x", "A warm, calm companion robot.")
+    assert [p[2]["instructions"] for p in posted] == [med_clips.INSTRUCTIONS, "A warm, calm companion robot."]
+    assert [p[2]["input"] for p in posted] == ["請現在吃第一種藥，Adapalene。", "您好！我來找您聊聊天。"]
+    assert all(p[0] == med_clips.SPEECH_URL and p[1] == "Bearer sk-x" and p[2]["response_format"] == "wav"
+               for p in posted)

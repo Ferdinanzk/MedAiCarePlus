@@ -101,15 +101,16 @@ def normalize_wav(data: bytes) -> bytes:
     return out.getvalue()
 
 
-def render(text: str, voice: str, api_key: str) -> bytes:
+def render(text: str, voice: str, api_key: str, instructions: str = INSTRUCTIONS) -> bytes:
     """The speech API, tried twice (a read timed out at 30 s on 14 Oct 2026 for a 4 s clip); the WAV, normalized.
-    Raises on failure (the key never gets logged)."""
+    `instructions` tells the voice how to speak: the medicine prompt's by default (the reminders use it too); Reachy's
+    own lines bring their own (services/voice_lines.py). Raises on failure (the key never gets logged)."""
     last: Exception | None = None
     for attempt in range(RETRIES + 1):
         try:
             response = requests.post(SPEECH_URL, timeout=TIMEOUT, headers={"Authorization": f"Bearer {api_key}"},
                                      json={"model": MODEL, "voice": voice, "input": text,
-                                           "instructions": INSTRUCTIONS, "response_format": "wav"})
+                                           "instructions": instructions, "response_format": "wav"})
         except requests.RequestException as error:
             last = error
             continue
