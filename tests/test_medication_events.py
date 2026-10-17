@@ -206,3 +206,22 @@ def test_the_robot_fetches_a_spoken_prompt_or_a_404(env, monkeypatch):
     assert response.headers["etag"] == '"k102zh-TW"' and response.headers["content-type"].startswith("audio/wav")
     assert env.robot.get("/api/device/clips/med/11").status_code == 404
     assert env.robot.get("/api/device/clips/med/10?position=9").status_code == 422
+
+
+def test_a_robot_whose_medicine_clip_is_current_gets_a_304(env, monkeypatch):
+    asked = []
+
+    async def clip(u_id, med_id, position, language):
+        asked.append(med_id)
+        return b"RIFFwav", "k10"
+    monkeypatch.setattr(med_clips, "clip", clip)
+    response = env.robot.get("/api/device/clips/med/10", headers={"If-None-Match": '"k10"'})
+    assert response.status_code == 304 and response.content == b"" and response.headers["etag"] == '"k10"'
+    assert response.headers["cache-control"] == "private"
+    # another key (the medicine renamed, the voice changed): the clip itself
+    response = env.robot.get("/api/device/clips/med/10", headers={"If-None-Match": '"k9"'})
+    assert response.status_code == 200 and response.content == b"RIFFwav"
+    # a weak tag, or several tags: the key among them is enough (RFC 9110)
+    assert env.robot.get("/api/device/clips/med/10", headers={"If-None-Match": 'W/"k10"'}).status_code == 304
+    assert env.robot.get("/api/device/clips/med/10", headers={"If-None-Match": '"k9", "k10"'}).status_code == 304
+    assert asked == [10, 10, 10, 10]   # the kept clip is read each time (disk, not the API); the body is skipped
