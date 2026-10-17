@@ -6,7 +6,9 @@ one LiveRelay runs the chat on it. JSON text frames carry the messages; binary f
 - robot -> server: {"type": "start", "task_id", "language", "rate": 16000, "bridge_version"} first; later
   {"type": "end", "reason"}, {"type": "playing"} and {"type": "idle"}.
 - server -> robot: {"type": "ready", "conversation_id"}, {"type": "flush"}, {"type": "say", "speech_text", "reason"},
-  {"type": "fallback", "reason", "conversation_id"} and {"type": "end", "reason", "risk"}.
+  {"type": "fallback", "reason", "conversation_id"} and {"type": "end", "reason", "risk"}. For a companion robot
+  (below), `ready` and `say` also carry "clip" while a live voice target exists: {"id", "key"} of that line's copy
+  in the live voice (_with_clip, services/voice_lines.py), which robot app 0.16.0 plays when it holds that key.
 
 The start: after `start` the server checks, in this order, and answers `fallback` (conversation_id null; then it
 closes the socket) at the first failure, before any conversation row exists: LIVE_VOICE_TEST (live_disabled), the
