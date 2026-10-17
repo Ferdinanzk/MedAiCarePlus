@@ -60,6 +60,7 @@ TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the f
 LINES_RETRY_MINUTES = 30     # the scheduler tries the fixed lines still missing again this often (voice_lines job)
 
 _renders: dict[str, asyncio.Lock] = {}   # one lock per key, as med_clips: two requests never render the same line twice
+_ahead: set = set()   # the background renders of the per-patient lines (render_ahead_for_patient), kept until done
 
 
 def line_text(line_id: str, language: str, name: str | None = None) -> str | None:
@@ -271,3 +272,25 @@ async def retry_missing() -> None:
     if failed:
         log.warning("voice lines: %d fixed lines are still missing in the live voice (%s); tried again in %d min",
                     len(failed), ", ".join(failed), LINES_RETRY_MINUTES)
+
+
+def render_ahead_for_patient(u_id: int) -> asyncio.Task | None:
+    """The per-patient lines (the opening and the reminder lead-in, both languages) rendered now, in the background,
+    when a task is queued for the patient (reachy_tasks.enqueue_reachy_task) and when the call name's inputs change
+    (the Reachy card's call name, a memory 'name' entry, a consent change), so the next check-in finds them kept.
+    Nothing without a live voice target (None, at once); lines already kept cost one file check each."""
+    if ai_settings.live_target() is None:
+        return None
+    task = asyncio.get_running_loop().create_task(_render_patient(u_id))
+    _ahead.add(task)
+    task.add_done_callback(_ahead.discard)
+    return task
+
+
+async def _render_patient(u_id: int) -> None:
+    try:
+        for line_id in PATIENT_LINES:
+            for language in LANGUAGES:
+                await line(u_id, line_id, language)
+    except Exception as error:   # a render failure is already logged by fetch; this is the consent or name read
+        log.warning("voice lines for patient %s: the render ahead failed (%s)", u_id, type(error).__name__)
