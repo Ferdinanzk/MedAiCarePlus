@@ -255,3 +255,63 @@ def test_two_fetches_of_one_line_at_once_render_it_once(voice):
 
     first, second = asyncio.run(scenario())
     assert first == second and first is not None and len(voice.renders) == 1
+
+
+# ── the route ──
+
+def test_the_robot_fetches_a_line_with_its_key_and_gets_a_304_before_any_render(env, monkeypatch):
+    from pathlib import Path
+    located = voice_lines.Located("rest", "en", "I'll rest for a bit. Call me if you need anything.", "marin",
+                                  "k-rest", Path("rest.wav"))
+    asked, fetched = [], []
+
+    async def locate(u_id, line_id, language):
+        asked.append((u_id, line_id, language))
+        return located if (line_id, language) == ("rest", "en") else None
+
+    async def fetch(found):
+        fetched.append(found.key)
+        return b"RIFFwav", found.key
+
+    monkeypatch.setattr(voice_lines, "locate", locate)
+    monkeypatch.setattr(voice_lines, "fetch", fetch)
+    response = env.robot.get("/api/device/clips/line/rest?language=en")
+    assert response.status_code == 200 and response.content == b"RIFFwav"
+    assert response.headers["etag"] == '"k-rest"' and response.headers["cache-control"] == "private"
+    assert response.headers["content-type"].startswith("audio/wav")
+    assert asked == [(7, "rest", "en")] and fetched == ["k-rest"]          # the device's own patient
+    # the robot's copy is current: 304 without a body, and nothing is rendered or read
+    response = env.robot.get("/api/device/clips/line/rest?language=en", headers={"If-None-Match": '"k-rest"'})
+    assert response.status_code == 304 and response.content == b"" and response.headers["etag"] == '"k-rest"'
+    assert fetched == ["k-rest"]
+    # another key (the voice changed, the name changed): the new copy
+    response = env.robot.get("/api/device/clips/line/rest?language=en", headers={"If-None-Match": '"k-old"'})
+    assert response.status_code == 200 and fetched == ["k-rest", "k-rest"]
+    assert env.robot.get("/api/device/clips/line/rest").status_code == 404   # zh-TW: not located in this fake
+
+
+def test_no_line_is_a_404_but_a_failing_lookup_is_not(env, monkeypatch):
+    from pathlib import Path
+
+    async def nothing(u_id, line_id, language):
+        return None
+    monkeypatch.setattr(voice_lines, "locate", nothing)
+    response = env.robot.get("/api/device/clips/line/opening")
+    assert response.status_code == 404 and response.json() == {"detail": "No clip for this line"}
+
+    located = voice_lines.Located("rest", "zh-TW", "我先休息一下，有需要再叫我喔。", "marin", "k", Path("rest.wav"))
+
+    async def found(u_id, line_id, language):
+        return located
+
+    async def failed(found):
+        return None
+    monkeypatch.setattr(voice_lines, "locate", found)
+    monkeypatch.setattr(voice_lines, "fetch", failed)
+    assert env.robot.get("/api/device/clips/line/rest").status_code == 404   # the render failed: Matcha this time
+
+    async def broken(u_id, line_id, language):
+        raise RuntimeError("database down")
+    monkeypatch.setattr(voice_lines, "locate", broken)
+    with pytest.raises(RuntimeError):   # a 500 on the robot, never a 404: the robot keeps its copy
+        env.robot.get("/api/device/clips/line/opening")

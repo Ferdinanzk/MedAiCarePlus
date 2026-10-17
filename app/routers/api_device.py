@@ -277,6 +277,28 @@ async def medication_clip(med_id: int, request: Request, position: int = Query(1
     return _wav_response(None if _unchanged(request, key) else data, key)
 
 
+@router.get("/clips/line/{line_id}")
+async def line_clip(line_id: str, request: Request, language: str = Query("zh-TW"),
+                    device: dict = Depends(get_device)):
+    """One of Reachy's own lines around a live chat, in the live voice (services/voice_lines.py): a PCM16 mono 16 kHz
+    WAV with its key in ETag; 304 for a matching If-None-Match, checked before any render; 404 when there is none
+    (no live voice target, an unknown line, a per-patient line without current check-in consent, or a render that
+    failed): the robot then drops its copy and says the line with its own voice. A failing lookup is a 500 on
+    purpose: the robot keeps its copy through a database error."""
+    from app.services import voice_lines
+
+    found = await voice_lines.locate(device["u_id"], line_id, language)
+    if found is None:
+        raise HTTPException(404, "No clip for this line")
+    if _unchanged(request, found.key):
+        return _wav_response(None, found.key)
+    kept = await voice_lines.fetch(found)
+    if kept is None:
+        raise HTTPException(404, "No clip for this line")
+    data, key = kept
+    return _wav_response(data, key)
+
+
 # ── Check-in conversations ───────────────────────────────────────────────────
 
 class ConversationStartPayload(BaseModel):
