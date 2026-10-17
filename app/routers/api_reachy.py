@@ -11,7 +11,7 @@ from app import config
 from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.jobs.missed_dose_job import _slot_key
-from app.services import consent_service, dose_safety, memory, reachy_tasks, schedule
+from app.services import consent_service, dose_safety, memory, reachy_tasks, schedule, voice_lines
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
@@ -112,7 +112,7 @@ async def status(user: dict = Depends(get_consented_user)):
 @router.patch("/settings")
 async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_user)):
     """A call name follows the rules of the patient's memory 'name' entry (422 invalid_call_name); an empty one goes
-    back to the registered name (NULL)."""
+    back to the registered name (NULL). A changed name renders the opening ahead in the live voice (voice_lines)."""
     call_name = None
     if payload.call_name is not None and payload.call_name.strip():
         call_name = memory.clean_call_name(payload.call_name)
@@ -127,7 +127,10 @@ async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_
             raise HTTPException(409, "robot_not_paired")
         if payload.call_name is not None:
             await conn.execute('UPDATE "user" SET reachy_call_name = $2 WHERE u_id = $1', user["u_id"], call_name)
-        return await _status(conn, user["u_id"])
+        status = await _status(conn, user["u_id"])
+    if payload.call_name is not None:   # after the commit: the render reads the new name on its own connection
+        voice_lines.render_ahead_for_patient(user["u_id"])
+    return status
 
 
 @router.post("/checkin")

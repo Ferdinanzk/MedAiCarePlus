@@ -248,3 +248,17 @@ def test_live_voice_test_is_off_unless_the_env_says_1_true_or_yes(value, expecte
 def test_env_example_documents_the_live_voice_test_switch_off():
     lines = (REPO / ".env.example").read_text(encoding="utf-8").splitlines()
     assert "LIVE_VOICE_TEST=0" in lines
+
+
+def test_a_new_call_name_renders_the_opening_ahead(env, monkeypatch):
+    from app.services import voice_lines
+    ahead = []
+    monkeypatch.setattr(voice_lines, "render_ahead_for_patient", lambda u_id: ahead.append(u_id))
+    assert _settings(env, {"auto_record": True}).status_code == 200
+    assert ahead == []                                        # no name in the request: the opening is unchanged
+    assert _settings(env, {"call_name": "阿嬤"}).status_code == 200
+    assert ahead == [7]
+    assert _settings(env, {"call_name": ""}).status_code == 200    # back to the registered name: a new opening too
+    assert ahead == [7, 7]
+    assert _settings(env, {"call_name": "我不想活了"}).status_code == 422
+    assert ahead == [7, 7]                                    # nothing saved, nothing rendered

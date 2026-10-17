@@ -314,3 +314,15 @@ def test_consent_api_grant_and_withdrawal_update_status(monkeypatch):
     assert response.status_code == 200
     assert response.json()["core_current"] is False
     assert client.get("/api/consent/status").json()["core_current"] is False
+
+
+def test_a_consent_change_renders_the_patients_voice_lines_ahead(monkeypatch):
+    from app.services import voice_lines
+    ahead = []
+    monkeypatch.setattr(voice_lines, "render_ahead_for_patient", lambda u_id: ahead.append(u_id))
+    conn = _Connection()
+    client = _client(monkeypatch, conn)
+    assert client.post("/api/consent", json=_payload()).status_code == 200
+    assert ahead == [7]                                       # memory consent decides whose name the opening uses
+    assert client.post("/api/consent", json=_payload(terms_version="old")).status_code == 409
+    assert ahead == [7]                                       # refused: nothing changed, nothing rendered

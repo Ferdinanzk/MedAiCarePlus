@@ -208,6 +208,22 @@ def test_add_validates_and_upserts_a_patient_row(client_factory):
     assert client.post("/api/memory", json={"kind": "mood", "text": "開心"}).status_code == 422
 
 
+def test_a_name_entry_written_or_deleted_renders_the_opening_ahead(client_factory, monkeypatch):
+    from app.services import voice_lines
+    ahead = []
+    monkeypatch.setattr(voice_lines, "render_ahead_for_patient", lambda u_id: ahead.append(u_id))
+    conn = Conn(rows=[{"memory_id": uuid.uuid4(), "kind": "name", "subject": "preferred_name"}])
+    client = client_factory(dict(MEMORY_ON), conn)
+    assert client.post("/api/memory", json={"kind": "like", "text": "喜歡散步"}).status_code == 200
+    assert ahead == []                                        # another kind leaves the opening as it is
+    assert client.post("/api/memory", json={"kind": "name", "text": "王奶奶"}).status_code == 200
+    assert ahead == [7]
+    assert client.delete("/api/memory/fact?kind=name&subject=preferred_name").status_code == 200
+    assert ahead == [7, 7]
+    assert client.delete("/api/memory?confirm=all").status_code == 200
+    assert ahead == [7, 7, 7]                                 # everything deleted: the name entry may be among it
+
+
 def test_delete_fact_with_slash_and_cjk_subject(client_factory):
     first, second = uuid.uuid4(), uuid.uuid4()
     conn = Conn(rows=[{"memory_id": first, "kind": "person", "subject": "媽媽/爸爸"},
