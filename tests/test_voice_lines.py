@@ -87,3 +87,45 @@ def test_expected_clip_names_the_copy_the_robot_should_play(monkeypatch):
     assert voice_lines.expected_clip("opening", OPENING_EN, "en")["key"] == voice_lines.key_for("opening", OPENING_EN, "en", "marin")
     assert voice_lines.expected_clip("dance", "x", "zh-TW") is None
     assert voice_lines.expected_clip("repeat", "", "zh-TW") is None
+
+
+# ── the robot's format ──
+
+def _samples(wav_bytes: bytes) -> tuple[tuple, int, int]:
+    with wave.open(io.BytesIO(wav_bytes)) as w:
+        assert w.getsampwidth() == 2
+        frames = w.readframes(w.getnframes())
+        return struct.unpack("<" + "h" * (len(frames) // 2), frames), w.getframerate(), w.getnchannels()
+
+
+def test_to_robot_wav_gives_pcm16_mono_16_khz_and_trims_the_leading_silence():
+    silence, tone = b"\x00\x00" * 4800, b"\x10\x27" * 2400   # 200 ms of silence, then 100 ms at level 10000, 24 kHz
+    samples, rate, channels = _samples(voice_lines.to_robot_wav(_streamed_wav(silence + tone, rate=24000)))
+    assert (rate, channels) == (16000, 1)
+    # the tone (100 ms = 1600 frames at 16 kHz) with at most about 10 ms of what came before it (the resampler's
+    # filter rings a little before the first sound)
+    assert 1600 <= len(samples) <= 1600 + 160 + 64 and max(samples) > 9000
+    stereo = _streamed_wav(b"\x10\x27\x10\x27" * 1600, rate=16000, channels=2)        # already 16 kHz, two channels
+    samples, rate, channels = _samples(voice_lines.to_robot_wav(stereo))
+    assert (rate, channels, len(samples)) == (16000, 1, 1600) and samples[0] == 10000  # mixed to mono, no trim needed
+    with pytest.raises(ValueError):
+        voice_lines.to_robot_wav(b"OggS" + b"\0" * 40)                                 # not a WAV
+    with pytest.raises(ValueError):
+        voice_lines.to_robot_wav(_streamed_wav(b"\x00\x00" * 1600, rate=16000))        # no sound at all: never kept
+
+
+def test_render_line_renders_with_the_lines_instructions_then_converts(monkeypatch):
+    renders = []
+
+    def render(text, voice, api_key, instructions=med_clips.INSTRUCTIONS):
+        renders.append((text, voice, api_key, instructions))
+        if voice == "broken":
+            raise RuntimeError("speech API answered 502")
+        return _streamed_wav(b"\x10\x27" * 2400, rate=24000)
+
+    monkeypatch.setattr(med_clips, "render", render)
+    out = voice_lines.render_line("您好！", "marin", "sk-x", voice_lines.instructions_for("checkin_greeting"))
+    assert renders == [("您好！", "marin", "sk-x", voice_lines.INSTRUCTIONS["companion"])]
+    assert _samples(out)[1:] == (16000, 1)
+    with pytest.raises(RuntimeError, match="speech API answered 502"):
+        voice_lines.render_line("您好！", "broken", "sk-x", voice_lines.instructions_for("checkin_greeting"))

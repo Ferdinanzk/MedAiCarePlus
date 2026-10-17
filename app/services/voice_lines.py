@@ -14,8 +14,11 @@ patient's check-in consent, because they carry the call name.
 """
 
 import hashlib
+import io
 import logging
+import math
 import re
+import wave
 
 from app.services import ai_settings, conversation, med_clips, memory
 
@@ -46,6 +49,9 @@ INSTRUCTIONS = {
 DIGITS = {"zh-TW": "零一二三四五六七八九",
           "en": ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")}
 _NUMBER = re.compile(r"\d{3,}")   # 119 and 1925 are read digit by digit; "24 小時" / "24 hours" stays a number
+RATE = 16000                 # the robot's live player takes PCM16 mono 16 kHz; robot.play_clip takes it too
+TRIM_LEVEL = 0.003           # about -50 dBFS of full scale: the deploy tool's threshold for Matcha's clips ...
+TRIM_KEEP_SECONDS = 0.01     # ... which keeps 10 ms of the silence before the first sound
 
 
 def line_text(line_id: str, language: str, name: str | None = None) -> str | None:
@@ -104,3 +110,39 @@ def expected_clip(line_id: str, text: str, language: str) -> dict | None:
     if target is None or line_id not in LINE_IDS or not text:
         return None
     return {"id": line_id, "key": key_for(line_id, text, language, med_clips.voice_for(target))}
+
+
+def to_robot_wav(wav_bytes: bytes) -> bytes:
+    """The speech API's WAV (24 kHz mono in practice; any PCM16 rate or channel count) as the robot keeps it: PCM16
+    mono 16 kHz, the leading silence trimmed to about 10 ms below about -50 dBFS, as the deploy tool trims Matcha's
+    clips, so a kept line starts as promptly as a Matcha one. Raises ValueError for anything but 16-bit PCM
+    (normalize_wav) and for a WAV with no sound at all: silence where Reachy spoke before is never kept."""
+    import numpy as np
+    from scipy.signal import resample_poly
+    with wave.open(io.BytesIO(med_clips.normalize_wav(wav_bytes)), "rb") as wav:
+        rate, channels = wav.getframerate(), wav.getnchannels()
+        frames = wav.readframes(wav.getnframes())
+    samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    if rate != RATE:
+        g = math.gcd(RATE, rate)
+        samples = resample_poly(samples, RATE // g, rate // g)
+    loud = np.flatnonzero(np.abs(samples) > TRIM_LEVEL)
+    if not len(loud):
+        raise ValueError("the WAV holds no sound")
+    samples = samples[max(0, int(loud[0]) - int(RATE * TRIM_KEEP_SECONDS)):]
+    pcm = np.clip(np.round(samples * 32768.0), -32768, 32767).astype("<i2").tobytes()
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(RATE)
+        wav.writeframes(pcm)
+    return out.getvalue()
+
+
+def render_line(text: str, voice: str, api_key: str, instructions: str) -> bytes:
+    """The speech API (med_clips.render: two tries of med_clips.TIMEOUT), then the robot's format. Blocking: callers
+    run it with asyncio.to_thread. Raises on failure; the key is never logged."""
+    return to_robot_wav(med_clips.render(text, voice, api_key, instructions))
