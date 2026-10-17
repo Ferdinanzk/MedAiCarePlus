@@ -114,3 +114,20 @@ No notes.
 
 - **C:\Reachy_Mini\repo\medcare-reachy-bridge\medcare_reachy\bridge\tests\test_session_live.py:41-45**: FakeLiveChat's class docstring still describes the old signature ("stop(reason, say) records the companion's ending") after Task 7 gave stop() the `clip` keyword; the new field's inline comment is the only place the keyword is documented.
   - Suggested: In the FakeLiveChat docstring change "stop(reason, say) records the companion's ending and ends the chat with it." to "stop(reason, say, clip) records the companion's ending (and the kept copy it names, in `clips`) and ends the chat with it." No code change; can ride along with Task 9's commit.
+
+## Whole-branch review (workflow wf_2fad42b9-909) and after
+
+24 findings over four lenses (spec, contract, safety, tests); two skeptics per finding; 14 held (2 important) and
+were fixed on both branches (server 06be48f..1679764, robot 5f32461), then re-reviewed; the re-review's three
+leftovers were fixed in server 2e9a378 and robot dd05543. Left as they are, by ruling:
+
+- **Robot `session.py` `_wind_down` (the kept copy when `outcomes["live"]` is set)**: a check-in whose live chat never
+  ran (`open_live_chat` returned None, outcome `unsupported`; or a `fallback` before any conversation) ends with the
+  marin wind-down after a Matcha text chat. Raised twice (whole-branch safety lens, and the final check of the small
+  fixes); both skeptics refuted it the first time because the spec says exactly that ("when a live chat ran in this
+  task (`outcomes["live"]` is set)"), and the path is rare (no voice detector model, or the server refused live).
+  - Ruling: unchanged in v1. If the listen test or a later spec wants it, set the rule to `outcomes.get("live") not in
+    (None, "unsupported")` or to "a conversation id came back".
+- **The robot timing tests** (`test_speech.py`, `test_gestures.py`) failed on the test PC because Python 3.11 on
+  Windows reads `time.monotonic()` in 15.6 ms steps; fixed in robot 4a3eaf3 (one tick of slack), not a same-voice
+  defect.
