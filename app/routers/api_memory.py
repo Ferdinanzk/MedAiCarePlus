@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.database import get_pool
 from app.dependencies import get_consented_user, get_current_user
-from app.services import consent_service, deletion_ledger, memory
+from app.services import consent_service, deletion_ledger, memory, voice_lines
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 Kind = Literal["name", "person", "like", "routine", "event"]
@@ -59,6 +59,8 @@ async def _save(u_id: int, raw: dict) -> dict:
         saved = await memory.save_patient_fact(conn, u_id, fact)
     if saved is None:
         raise HTTPException(403, "memory_consent_required")
+    if fact["kind"] == "name":   # the opening line uses it: rendered ahead in the live voice (services/voice_lines.py)
+        voice_lines.render_ahead_for_patient(u_id)
     return _item(saved, {})
 
 
@@ -85,6 +87,8 @@ async def _delete(u_id: int, kind: str | None, subject: str | None) -> list[str]
         ids = await memory.delete_facts(conn, u_id, kind, subject)
     for memory_id in ids:
         deletion_ledger.append_host_file("memory", u_id, memory_id)
+    if kind in (None, "name"):   # the name entry may be gone: the opening goes back to the card's or registered name
+        voice_lines.render_ahead_for_patient(u_id)
     return ids
 
 
