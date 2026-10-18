@@ -767,6 +767,8 @@ The map stays as a reference for how an intake works today.
    `CLAUDE.md`, but nothing waits on it now that the intake request is dropped).
 2. **Finding 1** (the token in the access log) first, then the P0 fixes of the priority list.
 3. Then the face lock, the OCR test, and the new tools' plan (robot app 0.17.0), on `tool-fixed-version-05`.
+   The whole list for version 5, with the patient voiceprint (planned, not built), is
+   [docs/VERSION_05_IMPROVEMENTS.md](docs/VERSION_05_IMPROVEMENTS.md).
 
 ---
 
