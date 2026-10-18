@@ -4,7 +4,10 @@ The user's request (18 Oct): during a medicine intake, use face recognition, pil
 recognition; if the robot's frames are not enough, stream them to the laptop for detection; and keep sending the
 video after the intake. This map comes from a read-only workflow (`wf_9efceda2-ebf`: four mappers and a synthesis
 that checked the numbers itself) over the server (`tool-fixed-version-03`, code `8826c92`), robot app 0.16.0
-(`c56bbe2`) and the logs and database of the 16:55 test. **Nothing here is built yet.** Times are Taipei time.
+(`c56bbe2`) and the logs and database of the 16:55 test. Times are Taipei time.
+
+> **Dropped by the user** (18 Oct 2026, evening): they had thought these tools were not built yet. Nothing is to be
+> built for this request; the map stays as a reference for how an intake inside a chat works today.
 
 ## How it works today
 
