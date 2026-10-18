@@ -1,11 +1,11 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **18 October 2026**, GitHub branch **`tool-fixed-version-03`** (section 11 is new in it: the live tests,
-the tool audit and what to do first; section 10, the same voice and the new tools design, came with
-`tool-fixed-version-02`; section 9 with `tool-fixed-version-01`; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
+Status as of **18 October 2026, evening**, GitHub branch **`tool-fixed-version-04`** (section 12 is new in it: Wi-Fi,
+the LINE test with a family confirmation, and the intake map; section 11, the live tests and the tool audit, came
+with `tool-fixed-version-03`; section 10 with `tool-fixed-version-02`; section 9 with `tool-fixed-version-01`; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
 `reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
-[section 11](#11-live-tests-the-tool-audit-and-what-to-do-first-17-october-night-to-18-october-2026) for what
-to do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
+[section 12](#12-wi-fi-the-line-test-with-a-family-confirmation-and-the-intake-map-18-october-2026-afternoon)
+for what to do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
 where each one goes.
 
 The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
@@ -694,6 +694,78 @@ back at pending, overdose protection can allow it again;
    designed yet: Reachy takes a photo of a prescription and the computer finishes it later, as the Scan page's cards
    (the open question: who confirms it on the computer).
 5. **Then the new tools' implementation plan** (robot app 0.17.0), on a new branch (`tool-fixed-version-04`).
+
+## 12. Wi-Fi, the LINE test with a family confirmation, and the intake map (18 October 2026, afternoon)
+
+`tool-fixed-version-04` is `tool-fixed-version-03` (section 11) plus one code change, one report and this section:
+commit `e194048` (the LINE webhook logs every event's type and why a family tap changed nothing; never an ID or the
+button's data; no behaviour change; two new tests, the whole suite 3180 passed) and
+[docs/INTAKE_IN_CHAT_MAP_2026-10-18.md](docs/INTAKE_IN_CHAT_MAP_2026-10-18.md). **The robot app did not change:**
+still 0.16.0 (`c56bbe2`); the robot repo's and the Hugging Face space's `tool-fixed-version-04` are that same commit
+(space `ae4154c`), and the space's `main` stays 0.15.0.
+
+**State at the end of the round (the test PC).**
+
+- **Network:** the robot moved from this PC's hotspot to a Wi-Fi network (both on it; `DEVICE_BIND` and the robot's
+  `app_url` were set to this PC's address there and the robot connected). At about 18:10 this PC was on another Wi-Fi
+  network (`eduroam`, a shared campus network), the old address was gone and the app could not start, so
+  `DEVICE_BIND=127.0.0.1` now: the server, the web app and the LINE webhook run, **the robot cannot connect** until it
+  and this PC share a network again. Then set `DEVICE_BIND` to this PC's address there, `docker compose up -d app`,
+  and the robot's `app_url` (its settings page on port 8042, `POST /api/config`; it restarts its bridge).
+- **LINE:** the Ai_Deep account (14 of its 200 messages used this month); its webhook points at this PC's Cloudflare
+  tunnel (the user recreated the dead tunnel with `docker compose --profile line up -d --force-recreate line-tunnel`
+  and ran `scripts/line-tunnel.ps1`). Pushes are **off** again between tests (`LINE_CHANNEL_ACCESS_TOKEN` empty, the
+  secret kept, so family taps still reach the server). Turning them on: section 11 and the memory note.
+- `reachy_device.auto_record` is **FALSE** on the active robot row: the robot was paired again at 16:50, and the two
+  older rows that had TRUE are revoked. `LIVE_VISION_CLOUD=1` as in section 11.
+
+**The tests with the user (16:48-18:05).**
+
+- **The family confirmation works end to end.** The robot's own dose flow for a medicine at 18:00 sent the request
+  and its video; the family tap at 18:02:00 confirmed it, the dose was recorded as taken (at the camera's moment) and
+  the reply went out. An earlier request (16:55) was most likely tapped while the bot's webhook still pointed at an
+  outside service (before 17:03), so the tap never reached this server; nothing was logged then, which is why
+  `e194048` adds the logs.
+- **The video:** the 16:55 clip was made and kept unsent (no public link: the webhook pointed elsewhere and this PC's
+  tunnel had died with the network change); it went out at 17:05 once the tunnel and the webhook were fixed. The
+  request still said the video follows in the next message (priority item 18).
+- **The intake inside a chat (16:55):** the camera never recognised the patient during the 30 s watch (7 mismatch, 3
+  searching), so the pill detector and the emotion check never ran; the dose was filed on the patient's word.
+- **17:46:** 「我吃完了」 was not filed: the due check offered only a dose already waiting for family, so GPT-Live
+  applauded and recorded nothing, and an open dose of another medicine was never offered (priority item 6).
+- **Reminders in a chat** fired and were spoken (16:55, 17:45); the "my medicine" form is still refused first (item 16).
+- **The label reading** (`identify_medicine`) read a box's name and strength in 13.8 s and rightly said it could not
+  confirm the patient's prescription.
+- **A chat cannot end** while the camera does not recognise the patient: Reachy stays awake and the goodbye is not
+  heard (items 8 and 24).
+- After the 18:00 dose an `extra_event` message went to family: the 2-minute watch saw another hand-to-mouth moment
+  (probably drinking water).
+
+**New findings** (not fixed):
+
+1. **The server's access log writes each family video link in full, token included** (uvicorn's request lines for
+   `/api/media/line/...`), while the design keeps only the token's SHA-256. Filter or mask that path in the access log.
+2. When the public link comes back, the startup report keeps the earlier failed verdict and logs
+   `[STARTUP] line: FAILED` with a working link (`startup_report.py:185-186`).
+3. A tap made while the bot's webhook points elsewhere is lost for good (an operations rule: keep the webhook here).
+
+**The intake request** (the user's: face, pill-intake and emotion recognition during a medicine intake, the stream to
+the laptop when the frames are not enough, the video kept after the intake):
+[docs/INTAKE_IN_CHAT_MAP_2026-10-18.md](docs/INTAKE_IN_CHAT_MAP_2026-10-18.md). All of it already exists, and the laptop
+already does all the detection; the gaps are only inside a live chat: the watch does not tell GPT-Live when the face
+is not recognised, a chat streams 2 frames a second, and emotion is not scored at the dose rate. Claude's
+recommendation (not approved yet): tell GPT-Live when the patient is not recognised, raise the stream to the camera's
+10 frames a second only for the watch, score emotion and write a mood record for the watched dose; keep
+`auto_record` FALSE and the camera at 10 frames a second until decision D2.
+
+**How to continue, in order**
+
+1. **The user's answers:** what "keep sending the video after the intake" means (keep watching after 「我吃完了」; the
+   seconds after the intake in the family video, which needs a new video notice and everyone's consent again; or
+   always deliver a video that was late); decision D2; removing the test medicine's two leftover dose times.
+2. **Finding 1** (the token in the access log) first, then the P0 fixes of the priority list.
+3. **The intake inside a chat:** a short design from the map, then the plan and the build (both repos).
+4. Then the face lock, the OCR test, and the new tools' plan (robot app 0.17.0), on `tool-fixed-version-05`.
 
 ---
 
