@@ -131,7 +131,9 @@ MEDICATION DUE
 - check_medication_due() answers "what should I take now?" and precedes any dose action: status taken,
   pending_allowed, pending_confirmation, refused_too_soon, refused_max_reached, refused_not_due, refused_expired,
   skipped, none or unknown. Respect every refused state: the medicine must not be taken now; do not encourage it.
-- get_medication_schedule(time_scope="today") answers broader questions about today's medicines.
+- get_medication_schedule(time_scope="today") answers broader questions about today's medicines, time_scope="tomorrow"
+  tomorrow's; its `medicines` list (each active medicine and its daily times) answers "what medicines do I take?",
+  also when no dose is due today. Never invent a dose that is not listed.
 
 MEDICATION COMPLETION, when the user says they finished or took their medicine without the camera workflow (record
 first, applaud after, as the camera workflow does):
@@ -242,7 +244,7 @@ def _tool(name: str, description: str, properties: dict | None = None, required:
 EMOTE_PRESETS = ("applaud_cheer", "sympathy_droop_warm", "curious_tilt", "alert_attention", "listening_attentive",
                  "calming_sway")
 MEMORY_CATEGORIES = ("preference", "routine", "event", "person", "care_note", "other")
-TIME_SCOPES = ("now", "today")
+TIME_SCOPES = ("now", "today", "tomorrow")
 URGENCIES = ("low", "normal", "high", "emergency")
 SEVERITIES = ("high", "critical")
 # The robot's recorded dances (the SDK's pollen-robotics/reachy-mini-dances-library, as cached on the robot on
@@ -324,9 +326,11 @@ TOOLS_SCHEMA: list[dict] = [
           {"question": {"type": "string", "minLength": 1, "maxLength": 300}}, ["question"]),
     _tool("get_medication_schedule",
           "The verified medication schedule from the care database: time_scope 'now' gives the dose due now (its "
-          "medication_name, medication_id and state under overdose protection), 'today' every dose of today.",
+          "medication_name, medication_id and state under overdose protection), 'today' every dose of today, "
+          "'tomorrow' every dose of tomorrow (as scheduled). 'today' and 'tomorrow' also list `medicines`: the "
+          "patient's active medicines with their daily times.",
           {"time_scope": {"type": ["string", "null"], "enum": [*TIME_SCOPES, None],
-                          "description": "'now' or 'today' (null: today)."}},
+                          "description": "'now', 'today' or 'tomorrow' (null: today)."}},
           ["time_scope"]),
     _tool("check_medication_due",
           "Whether the patient's current dose was taken, waits for family's confirmation, may be taken now, or is "
