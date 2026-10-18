@@ -1,11 +1,11 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **17 October 2026, night**, GitHub branch **`tool-fixed-version-02`** (section 10 is new in it: the
-same-voice work, built and reviewed, and the design of the new agent tools; section 9 came with
-`tool-fixed-version-01`, which this branch builds on; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
+Status as of **18 October 2026**, GitHub branch **`tool-fixed-version-03`** (section 11 is new in it: the live tests,
+the tool audit and what to do first; section 10, the same voice and the new tools design, came with
+`tool-fixed-version-02`; section 9 with `tool-fixed-version-01`; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
 `reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
-[section 10](#10-same-voice-built-and-reviewed-and-the-new-tools-design-17-october-2026-night) for what to
-do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
+[section 11](#11-live-tests-the-tool-audit-and-what-to-do-first-17-october-night-to-18-october-2026) for what
+to do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
 where each one goes.
 
 The handoff of 2 October is kept at the end of this file ([History](#history-handoff-of-2-october-2026)). Some of it
@@ -614,6 +614,81 @@ passed, as for the medicine prompts.
 **Still open from section 9:** the false "Reachy is offline" notice, the request's video wording when the link is
 already down, the Cloudflare quick tunnel dying, LINE "Use webhook" off, and the safety model retiring on 20 Oct. The
 test medicine 「測試藥」 is still active on the test patient (archive it on the Medications page when testing is done).
+
+## 11. Live tests, the tool audit and what to do first (17 October night to 18 October 2026)
+
+`tool-fixed-version-03` is `tool-fixed-version-02` (section 10: same voice, built, reviewed and deployed) plus the
+three reports of this round and this section. **No code changed:** the server is still `8826c92`'s code and the
+robot app is still 0.16.0 (`c56bbe2`, the robot repo's branch `tool-fixed-version-03` is that same commit; on the
+Hugging Face space, `tool-fixed-version-03` is the same files as `tool-fixed-version-02`, and `main` stays 0.15.0).
+
+**What runs on the test PC.** The server image of `8826c92`, and robot app 0.16.0 on the robot (installed on 17 Oct
+with `tools/deploy_to_robot.py`; heartbeats report `bridge_version` 0.16.0). The test PC's `.env` (never in git)
+differs from the defaults in four switches: `LIVE_VOICE_TEST=1` and `LIVE_TOOLS=1` (as before),
+`LIVE_VISION_CLOUD=1` (17 Oct 21:57, on the user's ask: the vision tools send a camera frame to the OCR's Gemini
+model; test only, no patient notice covers it), and `LINE_CHANNEL_ACCESS_TOKEN` **empty** (18 Oct, about 01:40:
+LINE pushes are off to save the free plan's 200 messages a month; the channel secret is kept).
+
+**The live tests with the user** (17 Oct 21:49-22:24, 18 Oct 00:55-01:04 and 12:40-12:52):
+
+- **Same voice:** the check-in greeting, the opening with the name, the reminder lead-in and the reminder played from
+  the marin copies; the robot logged no failed copy. The user's verdict on the sound was not given yet.
+- **Camera vision:** `describe_view` answered `vision_off` (in 66 ms) until `LIVE_VISION_CLOUD` was set; then two
+  looks of 4.6-5.0 s answered correctly (what was in view, the colour of a top).
+- **Reachy stood silent after a reminder:** [docs/REACHY_SILENT_NOT_SEEN_2026-10-17.md](docs/REACHY_SILENT_NOT_SEEN_2026-10-17.md).
+  GPT-Live starts only when the camera recognised the patient in the last 15 s (`live_session.patient_seen_recently`),
+  and the robot only logs `not_seen` (`live.py:517-519`), so after the 22:02 reminder the patient's words were never
+  heard and the medicine claim was lost; it recovered at 22:22, when the patient leaned in, and the claim was
+  recorded. Why the camera lost the match is not settled: the head levelled after the search (`hold_head`), a weak
+  face gallery (3 small crops from the web sign-up), or the patient moving.
+- **The 2-minute wait after a medicine chat:** the robot stays awake, silent, head level, for
+  `POST_SLOT_SECONDS = 120` (robot `session.py:917-924`), looking for an extra dose; the user thought it was stuck.
+- **18 Oct 12:43:** the daemon logged `Motor 'left_antenna' hardware errors: ['Overload Error']` every second for
+  about a minute; the app was stopped at 12:43:19 (most likely from the Reachy Mini Control app; not proven) and
+  started again at 12:51 by the PC's reconcile task. No error since. If it comes back, check that the left antenna
+  moves freely.
+
+**LINE.** On 17 Oct the account in use (Ai_Deep2) and Care Bot had sent 200 of 200 messages that month, so every
+push failed with `429 You have reached your monthly limit`, and the tools still answered "sent". With the user's OK
+the server was switched to the Ai_Deep account from the key folder (the test contacts had added it), the stuck
+messages went out, and then, on the user's ask, pushes were turned off. Ai_Deep's webhook points at an outside
+service, so family answer buttons do not reach this server and new dose videos have no public link. Before a LINE
+test: clear the outbox backlog first (rows `queued` or `failed`), then put a token back, and empty it again after.
+
+**The tool audit** ([docs/TOOL_STATUS_2026-10-18.md](docs/TOOL_STATUS_2026-10-18.md)): every tool checked in the
+code, the tests and the live logs, not in the docs. Of the 25 tools in `TOOLS_SCHEMA`, 7 work on the robot, 12 work in
+tests only, 6 are partial and none is broken; the 8 approved new tools have no code; `idle_do_nothing` is skipped.
+New defects: `set_reminder` refuses the "my medicine" form its own schema documents (`reminders.py:207, 216-217`);
+`remember` can never store an `event` (its schema has no date); the tool log line says "ok" whenever the call
+returned (`agent_bridge.py:253-255`); `notify_family` and `emergency_alert` answer queued or alerted while LINE
+refuses every push.
+
+**What to do first** ([docs/TOOL_PRIORITIES_2026-10-18.md](docs/TOOL_PRIORITIES_2026-10-18.md)): three rankings (by
+patient safety, the patient's experience and delivery), merged and checked against the code: 12 items now, 13 for the
+next build (robot app 0.17.0), 18 later, and a 10-minute robot scenario for the tools never tried on the robot.
+Checked by Claude in the code and the database: `reachy_device.auto_record` is TRUE on both rows (this file's
+Phase 2 rule says FALSE until decision D2); the test medicine 「測試藥」 keeps the custom times 01:04 and 12:48, so
+the robot runs a dose task for it every day (`set_test_dose.py` adds a time at each run); an expired family request
+puts the dose back to pending (`dose_confirmation.py:303-314, 498-507`), so overdose protection can allow it again;
+`reminders.py` never asks overdose protection.
+
+**How to continue, in order**
+
+1. **Ask the user** (asked on 18 Oct, not answered yet): set `auto_record` back to FALSE, remove the two test times
+   from 「測試藥」, clear the outbox backlog; how LINE should deliver for tests (and whether to point Ai_Deep's
+   webhook at this server, which takes it from the outside service).
+2. **The P0 server fixes** of the priority list: the spoken cue when the camera does not recognise the patient, the
+   quiet pause counted from the end of Reachy's reply, honest delivery answers, the real status in the tool log line,
+   the due check listing every open dose, and the rule for an expired family request (the user decides it).
+3. **The face lock** (the user's ask: 「你看得到我嗎」 / 「看著我」 / "can you see me" / "look at me"): part of
+   `head_tracking`, with the design changes of item 21 of the priority list (aim at the face when found, never snap
+   back to level, an aim box when one face is in view that never counts as seen, scan when nobody is seen). The
+   brainstorming is open: the user's own description of what Reachy should do, step by step, is still to come.
+4. **The OCR test on the robot** (`identify_medicine`, `verify_medication`, with a medicine bag or a prescription;
+   needs `LIVE_VISION_CLOUD=1`): not run yet, because the 12:40 session was stopped. A new idea from the user, not
+   designed yet: Reachy takes a photo of a prescription and the computer finishes it later, as the Scan page's cards
+   (the open question: who confirms it on the computer).
+5. **Then the new tools' implementation plan** (robot app 0.17.0), on a new branch (`tool-fixed-version-04`).
 
 ---
 
