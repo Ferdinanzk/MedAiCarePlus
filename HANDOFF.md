@@ -757,19 +757,16 @@ repo's `tool-fixed-version-04` (`c56bbe2`) exists only on the test PC (GitHub re
 the laptop when the frames are not enough, the video kept after the intake):
 [docs/INTAKE_IN_CHAT_MAP_2026-10-18.md](docs/INTAKE_IN_CHAT_MAP_2026-10-18.md). All of it already exists, and the laptop
 already does all the detection; the gaps are only inside a live chat: the watch does not tell GPT-Live when the face
-is not recognised, a chat streams 2 frames a second, and emotion is not scored at the dose rate. Claude's
-recommendation (not approved yet): tell GPT-Live when the patient is not recognised, raise the stream to the camera's
-10 frames a second only for the watch, score emotion and write a mood record for the watched dose; keep
-`auto_record` FALSE and the camera at 10 frames a second until decision D2.
+is not recognised, a chat streams 2 frames a second, and emotion is not scored at the dose rate. **Dropped by the
+user** (18 Oct, evening: they had thought these tools were not built yet): nothing is to be built for this request.
+The map stays as a reference for how an intake works today.
 
 **How to continue, in order**
 
-1. **The user's answers:** what "keep sending the video after the intake" means (keep watching after 「我吃完了」; the
-   seconds after the intake in the family video, which needs a new video notice and everyone's consent again; or
-   always deliver a video that was late); decision D2; removing the test medicine's two leftover dose times.
+1. **The user's answer:** removing the test medicine's two leftover dose times (decision D2 stays open in
+   `CLAUDE.md`, but nothing waits on it now that the intake request is dropped).
 2. **Finding 1** (the token in the access log) first, then the P0 fixes of the priority list.
-3. **The intake inside a chat:** a short design from the map, then the plan and the build (both repos).
-4. Then the face lock, the OCR test, and the new tools' plan (robot app 0.17.0), on `tool-fixed-version-05`.
+3. Then the face lock, the OCR test, and the new tools' plan (robot app 0.17.0), on `tool-fixed-version-05`.
 
 ---
 
