@@ -706,20 +706,28 @@ still 0.16.0 (`c56bbe2`); the Hugging Face space's `tool-fixed-version-04` is th
 repo's `tool-fixed-version-04` (`c56bbe2`) exists only on the test PC (GitHub refuses its pushes), and the space's
 `main` stays 0.15.0.
 
-**State at the end of the round (the test PC).**
+**State at the end of the round (the test PC, 18 Oct about 21:00).**
 
-- **Network:** the robot moved from this PC's hotspot to a Wi-Fi network (both on it; `DEVICE_BIND` and the robot's
-  `app_url` were set to this PC's address there and the robot connected). At about 18:10 this PC was on another Wi-Fi
-  network (`eduroam`, a shared campus network), the old address was gone and the app could not start, so
-  `DEVICE_BIND=127.0.0.1` now: the server, the web app and the LINE webhook run, **the robot cannot connect** until it
-  and this PC share a network again. Then set `DEVICE_BIND` to this PC's address there, `docker compose up -d app`,
-  and the robot's `app_url` (its settings page on port 8042, `POST /api/config`; it restarts its bridge).
-- **LINE:** the Ai_Deep account (14 of its 200 messages used this month); its webhook points at this PC's Cloudflare
-  tunnel (the user recreated the dead tunnel with `docker compose --profile line up -d --force-recreate line-tunnel`
-  and ran `scripts/line-tunnel.ps1`). Pushes are **off** again between tests (`LINE_CHANNEL_ACCESS_TOKEN` empty, the
-  secret kept, so family taps still reach the server). Turning them on: section 11 and the memory note.
-- `reachy_device.auto_record` is **FALSE** on the active robot row: the robot was paired again at 16:50, and the two
-  older rows that had TRUE are revoked. `LIVE_VISION_CLOUD=1` as in section 11.
+- **Network:** the robot and this PC are on the same Wi-Fi network, `DEVICE_BIND` is this PC's address there and the
+  robot is connected. (At about 18:10 this PC had moved to another network, `eduroam`; the old address was gone, the
+  app could not start, and `DEVICE_BIND=127.0.0.1` kept the server up without the robot. Whenever the network
+  changes: set `DEVICE_BIND` to this PC's address on the robot's network, `docker compose up -d app`, and the robot's
+  `app_url` on its settings page, port 8042, `POST /api/config`, which restarts its bridge.) After the Reachy Mini
+  Control app plays its wake-up move and starts the app, the robot stays awake until its next task (the app sleeps only
+  at the end of a task); the daemon's `POST /api/move/play/goto_sleep` puts it to sleep.
+- **LINE: on**, with the Ai_Deep account, and **it stays on until the user says otherwise** (the user's words, 18 Oct
+  20:20); its webhook points at this PC's Cloudflare tunnel (the user recreated the dead tunnel with `docker compose
+  --profile line up -d --force-recreate line-tunnel` and ran `scripts/line-tunnel.ps1`). Before turning LINE on, the
+  stale outbox rows were cancelled (54-57 and 66), so no old message went out.
+- **The robot is paired to a second test account** (since 20:28 on 18 Oct), whose one medicine was added that evening.
+- `reachy_device.auto_record`: **FALSE** on the first test account's active row (paired again at 16:50), but **TRUE**
+  on the second account's new row (paired at 20:28). It is harmless only while the robot camera stays below the
+  12 fps recording gate (it gives 10 fps; every dose then goes to family). `CLAUDE.md` says FALSE until decision D2:
+  ask the user before raising the camera's rate. `LIVE_VISION_CLOUD=1` as in section 11.
+- **Late fix `8ab9c45`:** `get_medication_schedule` has a third scope, `tomorrow` (tomorrow's doses, as scheduled), and
+  its `today` and `tomorrow` answers list the patient's active medicines with their daily times, so "what do I take
+  tomorrow?" and "what medicines do I take?" have an answer even when no dose is left today (asked on the second test
+  account, whose medicine was added after its last time of the day). One new test; the whole suite 3181 passed.
 
 **The tests with the user (16:48-18:05).**
 
