@@ -78,9 +78,14 @@ class Conn:
         ordered = sorted(self.intakes, key=lambda i: (self.intakes[i]["intake_time_stamp"], i))
         if query == dose_status.TODAY_SQL:
             return [{"intk_id": i, "intake_time_stamp": self.intakes[i]["intake_time_stamp"]} for i in ordered]
-        if query in (tool_registry.DOSES_SQL, tool_registry.SCHEDULE_SQL):
-            wanted = args[1] if query == tool_registry.DOSES_SQL else ordered
-            return [self._row(i) for i in ordered if i in wanted]
+        if query == tool_registry.DOSES_SQL:
+            return [self._row(i) for i in ordered if i in args[1]]
+        if query == tool_registry.SCHEDULE_SQL:   # the doses of the local day of args[1]
+            day = args[1].astimezone(ZONE).date()
+            return [self._row(i) for i in ordered if self.intakes[i]["intake_time_stamp"].astimezone(ZONE).date() == day]
+        if query == tool_registry.MEDICINE_TIMES_SQL:
+            return [{"med_id": med_id, "med_name": med["med_name"], "schedule_time": med.get("schedule_time")}
+                    for med_id, med in self.meds.items()]
         if query == tool_registry.MEDICINES_SQL:
             return [{"med_id": med_id, "med_name": med["med_name"]} for med_id, med in self.meds.items()]
         if query in (tool_registry.EMOTION_HISTORY_SQL, tool_registry.MOOD_HISTORY_SQL):
@@ -222,7 +227,7 @@ def test_the_seven_tools_are_registered_with_their_arguments():
     assert by_name["dance"]["properties"]["dance"]["enum"] == [*gpt_live_config.DANCES, None]
     assert list(by_name["stop_dance"]["properties"]) == []
     assert list(by_name["describe_view"]["properties"]) == ["question"]
-    assert by_name["get_medication_schedule"]["properties"]["time_scope"]["enum"] == ["now", "today", None]
+    assert by_name["get_medication_schedule"]["properties"]["time_scope"]["enum"] == ["now", "today", "tomorrow", None]
     assert set(by_name["start_pill_intake_detection"]["properties"]) == {"medication_name", "timeout_seconds"}
     assert list(by_name["get_pill_intake_result"]["properties"]) == ["session_id"]
     assert list(by_name["get_current_emotion"]["properties"]) == []
@@ -268,7 +273,7 @@ def test_argument_validation_of_the_new_tools():
         registry = ToolRegistry(Robot(), backend()[0])
         return [await registry.execute(name, args) for name, args in (
             ("verify_medication", {"expected_medication": "  "}),
-            ("get_medication_schedule", {"time_scope": "tomorrow"}),
+            ("get_medication_schedule", {"time_scope": "next_week"}),
             ("start_pill_intake_detection", {"medication_name": "Allegra", "timeout_seconds": 2}),
             ("record_medication_taken", {"medication_name": None, "session_id": None, "medication_id": None,
                                          "patient_confirmed": True}),
@@ -393,6 +398,26 @@ def test_get_medication_schedule_now_and_today(now):
     assert today["doses"][0]["taken_time"] == "2026-10-12T08:10:00+08:00"
     default = asyncio.run(ToolRegistry(Robot(), b).execute("get_medication_schedule", {"time_scope": None}))
     assert default["result"]["time_scope"] == "today"
+
+
+def test_get_medication_schedule_tomorrow_and_the_medicine_list(now):
+    """18 Oct 2026: a patient whose medicine was added in the evening asked 「明天要吃什麼藥」, and Reachy could only say
+    it sees today. 'tomorrow' lists tomorrow's doses as scheduled, and the answers list the patient's active medicines
+    with their daily times, even when no dose is due today."""
+    doses = intakes()
+    doses[3] = {"med_id": 10, "intake_stats": "pending", "intake_time_stamp": at(8) + datetime.timedelta(days=1),
+                "actual_intake_time": None}
+    b, _ = backend(Conn(doses, MEDS))
+    tomorrow = asyncio.run(b.get_medication_schedule("tomorrow"))
+    assert tomorrow["time_scope"] == "tomorrow" and tomorrow["date"] == "2026-10-13"
+    assert [(d["medication_id"], d["status"], d["scheduled_time"]) for d in tomorrow["doses"]] == [
+        ("dose-3", "scheduled", "2026-10-13T08:00:00+08:00")]
+    assert tomorrow["medicines"] == [{"medication_name": "Allegra", "daily_times": ["08:00", "20:00"], "weekdays": None}]
+    today = asyncio.run(b.get_medication_schedule("today"))
+    assert [d["medication_id"] for d in today["doses"]] == ["dose-1", "dose-2"]
+    assert today["medicines"] == tomorrow["medicines"]
+    via_tool = asyncio.run(ToolRegistry(Robot(), b).execute("get_medication_schedule", {"time_scope": "tomorrow"}))
+    assert via_tool["result"]["time_scope"] == "tomorrow"
 
 
 def test_verify_prescription_takes_dose_and_medicine_ids(now):

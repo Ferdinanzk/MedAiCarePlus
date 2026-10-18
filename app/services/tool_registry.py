@@ -109,6 +109,8 @@ DOSE_SQL = ("SELECT i.intk_id, i.med_id, m.med_name, i.intake_stats, i.intake_ti
             "WHERE i.u_id = $1 AND i.intk_id = $2")
 MEDICINE_SQL = "SELECT med_id, med_name, COALESCE(is_active, TRUE) AS active FROM medication WHERE u_id = $1 AND med_id = $2"
 MEDICINES_SQL = "SELECT med_id, med_name FROM medication WHERE u_id = $1 AND COALESCE(is_active, TRUE) ORDER BY med_id"
+MEDICINE_TIMES_SQL = ("SELECT med_id, med_name, schedule_time FROM medication WHERE u_id = $1 "
+                      "AND COALESCE(is_active, TRUE) ORDER BY med_id")
 EMOTION_HISTORY_SQL = ("SELECT dominant, dominant_score, basis, resolved_at FROM dose_emotion "
                        "WHERE u_id = $1 AND resolved_at >= $2 ORDER BY resolved_at DESC LIMIT 20")
 MOOD_HISTORY_SQL = ("SELECT mood, ended_at FROM conversation WHERE u_id = $1 AND ended_at >= $2 "
@@ -263,19 +265,38 @@ class ServerCareBackend:
                     "med_name": current["med_name"] if current else None, "doses": doses}
         return await self._db(work)
 
+    async def _medicines(self, conn) -> list[dict]:
+        """The patient's active medicines and their daily times, so "what are my medicines?" has an answer whatever
+        is due (18 Oct 2026: a medicine added in the evening had no dose left that day). weekdays None: every day."""
+        medicines = []
+        for row in await conn.fetch(MEDICINE_TIMES_SQL, self.u_id):
+            days = schedule.weekdays(row["schedule_time"])
+            medicines.append({"medication_name": row["med_name"], "daily_times": schedule.dose_times(row["schedule_time"]),
+                              "weekdays": None if days == schedule.ALL_WEEKDAYS else list(days)})
+        return medicines
+
     async def get_medication_schedule(self, time_scope: str = "today") -> dict:
         """time_scope "now": the dose due now (the reminder task's slot, else today's current slot) judged by
-        overdose protection; "today": every dose of today."""
+        overdose protection; "today": every dose of today; "tomorrow": every dose of tomorrow, as scheduled (not yet
+        judged: none is due). "today" and "tomorrow" also list the patient's active medicines (_medicines)."""
         if time_scope == "now":
             answer = await self.check_medication_due()
             due = [dose for dose in answer["doses"] if dose["status"] == "pending_allowed"]
             return {"time_scope": "now", **answer, "due_now": due, "anything_due": bool(due)}
 
         async def work(conn):
-            rows, verdicts = await self._today(conn)
             at = schedule.current_time()
+            if time_scope == "tomorrow":
+                day = at + datetime.timedelta(days=1)
+                rows = [dict(row) for row in await conn.fetch(SCHEDULE_SQL, self.u_id, day, MEDCARE_TIMEZONE)]
+                doses = [{"medication_id": f"dose-{row['intk_id']}", "medication_name": row["med_name"],
+                          "med_name": row["med_name"], "scheduled_time": _local(row["intake_time_stamp"]),
+                          "status": "scheduled"} for row in rows]
+                return {"time_scope": "tomorrow", "date": schedule.local_iso(day)[:10], "doses": doses,
+                        "medicines": await self._medicines(conn)}
+            rows, verdicts = await self._today(conn)
             return {"time_scope": "today", "date": schedule.local_iso(at)[:10],
-                    "doses": [self._dose(row, verdicts) for row in rows]}
+                    "doses": [self._dose(row, verdicts) for row in rows], "medicines": await self._medicines(conn)}
         return await self._db(work)
 
     async def _dose_by_name(self, conn, medication_name: str) -> dict | None:
