@@ -135,3 +135,6 @@ From `HANDOFF.md` section 12 and `docs/TOOL_PRIORITIES_2026-10-18.md`:
 4. The face lock (`head_tracking`, with the design changes of priority item 21).
 5. The OCR test on the robot (`identify_medicine`, `verify_medication`).
 6. The new tools' implementation plan (robot app 0.17.0).
+7. After the robot app starts with no task (for example when the Reachy Mini Control app plays its wake-up move and
+   starts it), the robot stays in the wake-up pose until its next task: the app calls `sleep` only at the end of a task
+   (robot `session.py:940, 1288, 1314`). Seen on 18 Oct 19:38-20:22. Put it to sleep at start when no task is running.
