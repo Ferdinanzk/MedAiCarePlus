@@ -624,10 +624,11 @@ Hugging Face space, `tool-fixed-version-03` is the same files as `tool-fixed-ver
 
 **What runs on the test PC.** The server image of `8826c92`, and robot app 0.16.0 on the robot (installed on 17 Oct
 with `tools/deploy_to_robot.py`; heartbeats report `bridge_version` 0.16.0). The test PC's `.env` (never in git)
-differs from the defaults in four switches: `LIVE_VOICE_TEST=1` and `LIVE_TOOLS=1` (as before),
+differs from the defaults in three switches: `LIVE_VOICE_TEST=1` and `LIVE_TOOLS=1` (as before),
 `LIVE_VISION_CLOUD=1` (17 Oct 21:57, on the user's ask: the vision tools send a camera frame to the OCR's Gemini
-model; test only, no patient notice covers it), and `LINE_CHANNEL_ACCESS_TOKEN` **empty** (18 Oct, about 01:40:
-LINE pushes are off to save the free plan's 200 messages a month; the channel secret is kept).
+model; test only, no patient notice covers it). And `LINE_CHANNEL_ACCESS_TOKEN` was **emptied**, back to its empty
+default (18 Oct, about 01:40: LINE pushes are off to save the free plan's 200 messages a month; the channel secret
+is kept).
 
 **The live tests with the user** (17 Oct 21:49-22:24, 18 Oct 00:55-01:04 and 12:40-12:52):
 
@@ -642,14 +643,16 @@ LINE pushes are off to save the free plan's 200 messages a month; the channel se
   recorded. Why the camera lost the match is not settled: the head levelled after the search (`hold_head`), a weak
   face gallery (3 small crops from the web sign-up), or the patient moving.
 - **The 2-minute wait after a medicine chat:** the robot stays awake, silent, head level, for
-  `POST_SLOT_SECONDS = 120` (robot `session.py:917-924`), looking for an extra dose; the user thought it was stuck.
+  `POST_SLOT_SECONDS = 120` (robot `session.py:80`, used at `:917-924`), looking for an extra dose; the user
+  thought it was stuck.
 - **18 Oct 12:43:** the daemon logged `Motor 'left_antenna' hardware errors: ['Overload Error']` every second for
   about a minute; the app was stopped at 12:43:19 (most likely from the Reachy Mini Control app; not proven) and
-  started again at 12:51 by the PC's reconcile task. No error since. If it comes back, check that the left antenna
-  moves freely.
+  came back at 12:51; what started it is not proven (this PC has no reconcile task installed). No error since. If
+  it comes back, check that the left antenna moves freely.
 
 **LINE.** On 17 Oct the account in use (Ai_Deep2) and Care Bot had sent 200 of 200 messages that month, so every
-push failed with `429 You have reached your monthly limit`, and the tools still answered "sent". With the user's OK
+push failed with `429 You have reached your monthly limit`, and the tools still answered as if family were told
+(`family_asked` true, `queued`, `alerted`). With the user's OK
 the server was switched to the Ai_Deep account from the key folder (the test contacts had added it), the stuck
 messages went out, and then, on the user's ask, pushes were turned off. Ai_Deep's webhook points at an outside
 service, so family answer buttons do not reach this server and new dose videos have no public link. Before a LINE
@@ -660,16 +663,17 @@ code, the tests and the live logs, not in the docs. Of the 25 tools in `TOOLS_SC
 tests only, 6 are partial and none is broken; the 8 approved new tools have no code; `idle_do_nothing` is skipped.
 New defects: `set_reminder` refuses the "my medicine" form its own schema documents (`reminders.py:207, 216-217`);
 `remember` can never store an `event` (its schema has no date); the tool log line says "ok" whenever the call
-returned (`agent_bridge.py:253-255`); `notify_family` and `emergency_alert` answer queued or alerted while LINE
+returned (`agent_bridge.py:253-254`); `notify_family` and `emergency_alert` answer queued or alerted while LINE
 refuses every push.
 
 **What to do first** ([docs/TOOL_PRIORITIES_2026-10-18.md](docs/TOOL_PRIORITIES_2026-10-18.md)): three rankings (by
 patient safety, the patient's experience and delivery), merged and checked against the code: 12 items now, 13 for the
 next build (robot app 0.17.0), 18 later, and a 10-minute robot scenario for the tools never tried on the robot.
-Checked by Claude in the code and the database: `reachy_device.auto_record` is TRUE on both rows (this file's
-Phase 2 rule says FALSE until decision D2); the test medicine 「測試藥」 keeps the custom times 01:04 and 12:48, so
+Checked by Claude in the code and the database: `reachy_device.auto_record` is TRUE on both rows (`CLAUDE.md:78`,
+the Phase 2 rule, says FALSE until decision D2); the test medicine 「測試藥」 keeps the custom times 01:04 and 12:48, so
 the robot runs a dose task for it every day (`set_test_dose.py` adds a time at each run); an expired family request
-puts the dose back to pending (`dose_confirmation.py:303-314, 498-507`), so overdose protection can allow it again;
+puts the dose back to its status before the request, pending or missed (`dose_confirmation.py:303-314, 498-507`);
+back at pending, overdose protection can allow it again;
 `reminders.py` never asks overdose protection.
 
 **How to continue, in order**
@@ -679,7 +683,8 @@ puts the dose back to pending (`dose_confirmation.py:303-314, 498-507`), so over
    webhook at this server, which takes it from the outside service).
 2. **The P0 server fixes** of the priority list: the spoken cue when the camera does not recognise the patient, the
    quiet pause counted from the end of Reachy's reply, honest delivery answers, the real status in the tool log line,
-   the due check listing every open dose, and the rule for an expired family request (the user decides it).
+   the due check listing every open dose, a send-by time for outbox messages (item 3), and the rule for an expired
+   family request (the user decides it).
 3. **The face lock** (the user's ask: 「你看得到我嗎」 / 「看著我」 / "can you see me" / "look at me"): part of
    `head_tracking`, with the design changes of item 21 of the priority list (aim at the face when found, never snap
    back to level, an aim box when one face is in view that never counts as seen, scan when nobody is seen). The
