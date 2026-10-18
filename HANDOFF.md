@@ -693,7 +693,8 @@ back at pending, overdose protection can allow it again;
    needs `LIVE_VISION_CLOUD=1`): not run yet, because the 12:40 session was stopped. A new idea from the user, not
    designed yet: Reachy takes a photo of a prescription and the computer finishes it later, as the Scan page's cards
    (the open question: who confirms it on the computer).
-5. **Then the new tools' implementation plan** (robot app 0.17.0), on a new branch (`tool-fixed-version-04`).
+5. **Then the new tools' implementation plan** (robot app 0.17.0), on a new branch (now `tool-fixed-version-05`, see
+   section 12).
 
 ## 12. Wi-Fi, the LINE test with a family confirmation, and the intake map (18 October 2026, afternoon)
 
@@ -701,8 +702,9 @@ back at pending, overdose protection can allow it again;
 commit `e194048` (the LINE webhook logs every event's type and why a family tap changed nothing; never an ID or the
 button's data; no behaviour change; two new tests, the whole suite 3180 passed) and
 [docs/INTAKE_IN_CHAT_MAP_2026-10-18.md](docs/INTAKE_IN_CHAT_MAP_2026-10-18.md). **The robot app did not change:**
-still 0.16.0 (`c56bbe2`); the robot repo's and the Hugging Face space's `tool-fixed-version-04` are that same commit
-(space `ae4154c`), and the space's `main` stays 0.15.0.
+still 0.16.0 (`c56bbe2`); the Hugging Face space's `tool-fixed-version-04` is that same files (`ae4154c`), the robot
+repo's `tool-fixed-version-04` (`c56bbe2`) exists only on the test PC (GitHub refuses its pushes), and the space's
+`main` stays 0.15.0.
 
 **State at the end of the round (the test PC).**
 
@@ -721,15 +723,17 @@ still 0.16.0 (`c56bbe2`); the robot repo's and the Hugging Face space's `tool-fi
 
 **The tests with the user (16:48-18:05).**
 
-- **The family confirmation works end to end.** The robot's own dose flow for a medicine at 18:00 sent the request
-  and its video; the family tap at 18:02:00 confirmed it, the dose was recorded as taken (at the camera's moment) and
-  the reply went out. An earlier request (16:55) was most likely tapped while the bot's webhook still pointed at an
-  outside service (before 17:03), so the tap never reached this server; nothing was logged then, which is why
-  `e194048` adds the logs.
-- **The video:** the 16:55 clip was made and kept unsent (no public link: the webhook pointed elsewhere and this PC's
-  tunnel had died with the network change); it went out at 17:05 once the tunnel and the webhook were fixed. The
+- **The family confirmation works end to end.** The robot's own dose flow for the 18:07 dose (intake 5), which it
+  started early at 18:00, sent the request and its video; the family tap at 18:02:00 confirmed it, the dose was
+  recorded as taken (at the moment the request was made, 18:00:55) and the reply went out. The earlier request
+  (16:55) is still open: before 17:03 the bot's webhook address did not answer (the server logged "tunnel not
+  answering"), so a tap made then was lost; after the tunnel was fixed, three webhook calls reached this server (17:03:42
+  the script's test, 17:11:34 the video's play-complete, and 17:08:31 of unknown type, possibly a tap that a check
+  turned away). Nothing said why, which is why `e194048` adds the logs; the next tap will show the reason.
+- **The video:** the 16:55 clip was made and kept unsent (no public link: the bot's webhook address did not answer,
+  logged as "tunnel not answering", and this PC's tunnel had died with the network change); it went out at 17:05 once the tunnel and the webhook were fixed. The
   request still said the video follows in the next message (priority item 18).
-- **The intake inside a chat (16:55):** the camera never recognised the patient during the 30 s watch (7 mismatch, 3
+- **The intake inside a chat (16:55):** the camera never recognised the patient during the 30 s watch (6 mismatch, 3
   searching), so the pill detector and the emotion check never ran; the dose was filed on the patient's word.
 - **17:46:** 「我吃完了」 was not filed: the due check offered only a dose already waiting for family, so GPT-Live
   applauded and recorded nothing, and an open dose of another medicine was never offered (priority item 6).
@@ -738,7 +742,7 @@ still 0.16.0 (`c56bbe2`); the robot repo's and the Hugging Face space's `tool-fi
   confirm the patient's prescription.
 - **A chat cannot end** while the camera does not recognise the patient: Reachy stays awake and the goodbye is not
   heard (items 8 and 24).
-- After the 18:00 dose an `extra_event` message went to family: the 2-minute watch saw another hand-to-mouth moment
+- After the 18:07 dose an `extra_event` message went to family: the 2-minute watch saw another hand-to-mouth moment
   (probably drinking water).
 
 **New findings** (not fixed):
