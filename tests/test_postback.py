@@ -142,6 +142,28 @@ def test_forged_or_unauthorised_postback_changes_nothing(db, monkeypatch, case):
     assert db.direct_sends == []
 
 
+def test_every_webhook_event_and_a_turned_away_tap_are_logged_without_ids(db, caplog):
+    """18 Oct 2026: a family tap changed nothing and nothing said why. Every event's type is logged, and a tap
+    that is turned away says which check stopped it; never the sender's LINE ID or the button's data."""
+    confirmation_id = _confirmation(db)
+    good = _button(db, confirmation_id, 1, "taken")
+    with caplog.at_level("INFO"):
+        _post([_postback(good[:-4] + "0000", "U-amy"), _postback(good, "U-stranger"), _postback(good, "")])
+    text = caplog.text
+    assert text.count("[LINE] webhook event: postback") == 3
+    assert "[LINE] postback ignored: the button's data or signature is not valid" in text
+    assert "[LINE] postback ignored: the sender is not that contact's LINE account" in text
+    assert "[LINE] postback ignored: LINE gave no sender" in text
+    assert "U-amy" not in text and "U-stranger" not in text and "s=" not in text and confirmation_id not in text
+
+
+def test_an_accepted_tap_is_logged_with_its_result(db, caplog):
+    confirmation_id = _confirmation(db)
+    with caplog.at_level("INFO"):
+        _post([_postback(_button(db, confirmation_id, 1, "taken"), "U-amy")])
+    assert "[LINE] postback applied: " in caplog.text and "U-amy" not in caplog.text
+
+
 def test_second_answer_and_replay_change_nothing_and_get_already_answered(db):
     """Review focus 4: the first valid answer wins; a second answer or a replay only gets a notice."""
     confirmation_id = _confirmation(db)

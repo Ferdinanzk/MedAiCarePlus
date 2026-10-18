@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import uuid
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
@@ -17,6 +18,8 @@ from zoneinfo import ZoneInfo
 from app.config import MEDCARE_TIMEZONE, SECRET_KEY
 from app.database import get_pool
 from app.services import dose_emotion, dose_report, dose_safety, outbox, schedule
+
+log = logging.getLogger(__name__)
 from app.services.intake_repository import take_stock
 
 SOURCES = ("uncertain_detection", "unsupported_dose", "degraded", "auto_record_off", "patient_claim")
@@ -381,23 +384,36 @@ async def resolve(conn, confirmation_id: str, contact_id: int, answer: str) -> d
             "stock_empty": stock_empty, "not_due": not_due, "refused": refused}
 
 
+def _ignored(why: str) -> None:
+    """A tap that changes nothing: the reason only, never the sender's LINE ID or the button's data."""
+    log.info("[LINE] postback ignored: %s", why)
+    return None
+
+
 async def handle_postback(conn, data: str, sender_line_id: str) -> dict | None:
     """Webhook entry point. Returns None (and changes nothing) unless the payload HMAC is valid,
     the sender is that verified contact, and the contact belongs to the confirmation's patient."""
     parsed = verify_postback(data)
-    if parsed is None or not sender_line_id:
-        return None
+    if parsed is None:
+        return _ignored("the button's data or signature is not valid")
+    if not sender_line_id:
+        return _ignored("LINE gave no sender")
     async with conn.transaction():
         contact = await conn.fetchrow(
             "SELECT id, u_id, name, line_id, verified, relationship FROM family_contacts WHERE id = $1",
             parsed["contact_id"])
-        if (not contact or not contact["verified"] or contact["relationship"] == "user"
-                or contact["line_id"] != sender_line_id):
-            return None
+        if not contact:
+            return _ignored("the button names no known contact")
+        if not contact["verified"]:
+            return _ignored("the contact is not verified")
+        if contact["relationship"] == "user":
+            return _ignored("the contact is the patient")
+        if contact["line_id"] != sender_line_id:
+            return _ignored("the sender is not that contact's LINE account")
         owner = await conn.fetchval("SELECT u_id FROM dose_confirmation WHERE confirmation_id = $1::uuid",
                                     parsed["id"])
         if owner is None or owner != contact["u_id"]:
-            return None
+            return _ignored("the request is unknown or not that contact's patient's")
         result = await resolve(conn, parsed["id"], contact["id"], parsed["answer"])
         await _enqueue_replies(conn, parsed, contact, result)
     outbox.wake()

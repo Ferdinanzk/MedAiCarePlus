@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import string
 from fastapi import APIRouter, Depends, Request
@@ -27,6 +28,7 @@ class NotificationSettingsPayload(BaseModel):
     overdose_protection: Optional[bool] = None
 
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/notify", tags=["notify-api"])
 
 # Separate router so LINE can POST to /line/webhook (the URL set in LINE Developer Console)
@@ -86,16 +88,19 @@ async def line_webhook(request: Request):
     line_svc = LineService.get_instance()
 
     for event in events:
+        log.info("[LINE] webhook event: %s", event.get("type"))   # the type only: never an ID or a text
         if event.get("type") == "postback":
             # Caregiver confirmation buttons. Invalid or unauthorised postbacks
-            # change nothing and get no reply; replies go through the outbox.
+            # change nothing and get no reply (the reason is logged); replies go through the outbox.
             try:
                 async with pool.acquire() as conn:
-                    await dose_confirmation.handle_postback(
+                    result = await dose_confirmation.handle_postback(
                         conn,
                         (event.get("postback") or {}).get("data", ""),
                         (event.get("source") or {}).get("userId", ""),
                     )
+                if result is not None:
+                    log.info("[LINE] postback applied: %s", result.get("status"))
             except Exception as exc:
                 print(f"[LINE] postback handling failed: {exc}")
             continue
