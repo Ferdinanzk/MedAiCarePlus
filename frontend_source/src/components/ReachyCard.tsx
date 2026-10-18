@@ -401,22 +401,22 @@ export default function ReachyCard() {
               <span className="block text-xs text-gray-500 mt-1">{t('reachy.liveVoiceHelp')}</span>
             </div>
           )}
-          <div className="flex flex-col sm:flex-row gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <button onClick={sendTestAlert} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-[#0057B8] text-white font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
-              <BellRing className="w-4 h-4" />{t('reachy.testAlert')}
+              <BellRing className="w-4 h-4 shrink-0" />{t('reachy.testAlert')}
             </button>
             <button onClick={sendRobotReminderNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-[#0057B8] text-[#0057B8] font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}{t('reachy.robotReminderNow')}
+              {busy ? <Loader2 className="w-4 h-4 shrink-0 animate-spin" /> : <Bot className="w-4 h-4 shrink-0" />}{t('reachy.robotReminderNow')}
             </button>
             <button onClick={sendLineReminderNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-green-700 text-green-800 font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <BellRing className="w-4 h-4" />}{t('reachy.manualReminderNow')}
+              {busy ? <Loader2 className="w-4 h-4 shrink-0 animate-spin" /> : <BellRing className="w-4 h-4 shrink-0" />}{t('reachy.manualReminderNow')}
             </button>
             {checkins && (
               <button onClick={talkNow} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl border border-[#0057B8] text-[#0057B8] font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
-                <MessageCircle className="w-4 h-4" />{t('conversations.talkNow')}
+                <MessageCircle className="w-4 h-4 shrink-0" />{t('conversations.talkNow')}
               </button>
             )}
-            <button onClick={unpair} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-gray-100 text-gray-700 font-medium disabled:opacity-50">{t('reachy.unpair')}</button>
+            <button onClick={unpair} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-gray-100 text-gray-700 font-medium disabled:opacity-50 flex items-center justify-center">{t('reachy.unpair')}</button>
           </div>
           {testNotice && (
             <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">
