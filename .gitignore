@@ -37,6 +37,8 @@ Thumbs.db
 
 # Logs
 *.log
+# line-tunnel.ps1's record of the tunnel start and address it registered with LINE
+logs/line-tunnel.stamp
 
 # Node
 node_modules/

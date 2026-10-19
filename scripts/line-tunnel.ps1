@@ -11,21 +11,32 @@ this script again whenever LINE verification or caregiver buttons stop working. 
 # Native exit codes are checked explicitly instead.
 $ErrorActionPreference = 'Continue'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+# Written on success: the tunnel container's StartedAt and the address registered with LINE. medcare-boot.ps1
+# -Reconcile reruns this script when the container's StartedAt no longer matches it (the tunnel restarted).
+$stampFile = Join-Path $repoRoot 'logs\line-tunnel.stamp'
+
+function Get-TunnelStartedAt {
+    $id = (docker compose --profile line ps -q line-tunnel 2>$null | Out-String).Trim()
+    if (-not $id) { return $null }
+    return (docker inspect -f '{{.State.StartedAt}}' $id 2>$null | Out-String).Trim()
+}
+
+function Wait-TunnelUrl([string]$StartedAt) {
+    # Only the log lines of the current start: after an engine restart the log also holds earlier runs' addresses.
+    $deadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $logs = (docker compose --profile line logs --since $StartedAt line-tunnel 2>&1 | Out-String)
+        $found = [regex]::Matches($logs, 'https://[a-z0-9-]+\.trycloudflare\.com')
+        if ($found.Count -gt 0) { return $found[$found.Count - 1].Value }
+    }
+    return $null
+}
+
 Push-Location -LiteralPath $repoRoot
 try {
     docker compose --profile line up -d line-webhook-proxy line-tunnel | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not start the LINE tunnel containers' }
-
-    $url = $null
-    $deadline = (Get-Date).AddSeconds(90)
-    while (-not $url -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 3
-        $logs = (docker compose --profile line logs line-tunnel 2>&1 | Out-String)
-        $found = [regex]::Matches($logs, 'https://[a-z0-9-]+\.trycloudflare\.com')
-        if ($found.Count -gt 0) { $url = $found[$found.Count - 1].Value }
-    }
-    if (-not $url) { throw 'The tunnel did not report an address within 90 s (docker compose --profile line logs line-tunnel)' }
-    Write-Host "Tunnel: $url"
 
     $python = @'
 import json, os, sys, time, urllib.error, urllib.request
@@ -67,9 +78,27 @@ with urllib.request.urlopen(req, timeout=20) as resp:
 print("LINE now sends to:", current.get("endpoint"), "| active:", current.get("active"))
 sys.exit(0 if body.get("success") and current.get("endpoint") == endpoint else 1)
 '@
-    $python | docker compose exec -T -e "WEBHOOK_URL=$url" -w /app app python -
-    if ($LASTEXITCODE -ne 0) { throw 'LINE could not reach the webhook through the tunnel' }
-    Write-Host 'LINE webhook is set and reachable.'
+    # A tunnel that is up but dead (LINE's test fails) gets one fresh start: a new container, a new address.
+    for ($round = 1; $round -le 2; $round++) {
+        $started = Get-TunnelStartedAt
+        if (-not $started) { throw 'The line-tunnel container is not there (docker compose --profile line ps)' }
+        $url = Wait-TunnelUrl $started
+        if (-not $url) { throw 'The tunnel did not report an address within 90 s (docker compose --profile line logs line-tunnel)' }
+        Write-Host "Tunnel: $url"
+        $python | docker compose exec -T -e "WEBHOOK_URL=$url" -w /app app python -
+        if ($LASTEXITCODE -eq 0) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $stampFile -Parent) | Out-Null
+            Set-Content -LiteralPath $stampFile -Value @("started_at=$started", "address=$url") -Encoding ASCII
+            Write-Host 'LINE webhook is set and reachable.'
+            return
+        }
+        if ($round -eq 1) {
+            Write-Host 'LINE could not reach the webhook through the tunnel: recreating the tunnel container once'
+            docker compose --profile line up -d --no-deps --force-recreate line-tunnel | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not recreate the LINE tunnel container' }
+        }
+    }
+    throw 'LINE could not reach the webhook through the tunnel, also after a fresh tunnel'
 }
 finally {
     Pop-Location
