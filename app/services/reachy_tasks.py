@@ -290,7 +290,7 @@ async def set_status(u_id: int, device_id: str, task_id: str, status: str, detai
                 "UPDATE reachy_task SET status = $2, detail = COALESCE($3::jsonb, detail), "
                 "finished_at = NOW(), lease_until = NULL WHERE task_id = $1::uuid RETURNING *",
                 task_id, status, detail_json)
-            await _queue_retry_due(conn, held)
+            await _queue_retry_due(conn, held, detail)
         else:
             task = await conn.fetchrow(
                 "UPDATE reachy_task SET status = $2, detail = COALESCE($3::jsonb, detail), "
@@ -301,11 +301,13 @@ async def set_status(u_id: int, device_id: str, task_id: str, status: str, detai
         return await task_payload(conn, task)
 
 
-async def _queue_retry_due(conn, held) -> None:
+async def _queue_retry_due(conn, held, ended: dict | None) -> None:
     """A task that a missed-dose retry marked while it was held (detail.retry_due) has just ended: queue that retry
     now, inside the caller's transaction and a savepoint, for the marked doses still open (pending or missed), until
     the retry's own expiry. Nothing when none is open or the retry has expired; a dose overdose protection refuses
-    now is logged and skipped, as missed_dose_job.send_robot does. The robot then leases it before any check-in."""
+    now is logged and skipped, as missed_dose_job.send_robot does. The robot then leases it before any check-in.
+    A dose the robot's ending detail gives the outcome meal_not_eaten is left out (review of quick fixes 3): Reachy
+    has just said it comes back once the patient has eaten, and the missed-dose job's next retry still comes."""
     detail = held["detail"]
     if isinstance(detail, str):
         detail = json.loads(detail)
@@ -317,9 +319,13 @@ async def _queue_retry_due(conn, held) -> None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at <= schedule.current_time():
         return
+    outcomes = (ended or {}).get("outcomes")
+    not_eaten = {str(intk_id) for intk_id, outcome in outcomes.items()
+                 if outcome == "meal_not_eaten"} if isinstance(outcomes, dict) else set()
     still_open = [row["intk_id"] for row in await conn.fetch(
         "SELECT intk_id FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[]) "
-        "AND intake_stats IN ('pending','missed') ORDER BY intk_id", held["u_id"], list(retry["intk_ids"]))]
+        "AND intake_stats IN ('pending','missed') ORDER BY intk_id", held["u_id"], list(retry["intk_ids"]))
+        if str(row["intk_id"]) not in not_eaten]
     if not still_open:
         return
     try:

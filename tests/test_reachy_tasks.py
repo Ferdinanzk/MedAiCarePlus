@@ -1118,6 +1118,24 @@ def test_a_missed_retry_during_a_held_task_is_due_and_queued_when_it_ends(db):
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
 
 
+@pytest.mark.parametrize("outcomes, queued", [
+    ({"101": "meal_not_eaten", "102": "meal_not_eaten"}, None),
+    ({"101": "meal_not_eaten", "102": "no_answer"}, [102])])
+def test_a_task_ended_by_meal_not_eaten_queues_no_retry_for_those_doses(db, outcomes, queued):
+    """Review of quick fixes 3: the robot has just said 「等您吃過飯，我再來陪您吃藥。」 and rests (the outcome
+    meal_not_eaten). A missed-dose retry that marked the held task meanwhile is not queued for such a dose as the task
+    ends, or Reachy would wake again at once; the missed-dose job's next retry still comes."""
+    task_id = enqueue(db, intk_ids=(101, 102))
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == task_id
+    for status in ("searching", "in_progress"):
+        run(reachy_tasks.set_status(7, DEVICE, task_id, status, None))
+    db.now = T0 + timedelta(minutes=10)
+    assert enqueue(db, reason="missed_retry", intk_ids=(101, 102)) == task_id   # marked retry_due
+    run(reachy_tasks.set_status(7, DEVICE, task_id, "completed", {"outcomes": outcomes}))
+    retries = [t for t in db.tasks if t["task_id"] != task_id]
+    assert [t["intk_ids"] for t in retries] == ([queued] if queued else [])
+
+
 # ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────
 
 CHECKIN_CONSENT = {**ROBOT_CONSENT, **{scope: {"granted": True, "terms_version": config.TERMS_VERSION}
