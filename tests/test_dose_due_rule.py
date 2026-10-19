@@ -120,7 +120,10 @@ def test_app_answers_409_with_the_dose_time(clock):
     from app.main import app, dose_refused
 
     assert app.exception_handlers[schedule.DoseRefused] is dose_refused
-    response = run(dose_refused(None, schedule.DoseNotDueYet(taipei(3, 8, 0), 5)))
+    from starlette.requests import Request   # the handler reads the path: a device route's refusal gets a clip
+    request = Request({"type": "http", "path": "/api/medications/5/take", "headers": [], "method": "POST",
+                       "query_string": b""})
+    response = run(dose_refused(request, schedule.DoseNotDueYet(taipei(3, 8, 0), 5)))
     assert response.status_code == 409
     assert json.loads(response.body) == {"detail": "dose_not_due_yet", "intk_id": 5, "med_name": None,
                                          "scheduled_time": "2026-10-03T08:00:00+08:00",

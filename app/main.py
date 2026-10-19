@@ -111,8 +111,18 @@ app = FastAPI(title="MedAiCarePlus", version="1.0.0", lifespan=lifespan)
 @app.exception_handler(DoseRefused)
 async def dose_refused(request, exc: DoseRefused):
     """Every route (both ports) refuses a dose overdose protection stops the same way: 409 with the reason
-    (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired), its times and the patient's sentence."""
-    return JSONResponse(exc.body(), status_code=409)
+    (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired), its times and the patient's sentence. On the
+    device port the sentence also comes as a `clip` in the live voice (services/speech_clips.py): its spoken form in
+    Traditional, issued to the refused dose's patient, who is the device's own."""
+    body = exc.body()
+    if request.url.path.startswith("/api/device/") and exc.u_id is not None:
+        from app.services import dose_safety, speech_clips
+
+        clip = speech_clips.issue(exc.u_id, dose_safety.reply_text(exc, body["language"], spoken=True),
+                                  body["language"])
+        if clip is not None:
+            body["clip"] = clip
+    return JSONResponse(body, status_code=409)
 
 
 @app.exception_handler(RequestValidationError)
