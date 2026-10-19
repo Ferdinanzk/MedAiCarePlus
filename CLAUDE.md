@@ -32,7 +32,7 @@ The running stack is **`docker-compose.yml`** (project `medcareai2`, services `p
 cd "d:\medcareai2_20260920\app"
 docker compose up -d                 # start
 docker compose up -d --build app     # rebuild after ANY backend or frontend edit
-.\scriptsebuild-app.ps1            # the same, but refuses while a dose session runs (-Force overrides)
+.\scripts\rebuild-app.ps1            # the same, but refuses while a dose session runs (-Force overrides)
 docker compose logs -f app           # tail logs
 ```
 
@@ -245,12 +245,12 @@ Spec: `docs/superpowers/specs/2026-10-12-live-voice-2a-design.md`, and for robot
 - **What changed on 19 Oct 2026** (the resilience audit, `.superpowers/quickfix/resilience-audit.json`):
   - `medcare-boot.ps1` and `install-autostart.ps1` use their own repo by default (they pointed at `C:\medcareai\MedAiCarePlus`), and the task and the Startup shortcut pass `-RepoRoot`.
   - The boot script takes only an adapter that is Up with a Preferred address (the disconnected Ethernet keeps an old 'Deprecated' lease with a lower metric), and the one in the robot's subnet when `REACHY_ROBOT_HOST` is an IP.
-  - Two runs never overlap: a named mutex (`Local\MedCareReachyBoot`) instead of `logsoot.lock`, so a power-off leaves no lock behind.
+  - Two runs never overlap: a named mutex (`Local\MedCareReachyBoot`) instead of `logs\boot.lock`, so a power-off leaves no lock behind.
   - LINE: `line-tunnel.ps1` reads the tunnel address only from the current start, recreates a dead tunnel once, and writes `logs\line-tunnel.stamp`; reconcile reruns it when the tunnel container restarted since then.
   - The robot's `app_url` is changed only when its current server does not answer or refuses its key (`server.state` `not_authorised`, robot app 0.17.0); a robot that works with another server is left alone.
   - The LINE proxy looks up the app through Docker's DNS at request time, so recreating the app no longer breaks the webhook.
   - Postgres gets 30 s and the app 10 s to stop (from the next time they are created).
-  - `scriptsebuild-app.ps1` rebuilds the app only while no robot task is active and no dose confirmation waits for family (`-Force` overrides): a rebuild stops the server for about 14 s.
+  - `scripts\rebuild-app.ps1` rebuilds the app only while no robot task is active and no dose confirmation waits for family (`-Force` overrides): a rebuild stops the server for about 14 s.
   - After an outage, a dose slot first seen past its last retry gets no "take it now" text and no robot task, only missed alerts that say the system was offline.
   - A backup container started after 02:30 makes the missing nightly backup once (in effect after the backup image is rebuilt).
 
