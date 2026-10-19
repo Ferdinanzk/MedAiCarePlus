@@ -51,8 +51,74 @@ def test_every_line_has_its_words_in_both_languages():
     assert voice_lines.line_text("reminder_lead", "zh-TW", "王奶奶") == "王奶奶，我來提醒您一件事。"
     assert voice_lines.line_text("reminder_lead", "en", None) == "I'm here to remind you of something."
     assert voice_lines.line_text("dance", "zh-TW") is None
-    assert voice_lines.LINE_IDS == ("checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down",
-                                    "opening", "reminder_lead")
+    # the robot's lines.LINE_IDS lists exactly these (quick fixes of 19 Oct 2026: the contract between both sides)
+    assert voice_lines.LINE_IDS == (
+        "checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down",
+        "wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
+        "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "thanks", "ack", "thinking_1",
+        "thinking_2", "thinking_3", "family_no_answer", "retry_limit",
+        "opening", "reminder_lead", "dose_search", "family_not_taken", "family_taken")
+
+
+MANIFEST = Path(__file__).resolve().parents[2] / "medcare-reachy-bridge" / "medcare_reachy" / "bridge" / "clips" / \
+    "manifest.json"
+MANIFEST_IDS = ("wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
+                "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "wind_down", "thanks", "ack",
+                "thinking_1", "thinking_2", "thinking_3")
+
+
+def test_the_robots_clip_lines_have_the_manifests_words():
+    """Every clip of the robot's manifest is a fixed line with the manifest's words, so the GPT copy says what the
+    Matcha clip says. Skipped where the robot repo is not beside this one."""
+    if not MANIFEST.is_file():
+        pytest.skip("the robot repo (medcare-reachy-bridge) is not beside this repo")
+    import json
+    clips = json.loads(MANIFEST.read_text(encoding="utf-8"))["clips"]
+    assert set(clips) == set(MANIFEST_IDS)
+    for line_id in MANIFEST_IDS:
+        assert line_id in voice_lines.FIXED_LINES
+        for language in ("zh-TW", "en"):
+            assert voice_lines.line_text(line_id, language) == clips[line_id][language], (line_id, language)
+
+
+def test_the_new_fixed_lines_have_their_words_and_the_fillers_their_own_instructions():
+    assert voice_lines.line_text("wake_greeting", "zh-TW") == "您好！吃藥的時間到了。"
+    assert voice_lines.line_text("thinking_3", "en") == "Let me think it over."
+    assert voice_lines.line_text("family_no_answer", "zh-TW") == "家人還沒有回覆，請先不要再吃一次喔。"
+    assert voice_lines.line_text("family_no_answer", "en") == (
+        "Your family hasn't answered yet. Please don't take it again for now.")
+    assert voice_lines.line_text("retry_limit", "zh-TW") == "我請家人來幫忙您吃藥喔。"
+    assert voice_lines.line_text("retry_limit", "en") == "I'll ask your family to help you with your medicine."
+    ack, thinking = voice_lines.instructions_for("ack"), voice_lines.instructions_for("thinking_1")
+    assert "short, soft acknowledgement" in ack and "thinking aloud" in thinking
+    assert voice_lines.instructions_for("thinking_2") == voice_lines.instructions_for("thinking_3") == thinking
+    companion = voice_lines.instructions_for("wake_greeting")
+    assert len({ack, thinking, companion, voice_lines.instructions_for("helpline")}) == 4
+    assert voice_lines.instructions_for("family_taken") == companion
+
+
+def test_the_dose_lines_carry_the_call_name_or_none():
+    assert voice_lines.line_text("dose_search", "zh-TW", "王奶奶") == "吃藥的時間到了，我來找王奶奶吃藥。"
+    assert voice_lines.line_text("dose_search", "zh-TW", None) == "吃藥的時間到了，我來找您吃藥。"
+    assert voice_lines.line_text("dose_search", "en", "Grandma Wang") == (
+        "It's time for your medicine. I've come to find Grandma Wang.")
+    assert voice_lines.line_text("dose_search", "en", None) == "It's time for your medicine. I've come to find you."
+    assert voice_lines.line_text("family_not_taken", "zh-TW", "王奶奶") == (
+        "王奶奶，家人說您這次的藥還沒有吃完喔，我們現在把它吃完吧。")
+    assert voice_lines.line_text("family_not_taken", "zh-TW", None) == "家人說您這次的藥還沒有吃完喔，我們現在把它吃完吧。"
+    assert voice_lines.line_text("family_not_taken", "en", "Grandma Wang") == (
+        "Grandma Wang, your family says you haven't finished this medicine yet. Let's finish it now.")
+    assert voice_lines.line_text("family_not_taken", "en", None) == (
+        "Your family says you haven't finished this medicine yet. Let's finish it now.")
+    assert voice_lines.line_text("family_taken", "zh-TW", "王奶奶") == "王奶奶，家人確認您已經吃藥了，拍拍手！您越來越健康了！"
+    assert voice_lines.line_text("family_taken", "zh-TW", None) == "家人確認您已經吃藥了，拍拍手！您越來越健康了！"
+    assert voice_lines.line_text("family_taken", "en", "Grandma Wang") == (
+        "Grandma Wang, your family confirmed you've taken your medicine. Well done! You're getting healthier every "
+        "day!")
+    assert voice_lines.line_text("family_taken", "en", None) == (
+        "Your family confirmed you've taken your medicine. Well done! You're getting healthier every day!")
+    assert set(voice_lines.DOSE_LINES) == {"dose_search", "family_not_taken", "family_taken"}
+    assert set(voice_lines.DOSE_LINES) < set(voice_lines.PATIENT_LINES)
 
 
 def test_the_help_lines_numbers_are_spelled_digit_by_digit_for_the_voice():
@@ -237,6 +303,26 @@ def test_a_patients_line_needs_checkin_consent_and_follows_the_call_name(voice, 
     assert asyncio.run(voice_lines.line(7, "rest", "zh-TW")) is not None     # a fixed line needs no check-in consent
 
 
+def test_the_dose_lines_need_only_the_robots_consent_and_follow_the_call_name(voice, tmp_path):
+    """The dose flow's per-patient lines (dose_search, family_not_taken, family_taken) are said in a dose task, so
+    the robot's consent (core and robot_camera: the device route's own gate) is enough; check-in consent is not
+    needed."""
+    voice.consent = {"core": CHECKIN["core"], "robot_camera": CHECKIN["robot_camera"]}   # no check-in consent
+    kept = asyncio.run(voice_lines.line(7, "dose_search", "zh-TW"))
+    assert kept is not None and voice.renders[-1][0] == "吃藥的時間到了，我來找王奶奶吃藥。"
+    assert [p.name for p in (tmp_path / "7").iterdir()] == [f"line_dose_search_{kept[1]}.wav"]
+    assert asyncio.run(voice_lines.line(7, "family_taken", "en")) is not None
+    assert voice.renders[-1][0].startswith("王奶奶, your family confirmed")
+    assert asyncio.run(voice_lines.line(7, "opening", "zh-TW")) is None    # the chat's lines still need check-in consent
+    voice.name = None
+    assert asyncio.run(voice_lines.line(7, "family_not_taken", "zh-TW")) is not None
+    assert voice.renders[-1][0] == "家人說您這次的藥還沒有吃完喔，我們現在把它吃完吧。"
+    voice.consent = {"core": CHECKIN["core"]}                              # the robot's consent withdrawn
+    renders = len(voice.renders)
+    assert asyncio.run(voice_lines.locate(7, "dose_search", "en")) is None
+    assert asyncio.run(voice_lines.line(7, "family_taken", "zh-TW")) is None and len(voice.renders) == renders
+
+
 def test_the_language_is_folded_and_only_the_known_lines_have_a_place(voice, tmp_path):
     found = asyncio.run(voice_lines.locate(None, "rest", "en-GB"))
     assert found == asyncio.run(voice_lines.locate(None, "rest", "en"))
@@ -277,7 +363,7 @@ def test_a_line_that_cannot_be_kept_is_a_warning_and_the_other_lines_still_rende
     assert failed == [f"{line_id}/zh-TW" for line_id in voice_lines.FIXED_LINES]   # every line was tried
     assert sorted(p.name.rsplit("_", 1)[0] for p in (tmp_path / "lines" / "en").iterdir()) == sorted(
         voice_lines.FIXED_LINES)                                                     # the English ones are kept
-    assert len(voice.renders) == 6                    # a folder that cannot be made costs no render
+    assert len(voice.renders) == len(voice_lines.FIXED_LINES)   # a folder that cannot be made costs no render
     assert "voice line rest (zh-TW) could not be kept (FileExistsError)" in caplog.text
     keys = [voice_lines.key_for(line_id, voice_lines.line_text(line_id, "zh-TW"), "zh-TW", "marin")
             for line_id in voice_lines.FIXED_LINES]
@@ -288,10 +374,11 @@ def test_a_line_that_cannot_be_kept_is_a_warning_and_the_other_lines_still_rende
     found.path.with_suffix(".part").mkdir()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(voice_lines.fetch(found)) is None and len(voice.renders) == 7
+        assert asyncio.run(voice_lines.fetch(found)) is None and len(voice.renders) == len(voice_lines.FIXED_LINES) + 1
         asyncio.run(voice_lines.retry_missing())      # the scheduler's job: no exception, its one summary line
     assert "voice line medicine (en) could not be kept" in caplog.text and found.key not in caplog.text
-    assert "7 fixed lines are still missing" in caplog.text and "medicine/en" in caplog.text
+    missing = len(voice_lines.FIXED_LINES) + 1        # every zh-TW line, and medicine/en
+    assert f"{missing} fixed lines are still missing" in caplog.text and "medicine/en" in caplog.text
 
 
 def test_a_kept_line_that_cannot_be_read_is_a_warning_and_the_other_lines_still_render(voice, caplog, monkeypatch):
@@ -398,19 +485,25 @@ def test_no_line_is_a_404_but_a_failing_lookup_is_not(env, monkeypatch):
 # ── rendered ahead: the fixed lines at startup, and again every 30 min ──
 
 def test_the_fixed_lines_are_rendered_ahead_once_and_the_failures_are_named(voice, tmp_path):
-    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 12   # 6 lines x 2 languages
+    total = 2 * len(voice_lines.FIXED_LINES)                          # 23 lines x 2 languages
+    assert len(voice_lines.FIXED_LINES) == 23
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == total
     for language in ("zh-TW", "en"):
         kept = {p.name.rsplit("_", 1)[0] for p in (tmp_path / "lines" / language).iterdir()}
         assert kept == set(voice_lines.FIXED_LINES)
-    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 12   # nothing missing now
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == total   # nothing missing now
     found = asyncio.run(voice_lines.locate(None, "helpline", "en"))
     found.path.unlink()                                               # one copy lost (a wiped volume)
     voice.fail = RuntimeError("speech API answered 503")
-    assert asyncio.run(voice_lines.render_fixed_ahead()) == ["helpline/en"] and len(voice.renders) == 13
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == ["helpline/en"] and len(voice.renders) == total + 1
     voice.fail = None
-    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 14
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == total + 2
     voice.target = None
-    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == 14   # nothing to do
+    assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == total + 2   # nothing to do
+    # the fillers go to the API with their own instructions
+    voice.target = TARGET
+    ack = next(r for r in voice.renders if r[0] == "嗯")
+    assert ack[3] == voice_lines.INSTRUCTIONS["ack"]
 
 
 def test_the_startup_report_marks_the_voice_lines_stage_without_holding_up_the_summary(monkeypatch):
@@ -439,14 +532,14 @@ def test_the_startup_report_marks_the_voice_lines_stage_without_holding_up_the_s
         gate["release"] = asyncio.Event()
         await startup_report.finish(None, live_status="ok")
         # the summary is logged before the renders finish: the stage is still pending, its renders in the background
-        assert logged[-1]["pending"] and not logged[-1]["ok"] and "12 fixed lines" in logged[-1]["detail"]
+        assert logged[-1]["pending"] and not logged[-1]["ok"] and "46 fixed lines" in logged[-1]["detail"]
         assert startup_report._tasks
         gate["release"].set()
         await asyncio.gather(*startup_report._tasks)
         return startup_report.summary()["stages"]["voice_lines"]   # the stage's final mark, after the renders
 
     stage = asyncio.run(scenario())
-    assert stage["ok"] and not stage["pending"] and "12 fixed lines kept" in stage["detail"]
+    assert stage["ok"] and not stage["pending"] and "46 fixed lines kept" in stage["detail"]
     stage = asyncio.run(scenario())
     assert not stage["ok"] and not stage["pending"] and "30 min" in stage["detail"]
     assert "helpline/en, rest/zh-TW" in stage["detail"] and "sk-x" not in stage["detail"]
@@ -478,7 +571,7 @@ def test_the_retry_logs_what_is_still_missing(voice, caplog):
     voice.fail = RuntimeError("speech API answered 503")
     with caplog.at_level(logging.WARNING):
         asyncio.run(voice_lines.retry_missing())
-    assert "12 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text
+    assert "46 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text
 
 
 # ── rendered ahead: the patient's lines ──
@@ -492,14 +585,29 @@ def test_the_patients_lines_are_rendered_ahead_in_the_background(voice):
         await asyncio.sleep(0)
 
     asyncio.run(scenario())
+    named = {line_id: {lang: voice_lines.line_text(line_id, lang, "王奶奶") for lang in ("zh-TW", "en")}
+             for line_id in voice_lines.DOSE_LINES}
     assert sorted(text for text, *_ in voice.renders) == sorted([
-        OPENING_ZH, OPENING_EN, "王奶奶，我來提醒您一件事。", "王奶奶, I'm here to remind you of something."])
+        OPENING_ZH, OPENING_EN, "王奶奶，我來提醒您一件事。", "王奶奶, I'm here to remind you of something.",
+        *(text for texts in named.values() for text in texts.values())])          # 5 lines x 2 languages
+    assert len(voice.renders) == 10
     voice.target = None
     assert voice_lines.render_ahead_for_patient(7) is None          # no live target: nothing, and no loop needed
 
 
+def test_without_checkin_consent_the_render_ahead_still_makes_the_dose_lines(voice):
+    voice.consent = {"core": CHECKIN["core"], "robot_camera": CHECKIN["robot_camera"]}
+
+    async def scenario():
+        await voice_lines.render_ahead_for_patient(7)
+
+    asyncio.run(scenario())
+    assert sorted(text for text, *_ in voice.renders) == sorted(
+        voice_lines.line_text(line_id, lang, "王奶奶") for line_id in voice_lines.DOSE_LINES for lang in ("zh-TW", "en"))
+
+
 def test_a_render_ahead_that_fails_is_logged_and_never_raises(voice, caplog, monkeypatch):
-    async def broken(u_id):
+    async def broken(u_id, dose_line=False):
         raise RuntimeError("database down")   # the consent or name read failed (locate raises through line)
     monkeypatch.setattr(voice_lines, "patient_name", broken)
 
