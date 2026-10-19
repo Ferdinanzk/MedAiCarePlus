@@ -372,8 +372,8 @@ async def speech_to_text(request: Request, language: Literal["zh-TW", "en"] = Qu
     """One segment of the done-mode listener (raw PCM16 mono 16 kHz, application/octet-stream) as text, through
     OpenAI's transcription endpoint (services/speech_to_text.py; quick fixes 2 of 19 Oct 2026): 200 {"text",
     "model", "ms"}. 404 no_cloud_stt without a live voice target with a key or without the robot's microphone
-    consent; 413 over 15 s of audio, 422 under 0.2 s; 502 stt_failed for any failure of the call. The robot then
-    uses its own Whisper. Nothing is stored, and no log carries the words or the audio."""
+    consent; 413 over 15 s of audio, 422 under 0.2 s or an odd number of bytes; 502 stt_failed for any failure of
+    the call. The robot then uses its own Whisper. Nothing is stored, and no log carries the words or the audio."""
     from app.services import speech_to_text as stt
 
     api_key = stt.cloud_key()
@@ -385,6 +385,8 @@ async def speech_to_text(request: Request, language: Literal["zh-TW", "en"] = Qu
         raise HTTPException(413, "audio_too_long")
     if len(audio) < stt.MIN_BYTES:
         raise HTTPException(422, "audio_too_short")
+    if len(audio) % 2:   # PCM16 is 2 bytes a sample; an odd data chunk would make a malformed WAV (no pad byte)
+        raise HTTPException(422, "audio_not_pcm16")
     try:
         return await stt.transcribe(audio, language, api_key)
     except stt.SttFailed:
