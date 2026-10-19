@@ -210,7 +210,8 @@ class FakeDB:
                     if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")]
         if "FROM intake i JOIN medication m" in query:
             assert "ORDER BY m.med_name, m.med_id" in query
-            rows = [self.doses[i] for i in args[1] if i in self.doses]
+            assert "m.schedule_time, m.instructions, i.intake_time_stamp" in query   # what after_meal reads
+            rows = [{"schedule_time": None, "instructions": None, **self.doses[i]} for i in args[1] if i in self.doses]
             return sorted(rows, key=lambda d: (d["med_name"], d["med_id"]))
         if "JOIN reachy_device d" in query:
             now, seen_before = args
@@ -371,7 +372,7 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     assert task["checkin"] is False      # nor the check-in scopes
     assert [d["med_name"] for d in task["doses"]] == ["Aspirin", "Metformin", "Zinc"]
     assert set(task["doses"][0]) == {"intk_id", "med_id", "med_name", "pill_description", "dose_form",
-                                     "units_per_dose", "intake_stats", "supported"}
+                                     "units_per_dose", "intake_stats", "supported", "after_meal"}
     assert [d["supported"] for d in task["doses"]] == [False, True, False]
     assert db.by_id(first)["lease_until"] == T0 + timedelta(seconds=60)
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == later
@@ -388,6 +389,48 @@ def test_the_payload_carries_the_name_reachy_calls_the_patient(db):
     db.call_names[7] = None
     db.users[7] = "Demo Patient 1790963685"     # a registered name Reachy would not say: no name
     assert run(reachy_tasks.current_task(7, DEVICE))["call_name"] is None
+
+
+@pytest.mark.parametrize("local, expected", [
+    ("10:29", False), ("10:30", True), ("12:00", True), ("14:30", True), ("14:31", False),
+    ("16:29", False), ("16:30", True), ("20:00", True), ("21:30", True), ("21:31", False),
+    ("08:00", False), ("22:00", False)])
+def test_an_after_meal_dose_counts_only_at_lunch_or_dinner_local_time(local, expected):
+    """Quick fixes 2 of 19 Oct 2026: Reachy asks 「您有吃飯了嗎？」 before such a dose. Lunch is 10:30-14:30 and
+    dinner 16:30-21:30 in MEDCARE_TIMEZONE (Taipei: UTC+8), both ends included."""
+    hours, minutes = map(int, local.split(":"))
+    at = T0 + timedelta(hours=hours - 8, minutes=minutes)   # T0 is 08:00 in Taipei
+    assert reachy_tasks.after_meal({"after_meals": True}, None, at) is expected
+    assert reachy_tasks.after_meal(None, "每日三次，飯後服用", at) is expected
+    assert reachy_tasks.after_meal('{"after_meals": true}', "", at) is expected   # asyncpg hands JSONB back as text
+    assert reachy_tasks.after_meal({"after_meals": False, "noon": True}, "餐前服用", at) is False
+    assert reachy_tasks.after_meal({}, None, at) is False
+
+
+def test_an_after_meal_dose_is_marked_by_its_schedule_or_its_instructions():
+    lunch = T0 + timedelta(hours=4)   # 12:00 in Taipei
+    assert reachy_tasks.after_meal(None, "餐後一小時服用", lunch) is True
+    assert reachy_tasks.after_meal({"after_meals": True, "noon": True}, "飯前", lunch) is True
+    assert reachy_tasks.after_meal({"before_meals": True}, "睡前", lunch) is False
+    assert reachy_tasks.after_meal(None, None, lunch) is False
+    assert reachy_tasks.after_meal({"after_meals": True}, None, None) is False   # no dose time: never a meal time
+
+
+def test_each_dose_of_the_payload_says_whether_it_is_taken_after_a_meal(db):
+    """after_meal per dose, in the leased task and in tasks/current: the robot asks about the meal before the
+    medicine prompt when any dose of the slot still to prompt has it."""
+    db.doses[101].update(schedule_time={"after_meals": True}, intake_time_stamp=T0 + timedelta(hours=4))   # 12:00
+    db.doses[102].update(instructions="飯後服用", intake_time_stamp=T0 + timedelta(hours=4))
+    db.doses[103].update(schedule_time={"after_meals": True})   # 08:00: breakfast is no lunch or dinner
+    db.now = T0 + timedelta(hours=4)
+    enqueue(db, slot=T0 + timedelta(hours=4), expires=T0 + timedelta(hours=5))
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert {d["intk_id"]: d["after_meal"] for d in task["doses"]} == {101: True, 102: True, 103: False}
+    db.doses[102]["instructions"] = "飯前服用"
+    current = run(reachy_tasks.current_task(7, DEVICE))
+    assert {d["intk_id"]: d["after_meal"] for d in current["doses"]} == {101: True, 102: False, 103: False}
+    assert all(set(d) >= {"after_meal"} and "schedule_time" not in d and "instructions" not in d
+               for d in current["doses"])   # only the answer goes to the robot
 
 
 def test_lease_next_skips_expired_tasks(db):
