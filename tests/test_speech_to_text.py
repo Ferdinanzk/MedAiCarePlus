@@ -170,6 +170,14 @@ def test_at_least_a_fifth_of_a_second_of_audio(stt):
     assert len(stt.posts) == 1
 
 
+def test_an_odd_number_of_bytes_is_no_pcm16_and_is_never_sent(stt):
+    """PCM16 has 2 bytes a sample: an odd body would go out as a WAV whose odd data chunk lacks RIFF's pad byte."""
+    for odd in (b"\0\0" * 3_200 + b"\0", b"\0\0" * 239_999 + b"\0"):   # 0.2 s and 15 s, one byte off
+        response = _stt(stt, odd)
+        assert response.status_code == 422 and response.json() == {"detail": "audio_not_pcm16"}
+    assert stt.posts == []
+
+
 # ── the failures ──
 
 @pytest.mark.parametrize("answer, reason", [
