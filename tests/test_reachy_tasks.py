@@ -648,7 +648,7 @@ class _Line:
     def send_text(self, *args):
         pass
 
-    def send_missed_dose_alert(self, *args):
+    def send_missed_dose_alert(self, *args, **kwargs):
         pass
 
 
@@ -834,6 +834,95 @@ def test_a_dose_refused_while_the_robot_is_sent_never_undoes_the_reminder(monkey
     assert calls == [[101, 102]] and sent
     assert any(entry[0] == "execute" and entry[1].startswith("UPDATE intake SET reminder_sent = TRUE")
                for entry in conn.log)
+
+
+class _FamilyConn(_ReminderConn):
+    """_ReminderConn whose patient has one verified family contact for missed-dose alerts."""
+
+    async def fetch(self, query, *args):
+        if "FROM family_contacts" in query:
+            return [{"line_id": "UF", "name": "Daughter"}]
+        return await super().fetch(query, *args)
+
+
+def _run_at(monkeypatch, moment, rows):
+    """check_missed_doses at `moment` over `rows` (family on); returns (robot calls, patient texts, family alerts,
+    the conn)."""
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    for row in rows:
+        row["notify_family_on_missed"] = True
+    conn = _FamilyConn(rows)
+    calls, sent, family = [], [], []
+
+    async def fake_enqueue(c, u_id, slot_time, intk_ids, reason, expires_at, at=None):
+        calls.append((list(intk_ids), reason))
+
+    line = _Line()
+    line.send_text = lambda line_id, text: sent.append(text)
+    line.send_missed_dose_alert = lambda *args, **kwargs: family.append((args, kwargs))
+    monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
+    monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
+    monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
+    monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
+    run(missed_dose_job.check_missed_doses())
+    return calls, sent, family, conn
+
+
+SLOT_20 = datetime(2026, 10, 16, 10, 5, tzinfo=timezone.utc)            # 18:05 in Taipei
+
+
+def test_after_an_outage_a_slot_past_its_last_retry_is_only_reported_missed_while_offline(monkeypatch):
+    """16 Oct 2026: the server came back at 22:57 and the first run sent the 18:05 slot a "(10m) please take it as
+    soon as possible" text and a robot task, then the missed alerts within a second. A slot first seen past its last
+    retry gets neither: only the missed alerts, which say it was missed while the system was offline."""
+    rows = _reminder_rows(SLOT_20, reminder_sent=False, retries_sent=0)
+    calls, sent, family, conn = _run_at(monkeypatch, SLOT_20 + timedelta(hours=4, minutes=52), rows)
+    assert calls == []                                              # no robot for a slot 4.5 h old
+    (text,) = sent                                                  # the missed alert alone
+    assert "請盡快服用" not in text and "逾時" not in text
+    assert text.startswith("❌ 用藥未完成") and "系統離線" in text
+    ((args, kwargs),) = family
+    assert args[0] == "UF" and kwargs == {"offline": True}
+    executed = [entry[1] for entry in conn.log if entry[0] == "execute"]
+    assert not any(q.startswith("UPDATE intake SET missed_reminders_sent") for q in executed)
+    assert any(q.startswith("UPDATE intake SET intake_stats = 'missed'") for q in executed)
+    assert not any("missed_reminder'" in q for q in executed)
+
+
+@pytest.mark.parametrize("retries,retries_sent,late", [
+    (3, 2, timedelta(minutes=30, seconds=20)),    # the third retry and the missed alert in one normal run
+    (1, 0, timedelta(minutes=10, seconds=40)),    # one retry: it and the missed alert come in the same run
+    (3, 0, timedelta(minutes=31)),                # first seen just past the last retry: within the job's grace
+])
+def test_a_slot_reached_on_time_keeps_its_last_retry_and_plain_missed_alerts(monkeypatch, retries, retries_sent,
+                                                                             late):
+    rows = _reminder_rows(SLOT_20, reminder_sent=True, retries_sent=retries_sent)
+    for row in rows:
+        row["remind_after_retries"] = retries
+    calls, sent, family, conn = _run_at(monkeypatch, SLOT_20 + late, rows)
+    assert [reason for _, reason in calls] == ["missed_retry"]
+    retry, missed = sent
+    assert "請盡快服用" in retry and missed.startswith("❌ 用藥未完成") and "系統離線" not in missed
+    ((args, kwargs),) = family
+    assert kwargs == {"offline": False}
+
+
+def test_the_family_alert_says_the_dose_was_missed_while_the_system_was_offline():
+    from app.services.line_service import LineService
+
+    sent = []
+    svc = LineService.__new__(LineService)
+    svc.send_text = lambda to, text: sent.append(text) or {}
+    svc.send_missed_dose_alert("UF", "Pearl", "Med 101", "2026-10-16 18:05", offline=True)
+    svc.send_missed_dose_alert("UF", "Pearl", "Med 101", "2026-10-16 18:05")
+    offline, plain = sent
+    assert "系統離線" in offline and "請關心確認狀況。" in offline
+    assert "系統離線" not in plain and plain.endswith("請關心確認狀況。")
 
 
 # ── Overdose protection on enqueue and lease ─────────────────────────────────

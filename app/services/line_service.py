@@ -71,12 +71,15 @@ class LineService:
         return {"status": "failed", "http_status": resp.status_code, "request_id": request_id,
                 "error": f"LINE API {resp.status_code}: {resp.text[:500]}"}
 
-    def send_missed_dose_alert(self, to: str, patient_name: str, medication_name: str, scheduled_time: str) -> dict:
+    def send_missed_dose_alert(self, to: str, patient_name: str, medication_name: str, scheduled_time: str,
+                               offline: bool = False) -> dict:
+        # offline: missed while the system was down, so no reminder went out (missed_dose_job.missed_offline)
         text = (
             f"⚠️ 用藥提醒\n"
             f"{patient_name} 錯過了預定用藥\n"
             f"藥物：\n{medication_name}\n"
             f"預定時間：{scheduled_time}\n"
+            + ("（這段時間系統離線，沒能及時提醒。）\n" if offline else "") +
             f"請關心確認狀況。"
         )
         return self.send_text(to, text)
