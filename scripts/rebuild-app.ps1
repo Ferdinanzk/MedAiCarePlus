@@ -1,10 +1,10 @@
 <#
 Rebuild and restart the app container, but only while no dose session is in progress (19 Oct 2026).
 
-A rebuild takes the server away for about 14 s, longer than the robot's 10 s limit: a dose slot in progress is
-dropped, and when the robot picks the task up again it announces the dose again and no longer waits for family's
-answer. So this refuses while a robot task is leased, searching or in progress (and not expired), or while a dose
-confirmation still waits for family's answer (resolution IS NULL).
+A rebuild takes the server away for about 14 s, longer than the 10 s a robot app before 0.17.0 waits for it (0.17.0
+waits 30 s): a dose slot in progress is dropped, and when the robot picks the task up again it announces the dose
+again and no longer waits for family's answer. So this refuses while a robot task is leased, searching or in
+progress (and not expired), or while a dose confirmation still waits for family's answer (resolution IS NULL).
 
     .\scripts\rebuild-app.ps1          # refuses with the reason while a session is active, else rebuilds the app
     .\scripts\rebuild-app.ps1 -Force   # rebuilds anyway
@@ -45,7 +45,7 @@ $open = Get-Count 'SELECT count(*) FROM dose_confirmation WHERE resolution IS NU
 $reasons = Get-BusyReasons $tasks $open
 if ($reasons.Count -gt 0 -and -not $Force) {
     Write-Host ("Not rebuilding: {0}." -f ($reasons -join '; '))
-    Write-Host 'A rebuild stops the server for about 14 s, and the robot drops a dose session after 10 s. Try again when it is over, or run with -Force.'
+    Write-Host 'A rebuild stops the server for about 14 s, and a robot app before 0.17.0 drops a dose session after 10 s without it. Try again when it is over, or run with -Force.'
     exit 1
 }
 if ($reasons.Count -gt 0) { Write-Host ("Rebuilding anyway (-Force): {0}." -f ($reasons -join '; ')) }
