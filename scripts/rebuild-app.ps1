@@ -6,7 +6,9 @@ waits 30 s): a dose slot in progress is dropped, and when the robot picks the ta
 again and no longer waits for family's answer. So this refuses while a robot task is leased, searching or in
 progress (and not expired), or while a dose confirmation still waits for family's answer (resolution IS NULL).
 The image is built first, while the old container keeps serving (that can take minutes), and the check runs after
-the build, right before the container is recreated: a task leased during the build is seen.
+the build, right before the container is recreated: a task leased during the build is seen. When postgres's own
+settings in docker-compose.yml changed too (the stop timeouts of 19 Oct), compose recreates postgres first, under
+the same check: this is the guarded way to apply them.
 
     .\scripts\rebuild-app.ps1          # builds, then refuses with the reason while a session is active, else recreates
     .\scripts\rebuild-app.ps1 -Force   # recreates anyway
