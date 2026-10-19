@@ -63,11 +63,30 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
+# Quick fixes 2 of 19 Oct 2026: before an after-meal dose at lunch or dinner Reachy asks 「您有吃飯了嗎？」 (the
+# meal_check line). The meal times are local (MEDCARE_TIMEZONE), "HH:MM", both ends included; breakfast is not one.
+MEAL_WINDOWS = (("10:30", "14:30"), ("16:30", "21:30"))
+AFTER_MEAL_WORDS = ("飯後", "餐後")
+
+
+def after_meal(schedule_time, instructions: str | None, dose_time: datetime | None) -> bool:
+    """The dose is taken after a meal (its medicine's schedule_time.after_meals is true, or its instructions say 飯後
+    or 餐後) and its local time is at lunch or dinner (MEAL_WINDOWS)."""
+    marked = schedule.load(schedule_time).get("after_meals") is True or any(
+        word in (instructions or "") for word in AFTER_MEAL_WORDS)
+    if not marked or dose_time is None:
+        return False
+    if dose_time.tzinfo is None:
+        dose_time = dose_time.replace(tzinfo=timezone.utc)
+    local = dose_time.astimezone(_LOCAL_TZ).strftime("%H:%M")
+    return any(start <= local <= end for start, end in MEAL_WINDOWS)
+
+
 async def task_payload(conn, task) -> dict:
     """Task as the bridge sees it. Doses are re-read on every call (restart recovery)."""
     doses = await conn.fetch(
-        "SELECT i.intk_id, m.med_id, m.med_name, m.pill_description, m.dose_form, m.units_per_dose, i.intake_stats "
-        "FROM intake i JOIN medication m ON m.med_id = i.med_id "
+        "SELECT i.intk_id, m.med_id, m.med_name, m.pill_description, m.dose_form, m.units_per_dose, i.intake_stats, "
+        "m.schedule_time, m.instructions, i.intake_time_stamp FROM intake i JOIN medication m ON m.med_id = i.med_id "
         "WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) ORDER BY m.med_name, m.med_id, i.intk_id",
         task["u_id"], list(task["intk_ids"]))
     head = await conn.fetchrow(
@@ -100,6 +119,8 @@ async def task_payload(conn, task) -> dict:
             "pill_description": d["pill_description"], "dose_form": d["dose_form"],
             "units_per_dose": float(d["units_per_dose"]) if d["units_per_dose"] is not None else None,
             "intake_stats": d["intake_stats"], "supported": is_supported(d["dose_form"], d["units_per_dose"]),
+            # The robot asks whether the patient has eaten before such a dose's prompt (quick fixes 2, 19 Oct).
+            "after_meal": after_meal(d["schedule_time"], d["instructions"], d["intake_time_stamp"]),
         } for d in doses],
     }
 
