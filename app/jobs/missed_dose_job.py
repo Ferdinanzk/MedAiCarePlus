@@ -15,6 +15,10 @@ _TZ = ZoneInfo(MEDCARE_TIMEZONE)
 # falls within the same 5-minute window for the same user are treated as one
 # "slot" and a single LINE message is sent for the whole slot (per phase).
 SLOT_WINDOW_MINUTES = 5
+# A slot first seen more than this past its last retry was missed while the system was offline: the job runs every
+# minute, so in normal operation it reaches each retry within a run or two.
+OFFLINE_GRACE_SECONDS = 120
+OFFLINE_NOTE = "（這段時間系統離線，沒能及時提醒您。）"
 
 
 def _slot_key(intake_time: datetime) -> datetime:
@@ -125,6 +129,12 @@ async def check_missed_doses():
 
             time_to_slot = (slot_time - now).total_seconds()
             time_since_slot = (now - slot_time).total_seconds()
+            # After an outage (16 Oct 2026: the first run after the server came back sent the 18:05 and 18:25 slots,
+            # about 4.5 h late, a "(10m) please take it as soon as possible" text, a robot task and, in the same second,
+            # the missed alerts), a slot this run first sees past its last retry gets only the missed alerts, which
+            # say it was missed while the system was offline.
+            missed_offline = (group_retry_count == 0 and
+                              time_since_slot >= remind_after_retries * remind_after_secs + OFFLINE_GRACE_SECONDS)
             # A Reachy task for this slot stays useful until the missed window ends.
             task_expires_at = slot_time + timedelta(minutes=remind_after_minutes * (remind_after_retries + 1))
             # Overdose protection, judged on this run's clock when a reminder goes out: the robot is sent for the
@@ -181,7 +191,8 @@ async def check_missed_doses():
             # --- 2. Missed Warnings (one message per retry tick per slot) ---
             if time_since_slot > 0:
                 if (
-                    time_since_slot >= (group_retry_count + 1) * remind_after_secs
+                    not missed_offline
+                    and time_since_slot >= (group_retry_count + 1) * remind_after_secs
                     and group_retry_count < remind_after_retries
                 ):
                     time_passed_mins = int((group_retry_count + 1) * remind_after_minutes)
@@ -229,12 +240,14 @@ async def check_missed_doses():
                                     patient_name,
                                     med_list_str,  # group: comma-joined med names
                                     local_slot.strftime("%Y-%m-%d %H:%M"),
+                                    offline=missed_offline,
                                 )
                                 await conn.execute(
                                     "INSERT INTO notification (u_id, category, type, message) "
                                     "VALUES ($1, 'family', 'missed_alert', $2)",
                                     u_id,
-                                    f"Missed alert for {slot_label} slot ({len(med_names)} med(s)) sent to family: {contact['name']}",
+                                    f"Missed alert for {slot_label} slot ({len(med_names)} med(s)) sent to family: {contact['name']}"
+                                    + (" (missed while the system was offline)" if missed_offline else ""),
                                 )
 
                     # Notify patient (one message, listing all missed meds).
@@ -242,6 +255,7 @@ async def check_missed_doses():
                         msg = (
                             f"❌ 用藥未完成\n"
                             f"您已錯過 {slot_label} 的預定用藥\n"
+                            + (f"{OFFLINE_NOTE}\n" if missed_offline else "") +
                             f"藥物：\n{med_list_str}\n"
                             f"時間：{local_slot.strftime('%Y-%m-%d %H:%M')}\n"
                             f"系統已通知您的家人聯絡人。"
@@ -251,5 +265,6 @@ async def check_missed_doses():
                             "INSERT INTO notification (u_id, category, type, message) "
                             "VALUES ($1, 'user', 'missed_alert', $2)",
                             u_id,
-                            f"Missed dose final alert for {slot_label} slot ({len(med_names)} med(s)): {', '.join(med_names)}",
+                            f"Missed dose final alert for {slot_label} slot ({len(med_names)} med(s)): {', '.join(med_names)}"
+                            + (" (missed while the system was offline)" if missed_offline else ""),
                         )
