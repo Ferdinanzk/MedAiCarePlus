@@ -11,8 +11,10 @@ the relay's `ready` and `say`). The robot (app 0.16.0) keeps a copy per line and
 stays the fallback for any line it has no copy of, and robot app 0.15.0 ignores all of this. Only while a live voice
 target exists (ai_settings.live_target, the medicine prompts' gate); the chat's two per-patient lines also need the
 patient's check-in consent, because they carry the call name. Since the quick fixes of 19 Oct 2026 (robot app 0.17.0)
-every clip of the robot's dose flow is a line here too, and so are the dose flow's three per-patient lines
-(DOSE_LINES), which need only the robot's consent.
+every clip of the robot's dose flow is a line here too, and so are the dose flow's per-patient lines (DOSE_LINES),
+which need only the robot's consent. Quick fixes 2 (same evening) add the three lines Reachy says after the camera's
+intake event, by the detector's confidence (intake_low, intake_mid, intake_high), and meal_check, the question before
+an after-meal dose at lunch or dinner (reachy_tasks.after_meal).
 """
 
 import asyncio
@@ -34,14 +36,15 @@ log = logging.getLogger(__name__)
 # The robot-owned lines (the robot's own Simplified constants are its Matcha fallback; these are the Traditional and
 # English words the live voice says), then the server-owned ones, which are read from their own constants. Since the
 # quick fixes of 19 Oct 2026 every clip of the robot's manifest (bridge/clips/manifest.json, its words copied here
-# verbatim) is a fixed line too, plus the two lines of the wait for family's answer, so every line is in one voice.
+# verbatim) is a fixed line too, plus the two lines of the wait for family's answer, so every line is in one voice;
+# then the three lines after the camera's intake event (quick fixes 2: at most 40 %, 41-69 %, at least 70 %).
 FIXED_LINES = ("checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down",
                "wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
                "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "thanks", "ack", "thinking_1",
-               "thinking_2", "thinking_3", "family_no_answer", "retry_limit")
+               "thinking_2", "thinking_3", "family_no_answer", "retry_limit", "intake_low", "intake_mid", "intake_high")
 # They carry the call name: rendered per patient. The chat's lines need check-in consent; the dose flow's lines
 # (DOSE_LINES) only the robot's consent, as every line of a dose task.
-DOSE_LINES = ("dose_search", "family_not_taken", "family_taken")
+DOSE_LINES = ("dose_search", "family_not_taken", "family_taken", "meal_check")
 PATIENT_LINES = ("opening", "reminder_lead") + DOSE_LINES
 LINE_IDS = FIXED_LINES + PATIENT_LINES
 LANGUAGES = ("zh-TW", "en")
@@ -76,6 +79,11 @@ LINE_TEXTS = {
     "family_no_answer": {"zh-TW": "家人還沒有回覆，請先不要再吃一次喔。",
                          "en": "Your family hasn't answered yet. Please don't take it again for now."},
     "retry_limit": {"zh-TW": "我請家人來幫忙您吃藥喔。", "en": "I'll ask your family to help you with your medicine."},
+    "intake_low": {"zh-TW": "我沒辦法確認您有沒有吃藥，我請家人確認一下。",
+                   "en": "I can't be sure whether you took your medicine, so I'll ask your family to check."},
+    "intake_mid": {"zh-TW": "好，有看到了，我通知家人一下。", "en": "Okay, I saw that. I'll let your family know."},
+    "intake_high": {"zh-TW": "太棒了！您把藥吃了，身體會越來越好的！",
+                    "en": "Wonderful! You took your medicine. You'll keep getting better!"},
 }
 # The dose flow's per-patient lines: with the call name, and the form without one.
 DOSE_TEXTS = {
@@ -93,6 +101,9 @@ DOSE_TEXTS = {
         "en": ("{name}, your family confirmed you've taken your medicine. Well done! You're getting healthier every "
                "day!", "Your family confirmed you've taken your medicine. Well done! You're getting healthier every "
                "day!")},
+    "meal_check": {
+        "zh-TW": ("{name}，您有吃飯了嗎？", "您有吃飯了嗎？"),
+        "en": ("{name}, have you eaten yet?", "Have you eaten yet?")},
 }
 # How the voice says a line (part of its key, so new wording re-renders): the help line calm and clear, the numbers
 # one digit at a time; the 「嗯」 and the thinking phrases short and soft; every other line warm, calm and slow, in the
