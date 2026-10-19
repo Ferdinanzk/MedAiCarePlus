@@ -240,3 +240,18 @@ def test_the_docs_name_the_access_recheck_and_the_endings_it_adds():
                  "access_withdrawn", "access_unverified", "memory_withdrawn", "DB_TIMEOUT_SECONDS = 5.0",
                  "SILENCE_END_SECONDS = 45", "CHECKIN_SILENCE = None"):
         assert name in section, f"CLAUDE.md's live voice section doesn't name {name}"
+
+
+def test_cloud_speech_to_text_has_a_release_gate_and_the_older_bullets_name_it():
+    """Quick fixes 2 sends the patient's audio to OpenAI, which the microphone switch and the robot notice say never
+    happens (review of 19 Oct 2026): its bullet and the Phase 2b list carry a release gate, and the older bullets on
+    the "I finished" phrase and the dose lines name the cloud step and meal_check."""
+    quick_fixes_2 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fixes 2", ("- ", "#")))
+    assert "**Release gate:**" in quick_fixes_2 and "a new robot notice version and a consent scope" in quick_fixes_2
+    lines = (REPO / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    phase_2b = next(line for line in lines if line.startswith("- **Not in 2a (Phase 2b"))
+    assert "cloud speech-to-text" in phase_2b
+    finished = next(line for line in lines if line.startswith('- The robot app can listen for the patient\'s "I'))
+    assert "`POST /api/device/stt`" in finished
+    dose_lines = next(line for line in lines if line.startswith("  - **Dose lines with the name.**"))
+    assert "`meal_check`" in dose_lines

@@ -9,7 +9,9 @@ the robot then uses its local Whisper as before. The claim decision stays on the
 Only while a live voice target with a key exists (ai_settings.live_target, the gate of every line in the live voice)
 and the patient's robot microphone consent is current (the robot's listener needs it already: the task's
 `microphone`). Nothing is stored. The logs carry the audio's length, the language and the time, never the words, the
-audio or the key.
+audio or the key. Release gate: the patient's audio goes to OpenAI, which the microphone switch and the robot notice
+say never happens, so this is for test installations only (a live voice target needs LIVE_VOICE_TEST) until a new
+robot notice version and a consent scope cover it (CLAUDE.md, "Quick fixes 2").
 """
 
 import asyncio
@@ -29,7 +31,9 @@ TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 # OpenAI's docs (checked 19 Oct 2026): gpt-4o-mini-transcribe is a current transcription model (snapshot
 # 2025-12-15), takes `language` and `prompt`, and answers {"text"} with response_format json.
 STT_MODEL = "gpt-4o-mini-transcribe"
-STT_TIMEOUT_SECONDS = 8   # one try, the whole call; the robot waits at most 8 s too, then uses its own Whisper
+# One try, the whole call. The robot's own 8 s (AppClient.stt) starts before the upload, so it is the real limit: when
+# OpenAI is slow the robot gives up first and uses its own Whisper, and the call may still finish (and be billed).
+STT_TIMEOUT_SECONDS = 8
 RATE = 16000              # the robot's microphone audio: PCM16 mono 16 kHz
 MAX_BYTES = 15 * RATE * 2           # 15 s (480 000 bytes); more is a 413
 MIN_BYTES = RATE * 2 // 5           # 0.2 s (6 400 bytes); less is a 422
