@@ -9,8 +9,10 @@ voice itself), keeps it under MED_CLIP_DIR as the robot needs it (PCM16 mono 16 
 (GET /api/device/clips/line/{line_id}), and names the copy the robot should play beside the words it sends (`clip` on
 the relay's `ready` and `say`). The robot (app 0.16.0) keeps a copy per line and plays it when its key matches; Matcha
 stays the fallback for any line it has no copy of, and robot app 0.15.0 ignores all of this. Only while a live voice
-target exists (ai_settings.live_target, the medicine prompts' gate); the two per-patient lines also need the
-patient's check-in consent, because they carry the call name.
+target exists (ai_settings.live_target, the medicine prompts' gate); the chat's two per-patient lines also need the
+patient's check-in consent, because they carry the call name. Since the quick fixes of 19 Oct 2026 (robot app 0.17.0)
+every clip of the robot's dose flow is a line here too, and so are the dose flow's three per-patient lines
+(DOSE_LINES), which need only the robot's consent.
 """
 
 import asyncio
@@ -25,14 +27,22 @@ from pathlib import Path
 
 from app import config
 from app.database import get_pool
-from app.services import ai_settings, consent_service, conversation, med_clips, memory, reachy_tasks
+from app.services import ai_settings, consent_service, conversation, device_auth, med_clips, memory, reachy_tasks
 
 log = logging.getLogger(__name__)
 
 # The robot-owned lines (the robot's own Simplified constants are its Matcha fallback; these are the Traditional and
-# English words the live voice says), then the server-owned ones, which are read from their own constants.
-FIXED_LINES = ("checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down")
-PATIENT_LINES = ("opening", "reminder_lead")   # they carry the call name: rendered per patient, with consent
+# English words the live voice says), then the server-owned ones, which are read from their own constants. Since the
+# quick fixes of 19 Oct 2026 every clip of the robot's manifest (bridge/clips/manifest.json, its words copied here
+# verbatim) is a fixed line too, plus the two lines of the wait for family's answer, so every line is in one voice.
+FIXED_LINES = ("checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down",
+               "wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
+               "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "thanks", "ack", "thinking_1",
+               "thinking_2", "thinking_3", "family_no_answer", "retry_limit")
+# They carry the call name: rendered per patient. The chat's lines need check-in consent; the dose flow's lines
+# (DOSE_LINES) only the robot's consent, as every line of a dose task.
+DOSE_LINES = ("dose_search", "family_not_taken", "family_taken")
+PATIENT_LINES = ("opening", "reminder_lead") + DOSE_LINES
 LINE_IDS = FIXED_LINES + PATIENT_LINES
 LANGUAGES = ("zh-TW", "en")
 LINE_TEXTS = {
@@ -41,15 +51,62 @@ LINE_TEXTS = {
     "medicine": {"zh-TW": "該吃藥囉，我們等一下再聊。",
                  "en": "It's time for your medicine. Let's talk again in a little while."},
     "wind_down": {"zh-TW": "這次就到這裡，請多保重！", "en": "That's all for now. Take care!"},
+    "wake_greeting": {"zh-TW": "您好！吃藥的時間到了。", "en": "Hello! It's time for your medicine."},
+    "reminder": {"zh-TW": "提醒您，現在是吃藥的時間。", "en": "A gentle reminder: it's time for your medicine."},
+    "searching": {"zh-TW": "我正在找您，請到我面前來。", "en": "I'm looking for you. Please come in front of me."},
+    "waiting_for_patient": {
+        "zh-TW": "我在等要吃藥的人，請他到我面前來。",
+        "en": "I'm waiting for the person whose medicine this is. Please ask them to come to me."},
+    "waiting_for_tablet": {"zh-TW": "我會等您在平板上完成。", "en": "I'll wait until you finish on the tablet."},
+    "say_when_done": {"zh-TW": "吃完藥以後，請跟我說「我吃完了」。",
+                      "en": "When you have taken it, please tell me: I'm finished."},
+    "med_prompt_generic": {"zh-TW": "請現在吃下一種藥。", "en": "Please take your next medicine now."},
+    "already_taken": {"zh-TW": "這次的藥您已經吃過了，做得很好！",
+                      "en": "You've already taken these medicines. Well done!"},
+    "confirm_with_caregiver": {
+        "zh-TW": "我沒辦法確定您吃了沒，會請家人幫忙看看。請先別再吃一次喔。",
+        "en": "I can't be sure you took it, so I'll ask your family to check. Please don't take it again for now."},
+    "help": {"zh-TW": "需要幫忙嗎？準備好的時候，請在我面前吃藥。",
+             "en": "Do you need help? When you're ready, please take your medicine in front of me."},
+    "thanks": {"zh-TW": "謝謝您！", "en": "Thank you!"},
+    "ack": {"zh-TW": "嗯", "en": "Mm-hm."},
+    "thinking_1": {"zh-TW": "我再想一下喔。", "en": "Let me think a moment."},
+    "thinking_2": {"zh-TW": "讓我想一想喔。", "en": "Let me think about that."},
+    "thinking_3": {"zh-TW": "我想想看喔。", "en": "Let me think it over."},
+    "family_no_answer": {"zh-TW": "家人還沒有回覆，請先不要再吃一次喔。",
+                         "en": "Your family hasn't answered yet. Please don't take it again for now."},
+    "retry_limit": {"zh-TW": "我請家人來幫忙您吃藥喔。", "en": "I'll ask your family to help you with your medicine."},
+}
+# The dose flow's per-patient lines: with the call name, and the form without one.
+DOSE_TEXTS = {
+    "dose_search": {
+        "zh-TW": ("吃藥的時間到了，我來找{name}吃藥。", "吃藥的時間到了，我來找您吃藥。"),
+        "en": ("It's time for your medicine. I've come to find {name}.",
+               "It's time for your medicine. I've come to find you.")},
+    "family_not_taken": {
+        "zh-TW": ("{name}，家人說您這次的藥還沒有吃完喔，我們現在把它吃完吧。",
+                  "家人說您這次的藥還沒有吃完喔，我們現在把它吃完吧。"),
+        "en": ("{name}, your family says you haven't finished this medicine yet. Let's finish it now.",
+               "Your family says you haven't finished this medicine yet. Let's finish it now.")},
+    "family_taken": {
+        "zh-TW": ("{name}，家人確認您已經吃藥了，拍拍手！您越來越健康了！", "家人確認您已經吃藥了，拍拍手！您越來越健康了！"),
+        "en": ("{name}, your family confirmed you've taken your medicine. Well done! You're getting healthier every "
+               "day!", "Your family confirmed you've taken your medicine. Well done! You're getting healthier every "
+               "day!")},
 }
 # How the voice says a line (part of its key, so new wording re-renders): the help line calm and clear, the numbers
-# one digit at a time; every other line warm, calm and slow, in the spirit of the medicine prompt's instructions.
+# one digit at a time; the 「嗯」 and the thinking phrases short and soft; every other line warm, calm and slow, in the
+# spirit of the medicine prompt's instructions.
 INSTRUCTIONS = {
     "companion": ("A warm, calm companion robot talking with an older adult at home. Speak slowly, gently and "
                   "clearly, as to a friend, in the language the text is written in."),
     "helpline": ("A calm, steady companion robot telling an older adult at home where to get help right now. "
                  "Speak slowly and clearly, with warmth; read each phone number one digit at a time, with a short "
                  "pause between the digits."),
+    "ack": ("A short, soft acknowledgement from a warm companion robot listening to an older adult: quiet and "
+            "brief, in the language the text is written in."),
+    "thinking": ("A warm companion robot thinking aloud for a moment while an older adult waits: gentle, at a "
+                 "natural pace, in the language the text is written in."),
 }
 DIGITS = {"zh-TW": "零一二三四五六七八九",
           "en": ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")}
@@ -82,11 +139,16 @@ def line_text(line_id: str, language: str, name: str | None = None) -> str | Non
     if line_id == "reminder_lead":
         return (live_session.REMINDER_OPENING[lang].format(name=name) if name
                 else live_session.REMINDER_OPENING_NONAME[lang])
+    if line_id in DOSE_TEXTS:
+        named, plain = DOSE_TEXTS[line_id][lang]
+        return named.format(name=name) if name else plain
     return None
 
 
 def instructions_for(line_id: str) -> str:
-    return INSTRUCTIONS["helpline" if line_id == "helpline" else "companion"]
+    if line_id in ("helpline", "ack"):
+        return INSTRUCTIONS[line_id]
+    return INSTRUCTIONS["thinking" if line_id.startswith("thinking_") else "companion"]
 
 
 def speech_input(line_id: str, text: str, language: str) -> str:
@@ -198,12 +260,13 @@ class Located:
     path: Path
 
 
-async def patient_name(u_id: int) -> tuple[bool, str | None]:
-    """Whether the per-patient lines may be made (the patient's check-in consent is current: the live chat's own
-    gate), and the name Reachy calls the patient (memory.call_name: their memory 'name' entry while memory is on,
-    else the Reachy card's call name, else the registered name)."""
+async def patient_name(u_id: int, dose_line: bool = False) -> tuple[bool, str | None]:
+    """Whether the per-patient lines may be made, and the name Reachy calls the patient (memory.call_name: their
+    memory 'name' entry while memory is on, else the Reachy card's call name, else the registered name). The chat's
+    lines need the patient's check-in consent (the live chat's own gate); a dose line (DOSE_LINES) only the robot's
+    consent (core and robot_camera, as device_auth.get_device), because it is said in a dose task."""
     state = await consent_service.get_state(u_id)
-    if not reachy_tasks.checkin_allowed(state):
+    if not (device_auth.robot_consent_current(state) if dose_line else reachy_tasks.checkin_allowed(state)):
         return False, None
     async with get_pool().acquire() as conn:
         return True, await memory.call_name(conn, u_id, memory.consent_current(state))
@@ -211,7 +274,7 @@ async def patient_name(u_id: int) -> tuple[bool, str | None]:
 
 async def locate(u_id: int | None, line_id: str, language: str) -> Located | None:
     """The line's words, key and place, without rendering: None without a live voice target, for an unknown id
-    (never a path lookup), or for a per-patient line without current check-in consent. `u_id` is read only for
+    (never a path lookup), or for a per-patient line without its consent (patient_name). `u_id` is read only for
     the per-patient lines."""
     target = ai_settings.live_target()
     if target is None or not target.api_key or line_id not in LINE_IDS:
@@ -219,7 +282,7 @@ async def locate(u_id: int | None, line_id: str, language: str) -> Located | Non
     lang = med_clips.language_of(language)
     name = None
     if line_id in PATIENT_LINES:
-        allowed, name = await patient_name(u_id)
+        allowed, name = await patient_name(u_id, dose_line=line_id in DOSE_LINES)
         if not allowed:
             return None
     text = line_text(line_id, lang, name)
@@ -312,10 +375,11 @@ async def retry_missing() -> None:
 
 
 def render_ahead_for_patient(u_id: int) -> asyncio.Task | None:
-    """The per-patient lines (the opening and the reminder lead-in, both languages) rendered now, in the background,
-    when a task is queued for the patient (reachy_tasks.enqueue_reachy_task) and when the call name's inputs change
-    (the Reachy card's call name, a memory 'name' entry, a consent change), so the next check-in finds them kept.
-    Nothing without a live voice target (None, at once); lines already kept cost one file check each."""
+    """The per-patient lines (the opening, the reminder lead-in and the dose flow's lines, both languages) rendered
+    now, in the background, when a task is queued for the patient (reachy_tasks.enqueue_reachy_task) and when the
+    call name's inputs change (the Reachy card's call name, a memory 'name' entry, a consent change), so the next
+    task finds them kept; a line its consent does not allow is skipped (locate). Nothing without a live voice target
+    (None, at once); lines already kept cost one file check each."""
     if ai_settings.live_target() is None:
         return None
     task = asyncio.get_running_loop().create_task(_render_patient(u_id))
