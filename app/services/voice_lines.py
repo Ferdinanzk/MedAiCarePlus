@@ -14,7 +14,8 @@ patient's check-in consent, because they carry the call name. Since the quick fi
 every clip of the robot's dose flow is a line here too, and so are the dose flow's per-patient lines (DOSE_LINES),
 which need only the robot's consent. Quick fixes 2 (same evening) add the three lines Reachy says after the camera's
 intake event, by the detector's confidence (intake_low, intake_mid, intake_high), and meal_check, the question before
-an after-meal dose at lunch or dinner (reachy_tasks.after_meal).
+an after-meal dose at lunch or dinner (reachy_tasks.after_meal). Quick fixes 3 add meal_not_yet, what Reachy says when
+the patient answers that they have not eaten yet, before it rests.
 """
 
 import asyncio
@@ -44,7 +45,7 @@ FIXED_LINES = ("checkin_greeting", "repeat", "helpline", "rest", "medicine", "wi
                "thinking_2", "thinking_3", "family_no_answer", "retry_limit", "intake_low", "intake_mid", "intake_high")
 # They carry the call name: rendered per patient. The chat's lines need check-in consent; the dose flow's lines
 # (DOSE_LINES) only the robot's consent, as every line of a dose task.
-DOSE_LINES = ("dose_search", "family_not_taken", "family_taken", "meal_check")
+DOSE_LINES = ("dose_search", "family_not_taken", "family_taken", "meal_check", "meal_not_yet")
 PATIENT_LINES = ("opening", "reminder_lead") + DOSE_LINES
 LINE_IDS = FIXED_LINES + PATIENT_LINES
 LANGUAGES = ("zh-TW", "en")
@@ -104,6 +105,10 @@ DOSE_TEXTS = {
     "meal_check": {
         "zh-TW": ("{name}，您有吃飯了嗎？", "您有吃飯了嗎？"),
         "en": ("{name}, have you eaten yet?", "Have you eaten yet?")},
+    "meal_not_yet": {
+        "zh-TW": ("{name}，這個藥要吃完飯後再吃喔。等您吃過飯，我再來陪您吃藥。", "這個藥要吃完飯後再吃喔。等您吃過飯，我再來陪您吃藥。"),
+        "en": ("{name}, this medicine is taken after a meal. Once you've eaten, I'll come back to help you take it.",
+               "This medicine is taken after a meal. Once you've eaten, I'll come back to help you take it.")},
 }
 # How the voice says a line (part of its key, so new wording re-renders): the help line calm and clear, the numbers
 # one digit at a time; the 「嗯」 and the thinking phrases short and soft; every other line warm, calm and slow, in the

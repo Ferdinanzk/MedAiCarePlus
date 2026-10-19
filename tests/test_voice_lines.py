@@ -57,7 +57,7 @@ def test_every_line_has_its_words_in_both_languages():
         "wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
         "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "thanks", "ack", "thinking_1",
         "thinking_2", "thinking_3", "family_no_answer", "retry_limit", "intake_low", "intake_mid", "intake_high",
-        "opening", "reminder_lead", "dose_search", "family_not_taken", "family_taken", "meal_check")
+        "opening", "reminder_lead", "dose_search", "family_not_taken", "family_taken", "meal_check", "meal_not_yet")
 
 
 MANIFEST = Path(__file__).resolve().parents[2] / "medcare-reachy-bridge" / "medcare_reachy" / "bridge" / "clips" / \
@@ -117,7 +117,8 @@ def test_the_dose_lines_carry_the_call_name_or_none():
         "day!")
     assert voice_lines.line_text("family_taken", "en", None) == (
         "Your family confirmed you've taken your medicine. Well done! You're getting healthier every day!")
-    assert set(voice_lines.DOSE_LINES) == {"dose_search", "family_not_taken", "family_taken", "meal_check"}
+    assert set(voice_lines.DOSE_LINES) == {"dose_search", "family_not_taken", "family_taken", "meal_check",
+                                           "meal_not_yet"}
     assert set(voice_lines.DOSE_LINES) < set(voice_lines.PATIENT_LINES)
 
 
@@ -129,6 +130,20 @@ def test_the_meal_check_carries_the_call_name_or_none():
     assert voice_lines.line_text("meal_check", "en", "Grandma Wang") == "Grandma Wang, have you eaten yet?"
     assert voice_lines.line_text("meal_check", "en", None) == "Have you eaten yet?"
     assert "meal_check" in voice_lines.DOSE_LINES and voice_lines.instructions_for("meal_check") == (
+        voice_lines.INSTRUCTIONS["companion"])
+
+
+def test_the_meal_not_yet_line_carries_the_call_name_or_none():
+    """Quick fixes 3 of 19 Oct 2026: the patient answered the meal question with "not yet", so the intake ends and
+    Reachy rests. A dose line: only the robot's consent, rendered ahead with the other per-patient lines."""
+    assert voice_lines.line_text("meal_not_yet", "zh-TW", "王奶奶") == (
+        "王奶奶，這個藥要吃完飯後再吃喔。等您吃過飯，我再來陪您吃藥。")
+    assert voice_lines.line_text("meal_not_yet", "zh-TW", None) == "這個藥要吃完飯後再吃喔。等您吃過飯，我再來陪您吃藥。"
+    assert voice_lines.line_text("meal_not_yet", "en", "Grandma Wang") == (
+        "Grandma Wang, this medicine is taken after a meal. Once you've eaten, I'll come back to help you take it.")
+    assert voice_lines.line_text("meal_not_yet", "en", None) == (
+        "This medicine is taken after a meal. Once you've eaten, I'll come back to help you take it.")
+    assert "meal_not_yet" in voice_lines.DOSE_LINES and voice_lines.instructions_for("meal_not_yet") == (
         voice_lines.INSTRUCTIONS["companion"])
 
 
@@ -615,8 +630,8 @@ def test_the_patients_lines_are_rendered_ahead_in_the_background(voice):
              for line_id in voice_lines.DOSE_LINES}
     assert sorted(text for text, *_ in voice.renders) == sorted([
         OPENING_ZH, OPENING_EN, "王奶奶，我來提醒您一件事。", "王奶奶, I'm here to remind you of something.",
-        *(text for texts in named.values() for text in texts.values())])          # 6 lines x 2 languages
-    assert len(voice.renders) == 12
+        *(text for texts in named.values() for text in texts.values())])          # 7 lines x 2 languages
+    assert len(voice.renders) == 14
     voice.target = None
     assert voice_lines.render_ahead_for_patient(7) is None          # no live target: nothing, and no loop needed
 
