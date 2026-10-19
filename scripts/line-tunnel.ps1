@@ -35,7 +35,9 @@ function Wait-TunnelUrl([string]$StartedAt) {
 
 Push-Location -LiteralPath $repoRoot
 try {
-    docker compose --profile line up -d line-webhook-proxy line-tunnel | Out-Null
+    # --no-deps: a changed postgres or app definition must never recreate them from here (reconcile runs this
+    # whatever a dose session is doing); scripts\rebuild-app.ps1 is the guarded way to apply it.
+    docker compose --profile line up -d --no-deps line-webhook-proxy line-tunnel | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not start the LINE tunnel containers' }
 
     $python = @'
