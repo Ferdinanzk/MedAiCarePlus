@@ -401,6 +401,8 @@ CREATE TABLE IF NOT EXISTS dose_confirmation (
     resolution  VARCHAR(10) CHECK (resolution IN ('confirmed','denied','expired')),
     resolved_by INTEGER REFERENCES family_contacts(id) ON DELETE SET NULL
 );
+-- The robot polls family's answer every few seconds (GET /api/device/tasks/{task_id}/confirmation).
+CREATE INDEX IF NOT EXISTS dose_confirmation_task_idx ON dose_confirmation (task_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS monitor_extra_event (
     extra_id       UUID PRIMARY KEY,

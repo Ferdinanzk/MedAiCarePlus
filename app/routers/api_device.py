@@ -148,12 +148,46 @@ async def task_status(task_id: str, payload: StatusPayload, device: dict = Depen
         raise HTTPException(409, str(exc)) from exc
 
 
+# The robot waits for family's answer (robot app 0.17.0: up to 120 s), and after a "not taken" searches and runs the
+# intake again: a confirmation request keeps its task open at least this long from now (quick fixes of 19 Oct 2026).
+CONFIRM_WAIT_EXTEND_SECONDS = 600
+EXTEND_FOR_CONFIRM_SQL = (
+    "UPDATE reachy_task SET expires_at = GREATEST(expires_at, "
+    f"NOW() + INTERVAL '{CONFIRM_WAIT_EXTEND_SECONDS} seconds') "
+    "WHERE task_id = $1::uuid AND status IN ('leased','searching','in_progress')")
+# Family's answer to a task's request: the one `id` names, else the task's newest (index dose_confirmation_task_idx).
+FAMILY_ANSWER_SQL = (
+    "SELECT confirmation_id, intk_ids, resolution, created_at, resolved_at FROM dose_confirmation "
+    "WHERE u_id = $1 AND task_id = $2::uuid AND ($3::uuid IS NULL OR confirmation_id = $3::uuid) "
+    "ORDER BY created_at DESC LIMIT 1")
+
+
+@router.get("/tasks/{task_id}/confirmation")
+async def family_answer(task_id: str, request_id: uuid.UUID | None = Query(None, alias="id"),
+                        device: dict = Depends(get_device)):
+    """What family answered on LINE to the task's request: the request `id` names (the id its POST answered: a slot
+    of two medicines has two), else the task's newest. 200 {"status": "none"} when there is no such request, never
+    a 404 (the robot reads a 404 as a lost session); else its id, status (open, confirmed, denied or expired), doses
+    and times. The robot polls it while it waits; read only."""
+    async with get_pool().acquire() as conn:
+        task = await _leased_task(conn, device, task_id)
+        row = await conn.fetchrow(FAMILY_ANSWER_SQL, device["u_id"], str(task["task_id"]),
+                                  str(request_id) if request_id is not None else None)
+    if row is None:
+        return {"status": "none"}
+    return {"confirmation_id": str(row["confirmation_id"]), "status": row["resolution"] or "open",
+            "intk_ids": list(row["intk_ids"]), "created_at": row["created_at"].isoformat(),
+            "resolved_at": row["resolved_at"].isoformat() if row["resolved_at"] is not None else None}
+
+
 @router.post("/tasks/{task_id}/confirmation")
 async def confirmation(task_id: str, payload: ConfirmationPayload, device: dict = Depends(get_device)):
     """NEEDS_CONFIRM: the dose goes to caregiver confirmation (no stock change). A dose overdose protection refuses
     gets 409 with its reason (dose_not_due_yet, dose_too_soon, daily_max_reached, dose_expired; from
     dose_confirmation.create), whatever the patient said. The robot files this after it saw a hand-to-mouth event
-    or heard 「我吃完了」, so a second dose (too soon, or over the daily maximum) also alerts family."""
+    or heard 「我吃完了」, so a second dose (too soon, or over the daily maximum) also alerts family. In the same
+    transaction the task stays open at least CONFIRM_WAIT_EXTEND_SECONDS more, for the robot's wait for family's
+    answer and a second intake after a "not taken"."""
     from app.services import dose_confirmation
 
     # The robot files this while its camera session for the dose is still open: due and not expired are judged as
@@ -178,6 +212,7 @@ async def confirmation(task_id: str, payload: ConfirmationPayload, device: dict 
                     source=payload.source, evidence=evidence, started_at=started_at)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
+            await conn.execute(EXTEND_FOR_CONFIRM_SQL, str(task["task_id"]))
     except schedule.DoseRefused as refused:
         await dose_safety.alert_after(refused)
         raise

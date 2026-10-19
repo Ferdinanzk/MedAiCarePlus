@@ -66,6 +66,7 @@ class FakeConn:
         self.status_detail = None  # what the heartbeat stored (asyncpg hands JSONB back as text)
         self.task_due = False      # what reachy_tasks.task_due finds: a medicine task waiting (companion spec 3.4)
         self.task_due_asked = []   # (arguments, transaction depth) of each task_due read
+        self.requests = []         # dose_confirmation rows the family-answer route reads (newest found by created_at)
 
     def transaction(self):
         return _Transaction(self)
@@ -106,6 +107,11 @@ class FakeConn:
             return {"reachy_call_name": None, "name": "Pearl"}
         if "SELECT m.med_name FROM intake i JOIN medication m" in query:   # the dose event route's medicine
             return {"med_name": "Allegra"} if args[0] in self.doses and args[1] == 7 else None
+        if query == api_device.FAMILY_ANSWER_SQL:
+            u_id, task_id, wanted = args
+            rows = [r for r in self.requests if r["u_id"] == u_id and str(r["task_id"]) == task_id
+                    and (wanted is None or str(r["confirmation_id"]) == wanted)]
+            return dict(max(rows, key=lambda r: r["created_at"])) if rows else None
         raise AssertionError(query)
 
     def _stamp(self, intk_id):
@@ -280,6 +286,81 @@ def test_confirmation_calls_dose_confirmation_create(env):
     assert env.confirmations == [{"u_id": 7, "task_id": TASK_ID, "intk_ids": [101], "source": "auto_record_off",
                                   "evidence": {"score": .8, "video": "none:no_consent"},   # dose videos are off here
                                   "started_at": None}]   # no dose session open
+
+
+def test_a_confirmation_request_keeps_its_task_alive_for_the_family_wait(env):
+    """The robot waits up to 120 s for family's answer and may then search and run the intake again: in the same
+    transaction as the request, the task's expiry moves to at least 600 s from now (never earlier) while it is
+    leased, searching or in progress."""
+    response = env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                              json={"intk_id": 101, "source": "patient_claim"})
+    assert response.status_code == 200 and response.json() == {"confirmation_id": "conf-1"}
+    (extend,) = [entry for entry in env.conn.executed if "UPDATE reachy_task SET expires_at" in entry[0]]
+    query, args, depth = extend
+    assert api_device.CONFIRM_WAIT_EXTEND_SECONDS == 600 and depth == 1   # inside the request's transaction
+    assert "GREATEST(expires_at, NOW() + INTERVAL '600 seconds')" in query
+    assert "status IN ('leased','searching','in_progress')" in query and args == (TASK_ID,)
+    env.conn.executed.clear()   # a refused request (409) extends nothing
+    assert env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                          json={"intk_id": 102, "source": "patient_claim"}).status_code == 409
+    assert not any("UPDATE reachy_task SET expires_at" in entry[0] for entry in env.conn.executed)
+
+
+def _request(confirmation_id, minutes, resolution=None, task_id=TASK_ID, u_id=7, intk_ids=(101,)):
+    created = SLOT + timedelta(minutes=minutes)
+    return {"confirmation_id": uuid.UUID(confirmation_id), "u_id": u_id, "task_id": uuid.UUID(task_id),
+            "intk_ids": list(intk_ids), "resolution": resolution, "created_at": created,
+            "resolved_at": created + timedelta(minutes=1) if resolution else None}
+
+
+def test_family_answer_is_none_when_the_task_has_no_request(env):
+    response = env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation")
+    assert response.status_code == 200 and response.json() == {"status": "none"}   # never a 404: no session lost
+
+
+@pytest.mark.parametrize("resolution, status", [
+    (None, "open"), ("confirmed", "confirmed"), ("denied", "denied"), ("expired", "expired")])
+def test_family_answer_gives_the_newest_requests_status(env, resolution, status):
+    first, newest = str(uuid.uuid4()), str(uuid.uuid4())
+    env.conn.requests = [_request(first, 1, "denied"), _request(newest, 5, resolution, intk_ids=(101, 102))]
+    response = env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation")
+    assert response.status_code == 200
+    created = SLOT + timedelta(minutes=5)
+    assert response.json() == {
+        "confirmation_id": newest, "status": status, "intk_ids": [101, 102], "created_at": created.isoformat(),
+        "resolved_at": (created + timedelta(minutes=1)).isoformat() if resolution else None}
+
+
+def test_family_answer_reads_the_request_its_id_names(env):
+    """A slot of two medicines has two requests: the robot reads each by the id its POST answered."""
+    first, second, other_task = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    env.conn.requests = [_request(first, 1, "confirmed"), _request(second, 5, None, intk_ids=(102,)),
+                         _request(str(uuid.uuid4()), 9, "denied", task_id=other_task)]
+    response = env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation", params={"id": first})
+    assert response.json()["confirmation_id"] == first and response.json()["status"] == "confirmed"
+    assert response.json()["intk_ids"] == [101]
+    assert env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation").json()["confirmation_id"] == second
+    # an id that names no request of this task (another task's, or none): no request, never a 404
+    assert env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation",
+                         params={"id": str(uuid.uuid4())}).json() == {"status": "none"}
+    assert env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation", params={"id": "not-a-uuid"}).status_code == 422
+
+
+def test_family_answer_needs_this_devices_task(env):
+    env.conn.requests = [_request(str(uuid.uuid4()), 1, "confirmed")]
+    assert env.robot.get(f"/api/device/tasks/{uuid.uuid4()}/confirmation").status_code == 404
+    assert env.robot.get("/api/device/tasks/not-a-task/confirmation").status_code == 404
+    env.conn.task["lease_owner"] = str(uuid.uuid4())   # another robot holds it
+    assert env.robot.get(f"/api/device/tasks/{TASK_ID}/confirmation").status_code == 404
+    assert env.browser.get(f"/api/device/tasks/{TASK_ID}/confirmation").status_code == 404   # device port only
+
+
+def test_dose_confirmation_has_an_index_for_the_family_answer_poll():
+    from pathlib import Path
+    schema = (Path(__file__).resolve().parents[1] / "sql" / "init.sql").read_text(encoding="utf-8")
+    statement = ("CREATE INDEX IF NOT EXISTS dose_confirmation_task_idx ON dose_confirmation "
+                 "(task_id, created_at DESC);")
+    assert statement in schema and schema.index(statement) > schema.index("CREATE TABLE IF NOT EXISTS dose_confirmation")
 
 
 def test_confirmation_rejects_foreign_dose_task_and_errors(env):
