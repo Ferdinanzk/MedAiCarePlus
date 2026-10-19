@@ -76,10 +76,14 @@ async def task_payload(conn, task) -> dict:
         task["u_id"])
     consent = await consent_service.fetch_state(conn, task["u_id"])
     checkin = checkin_allowed(consent)
+    from app.services import memory   # here, not at the top, as voice_lines below
     return {
         "task_id": str(task["task_id"]), "slot_time": _iso(task["slot_time"]), "reason": task["reason"],
         "attempt": task["attempt"], "status": task["status"], "expires_at": _iso(task["expires_at"]),
         "patient_name": head["name"] if head else None,
+        # The name Reachy calls the patient (memory.call_name; None when there is none it would say): the robot's own
+        # voice says it in the dose greeting when the named line has no copy in the live voice (quick fixes, 19 Oct).
+        "call_name": await memory.call_name(conn, task["u_id"], memory.consent_current(consent)),
         "auto_record": bool(head and head["auto_record"]),
         # The robot may listen (speech-to-text on the robot) only while this consent is current.
         "microphone": consent_service.is_current(consent, "robot_microphone"),
