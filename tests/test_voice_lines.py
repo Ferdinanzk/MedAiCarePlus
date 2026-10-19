@@ -56,8 +56,8 @@ def test_every_line_has_its_words_in_both_languages():
         "checkin_greeting", "repeat", "helpline", "rest", "medicine", "wind_down",
         "wake_greeting", "reminder", "searching", "waiting_for_patient", "waiting_for_tablet", "say_when_done",
         "med_prompt_generic", "already_taken", "confirm_with_caregiver", "help", "thanks", "ack", "thinking_1",
-        "thinking_2", "thinking_3", "family_no_answer", "retry_limit",
-        "opening", "reminder_lead", "dose_search", "family_not_taken", "family_taken")
+        "thinking_2", "thinking_3", "family_no_answer", "retry_limit", "intake_low", "intake_mid", "intake_high",
+        "opening", "reminder_lead", "dose_search", "family_not_taken", "family_taken", "meal_check")
 
 
 MANIFEST = Path(__file__).resolve().parents[2] / "medcare-reachy-bridge" / "medcare_reachy" / "bridge" / "clips" / \
@@ -117,8 +117,34 @@ def test_the_dose_lines_carry_the_call_name_or_none():
         "day!")
     assert voice_lines.line_text("family_taken", "en", None) == (
         "Your family confirmed you've taken your medicine. Well done! You're getting healthier every day!")
-    assert set(voice_lines.DOSE_LINES) == {"dose_search", "family_not_taken", "family_taken"}
+    assert set(voice_lines.DOSE_LINES) == {"dose_search", "family_not_taken", "family_taken", "meal_check"}
     assert set(voice_lines.DOSE_LINES) < set(voice_lines.PATIENT_LINES)
+
+
+def test_the_meal_check_carries_the_call_name_or_none():
+    """Quick fixes 2 of 19 Oct 2026: before the medicine prompt of an after-meal dose at lunch or dinner. A dose line:
+    only the robot's consent, rendered ahead with the other per-patient lines."""
+    assert voice_lines.line_text("meal_check", "zh-TW", "王奶奶") == "王奶奶，您有吃飯了嗎？"
+    assert voice_lines.line_text("meal_check", "zh-TW", None) == "您有吃飯了嗎？"
+    assert voice_lines.line_text("meal_check", "en", "Grandma Wang") == "Grandma Wang, have you eaten yet?"
+    assert voice_lines.line_text("meal_check", "en", None) == "Have you eaten yet?"
+    assert "meal_check" in voice_lines.DOSE_LINES and voice_lines.instructions_for("meal_check") == (
+        voice_lines.INSTRUCTIONS["companion"])
+
+
+def test_the_lines_after_the_cameras_intake_event_have_their_words():
+    """Quick fixes 2 of 19 Oct 2026: the robot picks one by the detector's confidence (at most 40 %, 41-69 %, at
+    least 70 %). Fixed lines: no name, rendered ahead at startup."""
+    assert voice_lines.line_text("intake_low", "zh-TW") == "我沒辦法確認您有沒有吃藥，我請家人確認一下。"
+    assert voice_lines.line_text("intake_low", "en") == (
+        "I can't be sure whether you took your medicine, so I'll ask your family to check.")
+    assert voice_lines.line_text("intake_mid", "zh-TW") == "好，有看到了，我通知家人一下。"
+    assert voice_lines.line_text("intake_mid", "en") == "Okay, I saw that. I'll let your family know."
+    assert voice_lines.line_text("intake_high", "zh-TW") == "太棒了！您把藥吃了，身體會越來越好的！"
+    assert voice_lines.line_text("intake_high", "en") == (
+        "Wonderful! You took your medicine. You'll keep getting better!")
+    assert {"intake_low", "intake_mid", "intake_high"} <= set(voice_lines.FIXED_LINES)
+    assert not {"intake_low", "intake_mid", "intake_high"} & set(voice_lines.PATIENT_LINES)
 
 
 def test_the_help_lines_numbers_are_spelled_digit_by_digit_for_the_voice():
@@ -485,8 +511,8 @@ def test_no_line_is_a_404_but_a_failing_lookup_is_not(env, monkeypatch):
 # ── rendered ahead: the fixed lines at startup, and again every 30 min ──
 
 def test_the_fixed_lines_are_rendered_ahead_once_and_the_failures_are_named(voice, tmp_path):
-    total = 2 * len(voice_lines.FIXED_LINES)                          # 23 lines x 2 languages
-    assert len(voice_lines.FIXED_LINES) == 23
+    total = 2 * len(voice_lines.FIXED_LINES)                          # 26 lines x 2 languages
+    assert len(voice_lines.FIXED_LINES) == 26
     assert asyncio.run(voice_lines.render_fixed_ahead()) == [] and len(voice.renders) == total
     for language in ("zh-TW", "en"):
         kept = {p.name.rsplit("_", 1)[0] for p in (tmp_path / "lines" / language).iterdir()}
@@ -532,14 +558,14 @@ def test_the_startup_report_marks_the_voice_lines_stage_without_holding_up_the_s
         gate["release"] = asyncio.Event()
         await startup_report.finish(None, live_status="ok")
         # the summary is logged before the renders finish: the stage is still pending, its renders in the background
-        assert logged[-1]["pending"] and not logged[-1]["ok"] and "46 fixed lines" in logged[-1]["detail"]
+        assert logged[-1]["pending"] and not logged[-1]["ok"] and "52 fixed lines" in logged[-1]["detail"]
         assert startup_report._tasks
         gate["release"].set()
         await asyncio.gather(*startup_report._tasks)
         return startup_report.summary()["stages"]["voice_lines"]   # the stage's final mark, after the renders
 
     stage = asyncio.run(scenario())
-    assert stage["ok"] and not stage["pending"] and "46 fixed lines kept" in stage["detail"]
+    assert stage["ok"] and not stage["pending"] and "52 fixed lines kept" in stage["detail"]
     stage = asyncio.run(scenario())
     assert not stage["ok"] and not stage["pending"] and "30 min" in stage["detail"]
     assert "helpline/en, rest/zh-TW" in stage["detail"] and "sk-x" not in stage["detail"]
@@ -571,7 +597,7 @@ def test_the_retry_logs_what_is_still_missing(voice, caplog):
     voice.fail = RuntimeError("speech API answered 503")
     with caplog.at_level(logging.WARNING):
         asyncio.run(voice_lines.retry_missing())
-    assert "46 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text
+    assert "52 fixed lines are still missing" in caplog.text and "checkin_greeting/zh-TW" in caplog.text
 
 
 # ── rendered ahead: the patient's lines ──
@@ -589,8 +615,8 @@ def test_the_patients_lines_are_rendered_ahead_in_the_background(voice):
              for line_id in voice_lines.DOSE_LINES}
     assert sorted(text for text, *_ in voice.renders) == sorted([
         OPENING_ZH, OPENING_EN, "王奶奶，我來提醒您一件事。", "王奶奶, I'm here to remind you of something.",
-        *(text for texts in named.values() for text in texts.values())])          # 5 lines x 2 languages
-    assert len(voice.renders) == 10
+        *(text for texts in named.values() for text in texts.values())])          # 6 lines x 2 languages
+    assert len(voice.renders) == 12
     voice.target = None
     assert voice_lines.render_ahead_for_patient(7) is None          # no live target: nothing, and no loop needed
 
