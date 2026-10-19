@@ -122,3 +122,48 @@ def test_render_sends_the_instructions_it_is_given_and_the_medicine_ones_by_defa
     assert [p[2]["input"] for p in posted] == ["請現在吃第一種藥，Adapalene。", "您好！我來找您聊聊天。"]
     assert all(p[0] == med_clips.SPEECH_URL and p[1] == "Bearer sk-x" and p[2]["response_format"] == "wav"
                for p in posted)
+
+
+def test_a_total_limit_caps_the_whole_render_the_body_included(monkeypatch):
+    """requests' timeout limits each connect and each read, not the call: a WAV streamed in 6 chunks 3 s apart took
+    19 s with timeout=10. With `total` the body is streamed and the render gives up once that much time has passed."""
+    clock = [100.0]
+    posted = []
+
+    class Slow:
+        status_code = 200
+
+        def iter_content(self, size):
+            for _ in range(6):
+                clock[0] += 3
+                yield b"\0" * 64
+
+        def close(self):
+            posted.append("closed")
+
+    def post(url, timeout, headers, json, stream):
+        posted.append((timeout, stream))
+        return Slow()
+
+    monkeypatch.setattr(med_clips, "_clock", lambda: clock[0])
+    monkeypatch.setattr(med_clips.requests, "post", post)
+    with pytest.raises(TimeoutError):
+        med_clips.render("真好。", "marin", "sk-x", timeout=10, retries=0, total=10)
+    assert posted == [(10, True), "closed"] and clock[0] == 112.0     # stopped after the 4th chunk, at 12 s
+
+
+def test_within_its_total_limit_a_streamed_render_gives_the_wav(monkeypatch):
+    wav = _streamed_wav(b"\x10\x27" * 48)
+
+    class Quick:
+        status_code = 200
+
+        def iter_content(self, size):
+            yield wav[:20]
+            yield wav[20:]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(med_clips.requests, "post", lambda url, timeout, headers, json, stream: Quick())
+    assert med_clips.render("真好。", "marin", "sk-x", timeout=10, retries=0, total=10)[:4] == b"RIFF"
