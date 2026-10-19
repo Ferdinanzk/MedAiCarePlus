@@ -206,16 +206,22 @@ function Get-TunnelDrift([string]$Facts, [string[]]$StampLines) {
 }
 
 function Get-RobotServerProblem($Status) {
-    # Why the robot app has no working server, from its /api/status, or '' when it works with the one in its app_url.
-    # Only then does the robot stage re-point app_url: a robot another computer uses is left alone, or the two would
-    # keep taking it from each other. server.state is robot app 0.17.0's (absent before it); server.reachable is
-    # $null while no bridge runs (no app_url yet, or the app not started), and false until its first heartbeat answers.
-    if ($null -eq $Status -or $null -eq $Status.server) { return 'its status shows no server' }
+    # Why the robot app has no working server, from its /api/status: '' when it works with the one in its app_url, and
+    # $null while that cannot be told yet. Only a problem re-points app_url: a robot another computer uses is left
+    # alone, or the two would keep taking it from each other. No answer yet is not a problem: the server block is
+    # null while no bridge runs (the app just started, the bridge restarting after an app_url change), and reachable
+    # is false until the first heartbeat is answered (server.state null; the field is robot app 0.17.0's). One failed
+    # heartbeat (the other server's 14 s rebuild) is not one either: a server counts as gone only after
+    # unreachable_for_seconds reaches 30, the robot's own SERVER_LOST_SECONDS (the field is in every version).
+    if ($null -eq $Status -or $null -eq $Status.server) { return $null }
     $server = $Status.server
     if ("$($server.state)" -eq 'not_authorised') { return "its server $($server.url) does not accept it (not_authorised)" }
-    if ($null -eq $server.reachable) { return 'no bridge runs on it' }
-    if ($server.reachable -eq $false) { return "its server $($server.url) does not answer" }
-    return ''
+    if ($server.reachable -eq $true) { return '' }
+    $lost = $server.unreachable_for_seconds
+    if ($null -ne $lost -and [double]$lost -ge 30) {
+        return "its server $($server.url) has not answered for $([math]::Round([double]$lost)) s"
+    }
+    return $null
 }
 
 function Find-Robot([int]$TimeoutSeconds) {
@@ -450,6 +456,7 @@ try {
             $expected = "http://$bindIp`:8001"
             $urlOk = $false
             $otherServer = $false
+            $undecided = ''
             if ($null -eq $config) {
                 Write-Line 'robot' 'warning: the robot app settings (:8042/api/config) do not answer'
             } elseif ("$($config.app_url)".TrimEnd('/') -eq $expected) {
@@ -458,9 +465,37 @@ try {
             } else {
                 $status = Invoke-Json 'Get' "http://$robot`:8042/api/status"
                 $busy = $status -and ($status.task_id -or $status.slot_state)
-                $noServer = Get-RobotServerProblem $status
+                $noServer = $null
+                if (-not $busy -and -not "$($config.app_url)".Trim()) {
+                    $noServer = 'it had no app_url'
+                } elseif (-not $busy) {
+                    # Judged only once the robot's status says: right after its app or bridge starts there is no answer
+                    # yet. 60 s: a first heartbeat to a dead address fails after the robot's 10 s timeout, and 30 s more
+                    # must pass before that counts.
+                    $script:RobotStatus = $status
+                    $settled = Wait-Until {
+                        $s = Invoke-Json 'Get' "http://$robot`:8042/api/status"
+                        $script:RobotStatus = $s
+                        if ($s -and ($s.task_id -or $s.slot_state)) { return [pscustomobject]@{ Busy = $true; Problem = $null } }
+                        $p = Get-RobotServerProblem $s
+                        if ($null -ne $p) { return [pscustomobject]@{ Busy = $false; Problem = $p } }
+                        return $null
+                    } 60 3
+                    if ($null -eq $settled) {
+                        $s = $script:RobotStatus
+                        $appState = if ($s) { "$($s.state)" } else { 'no answer' }
+                        $serverState = if ($s -and $s.server -and $s.server.state) { "$($s.server.state)" } else { '-' }
+                        $lost = if ($s -and $s.server -and $null -ne $s.server.unreachable_for_seconds) { "$($s.server.unreachable_for_seconds) s" } else { '-' }
+                        $undecided = "its status did not show within 60 s whether that server works for it (robot app $appState, server state $serverState, unreachable for $lost)"
+                    } else {
+                        $busy = $settled.Busy
+                        $noServer = $settled.Problem
+                    }
+                }
                 if ($busy) {
                     Write-Line 'robot' "app_url is $($config.app_url) but a session is running on the robot: deferred to the next reconcile"
+                } elseif ($undecided) {
+                    Write-Line 'robot' "app_url is $($config.app_url) and $undecided"
                 } elseif (-not $noServer) {
                     $otherServer = $true
                     Write-Line 'robot' "app_url is $($config.app_url) and the robot works with that server (it answers and accepts the robot): left alone"
@@ -478,6 +513,8 @@ try {
             if ($otherServer) {
                 # no heartbeat comes to this server while the robot uses the other one
                 Skip-Stage 'robot' "the robot works with another server ($($config.app_url))"
+            } elseif ($undecided) {
+                Skip-Stage 'robot' "app_url $($config.app_url) left alone until the next reconcile (whether its server works for the robot is not known yet)"
             } else {
                 $heartbeat = Wait-Until {
                     $age = (& docker compose -p $ComposeProject -f $script:ComposeFile exec -T postgres psql -U medai -d medcareai2 -tAc "select coalesce(extract(epoch from (now()-max(last_seen_at)))::int, 99999) from reachy_device where revoked_at is null" 2>$null | Out-String).Trim()
