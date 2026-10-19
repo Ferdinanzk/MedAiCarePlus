@@ -353,6 +353,44 @@ async def speech_clip(key: str, language: str = Query("zh-TW"), device: dict = D
     return _wav_response(data, key)
 
 
+# ── Speech-to-text for the 「我吃完了」 listener ──────────────────────────────────
+
+async def _audio_at_most(request: Request, limit: int) -> bytes | None:
+    """The body, read only while it is at most `limit` bytes: None once it is longer, so an oversized upload is
+    never held whole."""
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
+@router.post("/stt")
+async def speech_to_text(request: Request, language: Literal["zh-TW", "en"] = Query("zh-TW"),
+                         device: dict = Depends(get_device)):
+    """One segment of the done-mode listener (raw PCM16 mono 16 kHz, application/octet-stream) as text, through
+    OpenAI's transcription endpoint (services/speech_to_text.py; quick fixes 2 of 19 Oct 2026): 200 {"text",
+    "model", "ms"}. 404 no_cloud_stt without a live voice target with a key or without the robot's microphone
+    consent; 413 over 15 s of audio, 422 under 0.2 s; 502 stt_failed for any failure of the call. The robot then
+    uses its own Whisper. Nothing is stored, and no log carries the words or the audio."""
+    from app.services import speech_to_text as stt
+
+    api_key = stt.cloud_key()
+    if api_key is None or not consent_service.is_current(await consent_service.get_state(device["u_id"]),
+                                                         "robot_microphone"):
+        raise HTTPException(404, "no_cloud_stt")
+    audio = await _audio_at_most(request, stt.MAX_BYTES)
+    if audio is None:
+        raise HTTPException(413, "audio_too_long")
+    if len(audio) < stt.MIN_BYTES:
+        raise HTTPException(422, "audio_too_short")
+    try:
+        return await stt.transcribe(audio, language, api_key)
+    except stt.SttFailed:
+        raise HTTPException(502, "stt_failed") from None
+
+
 # ── Check-in conversations ───────────────────────────────────────────────────
 
 class ConversationStartPayload(BaseModel):
