@@ -335,6 +335,21 @@ async def line_clip(line_id: str, request: Request, language: str = Query("zh-TW
     return _wav_response(data, key)
 
 
+@router.get("/clips/speech/{key}")
+async def speech_clip(key: str, language: str = Query("zh-TW"), device: dict = Depends(get_device)):
+    """A sentence the server sent this robot as text (the text chat's opening or reply, a refusal's sentence) in the
+    live voice (services/speech_clips.py): the PCM16 mono 16 kHz WAV of the key its `clip` named, once its render is
+    done (waiting at most speech_clips.WAIT_SECONDS); 404 for a key never issued to this device's patient, expired,
+    failed or not ready in time: the robot then says the words with its own voice. `language` is accepted as on the
+    line route; the key already names the words."""
+    from app.services import speech_clips
+
+    data = await speech_clips.get(device["u_id"], key)
+    if data is None:
+        raise HTTPException(404, "No clip for this text")
+    return _wav_response(data, key)
+
+
 # ── Check-in conversations ───────────────────────────────────────────────────
 
 class ConversationStartPayload(BaseModel):
@@ -490,13 +505,18 @@ async def _add_turn(conn, conversation_id, u_id: int, role: str, text: str, flag
         str(conversation_id), u_id, role, text, flagged, json.dumps(metrics) if metrics is not None else None)
 
 
-def _spoken(reply: str, language: str, end: bool, reply_turn_id: int, risk: bool = False,
+def _spoken(reply: str, language: str, end: bool, reply_turn_id: int, u_id: int, risk: bool = False,
             conversation_id=None) -> dict:
     # reply_turn_id: the robot posts how it played this line to /turns/{reply_turn_id}/metrics.
+    from app.services import speech_clips
+
     body = {"reply": reply, "speech_text": conversation.speech_text(reply, language), "end": end, "risk": risk,
             "reply_turn_id": reply_turn_id}
     if conversation_id is not None:
         body["conversation_id"] = str(conversation_id)
+    clip = speech_clips.issue(u_id, reply, language)   # the words in the live voice, rendered from now on
+    if clip is not None:
+        body["clip"] = clip
     return body
 
 
@@ -534,7 +554,8 @@ async def conversation_start(payload: ConversationStartPayload, device: dict = D
     # The forced get_today_dose_status call runs while the robot says the opening.
     _dose_openings[conversation_id] = _in_background(
         _open_dose_status(device["u_id"], conversation_id, turn_id, language, opening))
-    return _spoken(opening, language, end=False, reply_turn_id=turn_id, conversation_id=conversation_id)
+    return _spoken(opening, language, end=False, reply_turn_id=turn_id, u_id=device["u_id"],
+                   conversation_id=conversation_id)
 
 
 @router.post("/conversations/{conversation_id}/turn")
@@ -653,7 +674,7 @@ async def conversation_turn(conversation_id: str, payload: ConversationTurnPaylo
         # Post-chat work waits for it, so a late flag also means no post-chat model call (after_chat).
         after_chat.track_risk_check(cid, _in_background(_late_risk_check(
             device["u_id"], device["name"], cid, turn_id, reply_turn_id, text, history, language, rate_limited)))
-    return {**_spoken(reply, language, end=end, reply_turn_id=reply_turn_id, risk=risk),
+    return {**_spoken(reply, language, end=end, reply_turn_id=reply_turn_id, u_id=device["u_id"], risk=risk),
             "server_ms": _ms_since(received)}
 
 

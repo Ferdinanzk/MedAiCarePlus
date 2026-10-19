@@ -151,7 +151,10 @@ def test_refusals_are_not_value_errors_and_the_app_answers_each_with_409():
     refused = judge(allegra_day(), 308, taipei(3, 10, 30))
     assert not isinstance(refused, ValueError) and isinstance(refused, schedule.DoseRefused)
     assert app.exception_handlers[schedule.DoseRefused] is dose_refused
-    response = run(dose_refused(None, refused))
+    from starlette.requests import Request   # the handler reads the path: a device route's refusal gets a clip
+    request = Request({"type": "http", "path": "/api/medications/1/take", "headers": [], "method": "POST",
+                       "query_string": b""})
+    response = run(dose_refused(request, refused))
     assert response.status_code == 409 and json.loads(response.body)["detail"] == "dose_expired"
 
 
