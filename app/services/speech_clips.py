@@ -36,12 +36,13 @@ CLIP_ID = "speech"
 MAX_CHARS = 240        # conversation.clean_reply's cap: a longer text gets no clip
 CACHE_SIZE = 64        # clips kept, the least recently used dropped first
 TTL_SECONDS = 600      # a clip is kept this long after it was last issued
-RENDER_TIMEOUT = 10    # one try; the robot waits at most 5 s for it anyway
+RENDER_TIMEOUT = 10    # one try, the whole call (med_clips.render's total); the robot waits at most 5 s anyway
 WAIT_SECONDS = 8       # the route waits this long for a render still running
 TOKEN_BYTES = 10       # the key in the URL: 20 hex characters, random per issue
 TOKENS_MAX = 4 * CACHE_SIZE   # keys issued and still kept, the oldest dropped first (and each after TTL_SECONDS)
 
-_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="speech-clip")
+POOL_SIZE = 4          # renders at once: two slow answers never hold up a third reply's clip
+_pool = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="speech-clip")
 _running: set = set()   # the renders in flight, kept until done (an evicted clip's render still finishes)
 
 
@@ -124,7 +125,7 @@ def issue(u_id: int, text: str, language: str) -> dict | None:
 
 def _render_wav(text: str, voice: str, api_key: str) -> bytes:
     return voice_lines.to_robot_wav(med_clips.render(text, voice, api_key, voice_lines.INSTRUCTIONS["companion"],
-                                                     timeout=RENDER_TIMEOUT, retries=0))
+                                                     timeout=RENDER_TIMEOUT, retries=0, total=RENDER_TIMEOUT))
 
 
 async def _render(clip: _Clip, api_key: str) -> bytes | None:

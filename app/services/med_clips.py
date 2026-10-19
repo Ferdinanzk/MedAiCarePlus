@@ -14,6 +14,7 @@ import hashlib
 import io
 import logging
 import struct
+import time
 import wave
 from pathlib import Path
 
@@ -29,6 +30,7 @@ SPEECH_URL = "https://api.openai.com/v1/audio/speech"
 MODEL = "gpt-4o-mini-tts"
 TIMEOUT = 40
 RETRIES = 1
+CHUNK_BYTES = 16384   # a streamed answer is read this much at a time (render's `total`)
 VOICES = ("alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse", "marin",
           "cedar")
 DEFAULT_VOICE = "coral"
@@ -101,23 +103,44 @@ def normalize_wav(data: bytes) -> bytes:
     return out.getvalue()
 
 
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _body_by(response, ends: float) -> bytes:
+    """The streamed answer's body, read until `ends` (on _clock): TimeoutError once that has passed."""
+    body = bytearray()
+    for chunk in response.iter_content(CHUNK_BYTES):
+        body += chunk
+        if _clock() > ends:
+            response.close()
+            raise TimeoutError("the speech API's answer took too long")
+    return bytes(body)
+
+
 def render(text: str, voice: str, api_key: str, instructions: str = INSTRUCTIONS, timeout: float = TIMEOUT,
-           retries: int = RETRIES) -> bytes:
+           retries: int = RETRIES, total: float | None = None) -> bytes:
     """The speech API, tried twice (a read timed out at 30 s on 14 Oct 2026 for a 4 s clip); the WAV, normalized.
     `instructions` tells the voice how to speak: the medicine prompt's by default (the reminders use it too); Reachy's
     own lines bring their own (services/voice_lines.py). A sentence the robot waits for (services/speech_clips.py)
-    gets one try with a shorter `timeout`. Raises on failure (the key never gets logged)."""
+    gets one try with a shorter `timeout`, and `total`: requests' timeout limits each connect and each read, not the
+    whole call (a WAV streamed slowly took 19 s with timeout=10), so with `total` the body is streamed and the render
+    gives up (TimeoutError) once that many seconds have passed. Raises on failure (the key never gets logged)."""
+    ends = None if total is None else _clock() + total
+    stream = {} if ends is None else {"stream": True}
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
             response = requests.post(SPEECH_URL, timeout=timeout, headers={"Authorization": f"Bearer {api_key}"},
                                      json={"model": MODEL, "voice": voice, "input": text,
-                                           "instructions": instructions, "response_format": "wav"})
+                                           "instructions": instructions, "response_format": "wav"}, **stream)
+            if response.status_code == 200:
+                return normalize_wav(response.content if ends is None else _body_by(response, ends))
         except requests.RequestException as error:
             last = error
             continue
-        if response.status_code == 200:
-            return normalize_wav(response.content)
+        if ends is not None:
+            response.close()
         last = RuntimeError(f"speech API answered {response.status_code}")
         if response.status_code < 500 and response.status_code != 429:
             break

@@ -30,12 +30,12 @@ COMPANION = voice_lines.INSTRUCTIONS["companion"]
 @pytest.fixture
 def speech(monkeypatch):
     """A live target (marin) and the speech API faked: `renders` holds (text, voice, api_key, instructions, timeout,
-    retries) per call; `fail` is the error the next render raises; `gate`, when set, holds the render until set."""
+    retries, total) per call; `fail` is the error the next render raises; `gate`, when set, holds the render until set."""
     w = types.SimpleNamespace(renders=[], target=TARGET, fail=None, gate=None)
 
     def render(text, voice, api_key, instructions=med_clips.INSTRUCTIONS, timeout=med_clips.TIMEOUT,
-               retries=med_clips.RETRIES):
-        w.renders.append((text, voice, api_key, instructions, timeout, retries))
+               retries=med_clips.RETRIES, total=None):
+        w.renders.append((text, voice, api_key, instructions, timeout, retries, total))
         if w.gate is not None:
             w.gate.wait(5)
         if w.fail is not None:
@@ -92,7 +92,8 @@ def test_the_render_starts_at_once_with_one_try_of_10_s_and_the_patient_gets_the
         return clip, data, await speech_clips.get(8, clip["key"]), await speech_clips.get(7, "0" * 20)
 
     clip, data, other, unknown = asyncio.run(scenario())
-    assert speech.renders == [(REPLY, "marin", "sk-x", COMPANION, 10, 0)]
+    assert speech.renders == [(REPLY, "marin", "sk-x", COMPANION, 10, 0, 10)]     # 10 s for the whole call
+    assert speech_clips.POOL_SIZE == 4 and speech_clips._pool._max_workers == 4
     assert data[:4] == b"RIFF" and voice_lines.RATE == 16000      # voice_lines.to_robot_wav: PCM16 mono 16 kHz
     assert other is None and unknown is None                       # never issued to that patient; never issued
 
