@@ -54,6 +54,7 @@ class FakeDB:
         self.devices = {7: {"device_id": DEVICE, "auto_record": False, "live_voice": False, "last_seen_at": T0,
                             "revoked": False}}
         self.users = {7: "Pearl"}
+        self.call_names = {}   # the Reachy card's call name per patient ("user".reachy_call_name)
         self.doses = {
             101: {"intk_id": 101, "med_id": 2, "med_name": "Metformin", "pill_description": "white round",
                   "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
@@ -177,6 +178,8 @@ class FakeDB:
             active = device if device and not device["revoked"] else None
             return {"name": self.users[args[0]], "auto_record": active["auto_record"] if active else None,
                     "paired": active is not None}
+        if query == 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1':   # memory.call_name
+            return {"reachy_call_name": self.call_names.get(args[0]), "name": self.users.get(args[0])}
         if "WHERE u_id = $1 AND lease_owner = $2::uuid" in query:
             tasks = sorted((t for t in self.tasks if t["u_id"] == args[0] and t["lease_owner"] == args[1]
                             and t["status"] in ("leased", "searching", "in_progress")),
@@ -360,8 +363,9 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     task = run(reachy_tasks.lease_next(7, DEVICE, 0))
     assert task["task_id"] == first and task["status"] == "leased"
     assert set(task) == {"task_id", "slot_time", "reason", "attempt", "status", "expires_at",
-                         "patient_name", "auto_record", "microphone", "checkin", "live", "doses"}
+                         "patient_name", "call_name", "auto_record", "microphone", "checkin", "live", "doses"}
     assert task["patient_name"] == "Pearl" and task["auto_record"] is False
+    assert task["call_name"] == "Pearl"  # no call name on the Reachy card: the registered name (memory.call_name)
     assert task["live"] is False         # no live test switch, robot switch or live model in the fixture
     assert task["microphone"] is False   # no robot_microphone consent in the fixture
     assert task["checkin"] is False      # nor the check-in scopes
@@ -372,6 +376,18 @@ def test_lease_next_leases_oldest_queued_and_returns_payload(db):
     assert db.by_id(first)["lease_until"] == T0 + timedelta(seconds=60)
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == later
     assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+
+
+def test_the_payload_carries_the_name_reachy_calls_the_patient(db):
+    """call_name (memory.call_name) next to the registered patient_name: the robot's own voice says it when the
+    named dose line has no copy in the live voice (quick fixes of 19 Oct 2026)."""
+    enqueue(db)
+    db.call_names[7] = "阿嬤"
+    task = run(reachy_tasks.lease_next(7, DEVICE, 0))
+    assert task["call_name"] == "阿嬤" and task["patient_name"] == "Pearl"
+    db.call_names[7] = None
+    db.users[7] = "Demo Patient 1790963685"     # a registered name Reachy would not say: no name
+    assert run(reachy_tasks.current_task(7, DEVICE))["call_name"] is None
 
 
 def test_lease_next_skips_expired_tasks(db):
