@@ -205,6 +205,19 @@ function Get-TunnelDrift([string]$Facts, [string[]]$StampLines) {
     return ''
 }
 
+function Get-RobotServerProblem($Status) {
+    # Why the robot app has no working server, from its /api/status, or '' when it works with the one in its app_url.
+    # Only then does the robot stage re-point app_url: a robot another computer uses is left alone, or the two would
+    # keep taking it from each other. server.state is robot app 0.17.0's (absent before it); server.reachable is
+    # $null while no bridge runs (no app_url yet, or the app not started), and false until its first heartbeat answers.
+    if ($null -eq $Status -or $null -eq $Status.server) { return 'its status shows no server' }
+    $server = $Status.server
+    if ("$($server.state)" -eq 'not_authorised') { return "its server $($server.url) does not accept it (not_authorised)" }
+    if ($null -eq $server.reachable) { return 'no bridge runs on it' }
+    if ($server.reachable -eq $false) { return "its server $($server.url) does not answer" }
+    return ''
+}
+
 function Find-Robot([int]$TimeoutSeconds) {
     # The robot's IPv4: .env's REACHY_ROBOT_HOST, else mDNS (reachy-mini.local), else the ARP entry of its MAC
     # (campus networks drop mDNS; the ARP table has the robot once anything spoke to it).
@@ -411,7 +424,8 @@ try {
         }
     }
 
-    # 7. robot: find it, start its app if it is down, point it at this server, wait for its heartbeat
+    # 7. robot: find it, start its app if it is down, point it at this server unless it works with another one, wait
+    # for its heartbeat
     if ($NoRobot) {
         Skip-Stage 'robot' '-NoRobot'
     } elseif ($script:Results['ports'] -ne 'OK') {
@@ -435,6 +449,7 @@ try {
             $config = Invoke-Json 'Get' "http://$robot`:8042/api/config"
             $expected = "http://$bindIp`:8001"
             $urlOk = $false
+            $otherServer = $false
             if ($null -eq $config) {
                 Write-Line 'robot' 'warning: the robot app settings (:8042/api/config) do not answer'
             } elseif ("$($config.app_url)".TrimEnd('/') -eq $expected) {
@@ -443,28 +458,37 @@ try {
             } else {
                 $status = Invoke-Json 'Get' "http://$robot`:8042/api/status"
                 $busy = $status -and ($status.task_id -or $status.slot_state)
+                $noServer = Get-RobotServerProblem $status
                 if ($busy) {
                     Write-Line 'robot' "app_url is $($config.app_url) but a session is running on the robot: deferred to the next reconcile"
+                } elseif (-not $noServer) {
+                    $otherServer = $true
+                    Write-Line 'robot' "app_url is $($config.app_url) and the robot works with that server (it answers and accepts the robot): left alone"
                 } else {
                     $answer = Invoke-Json 'Post' "http://$robot`:8042/api/config" @{ app_url = $expected } 20
                     if ($null -ne $answer) {
                         $urlOk = $true
                         $script:Changed += "robot app_url $($config.app_url) -> $expected"
-                        Write-Line 'robot' "app_url set to $expected (was $($config.app_url)); the robot restarts its bridge"
+                        Write-Line 'robot' "app_url set to $expected (was $($config.app_url); $noServer); the robot restarts its bridge"
                     } else {
                         Write-Line 'robot' "warning: setting app_url on the robot failed"
                     }
                 }
             }
-            $heartbeat = Wait-Until {
-                $age = (& docker compose -p $ComposeProject -f $script:ComposeFile exec -T postgres psql -U medai -d medcareai2 -tAc "select coalesce(extract(epoch from (now()-max(last_seen_at)))::int, 99999) from reachy_device where revoked_at is null" 2>$null | Out-String).Trim()
-                if ($age -match '^\d+$' -and [int]$age -lt 30) { [int]$age } else { $null }
-            } 90 5
-            if ($null -ne $heartbeat) {
-                Set-Stage 'robot' $true "heartbeat received $heartbeat s ago (app_url $(if ($urlOk) { 'matches' } else { 'NOT confirmed' }))"
+            if ($otherServer) {
+                # no heartbeat comes to this server while the robot uses the other one
+                Skip-Stage 'robot' "the robot works with another server ($($config.app_url))"
             } else {
-                $why = if ($urlOk) { 'the robot app is not sending heartbeats yet (check its log: journalctl -u reachy-mini-daemon on the robot)' } else { 'its app_url could not be confirmed' }
-                Set-Stage 'robot' $false "no heartbeat on the server within 90 s; $why"
+                $heartbeat = Wait-Until {
+                    $age = (& docker compose -p $ComposeProject -f $script:ComposeFile exec -T postgres psql -U medai -d medcareai2 -tAc "select coalesce(extract(epoch from (now()-max(last_seen_at)))::int, 99999) from reachy_device where revoked_at is null" 2>$null | Out-String).Trim()
+                    if ($age -match '^\d+$' -and [int]$age -lt 30) { [int]$age } else { $null }
+                } 90 5
+                if ($null -ne $heartbeat) {
+                    Set-Stage 'robot' $true "heartbeat received $heartbeat s ago (app_url $(if ($urlOk) { 'matches' } else { 'NOT confirmed' }))"
+                } else {
+                    $why = if ($urlOk) { 'the robot app is not sending heartbeats yet (check its log: journalctl -u reachy-mini-daemon on the robot)' } else { 'its app_url could not be confirmed' }
+                    Set-Stage 'robot' $false "no heartbeat on the server within 90 s; $why"
+                }
             }
         }
     }
