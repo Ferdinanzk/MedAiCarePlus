@@ -5,9 +5,11 @@ A rebuild takes the server away for about 14 s, longer than the 10 s a robot app
 waits 30 s): a dose slot in progress is dropped, and when the robot picks the task up again it announces the dose
 again and no longer waits for family's answer. So this refuses while a robot task is leased, searching or in
 progress (and not expired), or while a dose confirmation still waits for family's answer (resolution IS NULL).
+The image is built first, while the old container keeps serving (that can take minutes), and the check runs after
+the build, right before the container is recreated: a task leased during the build is seen.
 
-    .\scripts\rebuild-app.ps1          # refuses with the reason while a session is active, else rebuilds the app
-    .\scripts\rebuild-app.ps1 -Force   # rebuilds anyway
+    .\scripts\rebuild-app.ps1          # builds, then refuses with the reason while a session is active, else recreates
+    .\scripts\rebuild-app.ps1 -Force   # recreates anyway
 
 Windows PowerShell 5.1.
 #>
@@ -40,15 +42,21 @@ function Get-BusyReasons($Tasks, $OpenConfirmations) {
     return ,$reasons
 }
 
+Write-Host 'Building the app image (the running app keeps serving meanwhile).'
+& docker compose -p $ComposeProject -f $composeFile build app
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "The build failed (exit $LASTEXITCODE): the running app is unchanged."
+    exit $LASTEXITCODE
+}
 $tasks = Get-Count "SELECT count(*) FROM reachy_task WHERE status IN ('leased','searching','in_progress') AND expires_at > NOW()"
 $open = Get-Count 'SELECT count(*) FROM dose_confirmation WHERE resolution IS NULL'
 $reasons = Get-BusyReasons $tasks $open
 if ($reasons.Count -gt 0 -and -not $Force) {
-    Write-Host ("Not rebuilding: {0}." -f ($reasons -join '; '))
-    Write-Host 'A rebuild stops the server for about 14 s, and a robot app before 0.17.0 drops a dose session after 10 s without it. Try again when it is over, or run with -Force.'
+    Write-Host ("The new image is built, but the app is not recreated: {0}." -f ($reasons -join '; '))
+    Write-Host 'Recreating stops the server for about 14 s, and a robot app before 0.17.0 drops a dose session after 10 s without it. Run this again when it is over (the build is cached), or run with -Force.'
     exit 1
 }
-if ($reasons.Count -gt 0) { Write-Host ("Rebuilding anyway (-Force): {0}." -f ($reasons -join '; ')) }
-else { Write-Host 'No dose session is running: rebuilding the app.' }
-& docker compose -p $ComposeProject -f $composeFile up -d --build app
+if ($reasons.Count -gt 0) { Write-Host ("Recreating anyway (-Force): {0}." -f ($reasons -join '; ')) }
+else { Write-Host 'No dose session is running: recreating the app from the new image.' }
+& docker compose -p $ComposeProject -f $composeFile up -d --no-build app
 exit $LASTEXITCODE
