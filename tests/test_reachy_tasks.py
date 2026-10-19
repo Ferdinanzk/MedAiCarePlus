@@ -410,10 +410,27 @@ def test_an_after_meal_dose_counts_only_at_lunch_or_dinner_local_time(local, exp
 def test_an_after_meal_dose_is_marked_by_its_schedule_or_its_instructions():
     lunch = T0 + timedelta(hours=4)   # 12:00 in Taipei
     assert reachy_tasks.after_meal(None, "餐後一小時服用", lunch) is True
-    assert reachy_tasks.after_meal({"after_meals": True, "noon": True}, "飯前", lunch) is True
+    assert reachy_tasks.after_meal({"after_meals": True, "noon": True}, "睡前", lunch) is True
     assert reachy_tasks.after_meal({"before_meals": True}, "睡前", lunch) is False
     assert reachy_tasks.after_meal(None, None, lunch) is False
     assert reachy_tasks.after_meal({"after_meals": True}, None, None) is False   # no dose time: never a meal time
+
+
+@pytest.mark.parametrize("schedule_time, instructions", [
+    ({"after_meals": True, "before_meals": True}, None),
+    ('{"after_meals": true, "before_meals": true}', None),           # asyncpg hands JSONB back as text
+    ({"before_meals": True}, "每日三次，飯後服用"),
+    (None, "空腹（飯前1小時或飯後2小時）服用"),
+    ({"after_meals": True}, "空腹服用"),
+    ({"after_meals": True, "noon": True}, "飯前"),
+    ({"after_meals": True}, "飯前30分鐘服用"),
+    (None, "餐前服用，飯後亦可"),
+    ({"after_meals": True}, "餐前服用")])
+def test_an_empty_stomach_or_before_meal_dose_is_never_after_a_meal(schedule_time, instructions):
+    """Quick fixes 3 of 19 Oct 2026: no meal question for such a medicine. schedule_time.before_meals, or 空腹, 飯前 or
+    餐前 anywhere in the instructions, wins over after_meals and over 飯後 or 餐後 in the same words."""
+    lunch = T0 + timedelta(hours=4)   # 12:00 in Taipei
+    assert reachy_tasks.after_meal(schedule_time, instructions, lunch) is False
 
 
 def test_each_dose_of_the_payload_says_whether_it_is_taken_after_a_meal(db):
@@ -429,6 +446,9 @@ def test_each_dose_of_the_payload_says_whether_it_is_taken_after_a_meal(db):
     db.doses[102]["instructions"] = "飯前服用"
     current = run(reachy_tasks.current_task(7, DEVICE))
     assert {d["intk_id"]: d["after_meal"] for d in current["doses"]} == {101: True, 102: False, 103: False}
+    db.doses[101]["instructions"] = "空腹（飯前1小時或飯後2小時）服用"   # quick fixes 3: no meal question
+    current = run(reachy_tasks.current_task(7, DEVICE))
+    assert {d["intk_id"]: d["after_meal"] for d in current["doses"]} == {101: False, 102: False, 103: False}
     assert all(set(d) >= {"after_meal"} and "schedule_time" not in d and "instructions" not in d
                for d in current["doses"])   # only the answer goes to the robot
 
