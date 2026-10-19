@@ -16,6 +16,9 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    # Time for a clean shutdown before Docker kills it: the containers had a 1 s stop timeout, and postgres ran crash
+    # recovery after stops. It applies from the next time a container is created.
+    stop_grace_period: 30s
 
   app:
     build: .
@@ -47,6 +50,7 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: 10s
 
   # LINE webhook, the app's only public entry point. Opt-in: scripts/line-tunnel.ps1
   # The tunnel reaches only this proxy, and the proxy forwards only POST /api/notify/webhook/line
