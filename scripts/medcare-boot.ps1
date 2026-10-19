@@ -192,6 +192,19 @@ function Get-ContainerFacts([string]$Name) {
     return [pscustomobject]@{ Id = $parts[0]; Status = $parts[1]; Health = $parts[2]; StartedAt = $parts[3] }
 }
 
+function Get-TunnelDrift([string]$Facts, [string[]]$StampLines) {
+    # Why the LINE webhook may point at a dead address, or '' when it is current. $Facts is the tunnel container's
+    # "<State.Status>|<State.StartedAt>"; the stamp is what line-tunnel.ps1 wrote after its last success. The quick
+    # tunnel gets a new address whenever its container starts, so the webhook holds only for the stamped start.
+    $parts = "$Facts".Trim() -split '\|'
+    if ($parts.Count -lt 2 -or -not $parts[1]) { return 'the tunnel container is not there' }
+    if ($parts[0] -ne 'running') { return "the tunnel container is $($parts[0])" }
+    $stamped = @($StampLines | Where-Object { $_ -like 'started_at=*' } | ForEach-Object { $_.Substring(11).Trim() }) | Select-Object -First 1
+    if (-not $stamped) { return 'no stamp from line-tunnel.ps1 (logs\line-tunnel.stamp): the webhook was not registered for this tunnel start' }
+    if ($stamped -ne $parts[1]) { return "the tunnel restarted at $($parts[1]) (the webhook was registered for its start at $stamped)" }
+    return ''
+}
+
 function Find-Robot([int]$TimeoutSeconds) {
     # The robot's IPv4: .env's REACHY_ROBOT_HOST, else mDNS (reachy-mini.local), else the ARP entry of its MAC
     # (campus networks drop mDNS; the ARP table has the robot once anything spoke to it).
@@ -359,10 +372,14 @@ try {
     } elseif ($script:Results['stack'] -ne 'OK') {
         Skip-Stage 'line' 'the stack is not up'
     } else {
-        $tunnelStatus = (& docker ps --filter "name=$script:TunnelContainer" --format '{{.Status}}' 2>$null | Out-String).Trim()
-        if ($Reconcile -and $tunnelStatus -like 'Up*') {
-            Set-Stage 'line' $true "tunnel container $tunnelStatus"
+        $tunnelFacts = (& docker inspect -f '{{.State.Status}}|{{.State.StartedAt}}' $script:TunnelContainer 2>$null | Out-String).Trim()
+        $stampFile = Join-Path $script:LogDir 'line-tunnel.stamp'
+        $stampLines = if (Test-Path -LiteralPath $stampFile) { @(Get-Content -LiteralPath $stampFile) } else { @() }
+        $drift = Get-TunnelDrift $tunnelFacts $stampLines
+        if ($Reconcile -and -not $drift) {
+            Set-Stage 'line' $true "tunnel running since $(($tunnelFacts -split '\|')[1]), the webhook registered for that start"
         } else {
+            if ($Reconcile) { Write-Line 'line' "$drift" }
             Write-Line 'line' "starting the tunnel and registering the webhook (scripts\line-tunnel.ps1; up to a few minutes)"
             $tunnelScript = Join-Path $RepoRoot 'scripts\line-tunnel.ps1'
             try {
