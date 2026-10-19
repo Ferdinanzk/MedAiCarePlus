@@ -255,3 +255,14 @@ def test_cloud_speech_to_text_has_a_release_gate_and_the_older_bullets_name_it()
     assert "`POST /api/device/stt`" in finished
     dose_lines = next(line for line in lines if line.startswith("  - **Dose lines with the name.**"))
     assert "`meal_check`" in dose_lines
+
+
+def test_quick_fixes_3_names_the_empty_stomach_rule_and_meal_not_yet():
+    """Quick fixes 3 of 19 Oct 2026: no meal question for a medicine taken before a meal or on an empty stomach, and
+    the line Reachy says when the patient has not eaten yet. The dose lines bullet names it too."""
+    quick_fixes_3 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fixes 3", ("- ", "#")))
+    for name in ("`before_meals`", "空腹", "飯前", "餐前", "`meal_not_yet`", "CONTRACT3.md"):
+        assert name in quick_fixes_3, f"CLAUDE.md's quick fixes 3 bullet doesn't name {name}"
+    lines = (REPO / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    dose_lines = next(line for line in lines if line.startswith("  - **Dose lines with the name.**"))
+    assert "`meal_not_yet`" in dose_lines
