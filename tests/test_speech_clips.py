@@ -1,6 +1,7 @@
 """Any sentence the server sends the robot as text, in the live voice (services/speech_clips.py, quick fixes of 19 Oct
-2026): the key and the gate, the background render (one try, 10 s), the in-memory LRU with its TTL, the route that
-serves only keys issued to the device's patient, and the `clip` on the text chat's lines and on a refusal's 409."""
+2026): the key (a random token per issue) and the gate, the background render (one try, 10 s), the help line from
+its kept copy, the in-memory LRU with its TTL, the route that serves only keys issued to the device's patient, and the
+`clip` on the text chat's lines and on a refusal's 409."""
 
 import asyncio
 import logging
@@ -14,6 +15,7 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
+from app import config   # noqa: E402
 from app.services import ai_settings, conversation, dose_safety, med_clips, speech_clips, voice_lines  # noqa: E402
 from tests import test_conversation, test_device_api   # noqa: E402
 from tests.test_med_clips import _streamed_wav   # noqa: E402
@@ -22,6 +24,7 @@ env = test_device_api.env       # the device API harness (dose routes)
 robot = test_conversation.robot  # the text chat over one event loop, so background renders finish
 TARGET = ai_settings.LiveTarget("sk-x", "gpt-live-1", "marin")
 REPLY = "真好，您走了多久呢？"
+COMPANION = voice_lines.INSTRUCTIONS["companion"]
 
 
 @pytest.fixture
@@ -42,16 +45,26 @@ def speech(monkeypatch):
     monkeypatch.setattr(med_clips, "render", render)
     monkeypatch.setattr(ai_settings, "live_target", lambda snapshot=None: w.target)
     speech_clips._clips.clear()
+    speech_clips._tokens.clear()
     yield w
     speech_clips._clips.clear()
+    speech_clips._tokens.clear()
 
 
-def test_the_key_is_the_texts_line_key_in_the_companion_voice(speech):
+def test_the_key_in_the_url_is_a_random_token_per_issue_so_a_logged_path_names_no_words(speech):
+    """uvicorn logs the device port's paths: the words' own key (line_key, the same in every process) would tell
+    anyone reading the logs which sentence a patient's robot fetched, the help line included."""
     async def scenario():
-        return speech_clips.issue(7, REPLY, "zh-TW")
+        first, second = speech_clips.issue(7, REPLY, "zh-TW"), speech_clips.issue(7, REPLY, "zh-TW")
+        return first, second, await speech_clips.get(7, first["key"]), await speech_clips.get(7, second["key"])
 
-    clip = asyncio.run(scenario())
-    assert clip == {"id": "speech", "key": voice_lines.line_key(REPLY, "marin", voice_lines.INSTRUCTIONS["companion"])}
+    first, second, one, two = asyncio.run(scenario())
+    content_key = voice_lines.line_key(REPLY, "marin", COMPANION)
+    assert first["id"] == second["id"] == "speech" and first["key"] != second["key"]
+    assert all(len(clip["key"]) == 20 and int(clip["key"], 16) >= 0 and clip["key"] != content_key
+               for clip in (first, second))
+    assert one == two and one[:4] == b"RIFF" and len(speech.renders) == 1      # one render under the words' key
+    assert list(speech_clips._clips) == [content_key]
 
 
 def test_no_clip_without_a_live_voice_target_for_no_words_or_a_long_text(speech):
@@ -74,17 +87,18 @@ def test_the_render_starts_at_once_with_one_try_of_10_s_and_the_patient_gets_the
     async def scenario():
         clip = speech_clips.issue(7, REPLY, "zh-TW")
         again = speech_clips.issue(7, REPLY, "zh-TW")          # the same words again: one render
-        assert again == clip
+        assert again["key"] != clip["key"]
         data = await speech_clips.get(7, clip["key"])
         return clip, data, await speech_clips.get(8, clip["key"]), await speech_clips.get(7, "0" * 20)
 
     clip, data, other, unknown = asyncio.run(scenario())
-    assert speech.renders == [(REPLY, "marin", "sk-x", voice_lines.INSTRUCTIONS["companion"], 10, 0)]
+    assert speech.renders == [(REPLY, "marin", "sk-x", COMPANION, 10, 0)]
     assert data[:4] == b"RIFF" and voice_lines.RATE == 16000      # voice_lines.to_robot_wav: PCM16 mono 16 kHz
     assert other is None and unknown is None                       # never issued to that patient; never issued
 
 
 def test_the_route_waits_at_most_8_s_for_a_render_still_running(speech, monkeypatch):
+    assert speech_clips.WAIT_SECONDS == 8
     monkeypatch.setattr(speech_clips, "WAIT_SECONDS", 0.05)
     speech.gate = threading.Event()
 
@@ -94,7 +108,7 @@ def test_the_route_waits_at_most_8_s_for_a_render_still_running(speech, monkeypa
         speech.gate.set()
         for _ in range(100):
             await asyncio.sleep(0.01)
-            if speech_clips._clips[clip["key"]].render.done():
+            if speech_clips._clips[speech_clips._tokens[clip["key"]].key].render.done():
                 break
         return late, await speech_clips.get(7, clip["key"])   # the render went on in the background
 
@@ -110,13 +124,14 @@ def test_a_failed_render_is_logged_without_the_words_or_the_key_and_a_new_issue_
         with caplog.at_level(logging.WARNING):
             assert await speech_clips.get(7, clip["key"]) is None
         speech.fail = None
-        assert speech_clips.issue(7, REPLY, "zh-TW") == clip     # issued again: rendered again
-        return clip, await speech_clips.get(7, clip["key"])
+        again = speech_clips.issue(7, REPLY, "zh-TW")     # issued again: rendered again
+        return clip, await speech_clips.get(7, again["key"])
 
     clip, data = asyncio.run(scenario())
     assert data[:4] == b"RIFF" and len(speech.renders) == 2
     assert "speech clip (zh-TW, 10 characters) could not be rendered (speech API answered 503)" in caplog.text
     assert REPLY not in caplog.text and clip["key"] not in caplog.text and "sk-x" not in caplog.text
+    assert voice_lines.line_key(REPLY, "marin", COMPANION) not in caplog.text
 
 
 def test_the_cache_keeps_64_clips_for_10_minutes(speech, monkeypatch):
@@ -132,22 +147,50 @@ def test_the_cache_keeps_64_clips_for_10_minutes(speech, monkeypatch):
         assert await speech_clips.get(7, keys[0]) is None and await speech_clips.get(7, first["key"]) is not None
         clock[0] += speech_clips.TTL_SECONDS + 1                         # 10 minutes on: every clip is gone
         assert await speech_clips.get(7, first["key"]) is None and not speech_clips._clips
+        assert not speech_clips._tokens                                  # and every key issued for them
+        await asyncio.sleep(0.05)
+        for _ in range(speech_clips.TOKENS_MAX + 1):                     # the keys are capped too
+            speech_clips.issue(7, "同一句。", "zh-TW")
+        assert len(speech_clips._tokens) == speech_clips.TOKENS_MAX
         await asyncio.sleep(0.05)
 
     asyncio.run(scenario())
-    assert (speech_clips.CACHE_SIZE, speech_clips.TTL_SECONDS) == (64, 600)
+    assert (speech_clips.CACHE_SIZE, speech_clips.TTL_SECONDS, speech_clips.TOKENS_MAX) == (64, 600, 256)
 
 
-def test_the_help_lines_numbers_are_spelled_digit_by_digit(speech):
+def _kept_helpline(language: str):
+    return voice_lines.fixed_path("helpline", language, voice_lines.key_for(
+        "helpline", conversation.HELPLINE[language], language, "marin"))
+
+
+def test_the_help_line_is_the_kept_helpline_line_never_a_new_render(speech, monkeypatch, tmp_path):
+    """A patient in crisis never waits for a render: the help line is voice_lines' kept `helpline` copy (rendered
+    ahead at startup, with the calm help-line instructions and the numbers digit by digit), read from its file."""
+    monkeypatch.setattr(config, "MED_CLIP_DIR", tmp_path)
+    kept = _kept_helpline("en")
+    kept.parent.mkdir(parents=True)
+    kept.write_bytes(b"RIFFkept")
+
+    async def scenario():
+        clip = speech_clips.issue(7, conversation.HELPLINE["en"], "en")
+        return clip, await speech_clips.get(7, clip["key"]), await speech_clips.get(8, clip["key"])
+
+    clip, data, other = asyncio.run(scenario())
+    assert data == b"RIFFkept" and speech.renders == [] and other is None
+    assert clip["key"] not in kept.name                                 # the URL still names nothing
+
+
+def test_a_help_line_not_kept_yet_is_rendered_as_the_helpline_line_and_kept(speech, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "MED_CLIP_DIR", tmp_path)
+
     async def scenario():
         clip = speech_clips.issue(7, conversation.HELPLINE["zh-TW"], "zh-TW")
-        await speech_clips.get(7, clip["key"])
-        return clip
+        return await speech_clips.get(7, clip["key"])
 
-    clip = asyncio.run(scenario())
-    assert "一一九" in speech.renders[0][0] and "119" not in speech.renders[0][0]
-    assert clip["key"] == voice_lines.line_key(conversation.HELPLINE["zh-TW"], "marin",
-                                               voice_lines.INSTRUCTIONS["companion"])
+    data = asyncio.run(scenario())
+    [(text, voice, api_key, instructions, *_)] = speech.renders
+    assert "一一九" in text and "119" not in text and instructions == voice_lines.INSTRUCTIONS["helpline"]
+    assert data[:4] == b"RIFF" and _kept_helpline("zh-TW").read_bytes() == data   # kept for the next time
 
 
 # ── the route ──
@@ -173,15 +216,30 @@ def test_the_robot_fetches_an_issued_clip_and_anything_else_is_a_404(env, monkey
 
 def test_the_text_chats_opening_and_reply_carry_a_clip_the_robot_can_fetch(robot, speech):
     opened = robot.client.post("/api/device/conversations", json={"task_id": test_conversation.TASK_ID}).json()
-    assert opened["clip"] == {"id": "speech", "key": voice_lines.line_key(
-        opened["reply"], "marin", voice_lines.INSTRUCTIONS["companion"])}
+    assert opened["clip"]["id"] == "speech" and opened["clip"]["key"] in speech_clips._tokens
     reply = robot.client.post(f"/api/device/conversations/{opened['conversation_id']}/turn",
                               json={"text": "我今天去散步"}).json()
-    assert reply["reply"] == REPLY and reply["clip"]["key"] == voice_lines.line_key(
-        REPLY, "marin", voice_lines.INSTRUCTIONS["companion"])
+    assert reply["reply"] == REPLY and speech_clips._tokens[reply["clip"]["key"]].key == voice_lines.line_key(
+        REPLY, "marin", COMPANION)
     response = robot.client.get(f"/api/device/clips/speech/{reply['clip']['key']}?language=zh-TW")
     assert response.status_code == 200 and response.content[:4] == b"RIFF"
+    assert response.headers["etag"] == f'"{reply["clip"]["key"]}"'      # the token, not the words' key
     assert {text for text, *_ in speech.renders} == {opened["reply"], REPLY}
+
+
+def test_a_risk_turn_in_the_text_chat_plays_the_kept_help_line(robot, speech, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "MED_CLIP_DIR", tmp_path)
+    kept = _kept_helpline("zh-TW")
+    kept.parent.mkdir(parents=True)
+    kept.write_bytes(b"RIFFhelp")
+    robot.state["risk"] = "self_harm"
+    opened = robot.client.post("/api/device/conversations", json={"task_id": test_conversation.TASK_ID}).json()
+    reply = robot.client.post(f"/api/device/conversations/{opened['conversation_id']}/turn",
+                              json={"text": "我今天去散步"}).json()
+    assert reply["risk"] is True and reply["reply"] == conversation.HELPLINE["zh-TW"]
+    response = robot.client.get(f"/api/device/clips/speech/{reply['clip']['key']}?language=zh-TW")
+    assert response.status_code == 200 and response.content == b"RIFFhelp"
+    assert {text for text, *_ in speech.renders} <= {opened["reply"]}    # the help line itself is never rendered
 
 
 def test_the_text_chat_sends_no_clip_without_a_live_voice_target(robot, speech):

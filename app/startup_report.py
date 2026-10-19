@@ -222,8 +222,9 @@ def voice_lines_stage() -> asyncio.Task | None:
     """Reachy's own lines around a live chat, rendered ahead in the live voice (services/voice_lines.py), after the
     live Check whatever its stored status, so a fresh start whose Check had been cleared still gets them. OK at once
     without a live target (nothing to render). Otherwise pending at once, as gpt_live while its Check runs, and the
-    renders run in the background (kept in _tasks, as finish_in_background does): 12 renders one after another, each
-    up to two tries of med_clips.TIMEOUT, must never hold up the summary line. _render_voice_lines settles the stage."""
+    renders run in the background (kept in _tasks, as finish_in_background does): one render per fixed line and
+    language (46 since the quick fixes of 19 Oct 2026) one after another, each up to two tries of med_clips.TIMEOUT,
+    must never hold up the summary line. _render_voice_lines settles the stage."""
     from app.services import ai_settings, voice_lines
     if ai_settings.live_target() is None:
         mark("voice_lines", True, "no live voice target: Reachy's own lines stay in the robot's own voice")

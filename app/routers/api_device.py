@@ -317,8 +317,9 @@ async def line_clip(line_id: str, request: Request, language: str = Query("zh-TW
                     device: dict = Depends(get_device)):
     """One of Reachy's own lines around a live chat, in the live voice (services/voice_lines.py): a PCM16 mono 16 kHz
     WAV with its key in ETag; 304 for a matching If-None-Match, checked before any render; 404 when there is none
-    (no live voice target, an unknown line, a per-patient line without current check-in consent, a render that
-    failed, or a line that could not be kept or read): the robot then drops its copy, never the current one (a matching If-None-Match
+    (no live voice target, an unknown line, a per-patient line without its consent: check-in consent for opening
+    and reminder_lead, the robot's consent for the dose lines; a render that failed, or a line that could not be
+    kept or read): the robot then drops its copy, never the current one (a matching If-None-Match
     is a 304 first), and says the line with its own voice. A failing lookup is a 500 on purpose: the robot keeps
     its copy through a database error."""
     from app.services import voice_lines
@@ -340,8 +341,9 @@ async def speech_clip(key: str, language: str = Query("zh-TW"), device: dict = D
     """A sentence the server sent this robot as text (the text chat's opening or reply, a refusal's sentence) in the
     live voice (services/speech_clips.py): the PCM16 mono 16 kHz WAV of the key its `clip` named, once its render is
     done (waiting at most speech_clips.WAIT_SECONDS); 404 for a key never issued to this device's patient, expired,
-    failed or not ready in time: the robot then says the words with its own voice. `language` is accepted as on the
-    line route; the key already names the words."""
+    failed or not ready in time: the robot then says the words with its own voice. The key is a random token per
+    issue, so the path the access log writes names no words. `language` is accepted as on the line route; the key
+    already names the clip."""
     from app.services import speech_clips
 
     data = await speech_clips.get(device["u_id"], key)
