@@ -85,6 +85,20 @@ def test_frequency_text_gives_dose_times(text, times, slots):
     assert result["max_per_day"] is None
 
 
+@pytest.mark.parametrize("text", [
+    "飯後服用，避免空腹",
+    "不可空腹，飯後服用",
+    "每日三次 飯後 勿空腹服用",
+    "一天2次 飯後 請勿空腹",
+    "Take after meals. Do not take on an empty stomach.",
+])
+def test_a_warning_against_an_empty_stomach_is_no_before_meal_mark(text):
+    """Review of quick fixes 3: 「避免空腹」 on an after-meal medicine (NSAIDs, aspirin) says "take it with food". It
+    marked before_meals, and reachy_tasks.after_meal then dropped the meal question."""
+    schedule = parsing.parse_frequency(text)["schedule"]
+    assert (schedule["before_meals"], schedule["after_meals"]) == (False, True)
+
+
 @pytest.mark.parametrize("text, times, most, slots", [
     ("一天3-4次", 3, 4, {M, N, E}),
     ("每日3至4次", 3, 4, {M, N, E}),

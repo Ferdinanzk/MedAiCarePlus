@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from app import config
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import ai_settings, consent_service, dose_safety, outbox, schedule
+from app.services import ai_settings, consent_service, dose_safety, ocr_parsing, outbox, schedule
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +66,8 @@ def _iso(value):
 # Quick fixes 2 of 19 Oct 2026: before an after-meal dose at lunch or dinner Reachy asks 「您有吃飯了嗎？」 (the
 # meal_check line). The meal times are local (MEDCARE_TIMEZONE), "HH:MM", both ends included; breakfast is not one.
 # Quick fixes 3: a medicine taken before a meal or on an empty stomach never gets the question, whatever else its
-# instructions say (「空腹（飯前1小時或飯後2小時）服用」 also names 飯後).
+# instructions say (「空腹（飯前1小時或飯後2小時）服用」 also names 飯後). A warning against an empty stomach
+# (「飯後服用，避免空腹」, 「勿空腹服用」: ocr_parsing.NOT_EMPTY_STOMACH) says the opposite and keeps the question.
 MEAL_WINDOWS = (("10:30", "14:30"), ("16:30", "21:30"))
 AFTER_MEAL_WORDS = ("飯後", "餐後")
 BEFORE_MEAL_WORDS = ("空腹", "飯前", "餐前")
@@ -75,8 +76,8 @@ BEFORE_MEAL_WORDS = ("空腹", "飯前", "餐前")
 def after_meal(schedule_time, instructions: str | None, dose_time: datetime | None) -> bool:
     """The dose is taken after a meal (its medicine's schedule_time.after_meals is true, or its instructions say 飯後
     or 餐後) and its local time is at lunch or dinner (MEAL_WINDOWS). Never when schedule_time.before_meals is true
-    or the instructions say 空腹, 飯前 or 餐前."""
-    schedule_time, words = schedule.load(schedule_time), instructions or ""
+    or the instructions say 空腹 (not as in 避免空腹), 飯前 or 餐前."""
+    schedule_time, words = schedule.load(schedule_time), ocr_parsing.NOT_EMPTY_STOMACH.sub("", instructions or "")
     if schedule_time.get("before_meals") is True or any(word in words for word in BEFORE_MEAL_WORDS):
         return False
     marked = schedule_time.get("after_meals") is True or any(word in words for word in AFTER_MEAL_WORDS)
