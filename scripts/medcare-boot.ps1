@@ -28,7 +28,6 @@ $ErrorActionPreference = 'Continue'
 $script:Mode = if ($Reconcile) { 'RECONCILE' } else { 'STARTUP' }
 $script:LogDir = Join-Path $RepoRoot 'logs'
 $script:LogFile = Join-Path $script:LogDir ("startup-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
-$script:LockFile = Join-Path $script:LogDir 'boot.lock'
 $script:ComposeFile = Join-Path $RepoRoot 'docker-compose.yml'
 $script:EnvFile = Join-Path $RepoRoot '.env'
 $script:Results = [ordered]@{}   # stage -> 'OK' | 'FAILED' | 'SKIPPED'
@@ -217,14 +216,16 @@ function Find-Robot([int]$TimeoutSeconds) {
 # ── the lock: two runs (logon + reconcile) never overlap ──────────────────────────────────────────────────────────
 
 New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null
-if (Test-Path -LiteralPath $script:LockFile) {
-    $other = (Get-Content -LiteralPath $script:LockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($other -and (Get-Process -Id $other -ErrorAction SilentlyContinue)) {
-        Write-Host "[$script:Mode] another run (PID $other) is still going; leaving it to finish"
-        exit 0
-    }
+# A named mutex, not a PID file: Windows frees it when its process dies, so a power-off cannot leave a lock behind.
+# An abandoned mutex (its last owner died holding it) is ours: WaitOne hands it over and reports that by throwing.
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\MedCareReachyBoot')
+$owned = $false
+try { $owned = $script:Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+if (-not $owned) {
+    Write-Host "[$script:Mode] another run is still going; leaving it to finish"
+    $script:Mutex.Dispose()
+    exit 0
 }
-Set-Content -LiteralPath $script:LockFile -Value $PID -Encoding ASCII
 Get-ChildItem -LiteralPath $script:LogDir -Filter 'startup-*.log' | Sort-Object Name -Descending |
     Select-Object -Skip 14 | Remove-Item -Force -ErrorAction SilentlyContinue
 
@@ -464,6 +465,7 @@ try {
     }
     if ($Reconcile -and ($script:Changed.Count -gt 0 -or $failed.Count -gt 0)) { Flush-Buffer }
     if (-not $Reconcile) { Flush-Buffer }
-    Remove-Item -LiteralPath $script:LockFile -Force -ErrorAction SilentlyContinue
+    try { $script:Mutex.ReleaseMutex() } catch { }
+    $script:Mutex.Dispose()
 }
 exit $exitCode
