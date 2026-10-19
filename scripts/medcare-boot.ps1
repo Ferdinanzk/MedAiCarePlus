@@ -100,24 +100,53 @@ function Set-EnvValue([string]$Name, [string]$Value) {
     [IO.File]::WriteAllText($script:EnvFile, $updated, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function ConvertTo-BitString([string]$Ip) {
+    # An IPv4 address as 32 '0'/'1' characters; $null for anything else (a host name, IPv6).
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$addr) -or "$($addr.AddressFamily)" -ne 'InterNetwork') { return $null }
+    return -join ($addr.GetAddressBytes() | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') })
+}
+
+function Test-SameSubnet([string]$A, [string]$B, [int]$Prefix) {
+    # True when two IPv4 addresses share their first $Prefix bits (the same /$Prefix network).
+    $bitsA = ConvertTo-BitString $A
+    $bitsB = ConvertTo-BitString $B
+    if (-not $bitsA -or -not $bitsB -or $Prefix -lt 1 -or $Prefix -gt 32) { return $false }
+    return $bitsA.Substring(0, $Prefix) -eq $bitsB.Substring(0, $Prefix)
+}
+
+function Select-LanCandidate($Candidates, [string]$RobotHost) {
+    # The lowest-metric candidate, unless another one's subnet holds the robot's address (REACHY_ROBOT_HOST, an IP).
+    $list = @($Candidates | Where-Object { $_ })
+    if ($list.Count -eq 0) { return $null }
+    if ($RobotHost) {
+        foreach ($c in $list) { if (Test-SameSubnet $c.Ip $RobotHost $c.Prefix) { return $c } }
+    }
+    return $list[0]
+}
+
 function Get-LanAdapter {
-    # The IPv4 address behind the default route, on a real adapter (not WSL's vEthernet, a VPN TAP or loopback).
+    # The IPv4 address behind the default route, on a real adapter (not WSL's vEthernet, a VPN TAP or loopback) that is
+    # Up and holds a Preferred address: a disconnected Ethernet keeps its old DHCP lease as 'Deprecated', and its route
+    # has a lower metric than the Wi-Fi's.
     $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Sort-Object RouteMetric, InterfaceMetric
+    $candidates = @()
     foreach ($route in $routes) {
         $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue
         if ($null -eq $adapter) { continue }
+        if ("$($adapter.Status)" -ne 'Up') { continue }
         if ($adapter.InterfaceDescription -match 'Hyper-V|WSL|TAP-Windows|VPN|Loopback' -or
             $adapter.Name -match 'vEthernet|WSL|TAP|VPN|Loopback') { continue }
         $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.AddressState -ne 'Tentative' } |
+            Where-Object { $_.IPAddress -notlike '169.254.*' -and "$($_.AddressState)" -eq 'Preferred' } |
             Select-Object -First 1
         if ($null -ne $ip) {
-            return [pscustomobject]@{ Ip = $ip.IPAddress; Prefix = $ip.PrefixLength; Alias = $adapter.Name;
-                                      Index = $route.InterfaceIndex; Dhcp = ($ip.PrefixOrigin -eq 'Dhcp') }
+            $candidates += [pscustomobject]@{ Ip = $ip.IPAddress; Prefix = $ip.PrefixLength; Alias = $adapter.Name;
+                                              Index = $route.InterfaceIndex; Dhcp = ($ip.PrefixOrigin -eq 'Dhcp') }
         }
     }
-    return $null
+    return Select-LanCandidate $candidates (Read-EnvValue 'REACHY_ROBOT_HOST')
 }
 
 function Get-Ssid {
