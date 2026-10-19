@@ -12,10 +12,12 @@ the laptop may restart unattended (Windows Update).
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = 'C:\medcareai\MedAiCarePlus',
+    [string]$RepoRoot = '',
     [switch]$Uninstall,
     [switch]$Firewall
 )
+# The default is this script's own repo; the tasks and the shortcut pass it on as -RepoRoot.
+if (-not $RepoRoot) { $RepoRoot = Split-Path $PSScriptRoot -Parent }
 $ErrorActionPreference = 'Continue'
 $script = Join-Path $RepoRoot 'scripts\medcare-boot.ps1'
 $tasks = @(
@@ -44,7 +46,7 @@ if ($Uninstall) {
 }
 
 if (-not (Test-Path -LiteralPath $script)) { Write-Host "missing $script"; exit 1 }
-$command = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"{1}' -f $script, '')
+$command = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -RepoRoot "{1}"' -f $script, $RepoRoot)
 # The logon entry: a shortcut in the user's Startup folder (no admin needed; schtasks refuses /SC ONLOGON without it).
 $startupDir = [Environment]::GetFolderPath('Startup')
 $shortcut = Join-Path $startupDir 'MedCare Reachy startup.lnk'
@@ -58,7 +60,7 @@ foreach ($t in $tasks) {
         $shell = New-Object -ComObject WScript.Shell
         $link = $shell.CreateShortcut($shortcut)
         $link.TargetPath = 'powershell.exe'
-        $link.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $script)
+        $link.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -RepoRoot "{1}"' -f $script, $RepoRoot)
         $link.WorkingDirectory = $RepoRoot
         $link.Description = 'Brings the MedCare Reachy stack up after sign-in (scripts\medcare-boot.ps1)'
         $link.Save()

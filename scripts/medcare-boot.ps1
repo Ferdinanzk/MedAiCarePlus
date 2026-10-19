@@ -18,9 +18,11 @@ param(
     [switch]$Reconcile,
     [switch]$NoRobot,
     [switch]$NoLine,
-    [string]$RepoRoot = 'C:\medcareai\MedAiCarePlus',
+    [string]$RepoRoot = '',
     [string]$ComposeProject = 'medcareai2'
 )
+# The default is this script's own repo (the folder above scripts\), so a copy in any folder runs against itself.
+if (-not $RepoRoot) { $RepoRoot = Split-Path $PSScriptRoot -Parent }
 
 $ErrorActionPreference = 'Continue'
 $script:Mode = if ($Reconcile) { 'RECONCILE' } else { 'STARTUP' }
