@@ -845,9 +845,16 @@ class _FamilyConn(_ReminderConn):
         return await super().fetch(query, *args)
 
 
-def _run_at(monkeypatch, moment, rows):
-    """check_missed_doses at `moment` over `rows` (family on); returns (robot calls, patient texts, family alerts,
-    the conn)."""
+_A_MINUTE_BEFORE = object()
+
+
+def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE):
+    """check_missed_doses at `moment` over `rows` (family on), the job's previous run at `last_run` (default: a minute
+    before, as in normal operation; None: the first run since the process started); returns (robot calls, patient
+    texts, family alerts, the conn)."""
+    if last_run is _A_MINUTE_BEFORE:
+        last_run = moment - timedelta(minutes=1)
+    monkeypatch.setattr(missed_dose_job, "_last_run_at", last_run)
 
     class _Clock(datetime):
         @classmethod
@@ -876,12 +883,16 @@ def _run_at(monkeypatch, moment, rows):
 SLOT_20 = datetime(2026, 10, 16, 10, 5, tzinfo=timezone.utc)            # 18:05 in Taipei
 
 
-def test_after_an_outage_a_slot_past_its_last_retry_is_only_reported_missed_while_offline(monkeypatch):
+@pytest.mark.parametrize("last_run", [
+    None,                                   # the first run since the server came back (16 Oct: the process restarted)
+    SLOT_20 + timedelta(minutes=5),         # the job's last run came before the slot's first retry (+10 min)
+])
+def test_after_an_outage_a_slot_past_its_last_retry_is_only_reported_missed_while_offline(monkeypatch, last_run):
     """16 Oct 2026: the server came back at 22:57 and the first run sent the 18:05 slot a "(10m) please take it as
     soon as possible" text and a robot task, then the missed alerts within a second. A slot first seen past its last
     retry gets neither: only the missed alerts, which say it was missed while the system was offline."""
     rows = _reminder_rows(SLOT_20, reminder_sent=False, retries_sent=0)
-    calls, sent, family, conn = _run_at(monkeypatch, SLOT_20 + timedelta(hours=4, minutes=52), rows)
+    calls, sent, family, conn = _run_at(monkeypatch, SLOT_20 + timedelta(hours=4, minutes=52), rows, last_run)
     assert calls == []                                              # no robot for a slot 4.5 h old
     (text,) = sent                                                  # the missed alert alone
     assert "請盡快服用" not in text and "逾時" not in text
@@ -910,6 +921,23 @@ def test_a_slot_reached_on_time_keeps_its_last_retry_and_plain_missed_alerts(mon
     assert "請盡快服用" in retry and missed.startswith("❌ 用藥未完成") and "系統離線" not in missed
     ((args, kwargs),) = family
     assert kwargs == {"offline": False}
+
+
+def test_a_dose_back_from_family_confirmation_late_is_not_called_missed_while_offline(monkeypatch):
+    """A dose sent to family before its first retry comes back 'pending' when family answer 'not taken' or the
+    request expires after 2 h (dose_confirmation._restore), with its retry count still 0: the job reads only
+    'pending' rows, so it counted none meanwhile. The job ran all along, so its missed alerts must not say the
+    system was offline."""
+    rows = _reminder_rows(SLOT_20, reminder_sent=True, retries_sent=0)
+    moment = SLOT_20 + timedelta(hours=2, minutes=1)
+    calls, sent, family, conn = _run_at(monkeypatch, moment, rows)          # the previous run a minute ago
+    assert sent and not any("系統離線" in text for text in sent)
+    assert sent[-1].startswith("❌ 用藥未完成")
+    ((args, kwargs),) = family
+    assert kwargs == {"offline": False}
+    executed = [entry[1] for entry in conn.log if entry[0] == "execute"]
+    assert any(q.startswith("UPDATE intake SET intake_stats = 'missed'") for q in executed)
+    assert missed_dose_job._last_run_at == moment                            # this run is the next one's evidence
 
 
 def test_the_family_alert_says_the_dose_was_missed_while_the_system_was_offline():

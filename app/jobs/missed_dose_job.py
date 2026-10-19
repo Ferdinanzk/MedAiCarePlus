@@ -19,6 +19,8 @@ SLOT_WINDOW_MINUTES = 5
 # minute, so in normal operation it reaches each retry within a run or two.
 OFFLINE_GRACE_SECONDS = 120
 OFFLINE_NOTE = "（這段時間系統離線，沒能及時提醒您。）"
+# When this process last finished a run of the job (None until its first one): the evidence that it was running.
+_last_run_at: datetime | None = None
 
 
 def _slot_key(intake_time: datetime) -> datetime:
@@ -59,8 +61,10 @@ async def check_missed_doses():
     2. Overdue retry warnings (+10, +20, etc. mins after slot_time) -> category user.
     3. Final missed alerts (after max retries) -> category user & category family.
     """
+    global _last_run_at
     pool = get_pool()
     now = datetime.now(timezone.utc)
+    previous_run = _last_run_at
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -82,6 +86,7 @@ async def check_missed_doses():
         )
 
         if not rows:
+            _last_run_at = now
             return
 
         line_svc = LineService.get_instance()
@@ -132,9 +137,14 @@ async def check_missed_doses():
             # After an outage (16 Oct 2026: the first run after the server came back sent the 18:05 and 18:25 slots,
             # about 4.5 h late, a "(10m) please take it as soon as possible" text, a robot task and, in the same second,
             # the missed alerts), a slot this run first sees past its last retry gets only the missed alerts, which
-            # say it was missed while the system was offline.
+            # say it was missed while the system was offline. The retry count alone is no evidence: a dose back from a
+            # family confirmation ('not taken', or the request expired after 2 h) is 'pending' again with no retry
+            # counted, because the job reads only 'pending' rows. So it is offline only when this process did not run
+            # the job since the slot's first reminder was due (its first retry, or the missed alert with no retries).
+            first_due = slot_time + timedelta(seconds=remind_after_secs if remind_after_retries > 0 else 0)
             missed_offline = (group_retry_count == 0 and
-                              time_since_slot >= remind_after_retries * remind_after_secs + OFFLINE_GRACE_SECONDS)
+                              time_since_slot >= remind_after_retries * remind_after_secs + OFFLINE_GRACE_SECONDS and
+                              (previous_run is None or previous_run < first_due))
             # A Reachy task for this slot stays useful until the missed window ends.
             task_expires_at = slot_time + timedelta(minutes=remind_after_minutes * (remind_after_retries + 1))
             # Overdose protection, judged on this run's clock when a reminder goes out: the robot is sent for the
@@ -268,3 +278,5 @@ async def check_missed_doses():
                             f"Missed dose final alert for {slot_label} slot ({len(med_names)} med(s)): {', '.join(med_names)}"
                             + (" (missed while the system was offline)" if missed_offline else ""),
                         )
+
+    _last_run_at = now   # only a run that finished: one that failed (the database down) is no evidence
