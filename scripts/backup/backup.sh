@@ -48,11 +48,22 @@ prune_backups() {
     find /backups/weekly -maxdepth 1 -type f -name '.*.tar.gpg.tmp' -mtime +0 -delete
 }
 
+backup_due() {
+    # $1 today (YYYY-MM-DD), $2 the time (HH:MM). At 02:30, and once after 02:30 while today's nightly folder is
+    # missing: a start later in the day catches up (the PC was off or Docker down at 02:30; 15-16 Oct 2026 have no
+    # backup), and so does a loop whose 60 s sleeps stepped over the 02:30 minute.
+    [ "$last_attempt" != "$1" ] || return 1
+    [ "$2" = "02:30" ] && return 0
+    hour=${2%:*}
+    minute=${2#*:}
+    [ $(( ${hour#0} * 60 + ${minute#0} )) -gt 150 ] && [ ! -d "/backups/nightly/$1" ]
+}
+
 last_attempt=""
 while :; do
     prune_backups
     today=$(date +%F)
-    if [ "$(date +%H:%M)" = "02:30" ] && [ "$last_attempt" != "$today" ]; then
+    if backup_due "$today" "$(date +%H:%M)"; then
         last_attempt=$today
         # Run outside a conditional so set -e remains effective in the subshell.
         set +e
