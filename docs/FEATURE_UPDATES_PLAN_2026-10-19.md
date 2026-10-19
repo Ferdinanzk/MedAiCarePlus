@@ -24,6 +24,21 @@ Items 0-4 need **no robot change** (robot app 0.16.0 already handles everything 
 About 9-11 working days in all, plus robot tests with the user. Suggested release: server items 0-4 and the server half
 of 5-6 first (one server deploy, no robot deploy), then robot app 0.17.0 for 4-6.
 
+## The user's decisions (19 Oct 2026)
+
+1. **A reminder for a medicine that is not due yet** (like secondmed at 11:24): "Tell the person to wait." Reachy
+   says the medicine is not due yet and when it is; no dose task. (Item 1.)
+2. **Family answers while no chat is running:** "Wake up and speak." The robot wakes, finds the patient and says it.
+   (Item 2.)
+3. **"Different voice":** "It should use the gpt-live voice." Reading A: every medicine line in the live voice
+   (marin). (Items 5 and 6.)
+4. **"Not taken" mid-chat:** "it will tell 阿公 to eat his medicine and be more empathetic." Reachy encourages the
+   patient warmly to take it now. (Items 2-3.) This answer was given to the question about item 4's retry, which
+   stays open (see item 4).
+5. **The name before the camera confirms the patient:** "Yes, it should use the name defined in the system." The
+   greeting says the call name at wake: the name set on the Reachy card, else the registered name, by today's rule
+   (`memory.call_name`). (Item 5.)
+
 ---
 
 ## 0. A dose filed on the patient's intention (safety bug, not on the list)
@@ -76,9 +91,15 @@ is still waiting for family: the user decides whether to leave it.
 4. The robot already does the rest on 0.16.0: the next heartbeat (every 10 s) answers `task_due`, the robot waits for
    the patient to stop talking (at most 30 s), says 「該吃藥囉，我們等一下再聊。」, ends the chat, runs its own dose flow
    with the camera at full rate (`runner.py:671-673`, `session.py:225`), then starts a new check-in.
-5. A dose refused, taken or already waiting for family: no task; the line plus the reason.
-6. With no chat running: queue the same dose task instead of a check-in.
-7. Also: `set_reminder` accepts "my medicine" without a name, and warns when it is set that no dose is due then.
+5. **A dose not due yet (the user's decision: "tell the person to wait"):** no task. Reachy says it is not time yet
+   and when it is, e.g. 「secondmed 要到下午6點27分才吃喔，請再等一下。」. "Not due" is judged by the dose's own time
+   (`schedule.due_from`, the 120-minute early window) even when overdose protection is off, so a reminder never starts
+   a dose early.
+6. A dose refused, taken or already waiting for family: no task; the line plus the reason.
+7. With no chat running: queue the same dose task instead of a check-in (or, when not due, the check-in that says to
+   wait).
+8. Also: `set_reminder` accepts "my medicine" without a name. When it is set for a time when no dose is due, it says
+   so then too (Claude's reading of "tell the person to wait"; the user can overrule it).
 
 The other option, telling GPT-Live to run the medicine steps inside the chat, is server-only too, but it depends on
 GPT-Live following five steps (item 0 shows it skipping the camera), and the chat camera runs at 2 fps, where the
@@ -88,12 +109,11 @@ intake detector is not calibrated.
 or waiting: no task; a two-medicine slot with one refused; no duplicate task for a slot already queued; no chat: a dose
 task; `set_reminder` for "my medicine". One robot test: 「一分鐘後提醒我吃藥」 with a dose due.
 
-**Risks.** With overdose protection off (as for u_id 2) the reminder could start a dose hours early, as the "Use
-Reachy" button already can. 10-40 s pass between the reminder line and 「該吃藥囉」.
+**Risks.** 10-40 s pass between the reminder line and 「該吃藥囉」. (A dose hours early is ruled out by decision 1.)
 
 **Questions.**
-1. If no dose of that medicine is due, should the reminder start it early (protection off) or only say the line?
-2. Should `set_reminder` warn when it is set that no dose is due then?
+1. ~~If no dose is due, start it early or only remind?~~ Decided: tell the patient to wait.
+2. ~~Warn when it is set?~~ Planned as Claude's reading of decision 1; the user can overrule it.
 3. After the dose, a new chat (the robot's current behaviour), or continue the same one?
 4. Both lines (the reminder, then 「該吃藥囉」), or only 「該吃藥囉」?
 
@@ -117,11 +137,14 @@ Reachy said nothing until someone in the room said 「阿公好像沒有吃藥�
 3. The running chat (`reminders.find_relay`): a new `LiveRelay.announce_dose(news)` that waits for a quiet moment
    like `speak`, never after a risk. GPT-Live running: the new status in its instructions, then commentary (it says
    it in its own words and keeps talking). Paused: a fixed line in the live voice (`speak`). Taken: the applause.
-4. No chat: a new `announced_at` column on `dose_confirmation`; the next chat within about 30 minutes says it once,
-   after its opening. Text chat: a note in the next reply's prompt.
-5. **"Not taken, may take now" (item 3):** the encouragement below, then, if the patient agrees, the dose task of
-   item 1, so the camera watches the dose (encouragement alone could lead to an unwatched second dose after a wrong
-   tap).
+4. **No chat (the user's decision: "wake up and speak"):** queue a check-in task that carries the news (like
+   `reminders._queue_checkin` carries a reminder). The robot wakes, finds the patient, and the chat opens with the
+   news right after its greeting; for "not taken, may take now" the dose task of step 5 instead. A new
+   `announced_at` column on `dose_confirmation` makes sure it is said once (also when a chat starts meanwhile). Text
+   chat: a note in the next reply's prompt.
+5. **"Not taken, may take now" (item 3; the user: "tell 阿公 to eat his medicine and be more empathetic"):** the warm
+   encouragement below, then the dose task of item 1, so the robot's dose flow runs and the camera watches the dose
+   (encouragement alone could lead to an unwatched second dose after a wrong tap).
 
 **Suggested words** (`{name}` from `memory.call_name`):
 - Taken: 「{name}，家人剛剛確認您已經吃藥了，拍拍手！您越來越健康了！」
@@ -141,8 +164,9 @@ said once in the next chat; the text chat's note.
 reword or drop a sentence of commentary. Two answers at once must merge into one line.
 
 **Questions.**
-1. No chat running: wake the robot to say it, say it in the next chat (recommended), or say nothing?
-2. "Not taken, may take now": only encourage, or encourage and offer the camera-watched dose (recommended)?
+1. ~~No chat running?~~ Decided: wake up and speak. New: should the robot also wake at night (for example between
+   22:00 and 07:00), or keep the news for the morning?
+2. ~~Only encourage?~~ Decided: tell 阿公 to take it, warmly; the plan adds the camera-watched dose task.
 3. If the patient insists "I did take it", keep encouraging, or stop and ask family again?
 4. "Taken": GPT-Live's own praise, or the fixed line?
 5. Should family get a LINE note when a request expires unanswered (today nothing)?
@@ -181,7 +205,8 @@ alert family on a match. A record or request made just before the stop stands.
 
 **Questions.**
 1. Who may press it (assumed: the patient's own web login)?
-2. Should Reachy come back at the missed-dose retry for that slot (recommended: yes)?
+2. Should Reachy come back at the missed-dose retry for that slot (recommended: yes)? Still open: the user's answer
+   of 19 Oct to this question was about the "not taken" case (decision 4).
 3. What should Reachy say (e.g. 「好的，我先休息了，有需要再叫我。」), and always go to sleep?
 4. Should a queued "Talk to Reachy now" task be cancelled too?
 5. One button, or a separate "end the chat only"?
@@ -206,8 +231,9 @@ registered name and is unused).
 **Questions.**
 1. Exact words: keep 「請吃藥」 right before 「請現在吃第一種藥，…」 (it may sound repeated)?
 2. The retry line 「提醒您，現在是吃藥的時間。」: add the name too?
-3. The name is said before the patient is verified, so a visitor hears it: OK, or say it after verification?
-4. When no call name is set, use the registered name (today's rule), or 「您好」?
+3. ~~Say the name before verification?~~ Decided: yes, at wake.
+4. ~~Which name?~~ Decided: "the name defined in the system": the Reachy card's call name, else the registered name
+   (today's `memory.call_name` rule); 「您好」 only when neither passes the name rules.
 
 ---
 
@@ -232,7 +258,8 @@ Recommendation: A. Cost is negligible (each line is rendered once, about US$0.00
 `LIVE_VOICE_TEST` (test only; `APP_ENV=prod` refuses it). Outside test mode everything falls back to Matcha. Making it
 work for real patients needs its own switch and a notice that the call name goes to OpenAI (Phase 2b).
 
-**Question.** Reading A (one voice everywhere) or B (and which voice)?
+**Decided:** Reading A. The user: "It should use the gpt-live voice." Every dose-flow line, the call-name greeting of
+item 5 included, is rendered in the live voice (marin), with the robot's Matcha WAV only as the fallback.
 
 ---
 
