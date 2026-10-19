@@ -88,6 +88,12 @@ _ENGLISH_SLOT_PATTERNS = (
     ("after_meals", re.compile(r"\bafter\s+(?:meals?|food|eating)\b", re.IGNORECASE)),
 )
 _LIST_PUNCTUATION = re.compile(r"[\s、，,/／.。・;；:：()（）\[\]]+")
+# A warning against an empty stomach (「飯後服用，避免空腹」, 「不可空腹」, 「勿空腹服用」; "do not take on an empty
+# stomach"), the pharmacy bag's words for NSAIDs and aspirin, says "take it with food": removed before the slot words
+# are read, so it marks no before_meals (review of quick fixes 3). reachy_tasks.after_meal removes it too. Read
+# before the punctuation goes, so 「特別：空腹服用」 never becomes 別空腹.
+NOT_EMPTY_STOMACH = re.compile(r"(?:勿|避免|不可|不要|不宜|不能|忌|非)\s*空腹")
+_NOT_EMPTY_STOMACH_EN = re.compile(r"\b(?:not|never|avoid|don't)\b[^.;,]{0,20}?\bempty stomach\b", re.IGNORECASE)
 
 
 def _nfkc(text) -> str:
@@ -218,14 +224,15 @@ def parse_frequency(text: str) -> dict:
     if interval is not None and not 1 <= interval <= 72:
         interval = None
 
-    compact = _LIST_PUNCTUATION.sub("", _NIGHT_BEFORE_BED.sub("", raw))
+    compact = _LIST_PUNCTUATION.sub("", NOT_EMPTY_STOMACH.sub("", _NIGHT_BEFORE_BED.sub("", raw)))
     for slot, pattern in _CJK_SLOT_PATTERNS:
         if pattern.search(compact):
             schedule[slot] = True
     if _THREE_MEALS.search(compact):
         schedule.update(morning=True, noon=True, night=True)
+    english = _NOT_EMPTY_STOMACH_EN.sub("", raw)
     for slot, pattern in _ENGLISH_SLOT_PATTERNS:
-        if pattern.search(raw):
+        if pattern.search(english):
             schedule[slot] = True
     for slot in code_slots:
         schedule[slot] = True

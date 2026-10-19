@@ -425,12 +425,28 @@ def test_an_after_meal_dose_is_marked_by_its_schedule_or_its_instructions():
     ({"after_meals": True, "noon": True}, "飯前"),
     ({"after_meals": True}, "飯前30分鐘服用"),
     (None, "餐前服用，飯後亦可"),
-    ({"after_meals": True}, "餐前服用")])
+    ({"after_meals": True}, "餐前服用"),
+    ({"after_meals": True}, "請空腹服用，勿與牛奶併服"),   # a 勿 elsewhere keeps the 空腹
+    ({"after_meals": True}, "特別：空腹服用")])
 def test_an_empty_stomach_or_before_meal_dose_is_never_after_a_meal(schedule_time, instructions):
     """Quick fixes 3 of 19 Oct 2026: no meal question for such a medicine. schedule_time.before_meals, or 空腹, 飯前 or
     餐前 anywhere in the instructions, wins over after_meals and over 飯後 or 餐後 in the same words."""
     lunch = T0 + timedelta(hours=4)   # 12:00 in Taipei
     assert reachy_tasks.after_meal(schedule_time, instructions, lunch) is False
+
+
+@pytest.mark.parametrize("schedule_time, instructions", [
+    (None, "飯後服用，避免空腹"),
+    (None, "不可空腹，飯後服用"),
+    ({"after_meals": True}, "勿空腹服用"),
+    ({"after_meals": True}, "請勿空腹服用"),
+    (None, "飯後服用，不宜空腹")])
+def test_a_warning_against_an_empty_stomach_keeps_the_meal_question(schedule_time, instructions):
+    """Review of quick fixes 3: 「飯後服用，避免空腹」, 「不可空腹，飯後服用」 and 「勿空腹服用」 say "take it with food" (the
+    pharmacy bag's warning on NSAIDs and aspirin). Such a 空腹 (ocr_parsing.NOT_EMPTY_STOMACH) is no empty-stomach
+    medicine: the meal question stays, as in quick fixes 2."""
+    lunch = T0 + timedelta(hours=4)   # 12:00 in Taipei
+    assert reachy_tasks.after_meal(schedule_time, instructions, lunch) is True
 
 
 def test_each_dose_of_the_payload_says_whether_it_is_taken_after_a_meal(db):
