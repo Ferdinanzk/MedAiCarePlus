@@ -601,6 +601,22 @@ def test_a_frame_the_server_holds_up_is_logged_with_where_it_waited(env, frames,
     assert "waiting for the session's frame lock" in lines[0] and "computing landmarks" in lines[0]
 
 
+def test_a_frame_for_a_session_that_just_ended_answers_409_not_500(env, frames, monkeypatch):
+    """The intake detector ends a session at its completion barrier; a frame already past the frame lock's
+    state.ended check then meets SessionEnded inside registry.landmarks, and gets the same 409 as the check gives."""
+    from app.services.intake_detection import SessionEnded
+
+    assert frames.post(1, 100.0).status_code == 200
+
+    async def ended(state, packet):
+        raise SessionEnded("session_ended")
+
+    monkeypatch.setattr(env.registry, "landmarks", ended)
+    late = frames.post(2, 100.1)
+    assert late.status_code == 409
+    assert late.json()["detail"] == "Session expired or belongs to another account"
+
+
 def test_frame_stream_needs_a_live_session_and_the_models(env, frames, monkeypatch):
     other = env.robot.post("/api/device/monitor/frame", data={
         "session_id": str(uuid.uuid4()), "generation": str(uuid.uuid4()), "frame_seq": "1", "timestamp": "1"},

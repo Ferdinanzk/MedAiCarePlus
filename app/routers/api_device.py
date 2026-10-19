@@ -23,6 +23,7 @@ from app.services import (after_chat, ai_settings, consent_service, conversation
                           live_session, memory, outbox, reachy_tasks, reminders, schedule)
 from app.services.device_auth import get_device, get_device_for_heartbeat, get_device_ws
 from app.services.face_recognition_service import FaceRecognitionService
+from app.services.intake_detection import SessionEnded
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
 from app.services.live_session import _in_background
@@ -983,6 +984,9 @@ async def monitor_frame(session_id: str = Form(...), generation: str = Form(...)
         try:
             payload = LandmarkPayload(session_id=session_id, generation=generation, **packet)
             response = await registry.landmarks(state, payload.model_dump())
+        except SessionEnded as exc:
+            # The detector ended the session after the state.ended check above (its completion barrier): same answer.
+            raise HTTPException(409, "Session expired or belongs to another account") from exc
         except (ValidationError, ValueError, TypeError, IndexError) as exc:
             raise HTTPException(422, str(exc)) from exc
     done = time.monotonic()
