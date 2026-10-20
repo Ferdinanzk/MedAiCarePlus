@@ -854,8 +854,14 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
     if payload.camera is not None:
         detail["camera"] = payload.camera.model_dump()   # the Reachy card reads it through /api/reachy/status
     if payload.companion:
-        detail["companion"] = True   # the missed-dose job reads it (reachy_tasks.meal_retry_waiting_sql)
+        detail["companion"] = True   # a companion session runs; companion_task (below) names the task it belongs to
     async with get_pool().acquire() as conn, conn.transaction():
+        if payload.companion:
+            # The task the session belongs to (a plain read, no lock): the missed-dose job releases a meal retry's
+            # hold only in that task's own chat (reachy_tasks.meal_retry_waiting_sql), as the flag lags a heartbeat.
+            task_id = await reachy_tasks.companion_task(conn, device["device_id"])
+            if task_id is not None:
+                detail["companion_task"] = task_id
         await conn.execute(
             "UPDATE reachy_device SET last_seen_at = NOW(), robot_reachable = $2, landmark_fps = $3, "
             "status_detail = $4::jsonb WHERE device_id = $1::uuid",

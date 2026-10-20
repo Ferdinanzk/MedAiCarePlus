@@ -140,20 +140,29 @@ class FakeDB:
         """reachy_tasks.meal_retry_waiting_sql: while the patient's robot is online (a heartbeat within
         OFFLINE_AFTER_SECONDS), a meal retry holds the dose when it has not reached the patient yet (queued, leased or
         searching), or when Reachy is with the patient for it (in_progress) unless the robot's latest heartbeat said a
-        companion session runs (status_detail's companion flag)."""
+        companion session runs for that very meal retry (status_detail's companion_task names it)."""
         device = self.devices.get(7)
         online = (device is not None and not device["revoked"] and device["last_seen_at"] is not None
                   and device["last_seen_at"] >= self.now - timedelta(seconds=reachy_tasks.OFFLINE_AFTER_SECONDS))
-        companion = online and (device["status_detail"] or {}).get("companion") is True
-        holding = ("queued", "leased", "searching") + (() if companion else ("in_progress",))
-        return online and any(t.get("not_before") is not None and t["status"] in holding
-                              and intk_id in t["intk_ids"] for t in self.tasks)
+        companion_task = (device["status_detail"] or {}).get("companion_task") if online else None
+
+        def holds(t):
+            return t["status"] in ("queued", "leased", "searching") or (
+                t["status"] == "in_progress" and str(t["task_id"]) != companion_task)
+        return online and any(t.get("not_before") is not None and holds(t) and intk_id in t["intk_ids"]
+                              for t in self.tasks)
 
     # asyncpg surface
     async def fetchval(self, query, *args):
         if "SELECT device_id FROM reachy_device" in query:
             device = self.devices.get(args[0])
             return device["device_id"] if device and not device["revoked"] else None
+        if query.startswith("SELECT task_id::text FROM reachy_task"):   # companion_task: a companion heartbeat's task
+            assert query == ("SELECT task_id::text FROM reachy_task WHERE lease_owner = $1::uuid "
+                             "AND status = 'in_progress' ORDER BY slot_time LIMIT 1")   # a plain read: no lock
+            held = sorted((t for t in self.tasks if t["lease_owner"] == args[0] and t["status"] == "in_progress"),
+                          key=lambda t: t["slot_time"])
+            return str(held[0]["task_id"]) if held else None
         if "INSERT INTO reachy_task" in query:
             assert "expires_at, not_before) VALUES" in query   # the meal retry's time is a column, not a timer
             task_id, u_id, slot, intk_ids, reason, expires, not_before = args
@@ -245,8 +254,9 @@ class FakeDB:
             assert ("meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
                     f"NOW() - INTERVAL '{reachy_tasks.OFFLINE_AFTER_SECONDS} seconds' AND (") in query
             assert "meal.status IN ('queued','leased','searching')" in query
-            assert ("OR (NOT COALESCE((meal_device.status_detail->>'companion')::boolean, FALSE) AND EXISTS "
-                    "(SELECT 1 FROM reachy_task meal") in query and "meal.status IN ('in_progress')" in query
+            assert ("meal.status IN ('in_progress') AND i.intk_id = ANY(meal.intk_ids) AND "
+                    "(meal_device.status_detail->>'companion_task') IS DISTINCT FROM meal.task_id::text)") in query
+            assert "status_detail->>'companion')" not in query   # the flag alone never releases a meal retry
             return [{"id": i, "u_id": 7, "intake_time_stamp": d["intake_time_stamp"], "reminder_sent": True,
                      "missed_reminders_sent": d.get("missed_reminders_sent", 0), "med_id": d["med_id"],
                      "med_name": d["med_name"], "patient_name": self.users[7], "patient_line_id": "U1",
@@ -1291,8 +1301,15 @@ def _job_on(db, monkeypatch, online=True):
 
 def _heartbeat(db, companion=False):
     """What api_device.heartbeat writes for the patient's robot at db.now: last_seen_at, a status_detail that has the
-    companion flag only while a companion session runs, and then extend_for_companion."""
-    db.devices[7].update(last_seen_at=db.now, status_detail={"companion": True} if companion else {})
+    companion flag and the task the session belongs to (reachy_tasks.companion_task: the task the robot holds in
+    progress) only while a companion session runs, and then extend_for_companion."""
+    detail = {}
+    if companion:
+        detail["companion"] = True
+        task_id = run(reachy_tasks.companion_task(db, DEVICE))
+        if task_id is not None:
+            detail["companion_task"] = task_id
+    db.devices[7].update(last_seen_at=db.now, status_detail=detail)
     if companion:
         run(reachy_tasks.extend_for_companion(db, DEVICE))
 
@@ -1479,10 +1496,10 @@ def test_a_dose_left_pending_in_a_meal_retry_gets_the_jobs_next_retry_and_ends_t
     """Review of quick fix 4: a meal retry holds its dose only until the companion chat after it. At 07:56 the patient
     says "not yet", and the job's +10 min retry is counted silently while the meal retry waits. At 08:16 the meal
     retry is leased, the patient says "eaten", the watch sees nothing and the dose is left pending; the robot goes on
-    to the check-in, whose heartbeats say a companion session runs (status_detail's companion flag) and keep the task
-    in progress (extend_for_companion). At +20 min the job handles the dose as for any dose task: its LINE text and a
-    robot retry for the slot, which is medicine first (task_due), so Reachy ends the chat with 「該吃藥囉」 and leases
-    it next."""
+    to the check-in, whose heartbeats say a companion session runs for the meal retry itself (status_detail's
+    companion_task names it) and keep the task in progress (extend_for_companion). At +20 min the job handles the dose
+    as for any dose task: its LINE text and a robot retry for the slot, which is medicine first (task_due), so Reachy
+    ends the chat with 「該吃藥囉」 and leases it next."""
     db.doses[102]["intake_stats"] = "taken"            # the slot's one dose to take: Metformin (101)
     db.now = T0 - timedelta(minutes=4)
     task_id = enqueue(db, intk_ids=(101,))
@@ -1496,6 +1513,7 @@ def test_a_dose_left_pending_in_a_meal_retry_gets_the_jobs_next_retry_and_ends_t
         run(reachy_tasks.set_status(7, DEVICE, meal["task_id"], status, None))
     db.now = T0 + timedelta(minutes=17)
     _heartbeat(db, companion=True)   # the check-in's heartbeat, after the dose was left pending
+    assert db.devices[7]["status_detail"] == {"companion": True, "companion_task": str(meal["task_id"])}
     db.now = T0 + timedelta(minutes=20)
     (text,) = _job_on(db, monkeypatch)
     assert "逾時 20 分鐘" in text and "Metformin" in text and "請盡快服用" in text
@@ -1547,6 +1565,37 @@ def test_a_meal_retry_with_the_patient_after_the_missed_window_keeps_its_dose_fr
     db.now = T0 + timedelta(minutes=39)
     (missed,) = _job_on(db, monkeypatch)
     assert missed.startswith("❌ 用藥未完成") and "Metformin" in missed and db.doses[101]["intake_stats"] == "missed"
+
+
+@pytest.mark.parametrize("not_yet_minutes, retries", [(0, 2), (15, 3)])
+def test_a_companion_flag_left_from_another_tasks_chat_keeps_the_meal_retrys_hold(db, monkeypatch, not_yet_minutes,
+                                                                                  retries):
+    """Review of quick fixes 4 and 5: the companion flag belongs to the device and lags by up to one heartbeat. The
+    patient says "not yet" (08:00, so the meal retry comes at 08:20, the job's +20 min retry; or 08:15, so it comes at
+    08:35, after the slot's missed window) and presses 'Talk to Reachy now' at 08:16 or 08:31. The heartbeat at the
+    meal retry's not_before says a companion session runs, for the check-in, and answers task_due: Reachy ends that
+    chat, completes the check-in, leases the meal retry at once and is with the patient for it (in_progress) before
+    the next heartbeat. The stored flag names the check-in, not the meal retry, so the hold stays: no LINE text, no
+    second visit for the slot, no missed mark and nothing that interrupts the dose (task_due)."""
+    task_id, meal = _not_yet_for_metformin(db, T0 + timedelta(minutes=not_yet_minutes))
+    for minutes in range(10, (meal["not_before"] - T0).seconds // 60, 10):
+        db.now = T0 + timedelta(minutes=minutes)
+        assert _job_on(db, monkeypatch) == []   # the meal retry is queued: held, its retries counted
+    db.now = meal["not_before"] - timedelta(minutes=4)
+    checkin = enqueue(db, reason="checkin", slot=db.now, intk_ids=())
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == checkin   # the meal retry is not due yet
+    for status in ("searching", "in_progress"):
+        run(reachy_tasks.set_status(7, DEVICE, checkin, status, None))
+    db.now = meal["not_before"]
+    _heartbeat(db, companion=True)   # the check-in's chat
+    assert db.devices[7]["status_detail"] == {"companion": True, "companion_task": checkin}
+    assert run(reachy_tasks.task_due(db, 7)) is True   # the meal retry is due: Reachy ends the chat for it
+    run(reachy_tasks.set_status(7, DEVICE, checkin, "completed", {"outcomes": {"checkin": "medicine"}}))
+    _reachy_with_the_patient(db, meal)   # before the next heartbeat: the stored flag still names the check-in
+    assert _job_on(db, monkeypatch) == []
+    assert [t["task_id"] for t in db.tasks] == [task_id, meal["task_id"], checkin]
+    assert (db.doses[101]["intake_stats"], db.doses[101]["missed_reminders_sent"]) == ("pending", retries)
+    assert run(reachy_tasks.task_due(db, 7)) is False
 
 
 def test_a_meal_retry_with_the_patient_holds_nothing_back_while_the_robot_is_offline(db, monkeypatch):

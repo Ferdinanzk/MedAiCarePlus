@@ -33,8 +33,9 @@ TRANSITIONS = {
 _OPEN_SQL = "('queued','leased','searching','in_progress')"
 _MEAL_WAITING_SQL = "('queued','leased','searching')"   # a meal retry that has not reached the patient yet
 _MEAL_WITH_PATIENT_SQL = "('in_progress')"               # Reachy is with the patient for it
-# The robot's latest heartbeat said a companion session runs (api_device.heartbeat keeps the flag in status_detail).
-_COMPANION_SQL = "COALESCE((meal_device.status_detail->>'companion')::boolean, FALSE)"
+# The robot's latest heartbeat did not say a companion session runs for this very meal retry (alias meal):
+# api_device.heartbeat stores the task such a session belongs to as status_detail's companion_task (companion_task()).
+_NOT_ITS_COMPANION_SQL = "(meal_device.status_detail->>'companion_task') IS DISTINCT FROM meal.task_id::text"
 _LOCAL_TZ = ZoneInfo(MEDCARE_TIMEZONE)
 
 
@@ -230,10 +231,12 @@ def _leasable_sql() -> str:
             "WHERE o.intk_id = ANY(t.intk_ids) AND o.intake_stats IN ('pending','missed'))))")
 
 
-def _meal_retry_sql(dose: str, statuses: str) -> str:
-    """A meal retry (a not_before) in one of `statuses` holds the dose `dose` (an intake alias)."""
+def _meal_retry_sql(dose: str, statuses: str, also: str = "") -> str:
+    """A meal retry (a not_before) in one of `statuses` holds the dose `dose` (an intake alias); `also` is one more
+    condition on that meal retry (alias meal)."""
+    also = f" AND {also}" if also else ""
     return (f"EXISTS (SELECT 1 FROM reachy_task meal WHERE meal.u_id = {dose}.u_id AND meal.not_before IS NOT NULL "
-            f"AND meal.status IN {statuses} AND {dose}.intk_id = ANY(meal.intk_ids))")
+            f"AND meal.status IN {statuses} AND {dose}.intk_id = ANY(meal.intk_ids){also})")
 
 
 def meal_retry_waiting_sql(dose: str) -> str:
@@ -242,14 +245,17 @@ def meal_retry_waiting_sql(dose: str) -> str:
     for it meanwhile. It holds while it has not reached the patient yet (queued, leased or searching), and while
     Reachy is with the patient for it (in_progress: the meal question, the prompt, the watch, family's answer), so
     the job sends no second visit for the slot and no missed mark while Reachy prompts the dose (re-review of quick
-    fix 4). The exception is the companion chat after the dose (the robot's latest heartbeat says one runs): there a
-    dose left pending gets the job's next retry, a task of the slot's own that task_due reports, and the chat ends
-    for the medicine instead of holding the dose for as long as it runs (review of quick fix 4). A robot offline
-    holds nothing back: the patient gets the LINE reminders the robot-offline notice promises family."""
+    fix 4). The exception is the companion chat after the dose (the robot's latest heartbeat says one runs for this
+    meal retry): there a dose left pending gets the job's next retry, a task of the slot's own that task_due reports,
+    and the chat ends for the medicine instead of holding the dose for as long as it runs (review of quick fix 4).
+    The heartbeat names the task the chat belongs to (companion_task), because its flag lags by up to one heartbeat:
+    a flag left from another task's chat (task_due ended it, and the robot is already with the patient for the meal
+    retry) releases nothing (review of quick fixes 4 and 5). A robot offline holds nothing back: the patient gets the
+    LINE reminders the robot-offline notice promises family."""
     return (f"EXISTS (SELECT 1 FROM reachy_device meal_device WHERE meal_device.u_id = {dose}.u_id "
             "AND meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
             f"NOW() - INTERVAL '{OFFLINE_AFTER_SECONDS} seconds' AND ({_meal_retry_sql(dose, _MEAL_WAITING_SQL)} "
-            f"OR (NOT {_COMPANION_SQL} AND {_meal_retry_sql(dose, _MEAL_WITH_PATIENT_SQL)})))")
+            f"OR {_meal_retry_sql(dose, _MEAL_WITH_PATIENT_SQL, _NOT_ITS_COMPANION_SQL)}))")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
@@ -478,6 +484,16 @@ async def extend_for_companion(conn, device_id: str) -> None:
         "UPDATE reachy_task SET expires_at = GREATEST(expires_at, "
         f"NOW() + INTERVAL '{COMPANION_TASK_EXTEND_SECONDS} seconds') "
         "WHERE lease_owner = $1::uuid AND status = 'in_progress'",
+        device_id)
+
+
+async def companion_task(conn, device_id: str) -> str | None:
+    """The task a companion session belongs to, for the heartbeat that says one runs: the in-progress task the robot
+    holds (the one extend_for_companion keeps open; current_task's order), its id as text, or None. A plain read that
+    locks nothing, so the heartbeat still locks its device row first and the task rows after it."""
+    return await conn.fetchval(
+        "SELECT task_id::text FROM reachy_task WHERE lease_owner = $1::uuid AND status = 'in_progress' "
+        "ORDER BY slot_time LIMIT 1",
         device_id)
 
 
