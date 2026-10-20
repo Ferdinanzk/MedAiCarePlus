@@ -342,3 +342,14 @@ def test_quick_fix_8_names_the_microphone_switch():
         assert name in quick_fix_8, f"CLAUDE.md's quick fix 8 bullet doesn't name {name}"
     section = _section("CLAUDE.md")
     assert section.index("- **Quick fix 7") < section.index("- **Quick fix 8") < section.index("- **Not in 2a")
+
+
+def test_quick_fix_8_says_to_switch_the_microphone_on_before_the_app_stops_following_it():
+    """Review of quick fix 8: volume 0 is the daemon's setting for the whole robot and stays after the robot app stops
+    following the switch (unpaired, consent withdrawn, stopped, rolled back), and the card then says where to raise it."""
+    quick_fix_8 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 8", ("- ", "#")))
+    for words in ("Turn the switch on before unpairing the robot", "rolling it back to 0.17.0",
+                  "raise it by hand in Reachy Mini Control", "at most 20 times", "only while the robot is online",
+                  "機器人的麥克風音量是 0，Reachy 聽不到聲音。請在 Reachy Mini Control 把麥克風音量調高。",
+                  "The robot's microphone volume is 0, so Reachy hears nothing. Raise it in Reachy Mini Control."):
+        assert words in quick_fix_8, f"CLAUDE.md's quick fix 8 bullet doesn't say {words}"
