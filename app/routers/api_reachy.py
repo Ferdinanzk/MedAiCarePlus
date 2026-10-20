@@ -42,6 +42,8 @@ class SettingsPayload(BaseModel):
     # Quick fix 5: Reachy comes back 20 minutes after "not eaten yet" (reachy_tasks._queue_meal_retry). Only true or
     # false: "true", 1 and the like are a 422, so a client's slip never switches it.
     meal_retry: StrictBool | None = None
+    # Quick fix 8: the robot's microphone, off while true (the robot app sets the daemon's microphone volume to 0).
+    mic_muted: StrictBool | None = None
 
 
 class TaskPayload(BaseModel):
@@ -52,14 +54,26 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
-def _camera(status_detail) -> dict | None:
-    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.7.0 send none).
-    asyncpg hands JSONB back as text."""
+def _detail(status_detail) -> dict:
+    """The robot's last heartbeat report (reachy_device.status_detail), {} without one. asyncpg hands JSONB back as
+    text."""
     if status_detail is None:
-        return None
+        return {}
     detail = json.loads(status_detail) if isinstance(status_detail, str) else status_detail
-    camera = detail.get("camera") if isinstance(detail, dict) else None
+    return detail if isinstance(detail, dict) else {}
+
+
+def _camera(status_detail) -> dict | None:
+    """The robot's camera as its last heartbeat reported it, or None (robots older than 0.7.0 send none)."""
+    camera = _detail(status_detail).get("camera")
     return camera if isinstance(camera, dict) else None
+
+
+def _mic_volume(status_detail) -> int | None:
+    """The daemon's microphone volume (0-100) as the robot's last heartbeat reported it, or None: robots older than
+    0.17.1 send none, and a robot whose daemon did not answer sends null (quick fix 8)."""
+    volume = _detail(status_detail).get("microphone_volume")
+    return volume if isinstance(volume, int) and not isinstance(volume, bool) else None
 
 
 async def _status(conn, u_id: int) -> dict:
@@ -71,7 +85,8 @@ async def _status(conn, u_id: int) -> dict:
     task = await conn.fetchrow(
         "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1 "
         "ORDER BY created_at DESC LIMIT 1", u_id)
-    names = await conn.fetchrow('SELECT reachy_call_name, name, reachy_meal_retry FROM "user" WHERE u_id = $1', u_id)
+    names = await conn.fetchrow(
+        'SELECT reachy_call_name, name, reachy_meal_retry, reachy_mic_muted FROM "user" WHERE u_id = $1', u_id)
     stored = names["reachy_call_name"] if names else None
     last_seen = device["last_seen_at"]
     online = last_seen is not None and datetime.now(timezone.utc) - last_seen <= timedelta(seconds=ONLINE_SECONDS)
@@ -89,6 +104,9 @@ async def _status(conn, u_id: int) -> dict:
         "live_voice": bool(device["live_voice"]), "live_voice_test": config.LIVE_VOICE_TEST,
         # Reachy comes back 20 minutes after "not eaten yet" (quick fix 5; off by default).
         "meal_retry": bool(names and names["reachy_meal_retry"]),
+        # The robot's microphone switch (quick fix 8; on by default) and the volume the robot last reported.
+        "mic_muted": bool(names and names["reachy_mic_muted"]),
+        "mic_volume": _mic_volume(device["status_detail"]),
         "robot_reachable": device["robot_reachable"],
         "landmark_fps": float(device["landmark_fps"]) if device["landmark_fps"] is not None else None,
         "camera": _camera(device["status_detail"]),
@@ -152,6 +170,9 @@ async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_
                                payload.meal_retry)
             if not payload.meal_retry:
                 await reachy_tasks.cancel_meal_retries(conn, user["u_id"])
+        if payload.mic_muted is not None:
+            await conn.execute('UPDATE "user" SET reachy_mic_muted = $2 WHERE u_id = $1', user["u_id"],
+                               payload.mic_muted)
         status = await _status(conn, user["u_id"])
     if payload.call_name is not None:   # after the commit: the render reads the new name on its own connection
         voice_lines.render_ahead_for_patient(user["u_id"])
