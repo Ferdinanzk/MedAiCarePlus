@@ -425,3 +425,32 @@ def test_a_gate_reset_is_logged_once_with_its_stage(clock, caplog):
     run, stage = asyncio.run(scenario())
     resets = _lines(caplog, ": reset at stage ")
     assert resets == [f"intake detector of session {run.state.session_id}: reset at stage {stage} (identity)"]
+
+
+def _closed_mouth_observations(detector, face_landmarks, hand_landmarks, width, height, **kwargs):
+    geometry, observations = _observations(detector, face_landmarks, hand_landmarks, width, height, **kwargs)
+    geometry["mouth_open"] = False
+    for observation in observations:
+        observation.mouth_open = False
+    return geometry, observations
+
+
+def test_a_closed_mouth_rejection_is_logged_once_with_its_stage(clock, caplog, monkeypatch):
+    """A whole gesture with the mouth shut: the pipeline rejects it at the withdrawal and makes no candidate."""
+    caplog.set_level(logging.INFO, logger="app.services.monitor_service")
+    monkeypatch.setattr(intake_detection, "build_temporal_observations", _closed_mouth_observations)
+
+    async def scenario():
+        run = _Run(clock)
+        await run.rest(1.0)
+        await run.gesture()
+        await run.rest(1.0)
+        return run
+
+    run = asyncio.run(scenario())
+    resets = _lines(caplog, ": reset at stage ")
+    prefix = f"intake detector of session {run.state.session_id}: reset at stage "
+    assert len(resets) == 1, resets
+    assert resets[0] in (f"{prefix}AT_MOUTH (closed_mouth_sequence_rejected)",
+                         f"{prefix}WITHDRAWING (closed_mouth_sequence_rejected)")
+    assert run.candidates == [] and run.state.latest_detector["stage"] == "READY"

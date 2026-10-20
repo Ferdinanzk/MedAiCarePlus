@@ -409,6 +409,9 @@ class TemporalIntakePipeline:
             # so it cannot prompt and does not block a later real intake attempt.
             self._reset(now, stage=Stage.READY, reason="closed_mouth_sequence_rejected")
             self.tracks.clear()
+            # The result was built before the reset: carry its reason on this one
+            # frame, so the monitor logs it.
+            result["reset_reason"] = "closed_mouth_sequence_rejected"
             return result
 
         event.candidate_id += 1
