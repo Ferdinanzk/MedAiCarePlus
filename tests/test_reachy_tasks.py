@@ -289,6 +289,16 @@ class FakeDB:
                     detail = json.loads(t["detail"] or "{}")
                     t.update(status="aborted", finished_at=args[0], detail=json.dumps({**detail,
                                                                                        "reason": "nothing_to_prompt"}))
+        elif "SET not_before = $3" in query:   # _queue_meal_retry: "not yet" again moves the waiting meal retry
+            assert ("expires_at = GREATEST(expires_at, "
+                    f"$3 + INTERVAL '{reachy_tasks.MANUAL_TASK_MIN_MINUTES} minutes') WHERE u_id = $1 AND status = 'queued' AND not_before IS NOT NULL AND not_before < $3 "
+                    "AND intk_ids && $2::int[]") in query
+            u_id, intk_ids, not_before = args
+            for t in self.tasks:
+                if (t["u_id"] == u_id and t["status"] == "queued" and t.get("not_before") is not None
+                        and t["not_before"] < not_before and set(t["intk_ids"]) & set(intk_ids)):
+                    t.update(not_before=not_before, expires_at=max(t["expires_at"], not_before + timedelta(
+                        minutes=reachy_tasks.MANUAL_TASK_MIN_MINUTES)))
         elif "'dose_expired'" in query:   # maintenance: a meal retry with an open dose expired before the lease
             assert "WHERE t.status = 'queued' AND t.not_before IS NOT NULL AND EXISTS" in query
             assert (f"AND {dose_safety.protected_sql('i')} "
@@ -1341,6 +1351,26 @@ def test_a_dose_resolved_before_the_report_or_already_waiting_gets_no_new_meal_r
     manual = enqueue(db, reason="manual", slot=T0, intk_ids=(101,))   # 'Use Reachy' on the 08:00 dose
     _completed_with(db, manual, {"101": "meal_not_eaten"})
     assert _meal_retries(db) == [retry]
+
+
+def test_not_yet_again_while_a_meal_retry_waits_moves_it_to_20_minutes_after_that_answer(db):
+    """Review of quick fix 4: 'Use Reachy' pressed at 08:12 while the meal retry waits for 08:20, and the patient says
+    "not yet" again. No second meal retry is queued (it counts once towards MEAL_RETRY_LIMIT), and the waiting one
+    comes 20 minutes after that answer (08:32), not minutes after it. Its expiry moves with it, as manual_expires_at
+    would set it from the new time."""
+    task_id = enqueue(db, intk_ids=(101,))
+    _completed_with(db, task_id, {"101": "meal_not_eaten"})
+    (retry,) = _meal_retries(db)
+    assert retry["not_before"] == T0 + timedelta(minutes=20) and retry["expires_at"] == T0 + timedelta(minutes=40)
+    db.now = T0 + timedelta(minutes=12)
+    manual = enqueue(db, reason="manual", slot=T0, intk_ids=(101,))   # 'Use Reachy' on the 08:00 dose
+    _completed_with(db, manual, {"101": "meal_not_eaten"})
+    assert _meal_retries(db) == [retry]
+    assert retry["not_before"] == T0 + timedelta(minutes=32) and retry["expires_at"] == T0 + timedelta(minutes=47)
+    db.now = T0 + timedelta(minutes=31)
+    assert run(reachy_tasks.task_due(db, 7)) is False and run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+    db.now = T0 + timedelta(minutes=32)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
 
 
 @pytest.mark.parametrize("status", ["taken", "pending_confirmation", "skipped"])
