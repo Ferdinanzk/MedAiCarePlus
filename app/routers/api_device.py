@@ -853,6 +853,8 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
               "missing_clips": payload.missing_clips}
     if payload.camera is not None:
         detail["camera"] = payload.camera.model_dump()   # the Reachy card reads it through /api/reachy/status
+    if payload.companion:
+        detail["companion"] = True   # the missed-dose job reads it (reachy_tasks.meal_retry_waiting_sql)
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute(
             "UPDATE reachy_device SET last_seen_at = NOW(), robot_reachable = $2, landmark_fps = $3, "
