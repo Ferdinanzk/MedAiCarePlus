@@ -32,11 +32,18 @@ EXPORT_QUERIES = {
 
 
 def _strip_secrets(account: dict) -> None:
-    """Credential-derived values stay out of the export, even hashed (a dose-video link token opens the clip)."""
+    """Credential-derived values stay out of the export, even hashed (a dose-video link token opens the clip), and so
+    does the robot app's control key from its last heartbeat (quick fix 9: it switches the robot's microphone)."""
     for table, column in (("user", "password_hash"), ("reachy_device", "token_hash"),
                           ("dose_video_link", "token_sha256")):
         for row in account.get(table, []):
             row.pop(column, None)
+    for row in account.get("reachy_device", []):
+        text = isinstance(row.get("status_detail"), str)   # asyncpg hands JSONB back as text
+        detail = json.loads(row["status_detail"]) if text else row.get("status_detail")
+        if isinstance(detail, dict) and "control" in detail:
+            detail = {key: value for key, value in detail.items() if key != "control"}
+            row["status_detail"] = json.dumps(detail) if text else detail
 
 
 class DeletePayload(BaseModel):

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,7 +14,8 @@ from app import config
 from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.jobs.missed_dose_job import _slot_key
-from app.services import consent_service, dose_confirmation, dose_safety, memory, reachy_tasks, schedule, voice_lines
+from app.services import (consent_service, dose_confirmation, dose_safety, memory, reachy_tasks, robot_control,
+                          schedule, voice_lines)
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
@@ -32,6 +34,10 @@ DEMO_SCHEDULE = {"morning": False, "noon": False, "night": False, "bedtime": Fal
 DEMO_STOCK = Decimal(30)       # its stock when made, and when topped up
 DEMO_STOCK_LOW = Decimal(10)   # topped up below this: an as-needed medicine's refill alert comes at 7 doses or fewer
 DEADLOCK = "40P01"             # PostgreSQL's deadlock_detected (asyncpg's DeadlockDetectedError.sqlstate)
+# Quick fix 9: the robot app's control address from its last heartbeat (robot_control), and the volume its answer gave.
+CONTROL_SQL = "SELECT status_detail FROM reachy_device WHERE device_id = $1::uuid"
+MIC_VOLUME_SQL = ("UPDATE reachy_device SET status_detail = COALESCE(status_detail, '{}'::jsonb) || "
+                  "jsonb_build_object('microphone_volume', $2::int) WHERE device_id = $1::uuid AND revoked_at IS NULL")
 
 
 class SettingsPayload(BaseModel):
@@ -150,7 +156,9 @@ async def status(user: dict = Depends(get_consented_user)):
 async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_user)):
     """A call name follows the rules of the patient's memory 'name' entry (422 invalid_call_name); an empty one goes
     back to the registered name (NULL). A changed name renders the opening ahead in the live voice (voice_lines).
-    Switching meal_retry off cancels the meal retry still waiting, in the same transaction (quick fix 5)."""
+    Switching meal_retry off cancels the meal retry still waiting, in the same transaction (quick fix 5). A mic_muted
+    press is applied on the robot at once after the commit when it can be (quick fix 9, _apply_mic): the answer then
+    has mic_applied."""
     call_name = None
     if payload.call_name is not None and payload.call_name.strip():
         call_name = memory.clean_call_name(payload.call_name)
@@ -174,9 +182,42 @@ async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_
             await conn.execute('UPDATE "user" SET reachy_mic_muted = $2 WHERE u_id = $1', user["u_id"],
                                payload.mic_muted)
         status = await _status(conn, user["u_id"])
+        if payload.mic_muted is not None:
+            control, _ = robot_control.check(_detail(await conn.fetchval(CONTROL_SQL, updated)).get("control"))
     if payload.call_name is not None:   # after the commit: the render reads the new name on its own connection
         voice_lines.render_ahead_for_patient(user["u_id"])
+    if payload.mic_muted is not None:   # after the commit: the heartbeat applies the saved switch whatever this does
+        status["mic_applied"] = await _apply_mic(user["u_id"], updated, control, payload.mic_muted, status)
     return status
+
+
+async def _apply_mic(u_id: int, device_id, control: dict | None, muted: bool, status: dict) -> bool:
+    """Quick fix 9: the microphone button applies the switch on the robot at once (POST {url}/api/microphone with the
+    robot app's key, robot_control.set_microphone), and keeps the volume the robot answered for the card, as a
+    heartbeat keeps it. Only while the robot is online: an older address may belong to another machine now, and the
+    key goes to the robot alone. True when the robot confirmed; false otherwise (no control address, offline, an
+    error, a timeout, a 401), and the robot's next heartbeat applies the switch within about 10 s. One INFO line."""
+    switched = "off" if muted else "on"
+    if control is None:
+        reason = "no control address"
+    elif not status["online"]:
+        reason = "robot offline"
+    else:
+        started = time.monotonic()
+        volume, reason = await robot_control.set_microphone(control, muted)
+        ms = round((time.monotonic() - started) * 1000)
+    if reason is not None:
+        log.info("microphone switched %s for patient %s: not applied directly (%s), the heartbeat will",
+                 switched, u_id, reason)
+        return False
+    try:
+        async with get_pool().acquire() as conn:
+            await conn.execute(MIC_VOLUME_SQL, device_id, volume)
+    except Exception:   # applied on the robot all the same; its next heartbeat reports the volume
+        log.warning("microphone of patient %s: keeping the volume the robot answered failed", u_id, exc_info=True)
+    status["mic_volume"] = volume
+    log.info("microphone switched %s for patient %s: applied on the robot in %d ms", switched, u_id, ms)
+    return True
 
 
 @router.post("/checkin")

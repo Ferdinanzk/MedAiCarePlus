@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validat
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
 from app.services import (after_chat, ai_settings, consent_service, conversation, dose_safety, dose_status, dose_video,
-                          live_session, memory, outbox, reachy_tasks, reminders, schedule)
+                          live_session, memory, outbox, reachy_tasks, reminders, robot_control, schedule)
 from app.services.device_auth import get_device, get_device_for_heartbeat, get_device_ws
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_detection import SessionEnded
@@ -103,6 +103,9 @@ class HeartbeatPayload(BaseModel):
     # Robot app 0.17.1 (quick fix 8): the daemon's microphone volume, null when the daemon did not answer. Only an
     # integer: "50", 50.0 and true are a 422.
     microphone_volume: StrictInt | None = Field(default=None, ge=0, le=100)
+    # Robot app 0.17.2 (quick fix 9): {"url", "key"} of its own web API, for the microphone button's direct call.
+    # Any value: robot_control.check keeps a good one and drops the rest, so it never refuses the heartbeat.
+    control: Any = None
 
 
 class MonitorStartPayload(BaseModel):
@@ -867,6 +870,9 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         detail["companion"] = True   # a companion session runs; companion_task (below) names the task it belongs to
     if payload.microphone_volume is not None:
         detail["microphone_volume"] = payload.microphone_volume   # the Reachy card shows it (/api/reachy/status)
+    control = robot_control.from_heartbeat(str(device["device_id"]), device["u_id"], payload.control)
+    if control is not None:
+        detail["control"] = control   # PATCH /api/reachy/settings calls it; /api/reachy/status never shows it
     async with get_pool().acquire() as conn, conn.transaction():
         if payload.companion:
             # The task the session belongs to (a plain read, no lock): the missed-dose job releases a meal retry's

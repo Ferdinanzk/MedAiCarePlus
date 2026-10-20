@@ -8,6 +8,7 @@ import subprocess
 import sys
 import types
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ from app import config
 from app.config import PUBLIC_PORT
 from app.dependencies import get_current_user
 from app.routers import api_reachy
-from app.services import consent_service, reachy_tasks
+from app.services import consent_service, reachy_tasks, robot_control
 
 REPO = Path(__file__).resolve().parent.parent
 DEVICE_ID = uuid.uuid4()
@@ -49,8 +50,12 @@ class FakeConn:
         self.user = {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False, "reachy_mic_muted": False}
         self.device = {"device_id": DEVICE_ID, "auto_record": False, "live_voice": False}
         self.status_detail = None   # the robot's last heartbeat report (asyncpg hands JSONB back as text)
+        self.last_seen_at = None    # the robot's last heartbeat (None: never, so offline)
         self.depth = 0
         self.updates = []   # (query, args) of every UPDATE, in order
+        self.control_reads = []   # (args, transaction depth) of each read of the robot's control address
+        self.volume_writes = []   # (args, transaction depth) of each write of the volume the robot answered
+        self.volume_error = False
 
     def transaction(self):
         return _Transaction(self)
@@ -59,7 +64,7 @@ class FakeConn:
         if "FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL" in query:
             if self.device is None or args[0] != 7:
                 return None
-            return {**self.device, "label": "Reachy Mini", "last_seen_at": None, "robot_reachable": None,
+            return {**self.device, "label": "Reachy Mini", "last_seen_at": self.last_seen_at, "robot_reachable": None,
                     "landmark_fps": None, "status_detail": self.status_detail}
         if "FROM reachy_task WHERE u_id = $1" in query:
             return None
@@ -81,6 +86,9 @@ class FakeConn:
             return self.device["device_id"]
         if "FROM family_contacts" in query:
             return 0
+        if query == api_reachy.CONTROL_SQL:   # quick fix 9: the control address the robot's heartbeat kept
+            self.control_reads.append((args, self.depth))
+            return self.status_detail if self.device is not None and args[0] == self.device["device_id"] else None
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -101,6 +109,14 @@ class FakeConn:
             self.updates.append((query, args))
             if args[0] == 7:
                 self.user["reachy_mic_muted"] = args[1]
+            return "UPDATE 1"
+        if query == api_reachy.MIC_VOLUME_SQL:   # quick fix 9: the volume the robot answered, as jsonb || does
+            self.volume_writes.append((args, self.depth))
+            if self.volume_error:
+                raise RuntimeError("database went away")
+            if self.device is not None and args[0] == self.device["device_id"]:
+                detail = json.loads(self.status_detail) if self.status_detail else {}
+                self.status_detail = json.dumps({**detail, "microphone_volume": args[1]})
             return "UPDATE 1"
         raise AssertionError(query)
 
@@ -137,9 +153,19 @@ def env(monkeypatch):
     monkeypatch.setattr(app, "dependency_overrides", {get_current_user: lambda: {"u_id": 7, "name": "Pearl"}})
     monkeypatch.setattr(consent_service, "get_state", get_state)
     monkeypatch.setattr(api_reachy, "get_pool", lambda: FakePool(conn))
+    # Quick fix 9: the direct call to the robot app (tests/test_robot_control.py tests the real one).
+    robot = types.SimpleNamespace(calls=[], answer=(0, None))
+
+    async def set_microphone(control, muted):
+        robot.calls.append({"control": control, "muted": muted, "depth": conn.depth,
+                            "saved": conn.user["reachy_mic_muted"]})
+        return robot.answer
+
     monkeypatch.setattr(reachy_tasks, "cancel_meal_retries", cancel_meal_retries)
+    monkeypatch.setattr(robot_control, "set_microphone", set_microphone)
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
-    return types.SimpleNamespace(conn=conn, client=TestClient(app, base_url=f"http://testserver:{PUBLIC_PORT}"))
+    return types.SimpleNamespace(conn=conn, robot=robot,
+                                 client=TestClient(app, base_url=f"http://testserver:{PUBLIC_PORT}"))
 
 
 def _settings(env, body):
@@ -344,6 +370,147 @@ def test_the_schema_adds_the_microphone_switch_unmuted_by_default():
     sql = (REPO / "sql" / "init.sql").read_text(encoding="utf-8")
     statement = 'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_mic_muted BOOLEAN NOT NULL DEFAULT FALSE;'
     assert sql.count(statement) == 1 and sql.index(statement) > sql.index('CREATE TABLE IF NOT EXISTS "user"')
+
+
+# ── Quick fix 9 (21 Oct 2026): the microphone button applies the switch on the robot at once ──
+
+CONTROL_KEY = "Zk-_" * 11   # 44 URL-safe characters, the shape of the robot app's secrets.token_urlsafe(32)
+CONTROL = {"url": "http://192.168.137.104:8042", "key": CONTROL_KEY}
+
+
+def _robot_reports(env, control=CONTROL, volume=100, online=True):
+    """The robot's last heartbeat, as api_device.heartbeat keeps it (status_detail, JSONB handed back as text)."""
+    env.conn.last_seen_at = datetime.now(timezone.utc) if online else None
+    detail = {"vision_fps": None, "bridge_version": "0.17.2", "missing_clips": None, "microphone_volume": volume}
+    env.conn.status_detail = json.dumps({**detail, **({"control": control} if control is not None else {})})
+
+
+def _mic_lines(caplog) -> list:
+    return [record.getMessage() for record in caplog.records
+            if record.name == api_reachy.log.name and record.getMessage().startswith("microphone switched")]
+
+
+def test_the_button_applies_the_switch_on_the_robot_after_the_commit(env, caplog):
+    _robot_reports(env)
+    env.robot.answer = (0, None)   # the robot app's answer: muted, and the daemon's volume after the change
+    with caplog.at_level("INFO"):
+        response = _settings(env, {"mic_muted": True})
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["mic_muted"], body["mic_applied"], body["mic_volume"]) == (True, True, 0)
+    # One call, after the transaction committed the switch: the heartbeat applies it too, whatever the call does.
+    assert env.robot.calls == [{"control": CONTROL, "muted": True, "depth": 0, "saved": True}]
+    assert env.conn.control_reads == [((DEVICE_ID,), 1)]   # read in the settings' own transaction
+    # The volume the robot answered is kept as the heartbeat keeps it, so the card shows it before the next one.
+    assert env.conn.volume_writes == [((DEVICE_ID, 0), 0)]
+    assert env.client.get("/api/reachy/status").json()["mic_volume"] == 0
+    (line,) = _mic_lines(caplog)
+    assert re.fullmatch(r"microphone switched off for patient 7: applied on the robot in \d+ ms", line)
+
+    env.robot.answer = (100, None)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        body = _settings(env, {"mic_muted": False}).json()
+    assert (body["mic_muted"], body["mic_applied"], body["mic_volume"]) == (False, True, 100)
+    assert env.robot.calls[1] == {"control": CONTROL, "muted": False, "depth": 0, "saved": False}
+    assert env.conn.volume_writes[1] == ((DEVICE_ID, 100), 0)
+    (line,) = _mic_lines(caplog)
+    assert re.fullmatch(r"microphone switched on for patient 7: applied on the robot in \d+ ms", line)
+
+
+def test_a_robot_that_could_not_read_its_volume_still_applied_the_switch(env):
+    _robot_reports(env, volume=100)
+    env.robot.answer = (None, None)
+    body = _settings(env, {"mic_muted": True}).json()
+    assert (body["mic_applied"], body["mic_volume"]) == (True, None)
+    assert env.conn.volume_writes == [((DEVICE_ID, None), 0)]
+    assert env.client.get("/api/reachy/status").json()["mic_volume"] is None
+
+
+@pytest.mark.parametrize("reason", ["timeout", "HTTP 401", "HTTP 503", "no connection", "bad answer"])
+def test_a_robot_that_did_not_confirm_leaves_it_to_the_heartbeat(env, caplog, reason):
+    _robot_reports(env, volume=100)
+    env.robot.answer = (None, reason)
+    with caplog.at_level("INFO"):
+        response = _settings(env, {"mic_muted": True})
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["mic_muted"], body["mic_applied"], body["mic_volume"]) == (True, False, 100)   # saved, not applied
+    assert env.conn.user["reachy_mic_muted"] is True and len(env.robot.calls) == 1
+    assert env.conn.volume_writes == []
+    assert _mic_lines(caplog) == [
+        f"microphone switched off for patient 7: not applied directly ({reason}), the heartbeat will"]
+
+
+@pytest.mark.parametrize("control", [None, {"url": "http://8.8.8.8:8042", "key": CONTROL_KEY},
+                                     {"url": "http://192.168.137.104:8042", "key": "short"}, "http://10.0.0.7:8042"])
+def test_without_a_control_address_the_heartbeat_applies_it(env, caplog, control):
+    """A robot app before 0.17.2 sends none; a stored one is checked again before any call."""
+    _robot_reports(env, control=control)
+    with caplog.at_level("INFO"):
+        body = _settings(env, {"mic_muted": True}).json()
+    assert (body["mic_muted"], body["mic_applied"]) == (True, False)
+    assert env.robot.calls == [] and env.conn.volume_writes == []
+    assert _mic_lines(caplog) == [
+        "microphone switched off for patient 7: not applied directly (no control address), the heartbeat will"]
+
+
+def test_an_offline_robot_is_not_called(env, caplog):
+    """Its last address may be old (another machine may have it now): the key never goes to it."""
+    _robot_reports(env, online=False)
+    with caplog.at_level("INFO"):
+        body = _settings(env, {"mic_muted": False}).json()
+    assert (body["mic_muted"], body["mic_applied"]) == (False, False)
+    assert env.robot.calls == []
+    assert _mic_lines(caplog) == [
+        "microphone switched on for patient 7: not applied directly (robot offline), the heartbeat will"]
+
+
+def test_a_failed_volume_write_keeps_the_robots_answer(env, caplog):
+    """The robot applied the switch: the answer says so, and the next heartbeat brings the volume to the card."""
+    _robot_reports(env, volume=100)
+    env.conn.volume_error = True
+    with caplog.at_level("INFO"):
+        body = _settings(env, {"mic_muted": True}).json()
+    assert (body["mic_applied"], body["mic_volume"]) == (True, 0)
+    assert [r.levelname for r in caplog.records if "volume the robot answered" in r.getMessage()] == ["WARNING"]
+    assert len(_mic_lines(caplog)) == 1
+
+
+@pytest.mark.parametrize("body", [{}, {"auto_record": True}, {"meal_retry": True}, {"call_name": "阿嬤"},
+                                  {"mic_muted": None}])
+def test_other_settings_never_call_the_robot(env, body):
+    _robot_reports(env)
+    answer = _settings(env, body).json()
+    assert "mic_applied" not in answer
+    assert env.robot.calls == [] and env.conn.control_reads == [] and env.conn.volume_writes == []
+
+
+def test_a_refused_press_never_calls_the_robot(env, monkeypatch):
+    _robot_reports(env)
+    assert _settings(env, {"mic_muted": "true"}).status_code == 422
+    env.conn.device = None
+    assert _settings(env, {"mic_muted": True}).status_code == 409
+
+    async def no_consent(u_id):
+        return {}
+
+    env.conn.device = {"device_id": DEVICE_ID, "auto_record": False, "live_voice": False}
+    monkeypatch.setattr(consent_service, "get_state", no_consent)
+    assert _settings(env, {"mic_muted": True}).status_code == 403
+    assert env.robot.calls == []
+
+
+def test_the_control_key_never_reaches_an_answer_or_a_log(env, caplog):
+    _robot_reports(env)
+    with caplog.at_level("DEBUG"):
+        for muted in (True, False):
+            assert CONTROL_KEY not in _settings(env, {"mic_muted": muted}).text
+        env.robot.answer = (None, "HTTP 401")
+        assert CONTROL_KEY not in _settings(env, {"mic_muted": True}).text
+        assert CONTROL_KEY not in env.client.get("/api/reachy/status").text
+    assert not any(CONTROL_KEY in record.getMessage() or "192.168.137.104" in record.getMessage()
+                   for record in caplog.records)
 
 
 # ── The schema and LIVE_VOICE_TEST ───────────────────────────────────────────
