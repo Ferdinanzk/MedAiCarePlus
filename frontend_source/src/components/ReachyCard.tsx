@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BellRing, Bot, Copy, Loader2, MessageCircle, Pill } from 'lucide-react';
 import LegalDocument from './LegalDocument';
@@ -12,10 +12,11 @@ const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysi
 /** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
 const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
 /** After the microphone switch changes, the card reads the status again every MIC_REREAD_MS, at most MIC_REREADS
- *  times, while the switch and the robot's reported volume disagree: the robot applies the switch at its next
- *  heartbeat (every 10 s) and reports the new volume at the one after. */
+ *  times (60 s), while the switch and the robot's reported volume disagree: the robot applies the switch at its next
+ *  heartbeat and reports the new volume at the one after. Each heartbeat waits 10 s and then up to about 2 s for each
+ *  daemon call, so a slow robot takes close to 40 s (review of quick fix 8). */
 const MIC_REREAD_MS = 3000;
-const MIC_REREADS = 12;
+const MIC_REREADS = 20;
 
 /**
  * `key` and its values, or `text` already worded (the server's reply when it refuses the dose).
@@ -48,6 +49,13 @@ export default function ReachyCard() {
   const [nameNotice, setNameNotice] = useState<'saved' | 'invalid' | null>(null);
   /** Status reads left after a microphone change (quick fix 8). */
   const [micRereads, setMicRereads] = useState(0);
+  /** Counts the statuses the card got from anything but a microphone re-read: a re-read sent before one of them came
+   *  is older and is dropped, so it never puts another switch back (review of quick fix 8). */
+  const statusAnswers = useRef(0);
+  const showStatus = useCallback((next: ReachyStatus) => {
+    statusAnswers.current += 1;
+    setStatus(next);
+  }, []);
 
   const load = useCallback(async () => {
     const [robot, consent] = await Promise.all([fetchReachyStatus(), fetchConsentStatus()]);
@@ -65,8 +73,8 @@ export default function ReachyCard() {
     setListening(next.listening);
     setCheckins(next.checkins);
     setMemory(next.memory);
-    setStatus(next.robot);
-  }, [load]);
+    showStatus(next.robot);
+  }, [load, showStatus]);
 
   useEffect(() => {
     let active = true;
@@ -78,20 +86,27 @@ export default function ReachyCard() {
   }, [load]);
 
   // The robot's microphone (quick fix 8). The robot reports the daemon's volume at each heartbeat (null: an older
-  // robot, or its daemon did not answer); while the switch and that volume disagree, the robot has not applied it yet.
-  const micVolume = status?.mic_volume ?? null;
-  const micApplying = micVolume !== null && (status?.mic_muted ? micVolume > 0 : micVolume === 0);
+  // robot, or its daemon did not answer); only an online robot's report is current. While the switch and that volume
+  // disagree, the robot has not applied the switch yet. Off with a volume above 0: the robot sets 0 at every
+  // heartbeat. On at 0: the robot raises only a volume it muted itself, so once the re-reads after a change are over
+  // the card says where to raise it instead of waiting for ever (review of quick fix 8).
+  const micVolume = status?.online ? status.mic_volume ?? null : null;
+  const micDisagrees = micVolume !== null && (status?.mic_muted ? micVolume > 0 : micVolume === 0);
+  const micApplying = micDisagrees && (!!status?.mic_muted || micRereads > 0);
+  const micAtZero = micDisagrees && !micApplying;
 
   useEffect(() => {
-    if (!micApplying || micRereads <= 0) return;
+    if (!micDisagrees || micRereads <= 0) return;
     let active = true;
     const timer = window.setTimeout(() => {
+      const sent = statusAnswers.current;   // a status the card gets meanwhile is newer than this read's answer
       fetchReachyStatus()
-        .then(next => { if (active) setStatus(next); }, () => undefined)   // a failed read waits for the next one
+        .then(next => { if (active && statusAnswers.current === sent) setStatus(next); },
+              () => undefined)   // a failed read waits for the next one
         .finally(() => { if (active) setMicRereads(left => left - 1); });
     }, MIC_REREAD_MS);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [micApplying, micRereads]);
+  }, [micDisagrees, micRereads]);
 
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -130,7 +145,7 @@ export default function ReachyCard() {
   const unpair = () => run(async () => {
     if (!confirm(t('reachy.unpairConfirm'))) return;
     setToken('');
-    setStatus(await unpairReachy());
+    showStatus(await unpairReachy());
   });
 
   const postMemory = async (value: boolean) => {
@@ -175,14 +190,14 @@ export default function ReachyCard() {
     await refresh();
   });
 
-  const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await updateReachySettings({ auto_record: value })));
+  const toggleAutoRecord = (value: boolean) => run(async () => showStatus(await updateReachySettings({ auto_record: value })));
 
-  const toggleMealRetry = (value: boolean) => run(async () => setStatus(await updateReachySettings({ meal_retry: value })));
+  const toggleMealRetry = (value: boolean) => run(async () => showStatus(await updateReachySettings({ meal_retry: value })));
 
   // Checked = on. Off has the robot app set the daemon's microphone volume to 0; the card then reads the status again
   // until the robot reports the new volume.
   const toggleMic = (value: boolean) => run(async () => {
-    setStatus(await updateReachySettings({ mic_muted: !value }));
+    showStatus(await updateReachySettings({ mic_muted: !value }));
     setMicRereads(MIC_REREADS);
   });
 
@@ -190,7 +205,7 @@ export default function ReachyCard() {
   // field, and the typed name stays so it can be fixed.
   const saveCallName = (value: string) => run(async () => {
     try {
-      setStatus(await updateReachySettings({ call_name: value }));
+      showStatus(await updateReachySettings({ call_name: value }));
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 422) {
         setNameNotice('invalid');
@@ -416,6 +431,7 @@ export default function ReachyCard() {
               </label>
               {micVolume !== null && <p className="text-xs text-gray-700">{t('reachy.micVolume', { n: micVolume })}</p>}
               {micApplying && <p role="status" className="text-xs text-amber-800">{t('reachy.micApplying')}</p>}
+              {micAtZero && <p role="status" className="text-xs text-amber-800">{t('reachy.micAtZero')}</p>}
             </div>
           </div>
           <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
