@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { BellRing, Bot, Copy, Loader2, MessageCircle } from 'lucide-react';
+import { BellRing, Bot, Copy, Loader2, MessageCircle, Pill } from 'lucide-react';
 import LegalDocument from './LegalDocument';
 import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalResponse } from '../lib/consent-api';
 import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
 import { deleteAllMemory } from '../lib/memory-api';
 import { fetchOverdoseProtection, notifyApi } from '../lib/notify-api';
-import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, startCheckin, unpairReachy, updateReachySettings, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
+import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTask, startCheckin, startDemoDose, unpairReachy, updateReachySettings, type ReachyStatus, type RobotCamera } from '../lib/reachy-api';
 
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
 /** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
@@ -37,6 +37,7 @@ export default function ReachyCard() {
   const [testNotice, setTestNotice] = useState<TestNotice | null>(null);
   const [lineReminderNotice, setLineReminderNotice] = useState('');
   const [robotReminderNotice, setRobotReminderNotice] = useState('');
+  const [demoSent, setDemoSent] = useState(false);
   /** The call name being typed; null shows the saved one. */
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   const [nameNotice, setNameNotice] = useState<'saved' | 'invalid' | null>(null);
@@ -209,6 +210,23 @@ export default function ReachyCard() {
     setRobotReminderNotice('');
     await startCheckin();
     setRobotReminderNotice(t('reachy.robotReminderQueued'));
+    await refresh();
+  });
+
+  // A dose of the demo medicine, Acetal 500mg, made now; Reachy comes for it at once and family get the LINE
+  // confirmation as for a real dose (quick fix 6). Not paired is said in this card's words; run() words the rest.
+  const sendDemoDose = () => run(async () => {
+    setDemoSent(false);
+    try {
+      await startDemoDose();
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.message === 'robot_not_paired') {
+        setError('reachy.demoDoseNotPaired');
+        return;
+      }
+      throw cause;
+    }
+    setDemoSent(true);
     await refresh();
   });
 
@@ -427,6 +445,13 @@ export default function ReachyCard() {
               </button>
             )}
             <button onClick={unpair} disabled={busy} className="min-h-12 px-5 py-3 rounded-xl bg-gray-100 text-gray-700 font-medium disabled:opacity-50 flex items-center justify-center">{t('reachy.unpair')}</button>
+          </div>
+          <div className="rounded-xl bg-gray-50 p-4 space-y-2">
+            <button onClick={sendDemoDose} disabled={busy} aria-describedby="reachy-demo-dose-help" className="min-h-12 w-full sm:w-auto px-5 py-3 rounded-xl border border-[#0057B8] bg-white text-[#0057B8] font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
+              {busy ? <Loader2 className="w-4 h-4 shrink-0 animate-spin" /> : <Pill className="w-4 h-4 shrink-0" />}{t('reachy.demoDose')}
+            </button>
+            <p id="reachy-demo-dose-help" className="text-xs text-gray-500">{t('reachy.demoDoseHelp')}</p>
+            {demoSent && <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">{t('reachy.demoDoseSent')}</p>}
           </div>
           {testNotice && (
             <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">
