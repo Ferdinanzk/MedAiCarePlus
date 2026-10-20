@@ -299,3 +299,15 @@ def test_quick_fix_4_re_review_holds_the_dose_while_reachy_prompts_it():
     for name in ("`reachy_device.status_detail`", "`companion`", "`in_progress`", "`task_due`"):
         assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
     assert "and also (review of quick fix 4) once Reachy is with the patient" not in quick_fix_4
+
+
+def test_quick_fix_5_names_the_meal_retry_switch():
+    """Quick fix 5 of 20 Oct 2026: the Reachy card's switch for "come back 20 minutes after 'not eaten'", off by
+    default. The quick fix 4 bullet says the meal retry is queued only while it is on."""
+    quick_fix_5 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 5", ("- ", "#")))
+    for name in ('`"user".reachy_meal_retry`', "`meal_retry`", "`/api/reachy/status`", "`PATCH /api/reachy/settings`",
+                 "`reachy_tasks.cancel_meal_retries`", "`meal_retry_off`", "還沒吃飯時，20 分鐘後再來提醒",
+                 "Come back 20 minutes after 'not eaten yet'", "CONTRACT5.md"):
+        assert name in quick_fix_5, f"CLAUDE.md's quick fix 5 bullet doesn't name {name}"
+    quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
+    assert "only while the patient's switch is on" in quick_fix_4

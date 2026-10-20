@@ -21,7 +21,7 @@ from app import config
 from app.config import PUBLIC_PORT
 from app.dependencies import get_current_user
 from app.routers import api_reachy
-from app.services import consent_service
+from app.services import consent_service, reachy_tasks
 
 REPO = Path(__file__).resolve().parent.parent
 DEVICE_ID = uuid.uuid4()
@@ -46,7 +46,7 @@ class FakeConn:
     COALESCE keeps the stored value when its argument is NULL (checked on PostgreSQL 16 when this was written)."""
 
     def __init__(self):
-        self.user = {"reachy_call_name": None, "name": "Pearl"}
+        self.user = {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False}
         self.device = {"device_id": DEVICE_ID, "auto_record": False, "live_voice": False}
         self.depth = 0
         self.updates = []   # (query, args) of every UPDATE, in order
@@ -62,7 +62,7 @@ class FakeConn:
                     "landmark_fps": None, "status_detail": None}
         if "FROM reachy_task WHERE u_id = $1" in query:
             return None
-        if query == 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1':
+        if query == 'SELECT reachy_call_name, name, reachy_meal_retry FROM "user" WHERE u_id = $1':
             return dict(self.user) if args[0] == 7 else None
         raise AssertionError(query)
 
@@ -88,6 +88,12 @@ class FakeConn:
             self.updates.append((query, args))
             if args[0] == 7:
                 self.user["reachy_call_name"] = args[1]
+            return "UPDATE 1"
+        if query == 'UPDATE "user" SET reachy_meal_retry = $2 WHERE u_id = $1':
+            assert self.depth > 0
+            self.updates.append((query, args))
+            if args[0] == 7:
+                self.user["reachy_meal_retry"] = args[1]
             return "UPDATE 1"
         raise AssertionError(query)
 
@@ -117,9 +123,14 @@ def env(monkeypatch):
     async def get_state(u_id):
         return CORE
 
+    async def cancel_meal_retries(c, u_id):   # what it cancels: tests/test_reachy_tasks.py
+        assert c is conn and conn.depth > 0   # in the settings' own transaction
+        conn.updates.append(("cancel_meal_retries", (u_id,)))
+
     monkeypatch.setattr(app, "dependency_overrides", {get_current_user: lambda: {"u_id": 7, "name": "Pearl"}})
     monkeypatch.setattr(consent_service, "get_state", get_state)
     monkeypatch.setattr(api_reachy, "get_pool", lambda: FakePool(conn))
+    monkeypatch.setattr(reachy_tasks, "cancel_meal_retries", cancel_meal_retries)
     monkeypatch.setattr(config, "LIVE_VOICE_TEST", False)
     return types.SimpleNamespace(conn=conn, client=TestClient(app, base_url=f"http://testserver:{PUBLIC_PORT}"))
 
@@ -209,6 +220,58 @@ def test_settings_need_a_paired_robot(env):
     response = _settings(env, {"call_name": "阿嬤"})
     assert response.status_code == 409 and response.json() == {"detail": "robot_not_paired"}
     assert env.conn.user["reachy_call_name"] is None
+
+
+# ── Quick fix 5 (20 Oct 2026): the switch for "come back 20 minutes after 'not eaten'" ──
+
+def test_status_gives_the_meal_retry_switch_off_by_default(env):
+    assert env.client.get("/api/reachy/status").json()["meal_retry"] is False
+    env.conn.user["reachy_meal_retry"] = True
+    assert env.client.get("/api/reachy/status").json()["meal_retry"] is True
+
+
+def test_the_meal_retry_switch_is_saved_and_a_field_left_out_keeps_it(env):
+    body = _settings(env, {"meal_retry": True}).json()   # what the card's switch sends
+    assert body["meal_retry"] is True and env.conn.user["reachy_meal_retry"] is True
+    for kept in ({}, {"auto_record": True}, {"call_name": "阿嬤"}, {"meal_retry": None}):
+        response = _settings(env, kept)
+        assert response.status_code == 200 and response.json()["meal_retry"] is True
+    assert [args for query, args in env.conn.updates if "reachy_meal_retry" in query] == [(7, True)]
+    assert ("cancel_meal_retries", (7,)) not in env.conn.updates   # switching on cancels nothing
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, "yes", "on", [], {}])
+def test_the_meal_retry_switch_takes_only_a_boolean(env, value):
+    response = _settings(env, {"meal_retry": value, "auto_record": True})
+    assert response.status_code == 422
+    assert env.conn.updates == []   # nothing is saved, not even the other fields, and nothing is cancelled
+    assert env.conn.user["reachy_meal_retry"] is False and env.conn.device["auto_record"] is False
+
+
+def test_switching_the_meal_retry_off_cancels_a_waiting_one_in_the_same_transaction(env):
+    """Off: the meal retry still waiting is cancelled (reachy_tasks.cancel_meal_retries), after the switch is written
+    and in the same transaction, so the missed-dose job's hold ends with it. Off again cancels again: nothing to do."""
+    env.conn.user["reachy_meal_retry"] = True
+    for _ in range(2):
+        body = _settings(env, {"meal_retry": False}).json()
+        assert body["meal_retry"] is False and env.conn.user["reachy_meal_retry"] is False
+    assert [query.split(" WHERE")[0] for query, args in env.conn.updates] == [
+        "UPDATE reachy_device SET auto_record = COALESCE($2, auto_record), live_voice = COALESCE($3, live_voice)",
+        'UPDATE "user" SET reachy_meal_retry = $2', "cancel_meal_retries"] * 2
+
+
+def test_the_meal_retry_switch_needs_a_paired_robot(env):
+    env.conn.device = None
+    response = _settings(env, {"meal_retry": True})
+    assert response.status_code == 409 and response.json() == {"detail": "robot_not_paired"}
+    assert env.conn.user["reachy_meal_retry"] is False
+
+
+def test_the_schema_adds_the_meal_retry_switch_off_by_default():
+    """Per patient, on "user" like the call name: re-pairing the robot keeps it, as it keeps the patient's tasks."""
+    sql = (REPO / "sql" / "init.sql").read_text(encoding="utf-8")
+    statement = 'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_meal_retry BOOLEAN NOT NULL DEFAULT FALSE;'
+    assert sql.count(statement) == 1 and sql.index(statement) > sql.index('CREATE TABLE IF NOT EXISTS "user"')
 
 
 # ── The schema and LIVE_VOICE_TEST ───────────────────────────────────────────

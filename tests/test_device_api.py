@@ -103,8 +103,8 @@ class FakeConn:
                     "landmark_fps": 9.9, "status_detail": self.status_detail}
         if "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1" in query:
             return None
-        if 'SELECT reachy_call_name, name FROM "user" WHERE u_id = $1' in query:
-            return {"reachy_call_name": None, "name": "Pearl"}
+        if query.startswith('SELECT reachy_call_name, name') and 'FROM "user" WHERE u_id = $1' in query:
+            return {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False}   # also api_reachy._status
         if "SELECT m.med_name FROM intake i JOIN medication m" in query:   # the dose event route's medicine
             return {"med_name": "Allegra"} if args[0] in self.doses and args[1] == 7 else None
         if query == api_device.FAMILY_ANSWER_SQL:
