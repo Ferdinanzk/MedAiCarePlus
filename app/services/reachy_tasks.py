@@ -32,6 +32,9 @@ TRANSITIONS = {
 }
 _OPEN_SQL = "('queued','leased','searching','in_progress')"
 _MEAL_WAITING_SQL = "('queued','leased','searching')"   # a meal retry that has not reached the patient yet
+_MEAL_WITH_PATIENT_SQL = "('in_progress')"               # Reachy is with the patient for it
+# The robot's latest heartbeat said a companion session runs (api_device.heartbeat keeps the flag in status_detail).
+_COMPANION_SQL = "COALESCE((meal_device.status_detail->>'companion')::boolean, FALSE)"
 _LOCAL_TZ = ZoneInfo(MEDCARE_TIMEZONE)
 
 
@@ -233,16 +236,19 @@ def _meal_retry_sql(dose: str, statuses: str) -> str:
 
 
 def meal_retry_waiting_sql(dose: str) -> str:
-    """A meal retry that has not reached the patient yet (queued, leased or searching) holds the dose `dose` (an
-    intake alias) while the patient's robot is online (a heartbeat within OFFLINE_AFTER_SECONDS): Reachy comes back
-    for it after the meal, so the missed-dose job sends nothing of its own for it meanwhile. Review of quick fix 4:
-    once Reachy is with the patient (in_progress) the job goes on as for any dose task, so a dose left pending there
-    gets the job's next retry, a task of the slot's own that task_due reports, and the check-in that follows ends for
-    the medicine instead of holding the dose for as long as the chat runs. A robot offline holds nothing back either:
-    the patient gets the LINE reminders the robot-offline notice promises family."""
-    return (f"({_meal_retry_sql(dose, _MEAL_WAITING_SQL)} AND EXISTS (SELECT 1 FROM reachy_device meal_device "
-            f"WHERE meal_device.u_id = {dose}.u_id AND meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
-            f"NOW() - INTERVAL '{OFFLINE_AFTER_SECONDS} seconds'))")
+    """A meal retry holds the dose `dose` (an intake alias) while the patient's robot is online (a heartbeat within
+    OFFLINE_AFTER_SECONDS): Reachy comes back for it after the meal, so the missed-dose job sends nothing of its own
+    for it meanwhile. It holds while it has not reached the patient yet (queued, leased or searching), and while
+    Reachy is with the patient for it (in_progress: the meal question, the prompt, the watch, family's answer), so
+    the job sends no second visit for the slot and no missed mark while Reachy prompts the dose (re-review of quick
+    fix 4). The exception is the companion chat after the dose (the robot's latest heartbeat says one runs): there a
+    dose left pending gets the job's next retry, a task of the slot's own that task_due reports, and the chat ends
+    for the medicine instead of holding the dose for as long as it runs (review of quick fix 4). A robot offline
+    holds nothing back: the patient gets the LINE reminders the robot-offline notice promises family."""
+    return (f"EXISTS (SELECT 1 FROM reachy_device meal_device WHERE meal_device.u_id = {dose}.u_id "
+            "AND meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
+            f"NOW() - INTERVAL '{OFFLINE_AFTER_SECONDS} seconds' AND ({_meal_retry_sql(dose, _MEAL_WAITING_SQL)} "
+            f"OR (NOT {_COMPANION_SQL} AND {_meal_retry_sql(dose, _MEAL_WITH_PATIENT_SQL)})))")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:

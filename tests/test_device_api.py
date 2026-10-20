@@ -462,6 +462,18 @@ def test_a_companion_heartbeat_keeps_the_held_task_alive(env, monkeypatch):
     assert found[0][1] == (DEVICE_ID,) and found[0][2] == 1   # inside the write transaction, with the lease extension
 
 
+def test_the_heartbeat_stores_whether_a_companion_session_runs(env, monkeypatch):
+    """Re-review of quick fix 4: a meal retry with the patient holds its dose from the missed-dose job except in the
+    companion chat after the dose, which the job reads from the robot's latest heartbeat (status_detail's companion
+    flag, reachy_tasks.meal_retry_waiting_sql). Each heartbeat replaces status_detail, so the flag is there only
+    while a companion session runs."""
+    _no_leases(monkeypatch)
+    for body, stored in (({"companion": True}, True), ({"companion": False}, None), ({}, None)):
+        assert env.robot.post("/api/device/heartbeat", json=body).status_code == 200
+        update = [entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0]][-1]
+        assert json.loads(update[1][3]).get("companion") is stored, body
+
+
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
 
 CAMERA_MEDIA = {"available": True, "released": False, "no_media": False}   # the daemon's GET /api/media/status
