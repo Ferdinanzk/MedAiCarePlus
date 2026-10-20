@@ -289,3 +289,13 @@ def test_quick_fix_4_review_names_when_the_hold_ends_and_the_open_mixed_slot_que
                  "\"not yet\" again", "the user decides"):
         assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
     assert "only the ones not eaten for are retried" not in quick_fix_4
+
+
+def test_quick_fix_4_re_review_holds_the_dose_while_reachy_prompts_it():
+    """Re-review of quick fix 4: a meal retry with the patient (in_progress) holds its dose too, so the job sends no
+    second visit and no missed mark while Reachy prompts it, except in the companion chat after the dose, which the
+    job reads from the robot's latest heartbeat (status_detail's companion flag)."""
+    quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
+    for name in ("`reachy_device.status_detail`", "`companion`", "`in_progress`", "`task_due`"):
+        assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
+    assert "and also (review of quick fix 4) once Reachy is with the patient" not in quick_fix_4
