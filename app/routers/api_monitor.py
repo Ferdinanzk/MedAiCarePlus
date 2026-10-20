@@ -12,7 +12,7 @@ from app.services import dose_safety, dose_video, reachy_tasks
 from app.services.emotion_service import EmotionService
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services.intake_repository import commit_monitored, undo_monitored
-from app.services.monitor_service import BusyOtherClient, registry
+from app.services.monitor_service import BusyOtherClient, mark_candidate_used, registry
 
 router = APIRouter(prefix="/api/intake/monitor", tags=["intake-monitor"])
 
@@ -141,9 +141,12 @@ async def outcome(payload: OutcomePayload, account: dict = Depends(current_accou
             if not candidate["ready"] or state.recorded or state.mode != "dose":
                 raise HTTPException(409, "Event is not ready for confirmation")
             if payload.outcome == "taken_confirmed":
+                mark_candidate_used(state, candidate["event_id"], "confirmed_by_user")
                 state.recorded = await commit_monitored(state, candidate, "confirmed_by_user")
                 state.mode = "observe"
             elif payload.outcome == "not_taken":
+                # Acted on, not expired: the detector keeps its latch, as before quick fix 7.
+                mark_candidate_used(state, candidate["event_id"], "not_taken")
                 state.candidate = None
             else:
                 raise HTTPException(422, "Invalid outcome")

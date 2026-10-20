@@ -27,7 +27,7 @@ from app.services.intake_detection import SessionEnded
 from app.services.intake_repository import commit_monitored
 from app.services.landmark_service import LandmarkService
 from app.services.live_session import _in_background
-from app.services.monitor_service import LABELS, BusyOtherClient, registry
+from app.services.monitor_service import LABELS, BusyOtherClient, mark_candidate_used, registry
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/device", tags=["device"])
@@ -196,6 +196,12 @@ async def confirmation(task_id: str, payload: ConfirmationPayload, device: dict 
     session = registry.sessions.get(registry.by_user.get(device["u_id"]) or "")
     started_at = (getattr(session, "started_at", None) if session is not None and session.client_type == CLIENT_TYPE
                   and session.intk_id == payload.intk_id else None)
+    # A request filed for the camera's candidate names its event (evidence.event_id, robot app session._needs_confirm):
+    # that candidate is used, whatever the request's outcome, so the detector keeps its latch (quick fix 7).
+    event_id = (payload.evidence or {}).get("event_id")
+    if (session is not None and session.client_type == CLIENT_TYPE and session.intk_id == payload.intk_id
+            and isinstance(event_id, str)):
+        mark_candidate_used(session, event_id, "confirmation")
     # What the request says about its video is known before it is made (dose_video.clip_outlook: the dose-video
     # consent and enough fresh frames); the clip of a detected moment starts before its approach.
     started = session.event_started_at if session is not None and session.client_type == CLIENT_TYPE else None

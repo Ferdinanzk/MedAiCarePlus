@@ -21,9 +21,13 @@ FACE_INDICES = (1, 10, 13, 14, 33, 61, 152, 263, 291)
 HAND_INDICES = (0, 4, 5, 6, 8, 9, 10, 12, 14, 16, 17, 18, 20)
 PACKET_HISTORY = 48
 CANDIDATE_TIMEOUT_SECONDS = 5.0
+# A robot session's ready candidate is kept this long from its creation (quick fix 7): the robot reads it only in
+# WATCHING, after its ~10-11 s medicine prompt, and a patient who takes the pill during the prompt makes one 1-2 s
+# into the session. Unready candidates, and every browser candidate, keep CANDIDATE_TIMEOUT_SECONDS.
+READY_CANDIDATE_SECONDS = 15.0
 
-# The detector's thresholds are per-frame deltas calibrated at ~15 fps
-# (CLAUDE.md), so a session only auto-commits while landmark capture keeps up.
+# A session only auto-commits while landmark capture keeps up: fewer frames give the detector fewer samples per
+# gesture (its speeds are per second, intake_temporal.py; CLAUDE.md corrected this in quick fix 7).
 FPS_WINDOW_SECONDS = 3.0
 FPS_MIN_SPAN_SECONDS = 1.0
 FPS_MIN = 12.0
@@ -195,6 +199,10 @@ class MonitorSession:
     # Kept for dose_video: set at the first APPROACHING of the session.
     event_started_at: float | None = None
     candidate: dict | None = None
+    # What used the current candidate (mark_candidate_used): 'confirmation' (the robot's request named its event),
+    # 'auto_commit', or the browser's 'confirmed_by_user' / 'not_taken'; None while nothing has. A dose candidate
+    # that expires unused re-arms the detector (_expire_candidate); a used one keeps its latch.
+    candidate_used: str | None = None
     latest_detector: dict | None = None
     recorded: dict | None = None
     ended: bool = False
@@ -316,11 +324,45 @@ def _accept_robot_emotion(state: "MonitorSession", packet: dict, now: float) -> 
                      "probabilities": probabilities, "error": None, "source": "robot"}
 
 
-def _expire_candidate(state: MonitorSession, now: float) -> None:
-    """Drop a prompt that was never completed, even when vision is idle."""
+def mark_candidate_used(state: MonitorSession, event_id: str, by: str) -> bool:
+    """Note that `by` acted on the session's current candidate, the one with event `event_id`: when it goes, the
+    detector keeps its latch, so one gesture never gives two events. False when there is no such candidate."""
     candidate = state.candidate
-    if candidate and now - float(candidate.get("created_at", now)) > CANDIDATE_TIMEOUT_SECONDS:
-        state.candidate = None
+    if not candidate or candidate.get("event_id") != event_id:
+        return False
+    if state.candidate_used is None:
+        state.candidate_used = by
+        log.info("intake candidate %s of session %s: used by %s", event_id, state.session_id, by)
+    return True
+
+
+async def _new_detector_session(state: MonitorSession) -> None:
+    """End the session's detector session and start a fresh one: a new id, the temporal pipeline at its start."""
+    await IntakeDetectionService.get_instance().end_session(state.u_id, state.detector_session_id)
+    state.detector_session_id = str(uuid.uuid4())
+    state.event_started_at = None
+
+
+async def _expire_candidate(state: MonitorSession, now: float) -> None:
+    """Drop a prompt that was never completed, even when vision is idle: an unready candidate after
+    CANDIDATE_TIMEOUT_SECONDS, a robot session's ready one after READY_CANDIDATE_SECONDS, both from its creation.
+    A dose candidate nothing used (mark_candidate_used) re-arms the detector at once, so the next real gesture
+    makes a new candidate (quick fix 7: before, the session stayed latched and every later gesture was ignored)."""
+    candidate = state.candidate
+    if not candidate:
+        return
+    age = now - float(candidate.get("created_at", now))
+    ready = bool(candidate.get("ready"))
+    if age <= (READY_CANDIDATE_SECONDS if ready and state.client_type == "reachy" else CANDIDATE_TIMEOUT_SECONDS):
+        return
+    state.candidate = None
+    if state.candidate_used is not None or state.mode != "dose" or state.ended:
+        return
+    log.info("intake candidate %s of session %s: expired unread (ready=%s, age %.1f s)",
+             candidate.get("event_id"), state.session_id, ready, age)
+    await _new_detector_session(state)
+    state.emotion_event_start = None
+    log.info("intake detector of session %s: re-armed with a fresh detector session", state.session_id)
 
 
 def _update_frame_rate(state: MonitorSession, timestamp: float) -> None:
@@ -510,19 +552,21 @@ class MonitorRegistry:
             for old_seq in tuple(state.packet_times):
                 if old_seq < cutoff:
                     del state.packet_times[old_seq]
-            _expire_candidate(state, now)
+            await _expire_candidate(state, now)
             if state.client_type == "reachy":
                 _accept_robot_emotion(state, packet, now)
             # A dose session pauses detection while its candidate is resolved.
             # After a record the session is in observe mode and keeps detecting.
             if state.mode == "dose" and (state.recorded or state.candidate):
                 return state.public()
-            selected = select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box) if state.verified(now) else None
+            verified = state.verified(now)
+            selected = select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box) if verified else None
             if not selected:
-                if state.latest_detector and state.latest_detector.get("stage") in ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING"):
-                    await IntakeDetectionService.get_instance().end_session(state.u_id, state.detector_session_id)
-                    state.detector_session_id = str(uuid.uuid4())
-                    state.event_started_at = None
+                stage = (state.latest_detector or {}).get("stage")
+                if stage in ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING"):
+                    await _new_detector_session(state)
+                    log.info("intake detector of session %s: reset at stage %s (%s)", state.session_id, stage,
+                             "ownership" if verified else "identity")
                 state.emotion_event_start = None
                 state.latest_detector = {"stage": "WAITING_FOR_PEARL", "decision": "none"}
                 return state.public()
@@ -532,6 +576,10 @@ class MonitorRegistry:
                        "hand_landmarks": [full_points(hand, HAND_INDICES) for hand in selected["hands"]]}
             result = await IntakeDetectionService.get_instance().process_frame(
                 state.u_id, state.detector_session_id, payload, result_transform=apply_policy)
+            if result.get("reset_reason"):
+                # The temporal pipeline gave up on an event (a timeout, or a closed-mouth sequence): once per event.
+                log.info("intake detector of session %s: reset at stage %s (%s)", state.session_id,
+                         (state.latest_detector or {}).get("stage"), result["reset_reason"])
             state.latest_detector = {key: result.get(key) for key in
                                      ("stage", "decision", "event_confidence", "mouth_open", "hand_near_mouth", "frame_seq")}
             state.latest_detector["evidence"] = detector_evidence(result)   # the live agent's intake tool reads it
@@ -570,9 +618,14 @@ class MonitorRegistry:
                                    "degraded": state.degraded,
                                    "evidence": detector_evidence(result),
                                    "ready": False}
+                state.candidate_used = None
                 reason = _hold_reason(state, state.candidate)
                 if reason:
                     _hold(state.candidate, reason)
+                log.info("intake candidate %s of session %s (detector session %s): created at frame_seq=%d, "
+                         "decision=%s, confidence=%.2f, hold=%s", event_id, state.session_id,
+                         state.detector_session_id, frame_seq, state.candidate["decision"],
+                         state.candidate["confidence"], state.candidate.get("hold_reason") or "none")
             return state.public()
 
     async def vision(self, state: MonitorSession, frame_seq: int, image_bytes: bytes, commit_callback) -> dict:
@@ -581,7 +634,7 @@ class MonitorRegistry:
             raise ValueError("Invalid camera frame")
         async with state.lock:
             now = time.monotonic()
-            _expire_candidate(state, now)
+            await _expire_candidate(state, now)
             # Use the landmark packet for this exact camera frame. Reading
             # last_packet here made normal request skew discard almost every
             # identity result once landmark capture ran faster than JPEG
@@ -686,16 +739,20 @@ class MonitorRegistry:
                 # Unchanged recording policy: a candidate becomes ready only on a frame with the mouth uncovered.
                 return state.public()
             if state.candidate and not state.candidate["ready"]:
-                if time.monotonic() - state.candidate["created_at"] > CANDIDATE_TIMEOUT_SECONDS:
-                    state.candidate = None
-                elif (frame_seq >= state.candidate["frame_seq"]
-                      and state.identity_frame_seq >= state.candidate["frame_seq"]
-                      and state.verified()):
+                await _expire_candidate(state, time.monotonic())   # an unready one's 5 s, after the identity call
+            if state.candidate and not state.candidate["ready"]:
+                if (frame_seq >= state.candidate["frame_seq"]
+                        and state.identity_frame_seq >= state.candidate["frame_seq"]
+                        and state.verified()):
                     state.candidate["ready"] = True
                     reason = _hold_reason(state, state.candidate)
+                    log.info("intake candidate %s of session %s: ready after %.1f s", state.candidate["event_id"],
+                             state.session_id, time.monotonic() - state.candidate["created_at"])
                     if reason:
                         _hold(state.candidate, reason)
                     elif state.candidate["decision"] == "confirmed" and state.mode == "dose":
+                        # The commit uses the candidate whatever its outcome (a refusal alerted family already).
+                        mark_candidate_used(state, state.candidate["event_id"], "auto_commit")
                         state.recorded = await commit_callback(state, state.candidate, "auto")
                         state.mode = "observe"
             return state.public()
