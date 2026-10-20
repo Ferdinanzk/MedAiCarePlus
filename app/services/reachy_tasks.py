@@ -464,8 +464,8 @@ async def notify_robot_offline(conn, u_id: int, slot_time, now: datetime) -> int
 
 
 async def maintenance(now=None) -> None:
-    """Expire tasks past expires_at, requeue expired leases, cancel meal retries with nothing left to prompt, and send
-    robot-offline notices."""
+    """Expire tasks past expires_at, requeue expired leases, cancel meal retries with nothing left to prompt or with a
+    dose that expired meanwhile, and send robot-offline notices."""
     now = now or datetime.now(timezone.utc)
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute(
@@ -483,6 +483,16 @@ async def maintenance(now=None) -> None:
             "detail = COALESCE(t.detail, '{}'::jsonb) || jsonb_build_object('reason', 'nothing_to_prompt') "
             "WHERE t.status = 'queued' AND t.not_before IS NOT NULL AND NOT EXISTS (SELECT 1 FROM intake i "
             "WHERE i.intk_id = ANY(t.intk_ids) AND i.intake_stats IN ('pending','missed'))",
+            now)
+        # So is one with an open dose that expired before the robot leased it (review of quick fix 4: the robot was
+        # busy or offline at not_before, when overdose protection last judged it). The lease would never hand it out
+        # (_leasable_sql), and the missed-dose job takes the dose at once instead of waiting for its expiry.
+        await conn.execute(
+            "UPDATE reachy_task t SET status = 'aborted', finished_at = $1, "
+            "detail = COALESCE(t.detail, '{}'::jsonb) || jsonb_build_object('reason', 'dose_expired') "
+            "WHERE t.status = 'queued' AND t.not_before IS NOT NULL AND EXISTS (SELECT 1 FROM intake i "
+            "WHERE i.intk_id = ANY(t.intk_ids) AND i.intake_stats IN ('pending','missed') "
+            f"AND {dose_safety.protected_sql('i')} AND {dose_safety.expired_sql('i', '$1::timestamptz')})",
             now)
         # A slot has come while its task is still queued and the robot has not
         # heartbeated for a minute: tell the caregivers (once per 6 h).

@@ -105,6 +105,12 @@ class FakeDB:
         return not row["protection"] or (schedule.is_due(row["intake_time_stamp"], self.now, row["previous_time"])
                                          and (expiry is None or self.now < expiry))
 
+    def expired(self, intk_id, at):
+        """dose_safety.expired_sql under the switch (protected_sql): R4 at `at`."""
+        (row,) = self.facts((7, [intk_id], at, "Asia/Taipei"))
+        expiry = dose_safety.expires_at(row["intake_time_stamp"], row["next_time"])
+        return row["protection"] and expiry is not None and at >= expiry
+
     def retry_due(self, task, u_id):
         """reachy_tasks._retry_due_sql: patient u_id's in-progress task marked retry_due, not expired, with a marked
         dose still open and startable."""
@@ -283,6 +289,16 @@ class FakeDB:
                     detail = json.loads(t["detail"] or "{}")
                     t.update(status="aborted", finished_at=args[0], detail=json.dumps({**detail,
                                                                                        "reason": "nothing_to_prompt"}))
+        elif "'dose_expired'" in query:   # maintenance: a meal retry with an open dose expired before the lease
+            assert "WHERE t.status = 'queued' AND t.not_before IS NOT NULL AND EXISTS" in query
+            assert (f"AND {dose_safety.protected_sql('i')} "
+                    f"AND {dose_safety.expired_sql('i', '$1::timestamptz')})") in query
+            for t in self.tasks:
+                if (t["status"] == "queued" and t.get("not_before") is not None
+                        and any(self.is_open(i) and self.expired(i, args[0]) for i in t["intk_ids"])):
+                    detail = json.loads(t["detail"] or "{}")
+                    t.update(status="aborted", finished_at=args[0], detail=json.dumps({**detail,
+                                                                                       "reason": "dose_expired"}))
         elif "SET lease_until = NOW()" in query:
             for t in self.tasks:
                 if t["lease_owner"] == args[0] and t["status"] in ("leased", "searching", "in_progress"):
@@ -1419,6 +1435,32 @@ def test_while_the_robot_is_offline_a_meal_retry_holds_nothing_back(db, monkeypa
     assert notice["kind"] == "robot_offline" and "LINE 用藥提醒仍會照常發送" in notice["messages"][0]["text"]
     db.now = T0 + timedelta(minutes=20)
     assert _job_on(db, monkeypatch) == []   # online again: held, its retry counted
+
+
+def test_a_meal_retry_whose_dose_expired_before_the_lease_is_cancelled(db, monkeypatch):
+    """Review of quick fix 4: overdose protection judged the dose only at not_before. Metformin again at 08:40 makes
+    the 08:00 dose expire at 08:20. The meal retry may be leased from 08:16, but the robot leases nothing in time
+    (busy, or offline), and from 08:20 the lease never hands it out. The minute job cancels it (dose_expired), so the
+    missed-dose job takes the dose at once instead of being held until the retry's own expiry (08:40)."""
+    db.doses[105] = {**db.doses[101], "intk_id": 105, "intake_time_stamp": T0 + timedelta(minutes=40)}
+    db.doses[102]["intake_stats"] = "taken"
+    db.now = T0 - timedelta(minutes=4)
+    task_id = enqueue(db, intk_ids=(101,))
+    _completed_with(db, task_id, {"101": "meal_not_eaten"})
+    (meal,) = _meal_retries(db)
+    assert meal["not_before"] == T0 + timedelta(minutes=16) and meal["expires_at"] == T0 + timedelta(minutes=40)
+    db.now = T0 + timedelta(minutes=10)
+    assert _job_on(db, monkeypatch) == []   # held, its retry counted
+    db.now = T0 + timedelta(minutes=19)
+    run(reachy_tasks.maintenance(now=db.now))
+    assert meal["status"] == "queued"       # its dose still startable
+    db.now = T0 + timedelta(minutes=20)
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None
+    run(reachy_tasks.maintenance(now=db.now))
+    assert meal["status"] == "aborted" and json.loads(meal["detail"]) == {"reason": "dose_expired"}
+    (text,) = _job_on(db, monkeypatch)
+    assert "⚠️ Metformin：" in text and "已經錯過了" in text and "請盡快服用" not in text
+    assert [t["task_id"] for t in db.tasks] == [task_id, meal["task_id"]]   # no robot for an expired dose
 
 
 def _waiting_rows(slot, retries_sent, waiting=(101,)):
