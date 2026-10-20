@@ -17,7 +17,6 @@ from app.services.device_auth import hash_token, issue_token
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
 
 ONLINE_SECONDS = 60
-MANUAL_TASK_MIN_MINUTES = 15
 
 
 class SettingsPayload(BaseModel):
@@ -146,7 +145,7 @@ async def checkin_task(user: dict = Depends(get_consented_user)):
         if device is None:
             raise HTTPException(409, "robot_not_paired")
         task_id = await reachy_tasks.enqueue_reachy_task(
-            conn, u_id, now, [], "checkin", now + timedelta(minutes=MANUAL_TASK_MIN_MINUTES))
+            conn, u_id, now, [], "checkin", now + timedelta(minutes=reachy_tasks.MANUAL_TASK_MIN_MINUTES))
         if task_id is None:
             raise HTTPException(403, "robot_consent_required")
     return {"task_id": task_id, "status": "queued", "slot_time": _iso(now)}
@@ -182,12 +181,7 @@ async def manual_task(payload: TaskPayload, user: dict = Depends(get_consented_u
         allowed = set(await dose_safety.allowed(conn, u_id, [row["intk_id"] for row in rows], at=now))
         intk_ids = [row["intk_id"] for row in rows if row["intk_id"] in allowed or row["intk_id"] == payload.intk_id]
         intk_ids = intk_ids or [payload.intk_id]
-        settings_row = await conn.fetchrow(
-            "SELECT COALESCE(remind_after_minutes, 10) AS after, COALESCE(remind_after_retries, 3) AS retries "
-            "FROM notification_settings WHERE u_id = $1", u_id)
-        after, retries = (settings_row["after"], settings_row["retries"]) if settings_row else (10, 3)
-        expires_at = max(slot_time + timedelta(minutes=after * (retries + 1)),
-                         datetime.now(timezone.utc) + timedelta(minutes=MANUAL_TASK_MIN_MINUTES))
+        expires_at = await reachy_tasks.manual_expires_at(conn, u_id, slot_time, datetime.now(timezone.utc))
         task_id = await reachy_tasks.enqueue_reachy_task(conn, u_id, slot_time, intk_ids, "manual", expires_at,
                                                          at=now)
         if task_id is None:

@@ -6,7 +6,7 @@ from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
 from app.services import dose_safety, schedule
 from app.services.line_service import LineService
-from app.services.reachy_tasks import enqueue_reachy_task
+from app.services.reachy_tasks import enqueue_reachy_task, meal_retry_waiting_sql
 
 log = logging.getLogger(__name__)
 _TZ = ZoneInfo(MEDCARE_TIMEZONE)
@@ -68,7 +68,7 @@ async def check_missed_doses():
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT i.intk_id AS id, i.u_id, i.intake_time_stamp,
                    i.reminder_sent,
                    i.missed_reminders_sent, m.med_id, m.med_name,
@@ -76,7 +76,8 @@ async def check_missed_doses():
                    COALESCE(ns.remind_before_minutes, 5) AS remind_before_minutes,
                    COALESCE(ns.remind_after_minutes, 10) AS remind_after_minutes,
                    COALESCE(ns.remind_after_retries, 3) AS remind_after_retries,
-                   COALESCE(ns.notify_family_on_missed, TRUE) AS notify_family_on_missed
+                   COALESCE(ns.notify_family_on_missed, TRUE) AS notify_family_on_missed,
+                   {meal_retry_waiting_sql('i')} AS meal_retry_waiting
             FROM intake i
             JOIN medication m ON m.med_id = i.med_id
             JOIN "user" u ON u.u_id = i.u_id
@@ -107,7 +108,14 @@ async def check_missed_doses():
 
         for (u_id, slot_time), group_rows in groups.items():
             intk_ids = [r["id"] for r in group_rows]
-            med_names = [r["med_name"] for r in group_rows]
+            # Quick fix 4 of 20 Oct 2026: a dose a meal retry waits for (meal_retry_waiting_sql: Reachy comes back
+            # after the patient said they had not eaten yet) gets no reminder, robot retry or missed mark of this
+            # job's own until that task has run. Its retries are still counted with the slot's (the flags below cover
+            # every dose of the slot), so afterwards the job goes on where the slot's timeline is: the missed alerts
+            # once its last retry has passed, never a burst of late "please take it" texts.
+            due_rows = [r for r in group_rows if not r["meal_retry_waiting"]]
+            due_ids = [r["id"] for r in due_rows]
+            med_names = [r["med_name"] for r in due_rows]
             # The patient's clock: the database hands times back in UTC ("14:00" was sent for the 22:00 dose).
             local_slot = slot_time.astimezone(_TZ)
             slot_label = local_slot.strftime("%H:%M")
@@ -155,10 +163,12 @@ async def check_missed_doses():
             # after the same medicine's previous one (due from halfway between them), one too soon after a dose taken
             # late, one over its daily maximum, and one missed past halfway to the next (never made up).
             async def protection_verdicts() -> tuple[list[int], list[str], list[tuple]]:
-                verdicts = await dose_safety.verdicts(conn, u_id, intk_ids, at=now)
-                allowed = [r["id"] for r in group_rows if verdicts.get(r["id"]) is None]
-                names = [r["med_name"] for r in group_rows if r["id"] in allowed]
-                held = [(r["med_name"], verdicts[r["id"]]) for r in group_rows if verdicts.get(r["id"]) is not None]
+                if not due_rows:
+                    return [], [], []
+                verdicts = await dose_safety.verdicts(conn, u_id, due_ids, at=now)
+                allowed = [r["id"] for r in due_rows if verdicts.get(r["id"]) is None]
+                names = [r["med_name"] for r in due_rows if r["id"] in allowed]
+                held = [(r["med_name"], verdicts[r["id"]]) for r in due_rows if verdicts.get(r["id"]) is not None]
                 return allowed, names, held
 
             async def send_robot(allowed: list[int], reason: str) -> None:
@@ -180,7 +190,7 @@ async def check_missed_doses():
                 and 0 < time_to_slot <= remind_before_secs
             ):
                 allowed, names, held = await protection_verdicts()
-                if patient_line_id:
+                if patient_line_id and due_rows:
                     msg = _reminder_text("🔔 用藥提醒", f"您預定於 {slot_label} 服用以下藥物：", "請準時服用。",
                                          names, held)
                     line_svc.send_text(patient_line_id, msg)
@@ -207,7 +217,7 @@ async def check_missed_doses():
                 ):
                     time_passed_mins = int((group_retry_count + 1) * remind_after_minutes)
                     allowed, names, held = await protection_verdicts()
-                    if patient_line_id:
+                    if patient_line_id and due_rows:
                         msg = _reminder_text("⚠️ 逾時用藥提醒", f"您已逾時 {time_passed_mins} 分鐘未服用以下藥物：",
                                              "請盡快服用。", names, held)
                         line_svc.send_text(patient_line_id, msg)
@@ -226,11 +236,11 @@ async def check_missed_doses():
                         await send_robot(allowed, "missed_retry")
 
                 # --- 3. Final Missed Alert (one per slot per recipient) ---
-                if time_since_slot >= remind_after_retries * remind_after_secs:
+                if time_since_slot >= remind_after_retries * remind_after_secs and due_rows:
                     await conn.execute(
                         "UPDATE intake SET intake_stats = 'missed', notify_stats = 'sent' "
                         "WHERE intk_id = ANY($1::int[])",
-                        intk_ids,
+                        due_ids,
                     )
 
                     # Notify family contacts (one message per family member, listing

@@ -313,6 +313,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_slot ON reachy_task(u_id, sl
 ALTER TABLE reachy_task DROP CONSTRAINT IF EXISTS reachy_task_reason_check;
 ALTER TABLE reachy_task ADD CONSTRAINT reachy_task_reason_check
     CHECK (reason IN ('upcoming','missed_retry','manual','checkin'));
+-- Quick fix 4 (20 Oct 2026): a meal retry (the patient had not eaten yet) may be leased only from not_before on.
+-- Only meal retries have one, so it also tells them apart (reachy_tasks.MEAL_RETRY_LIMIT counts them per dose).
+ALTER TABLE reachy_task ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
 
 -- Check-in conversations. Speech is turned into text on the robot; only text is stored.
 -- Retention (robot notice §5): turns 30 days, turns quoted in a safety alert 180 days,
