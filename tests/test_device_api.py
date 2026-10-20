@@ -640,6 +640,73 @@ def test_a_failing_microphone_switch_read_leaves_it_out_and_keeps_the_heartbeat(
     assert [r.levelname for r in caplog.records if "microphone switch" in r.getMessage()] == ["WARNING"]
 
 
+# ── Quick fix 9 (21 Oct 2026): the robot app's control address, for the microphone button's direct call ──
+
+CONTROL_KEY = "Qx7-" + "a1_B" * 10   # 44 URL-safe characters (the robot app makes it with secrets.token_urlsafe(32))
+CONTROL = {"url": "http://192.168.137.104:8042", "key": CONTROL_KEY}
+
+
+def test_heartbeat_keeps_the_robots_control_address(env, monkeypatch):
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.17.2", "microphone_volume": 100,
+                                                             "control": CONTROL})
+    assert response.status_code == 200
+    assert _last_detail(env) == {"vision_fps": None, "bridge_version": "0.17.2", "missing_clips": None,
+                                 "microphone_volume": 100, "control": CONTROL}
+
+
+def test_the_control_address_is_kept_only_while_the_robot_reports_it(env, monkeypatch):
+    """Each heartbeat replaces status_detail: a robot older than 0.17.2 sends none, and one that could not find its
+    address leaves it out; the button then waits for the heartbeat."""
+    _no_leases(monkeypatch)
+    for body in ({"bridge_version": "0.17.1"}, {"control": None}):
+        assert env.robot.post("/api/device/heartbeat", json={"control": CONTROL}).status_code == 200
+        assert _last_detail(env)["control"] == CONTROL
+        assert env.robot.post("/api/device/heartbeat", json=body).status_code == 200
+        assert "control" not in _last_detail(env)
+
+
+@pytest.mark.parametrize("control", [
+    {"url": "http://8.8.8.8:8042", "key": CONTROL_KEY},             # not a private network
+    {"url": "http://127.0.0.1:8042", "key": CONTROL_KEY},
+    {"url": "http://192.168.137.104:8000", "key": CONTROL_KEY},     # the daemon's port, not the app's
+    {"url": "http://192.168.137.104:8042/api", "key": CONTROL_KEY},
+    {"url": "http://user@192.168.137.104:8042", "key": CONTROL_KEY},
+    {"url": "http://reachy-mini.local:8042", "key": CONTROL_KEY},
+    {"url": "http://192.168.137.104:8042", "key": "short"},
+    {"url": "http://192.168.137.104:8042", "key": CONTROL_KEY + "+/="},
+    {"url": "http://192.168.137.104:8042"}, "http://192.168.137.104:8042", [CONTROL], 1, True,
+])
+def test_heartbeat_drops_any_other_control_and_still_answers(env, monkeypatch, control):
+    """Dropped, never a 422: the heartbeat's other fields are kept, so the robot stays online."""
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"microphone_volume": 55, "control": control})
+    assert response.status_code == 200 and response.json()["stop_all"] is False
+    assert "control" not in _last_detail(env) and _last_detail(env)["microphone_volume"] == 55
+
+
+def test_a_dropped_control_warns_once_and_never_shows_the_key(env, monkeypatch, caplog):
+    _no_leases(monkeypatch)
+    env.device["device_id"] = str(uuid.uuid4())   # a device of its own: the warnings are remembered per device
+    bad = {"url": "http://8.8.8.8:8042", "key": CONTROL_KEY}
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            assert env.robot.post("/api/device/heartbeat", json={"control": bad}).status_code == 200
+    warnings = [record for record in caplog.records if "control address" in record.getMessage()]
+    assert [record.levelname for record in warnings] == ["WARNING"]
+    assert "patient 7" in warnings[0].getMessage()
+    assert not any(CONTROL_KEY in record.getMessage() for record in caplog.records)
+
+
+def test_the_control_key_never_reaches_the_status_or_the_heartbeat_answer(env, monkeypatch):
+    _no_leases(monkeypatch)
+    answer = env.robot.post("/api/device/heartbeat", json={"microphone_volume": 100, "control": CONTROL})
+    assert CONTROL_KEY not in answer.text
+    status = env.browser.get("/api/reachy/status")
+    assert status.status_code == 200 and status.json()["mic_volume"] == 100
+    assert CONTROL_KEY not in status.text and "8042" not in status.text and "control" not in status.json()
+
+
 # ── Frame stream: the server computes the landmarks ─────────────────────────
 
 def _jpeg(width=64, height=48) -> bytes:

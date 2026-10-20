@@ -250,6 +250,23 @@ def test_export_strips_the_device_token_hash():
     assert rows["dose_video_link"] == [{"link_id": "l"}]
 
 
+def test_export_strips_the_robots_control_key():
+    """Quick fix 9: the heartbeat keeps the robot app's control address and key in status_detail; the key switches the
+    robot's microphone, so it never leaves the server. asyncpg hands JSONB back as text."""
+    from app.routers import api_account
+    key = "K" * 43
+    detail = {"vision_fps": None, "microphone_volume": 0, "control": {"url": "http://192.168.137.104:8042", "key": key}}
+    rows = {"reachy_device": [{"device_id": "a", "status_detail": json.dumps(detail)},
+                              {"device_id": "b", "status_detail": dict(detail)},
+                              {"device_id": "c", "status_detail": None},
+                              {"device_id": "d", "status_detail": "[]"}]}
+    api_account._strip_secrets(rows)
+    assert key not in json.dumps(rows)
+    assert json.loads(rows["reachy_device"][0]["status_detail"]) == {"vision_fps": None, "microphone_volume": 0}
+    assert rows["reachy_device"][1]["status_detail"] == {"vision_fps": None, "microphone_volume": 0}
+    assert [row["status_detail"] for row in rows["reachy_device"][2:]] == [None, "[]"]
+
+
 def test_export_reads_dose_video_links_through_their_video():
     query = api_account.EXPORT_QUERIES["dose_video_link"]
     assert "JOIN dose_video v" in query and query.endswith("WHERE v.u_id=$1")
