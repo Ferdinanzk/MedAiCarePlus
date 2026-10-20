@@ -66,6 +66,9 @@ interface MockOptions {
   micMuted?: boolean;
   /** The daemon's microphone volume from the robot's last heartbeat; left out: null (none reported). */
   micVolume?: number | null;
+  /** Quick fix 9: the robot applied a microphone press at once (the server's direct call) and answered this volume.
+   *  Left out: no control address (a robot app before 0.17.2), so the answer says mic_applied false. */
+  micApply?: ((muted: boolean) => number | null) | null;
 }
 
 /** What POST /api/reachy/demo-dose answers when it succeeds (quick fix 6). */
@@ -92,6 +95,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     mealRetry: options.mealRetry ?? false,
     micMuted: options.micMuted ?? false,
     micVolume: options.micVolume ?? null,
+    micApply: options.micApply ?? null,
     /** How many times the card read GET /api/reachy/status. */
     statusReads: 0,
     /** While set, GET /api/reachy/status answers (with the state as it was when it came) only once it resolves. */
@@ -175,7 +179,9 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       if ('live_voice' in body) state.liveVoice = body.live_voice;
       if ('meal_retry' in body) state.mealRetry = body.meal_retry;
       if ('mic_muted' in body) state.micMuted = body.mic_muted;
-      return route.fulfill({ json: robotStatus() });
+      // Quick fix 9: a microphone press says whether the robot applied it at once, and then keeps the robot's volume.
+      if ('mic_muted' in body && state.micApply) state.micVolume = state.micApply(body.mic_muted);
+      return route.fulfill({ json: { ...robotStatus(), ...('mic_muted' in body ? { mic_applied: !!state.micApply } : {}) } });
     }
     if (path === '/api/reachy/demo-dose' && request.method() === 'POST') {
       state.demoPosts += 1;
@@ -670,7 +676,8 @@ test('the Reachy card translations have the same keys in English and Traditional
   expect(keys[0]).toEqual(expect.arrayContaining([
     'callName', 'callNameHelp', 'callNamePlaceholder', 'callNameReset', 'callNameSaved', 'callNameInvalid',
     'liveVoice', 'liveVoiceHelp', 'mealRetry', 'mealRetryHelp',
-    'micSwitch', 'micSwitchHelp', 'micVolume', 'micApplying', 'micAtZero',
+    'micSwitch', 'micSwitchHelp', 'micApplying', 'micAtZero',
+    'micNowOn', 'micNowOnVolume', 'micNowOff', 'micTurnOff', 'micTurnOn', 'micApplied', 'micSaved',
     'demoDose', 'demoDoseHelp', 'demoDoseSent', 'demoDoseNotPaired', 'demoDoseSlotBusy', 'demoDoseOffline',
   ]));
 });
@@ -816,114 +823,176 @@ test('while the robot is offline the demo dose button says what a press does', a
   expect(api.demoPosts).toBe(1);
 });
 
-// ── Quick fix 8 (20 Oct 2026): the robot's microphone on and off (the robot app sets the daemon's volume to 0) ──
+// ── Quick fix 8 (20 Oct 2026): the robot's microphone on and off (the robot app sets the daemon's volume to 0), and
+//    quick fix 9 (21 Oct 2026): one button that applies it on the robot at once ──
 
-const micSwitch = (page: Page) => page.getByRole('checkbox', { name: /^(Robot microphone|機器人麥克風)/ });
-/** The switch's row: its words, and the volume lines under them. */
-const micRow = (page: Page) => micSwitch(page).locator('xpath=..');
+const MIC_BUTTON = /^(Turn microphone off|Turn microphone on|關閉麥克風|開啟麥克風|Applying on the robot…|正在套用到機器人…)$/;
+const micButton = (page: Page) => reachyCard(page).getByRole('button', { name: MIC_BUTTON });
+/** The microphone's box: its title, state line and help, the button, and the lines under it. */
+const micBox = (page: Page) => micButton(page).locator('xpath=..');
+/** The state line, exactly ("目前：開啟" is also the start of "目前：開啟（音量 40）"). */
+const micState = (page: Page, words: string) => reachyCard(page).getByText(words, { exact: true });
 const MIC_HELP_ZH = '關閉時會把 Reachy 的麥克風音量設為 0，Reachy 聽不到任何聲音（包括「我吃完了」和聊天）。約 10 秒內生效。';
 const MIC_HELP_EN = 'When off, Reachy\'s microphone volume is set to 0, so Reachy hears nothing (including "I finished" and ' +
   'chats). Takes effect within about 10 seconds.';
 const MIC_APPLYING = /正在套用到機器人…|Applying on the robot…/;
 const MIC_AT_ZERO_ZH = '機器人的麥克風音量是 0，Reachy 聽不到聲音。請在 Reachy Mini Control 把麥克風音量調高。';
 const MIC_AT_ZERO_EN = "The robot's microphone volume is 0, so Reachy hears nothing. Raise it in Reachy Mini Control.";
-const MIC_REREADS = 20;   // ReachyCard.tsx: the status reads after a microphone change, 3 s apart
+const MIC_SAVED_ZH = '已儲存，機器人約 10 秒內套用';
+const MIC_SAVED_EN = 'Saved. The robot applies it within about 10 seconds.';
+const MIC_APPLIED_ZH = '已套用到機器人';
+const MIC_APPLIED_EN = 'Applied on the robot';
+const MIC_REREADS = 20;          // ReachyCard.tsx: the status reads after a microphone change, 3 s apart
+const MIC_APPLIED_MS = 4000;     // ReachyCard.tsx: how long "Applied on the robot" stays
 
-test('the microphone switch shows only while a robot is paired', async ({ page }) => {
+test('the microphone button shows only while a robot is paired', async ({ page }) => {
   await seedSession(page);
   const api = await mockApi(page, { robotConsent: true });
   await page.goto('/settings');
   const pair = page.getByRole('button', { name: /Pair a Reachy robot|配對 Reachy 機器人/ });
   await expect(pair).toBeVisible();
-  await expect(micSwitch(page)).toHaveCount(0);
+  await expect(micButton(page)).toHaveCount(0);
   await clickCentred(pair);
-  await expect(micSwitch(page)).toBeChecked();   // on: the server's default
+  await expect(micButton(page)).toHaveText('關閉麥克風');   // on: the server's default
+  await expect(micState(page, '目前：開啟')).toBeVisible();   // no volume reported yet
   expect(api.settingsPatches).toEqual([]);
 });
 
-test("the microphone switch defaults on, saves only mic_muted and flips only on the server's answer", async ({ page }) => {
-  await seedSession(page);
-  const api = await mockApi(page, { paired: true, robotConsent: true, micVolume: 100 });
-  await page.goto('/settings');   // the app starts in Traditional Chinese
-  await expect(micSwitch(page)).toBeChecked();
-  await expect(micRow(page)).toContainText('機器人麥克風');
-  await expect(micRow(page)).toContainText(MIC_HELP_ZH);
-  await expect(micRow(page)).toContainText('麥克風音量：100');
-  await expect(reachyCard(page).getByText('麥克風音量：100')).toBeVisible();
-  await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);   // on, and the robot hears
+test('the microphone button sends only mic_muted, waits disabled, and leaves it to the heartbeat when not applied',
+  async ({ page }) => {
+    await seedSession(page);
+    const api = await mockApi(page, { paired: true, robotConsent: true, micVolume: 100 });
+    await page.goto('/settings');   // the app starts in Traditional Chinese
+    await expect(micBox(page)).toContainText('機器人麥克風');
+    await expect(micBox(page)).toContainText(MIC_HELP_ZH);
+    await expect(micState(page, '目前：開啟（音量 100）')).toBeVisible();
+    await expect(micButton(page)).toHaveText('關閉麥克風');
+    await expect(micButton(page)).toBeEnabled();
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);   // on, and the robot hears
 
-  // The switch mirrors the server's value: while the PATCH waits for its answer it stays on.
-  let answer = () => {};
-  api.settingsGate = new Promise<void>(resolve => { answer = resolve; });
-  await clickCentred(micSwitch(page));
-  await expect.poll(() => api.settingsPatches).toEqual([{ mic_muted: true }]);
-  await expect(micSwitch(page)).toBeChecked();
-  answer();
-  await expect(micSwitch(page)).not.toBeChecked();
-  api.settingsGate = null;
-  // Off, but the robot still reports its volume: it applies the switch at its next heartbeat.
-  await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
-  await expect(reachyCard(page).getByText('麥克風音量：100')).toBeVisible();
+    // While the PATCH waits, the button is disabled and says so; the state stays as the server has it.
+    let answer = () => {};
+    api.settingsGate = new Promise<void>(resolve => { answer = resolve; });
+    await clickCentred(micButton(page));
+    await expect.poll(() => api.settingsPatches).toEqual([{ mic_muted: true }]);
+    await expect(micButton(page)).toHaveText('正在套用到機器人…');
+    await expect(micButton(page)).toBeDisabled();
+    await expect(micState(page, '目前：開啟（音量 100）')).toBeVisible();
+    answer();
+    api.settingsGate = null;
+    // Not applied at once (no control address): saved, and the robot applies it at its next heartbeat.
+    await expect(micState(page, '目前：已關閉')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_SAVED_ZH, { exact: true })).toBeVisible();
+    await expect(micButton(page)).toHaveText('開啟麥克風');
+    await expect(micButton(page)).toBeEnabled();
+    await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();   // the robot still reports 100
+    await expect(reachyCard(page).getByText(MIC_APPLIED_ZH, { exact: true })).toHaveCount(0);
 
-  // The card reads the status again while it waits, and the line goes once the robot reports 0.
-  const reads = api.statusReads;
-  api.micVolume = 0;
-  await expect(reachyCard(page).getByText('麥克風音量：0')).toBeVisible();
-  await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
-  expect(api.statusReads).toBeGreaterThan(reads);
+    // The card reads the status again while it waits, and the line goes once the robot reports 0.
+    const reads = api.statusReads;
+    api.micVolume = 0;
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+    expect(api.statusReads).toBeGreaterThan(reads);
+    await expect(micState(page, '目前：已關閉')).toBeVisible();
 
-  // On again: applying until the robot reports a volume above 0.
-  await clickCentred(micSwitch(page));
-  await expect.poll(() => api.settingsPatches).toEqual([{ mic_muted: true }, { mic_muted: false }]);
-  await expect(micSwitch(page)).toBeChecked();
-  await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
-  api.micVolume = 85;
-  await expect(reachyCard(page).getByText('麥克風音量：85')).toBeVisible();
-  await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+    // On again: applying until the robot reports a volume above 0.
+    await clickCentred(micButton(page));
+    await expect.poll(() => api.settingsPatches).toEqual([{ mic_muted: true }, { mic_muted: false }]);
+    await expect(micButton(page)).toHaveText('關閉麥克風');
+    await expect(micState(page, '目前：開啟（音量 0）')).toBeVisible();
+    await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
+    api.micVolume = 85;
+    await expect(micState(page, '目前：開啟（音量 85）')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
 
-  // A PATCH that fails leaves it as the server has it, and says so.
-  api.settingsError = 500;
-  await clickCentred(micSwitch(page));
-  await expect(reachyCard(page).getByRole('alert')).toHaveText('操作未成功，請再試一次。');
-  expect(api.settingsPatches).toEqual([{ mic_muted: true }, { mic_muted: false }, { mic_muted: true }]);
-  await expect(micSwitch(page)).toBeChecked();
-  await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
-});
+    // A PATCH that fails leaves it as the server has it, and says so in the card's words.
+    api.settingsError = 500;
+    await clickCentred(micButton(page));
+    await expect(reachyCard(page).getByRole('alert')).toHaveText('操作未成功，請再試一次。');
+    expect(api.settingsPatches).toEqual([{ mic_muted: true }, { mic_muted: false }, { mic_muted: true }]);
+    await expect(micButton(page)).toHaveText('關閉麥克風');
+    await expect(micState(page, '目前：開啟（音量 85）')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_SAVED_ZH, { exact: true })).toHaveCount(0);
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+  });
 
-test('the microphone switch shows the value the server has, in English, and no volume before one is reported', async ({ page }) => {
-  await seedSession(page);
-  const api = await mockApi(page, { paired: true, robotConsent: true, micMuted: true });
-  await page.goto('/settings');   // the app starts in Traditional Chinese
-  await expect(micSwitch(page)).not.toBeChecked();
-  // An older robot (or a daemon that did not answer) reports no volume: no volume line and no applying line.
-  await expect(reachyCard(page).getByText('麥克風音量：')).toHaveCount(0);
-  await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+test('a press the robot applied at once shows the new state, says so for a few seconds and reads nothing more',
+  async ({ page }) => {
+    await page.clock.install();
+    await seedSession(page);
+    const api = await mockApi(page, { paired: true, robotConsent: true, micVolume: 100,
+                                      micApply: muted => (muted ? 0 : 100) });
+    await page.goto('/settings');
+    await expect(micState(page, '目前：開啟（音量 100）')).toBeVisible();
+    const reads = api.statusReads;
+    await clickCentred(micButton(page));
+    await expect(micState(page, '目前：已關閉')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_APPLIED_ZH, { exact: true })).toBeVisible();
+    await expect(micButton(page)).toHaveText('開啟麥克風');
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);   // the robot answered volume 0
+    await expect(reachyCard(page).getByText(MIC_SAVED_ZH, { exact: true })).toHaveCount(0);
+    await page.clock.fastForward(MIC_APPLIED_MS);
+    await expect(reachyCard(page).getByText(MIC_APPLIED_ZH, { exact: true })).toHaveCount(0);
+    await page.clock.fastForward(60_000);
+    expect(api.statusReads).toBe(reads);   // confirmed by the robot: no re-reads
 
-  api.micVolume = 40;   // off, but the robot's microphone is still at 40
-  await page.reload();
-  await expect(reachyCard(page).getByText('麥克風音量：40')).toBeVisible();
-  await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
-  await page.getByRole('button', { name: '中文' }).first().click();
-  await expect(micRow(page)).toContainText('Robot microphone');
-  await expect(micRow(page)).toContainText(MIC_HELP_EN);
-  await expect(micSwitch(page)).not.toBeChecked();
-  await expect(reachyCard(page).getByText('Microphone volume: 40')).toBeVisible();
-  await expect(reachyCard(page).getByText('Applying on the robot…')).toBeVisible();
-  // The volume lines are not part of the switch: pressing them flips nothing.
-  await clickCentred(reachyCard(page).getByText('Microphone volume: 40'));
-  await expect(micSwitch(page)).not.toBeChecked();
-  for (const width of [390, 1280]) {
-    await page.setViewportSize({ width, height: 900 });
-    await expect(micSwitch(page)).toBeVisible();
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-    if (process.env.REACHY_SCREENSHOTS) {
-      // 'instant', because index.css scrolls smoothly and the picture would be taken mid-scroll.
-      await micSwitch(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
-      await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-mic-${width}.png` });
+    await clickCentred(micButton(page));
+    await expect(micState(page, '目前：開啟（音量 100）')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_APPLIED_ZH, { exact: true })).toBeVisible();
+    await expect(micButton(page)).toHaveText('關閉麥克風');
+    expect(api.settingsPatches).toEqual([{ mic_muted: true }, { mic_muted: false }]);
+    expect(api.statusReads).toBe(reads);
+  });
+
+test('the microphone button in English, with no volume before one is reported, on a phone and a desktop',
+  async ({ page }) => {
+    await seedSession(page);
+    const api = await mockApi(page, { paired: true, robotConsent: true, micMuted: true });
+    await page.goto('/settings');   // the app starts in Traditional Chinese
+    await expect(micButton(page)).toHaveText('開啟麥克風');
+    await expect(micState(page, '目前：已關閉')).toBeVisible();
+    // An older robot (or a daemon that did not answer) reports no volume: no applying line.
+    await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+
+    api.micVolume = 40;   // off, but the robot's microphone is still at 40
+    await page.reload();
+    await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
+    await page.getByRole('button', { name: '中文' }).first().click();
+    await expect(micBox(page)).toContainText('Robot microphone');
+    await expect(micBox(page)).toContainText(MIC_HELP_EN);
+    await expect(micState(page, 'Now: off')).toBeVisible();
+    await expect(micButton(page)).toHaveText('Turn microphone on');
+    await expect(reachyCard(page).getByText('Applying on the robot…')).toBeVisible();
+    for (const width of [390, 1280]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(micButton(page)).toBeVisible();
+      expect((await micButton(page).boundingBox())!.height).toBeGreaterThanOrEqual(48);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      if (process.env.REACHY_SCREENSHOTS) {
+        // 'instant', because index.css scrolls smoothly and the picture would be taken mid-scroll.
+        await micButton(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+        await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-mic-${width}.png` });
+      }
     }
-  }
-  expect(api.settingsPatches).toEqual([]);   // showing the card sends nothing
-});
+    expect(api.settingsPatches).toEqual([]);   // showing the card sends nothing
+
+    // Both answers in English: saved (the heartbeat applies it), then applied at once.
+    await clickCentred(micButton(page));
+    await expect(micState(page, 'Now: on (volume 40)')).toBeVisible();
+    await expect(micButton(page)).toHaveText('Turn microphone off');
+    await expect(reachyCard(page).getByText(MIC_SAVED_EN, { exact: true })).toBeVisible();
+    api.micApply = muted => (muted ? 0 : 40);
+    await clickCentred(micButton(page));
+    await expect(micState(page, 'Now: off')).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_APPLIED_EN, { exact: true })).toBeVisible();
+    await expect(reachyCard(page).getByText(MIC_SAVED_EN, { exact: true })).toHaveCount(0);
+    if (process.env.REACHY_SCREENSHOTS) {
+      await page.setViewportSize({ width: 390, height: 900 });
+      await micButton(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-mic-applied-390.png` });
+    }
+    expect(api.settingsPatches).toEqual([{ mic_muted: false }, { mic_muted: true }]);
+  });
 
 // ── Review of quick fix 8 ──
 
@@ -931,8 +1000,8 @@ test('switched on with the volume at 0 and no change waiting, the card says wher
   await seedSession(page);
   const api = await mockApi(page, { paired: true, robotConsent: true, micVolume: 0 });
   await page.goto('/settings');   // the app starts in Traditional Chinese
-  await expect(micSwitch(page)).toBeChecked();
-  await expect(micRow(page)).toContainText('麥克風音量：0');
+  await expect(micButton(page)).toHaveText('關閉麥克風');
+  await expect(micState(page, '目前：開啟（音量 0）')).toBeVisible();
   // The robot app raises only a volume it muted itself, so the switch alone may never bring this back.
   await expect(reachyCard(page).getByText(MIC_AT_ZERO_ZH)).toBeVisible();
   await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
@@ -941,15 +1010,16 @@ test('switched on with the volume at 0 and no change waiting, the card says wher
     await expect(reachyCard(page).getByText(MIC_AT_ZERO_ZH)).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     if (process.env.REACHY_SCREENSHOTS) {
-      await micSwitch(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await micButton(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
       await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-mic-zero-${width}.png` });
     }
   }
   await page.getByRole('button', { name: '中文' }).first().click();
   await expect(reachyCard(page).getByText(MIC_AT_ZERO_EN)).toBeVisible();
+  await expect(micState(page, 'Now: on (volume 0)')).toBeVisible();
   api.micVolume = 70;
   await page.reload();   // back in Traditional Chinese
-  await expect(reachyCard(page).getByText('麥克風音量：70')).toBeVisible();
+  await expect(micState(page, '目前：開啟（音量 70）')).toBeVisible();
   await expect(reachyCard(page).getByText(MIC_AT_ZERO_ZH)).toHaveCount(0);
   expect(api.settingsPatches).toEqual([]);
 });
@@ -959,10 +1029,10 @@ test('switched on, the applying line gives way to the volume line once the re-re
   await seedSession(page);
   const api = await mockApi(page, { paired: true, robotConsent: true, micMuted: true, micVolume: 0 });
   await page.goto('/settings');
-  await expect(micSwitch(page)).not.toBeChecked();
+  await expect(micButton(page)).toHaveText('開啟麥克風');
   await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);   // off, and at 0: they agree
-  await clickCentred(micSwitch(page));
-  await expect(micSwitch(page)).toBeChecked();
+  await clickCentred(micButton(page));
+  await expect(micButton(page)).toHaveText('關閉麥克風');
   // The robot restores the volume at its next heartbeat when it muted it; meanwhile the card waits.
   await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
   await expect(reachyCard(page).getByText(MIC_AT_ZERO_ZH)).toHaveCount(0);
@@ -981,13 +1051,20 @@ test('an offline robot shows no microphone volume and no applying line', async (
   const api = await mockApi(page, { paired: true, robotConsent: true, online: false, micMuted: true, micVolume: 40 });
   await page.goto('/settings');
   await expect(reachyCard(page).getByText('離線', { exact: true })).toBeVisible();
-  await expect(micSwitch(page)).not.toBeChecked();
+  await expect(micButton(page)).toHaveText('開啟麥克風');
   // Its last report is old: the robot may never apply the switch while it is away.
-  await expect(reachyCard(page).getByText('麥克風音量：')).toHaveCount(0);
+  await expect(micState(page, '目前：已關閉')).toBeVisible();
   await expect(reachyCard(page).getByText(MIC_APPLYING)).toHaveCount(0);
+  api.micMuted = false;
+  await page.reload();
+  await expect(micState(page, '目前：開啟')).toBeVisible();   // and nothing about its volume
+  await expect(reachyCard(page).getByText('（音量')).toHaveCount(0);
   api.online = true;
   await page.reload();
-  await expect(reachyCard(page).getByText('麥克風音量：40')).toBeVisible();
+  await expect(micState(page, '目前：開啟（音量 40）')).toBeVisible();
+  api.micMuted = true;
+  await page.reload();
+  await expect(micState(page, '目前：已關閉')).toBeVisible();
   await expect(reachyCard(page).getByText('正在套用到機器人…')).toBeVisible();
 });
 
@@ -995,9 +1072,9 @@ test("a microphone re-read sent before another switch's answer never puts that s
   await seedSession(page);
   const api = await mockApi(page, { paired: true, robotConsent: true, micVolume: 100 });
   await page.goto('/settings');
-  await expect(micSwitch(page)).toBeChecked();
-  await clickCentred(micSwitch(page));          // off: the card re-reads every 3 s while the robot still reports 100
-  await expect(micSwitch(page)).not.toBeChecked();
+  await expect(micButton(page)).toHaveText('關閉麥克風');
+  await clickCentred(micButton(page));          // off: the card re-reads every 3 s while the robot still reports 100
+  await expect(micButton(page)).toHaveText('開啟麥克風');
   let release = () => {};
   api.statusGate = new Promise<void>(resolve => { release = resolve; });
   const reads = api.statusReads;
@@ -1010,7 +1087,7 @@ test("a microphone re-read sent before another switch's answer never puts that s
   await expect.poll(() => api.statusReads).toBe(reads + 2);   // handled: the next re-read went out
   await expect(mealRetrySwitch(page)).toBeChecked();
   releaseNext();
-  await expect(micSwitch(page)).not.toBeChecked();
+  await expect(micButton(page)).toHaveText('開啟麥克風');
   await expect(mealRetrySwitch(page)).toBeChecked();
   expect(api.settingsPatches).toEqual([{ mic_muted: true }, { meal_retry: true }]);
 });
