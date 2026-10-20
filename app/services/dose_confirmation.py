@@ -437,15 +437,17 @@ async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
     patient, slot = details["patient"], details["slot"]
 
     if result["status"] == "already_resolved":
+        # A request whose dose rows are gone (the demo dose button clears its earlier doses) has no slot to name.
+        who, whose = (f"{patient} {slot}", f"{patient}'s {slot}") if slot else (patient, f"{patient}'s")
         if result["resolution"] == "expired":
-            text = (f"此確認請求已逾時（{patient} {slot}）。\n"
-                    f"This request for {patient}'s {slot} dose has expired.")
+            text = (f"此確認請求已逾時（{who}）。\n"
+                    f"This request for {whose} dose has expired.")
         else:
             by = await conn.fetchval("SELECT name FROM family_contacts WHERE id = $1", result["resolved_by"]) \
                 or "another contact"
             zh, en = _ANSWER_TEXT[_RESOLUTION_ANSWER[result["resolution"]]]
-            text = (f"此確認已由 {by} 回覆：{zh}（{patient} {slot}）。\n"
-                    f"Already answered by {by}: {en} ({patient}'s {slot} dose).")
+            text = (f"此確認已由 {by} 回覆：{zh}（{who}）。\n"
+                    f"Already answered by {by}: {en} ({whose} dose).")
         await outbox.enqueue(conn, u_id=u_id, recipient_line_id=contact["line_id"], kind="dose_confirm_reply",
                              priority=1, messages=_text(text), recipient_contact_id=contact["id"],
                              dedupe_key=f"dose_confirm_late:{confirmation_id}:{contact['id']}")
