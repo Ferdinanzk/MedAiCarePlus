@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { BellRing, Bot, Copy, Loader2, MessageCircle, Pill } from 'lucide-react';
+import { BellRing, Bot, Copy, Loader2, MessageCircle, Mic, MicOff, Pill } from 'lucide-react';
 import LegalDocument from './LegalDocument';
 import { fetchConsentStatus, fetchLegal, legalLanguage, postConsent, type LegalResponse } from '../lib/consent-api';
 import { clockTime, doseRefusal, dueDose, hasReplyFor, nextDose, notDueYet, refusalMessage, rememberRefusal } from '../lib/doses';
@@ -11,12 +11,15 @@ import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTa
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
 /** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
 const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
-/** After the microphone switch changes, the card reads the status again every MIC_REREAD_MS, at most MIC_REREADS
- *  times (60 s), while the switch and the robot's reported volume disagree: the robot applies the switch at its next
- *  heartbeat and reports the new volume at the one after. Each heartbeat waits 10 s and then up to about 2 s for each
- *  daemon call, so a slow robot takes close to 40 s (review of quick fix 8). */
+/** After a microphone press the robot did not apply at once (quick fix 9: mic_applied false), the card reads the status
+ *  again every MIC_REREAD_MS, at most MIC_REREADS times (60 s), while the switch and the robot's reported volume
+ *  disagree: the robot applies the switch at its next heartbeat and reports the new volume at the one after. Each
+ *  heartbeat waits 10 s and then up to about 2 s for each daemon call, so a slow robot takes close to 40 s (review of
+ *  quick fix 8). */
 const MIC_REREAD_MS = 3000;
 const MIC_REREADS = 20;
+/** How long "Applied on the robot" stays after the robot applied a microphone press at once (quick fix 9). */
+const MIC_APPLIED_MS = 4000;
 
 /**
  * `key` and its values, or `text` already worded (the server's reply when it refuses the dose).
@@ -49,6 +52,9 @@ export default function ReachyCard() {
   const [nameNotice, setNameNotice] = useState<'saved' | 'invalid' | null>(null);
   /** Status reads left after a microphone change (quick fix 8). */
   const [micRereads, setMicRereads] = useState(0);
+  /** The microphone button's request is on its way (quick fix 9), and what its answer said. */
+  const [micPending, setMicPending] = useState(false);
+  const [micNotice, setMicNotice] = useState<'applied' | 'saved' | null>(null);
   /** Counts the statuses the card got from anything but a microphone re-read: a re-read sent before one of them came
    *  is older and is dropped, so it never puts another switch back (review of quick fix 8). */
   const statusAnswers = useRef(0);
@@ -94,6 +100,9 @@ export default function ReachyCard() {
   const micDisagrees = micVolume !== null && (status?.mic_muted ? micVolume > 0 : micVolume === 0);
   const micApplying = micDisagrees && (!!status?.mic_muted || micRereads > 0);
   const micAtZero = micDisagrees && !micApplying;
+  // The state line: the server's switch, and while the robot is online the volume it reported (quick fix 9).
+  const micState = status?.mic_muted ? t('reachy.micNowOff')
+    : micVolume !== null ? t('reachy.micNowOnVolume', { n: micVolume }) : t('reachy.micNowOn');
 
   useEffect(() => {
     if (!micDisagrees || micRereads <= 0) return;
@@ -108,10 +117,17 @@ export default function ReachyCard() {
     return () => { active = false; window.clearTimeout(timer); };
   }, [micDisagrees, micRereads]);
 
+  useEffect(() => {
+    if (micNotice !== 'applied') return;
+    const timer = window.setTimeout(() => setMicNotice(null), MIC_APPLIED_MS);
+    return () => window.clearTimeout(timer);
+  }, [micNotice]);
+
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
     setError('');
     setNameNotice(null);
+    setMicNotice(null);
     try {
       await action();
     } catch (cause) {
@@ -194,11 +210,19 @@ export default function ReachyCard() {
 
   const toggleMealRetry = (value: boolean) => run(async () => showStatus(await updateReachySettings({ meal_retry: value })));
 
-  // Checked = on. Off has the robot app set the daemon's microphone volume to 0; the card then reads the status again
-  // until the robot reports the new volume.
-  const toggleMic = (value: boolean) => run(async () => {
-    showStatus(await updateReachySettings({ mic_muted: !value }));
-    setMicRereads(MIC_REREADS);
+  // Off has the robot app set the daemon's microphone volume to 0. Quick fix 9: the server applies a press on the robot
+  // at once when it reaches the robot app (mic_applied: the answer is the new state). Otherwise the robot applies it at
+  // its next heartbeat, and the card reads the status again until the robot reports the new volume.
+  const pressMic = (muted: boolean) => run(async () => {
+    setMicPending(true);
+    try {
+      const next = await updateReachySettings({ mic_muted: muted });
+      showStatus(next);
+      setMicRereads(next.mic_applied ? 0 : MIC_REREADS);
+      setMicNotice(next.mic_applied ? 'applied' : 'saved');
+    } finally {
+      setMicPending(false);
+    }
   });
 
   // "" goes back to the registered name. A name the server refuses (422 invalid_call_name) is explained next to the
@@ -420,19 +444,29 @@ export default function ReachyCard() {
               <span className="block text-xs text-gray-500 mt-1">{t('reachy.listenHelp')}</span>
             </span>
           </label>
-          {/* The volume lines sit under the switch's words, outside its label, so pressing them flips nothing. */}
-          <div className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
-            <input id="reachy-mic" type="checkbox" className="mt-1 w-5 h-5" checked={!status.mic_muted} disabled={busy}
-              onChange={event => void toggleMic(event.target.checked)} />
-            <div className="space-y-2">
-              <label htmlFor="reachy-mic" className="block">
+          {/* Quick fix 9: one button instead of a switch, applied on the robot at once when the server reaches it. */}
+          <div className="rounded-xl bg-gray-50 p-4 space-y-3">
+            <div className="flex items-start gap-3">
+              {status.mic_muted
+                ? <MicOff aria-hidden="true" className="mt-0.5 w-5 h-5 shrink-0 text-red-700" />
+                : <Mic aria-hidden="true" className="mt-0.5 w-5 h-5 shrink-0 text-[#0057B8]" />}
+              <div className="min-w-0">
                 <span className="block text-sm font-medium text-gray-900">{t('reachy.micSwitch')}</span>
-                <span className="block text-xs text-gray-500 mt-1">{t('reachy.micSwitchHelp')}</span>
-              </label>
-              {micVolume !== null && <p className="text-xs text-gray-700">{t('reachy.micVolume', { n: micVolume })}</p>}
-              {micApplying && <p role="status" className="text-xs text-amber-800">{t('reachy.micApplying')}</p>}
-              {micAtZero && <p role="status" className="text-xs text-amber-800">{t('reachy.micAtZero')}</p>}
+                <span id="reachy-mic-state" className="block text-sm text-gray-700 mt-1">{micState}</span>
+                <span id="reachy-mic-help" className="block text-xs text-gray-500 mt-1">{t('reachy.micSwitchHelp')}</span>
+              </div>
             </div>
+            <button type="button" onClick={() => void pressMic(!status.mic_muted)} disabled={busy}
+              aria-describedby="reachy-mic-state reachy-mic-help"
+              className={`min-h-12 w-full sm:w-auto px-5 py-3 rounded-xl font-semibold disabled:opacity-50 flex items-center justify-center gap-2 ${
+                status.mic_muted ? 'bg-[#0057B8] text-white' : 'border border-[#0057B8] bg-white text-[#0057B8]'}`}>
+              {micPending && <Loader2 className="w-4 h-4 shrink-0 animate-spin" />}
+              {t(micPending ? 'reachy.micApplying' : status.mic_muted ? 'reachy.micTurnOn' : 'reachy.micTurnOff')}
+            </button>
+            {micNotice === 'applied' && <p role="status" className="text-sm text-green-700">{t('reachy.micApplied')}</p>}
+            {micNotice === 'saved' && <p role="status" className="text-sm text-blue-800">{t('reachy.micSaved')}</p>}
+            {micApplying && !micPending && <p role="status" className="text-xs text-amber-800">{t('reachy.micApplying')}</p>}
+            {micAtZero && !micPending && <p role="status" className="text-xs text-amber-800">{t('reachy.micAtZero')}</p>}
           </div>
           <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
             <input type="checkbox" className="mt-1 w-5 h-5" checked={checkins} disabled={busy}

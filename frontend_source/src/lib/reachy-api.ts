@@ -29,6 +29,9 @@ export interface ReachyStatus {
   /** The daemon's microphone volume (0-100) from the robot's last heartbeat; null: none reported (robot app before
    *  0.17.1, or its daemon did not answer). */
   mic_volume?: number | null;
+  /** Only in the answer of a PATCH that switched the microphone (quick fix 9): true when the robot applied it at once
+   *  (the server called the robot app directly); false when its next heartbeat will, within about 10 s. */
+  mic_applied?: boolean;
   last_seen_at?: string | null;
   online?: boolean;
   robot_reachable?: boolean | null;
@@ -76,7 +79,8 @@ export interface ReachySettings {
   live_voice?: boolean;
   /** Off also cancels a meal retry still waiting. */
   meal_retry?: boolean;
-  /** True turns the robot's microphone off (its volume set to 0 at the robot's next heartbeat). */
+  /** True turns the robot's microphone off (its volume set to 0 at once when the server reaches the robot app, else
+   *  at the robot's next heartbeat: the answer's mic_applied). */
   mic_muted?: boolean;
 }
 
