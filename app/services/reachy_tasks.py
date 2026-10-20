@@ -225,11 +225,19 @@ def _leasable_sql() -> str:
             "WHERE o.intk_id = ANY(t.intk_ids) AND o.intake_stats IN ('pending','missed'))))")
 
 
-def meal_retry_waiting_sql(dose: str) -> str:
-    """A meal retry still open (queued, or with the robot) holds the dose `dose` (an intake alias): Reachy comes back
-    for it after the meal, so the missed-dose job sends nothing of its own for it until that task has run."""
+def _meal_retry_sql(dose: str, statuses: str) -> str:
+    """A meal retry (a not_before) in one of `statuses` holds the dose `dose` (an intake alias)."""
     return (f"EXISTS (SELECT 1 FROM reachy_task meal WHERE meal.u_id = {dose}.u_id AND meal.not_before IS NOT NULL "
-            f"AND meal.status IN {_OPEN_SQL} AND {dose}.intk_id = ANY(meal.intk_ids))")
+            f"AND meal.status IN {statuses} AND {dose}.intk_id = ANY(meal.intk_ids))")
+
+
+def meal_retry_waiting_sql(dose: str) -> str:
+    """A meal retry that has not reached the patient yet (queued, leased or searching) holds the dose `dose` (an
+    intake alias): Reachy comes back for it after the meal, so the missed-dose job sends nothing of its own for it
+    meanwhile. Once Reachy is with the patient (in_progress) the job goes on as for any dose task (review of quick fix
+    4): a dose left pending there gets the job's next retry, a task of the slot's own that task_due reports, so the
+    check-in that follows ends for the medicine instead of holding the dose for as long as the chat runs."""
+    return _meal_retry_sql(dose, "('queued','leased','searching')")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
@@ -389,7 +397,7 @@ async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
     rows = [row for row in await conn.fetch(
         "SELECT i.intk_id, i.intake_time_stamp, (SELECT COUNT(*) FROM reachy_task meal WHERE meal.u_id = i.u_id "
         "AND meal.not_before IS NOT NULL AND i.intk_id = ANY(meal.intk_ids)) AS meal_retries, "
-        f"{meal_retry_waiting_sql('i')} AS waiting FROM intake i WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) "
+        f"{_meal_retry_sql('i', _OPEN_SQL)} AS waiting FROM intake i WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) "
         "AND i.intake_stats IN ('pending','missed') ORDER BY i.intk_id", task["u_id"], not_eaten)
         if row["meal_retries"] < MEAL_RETRY_LIMIT and not row["waiting"]]
     not_before = schedule.current_time() + timedelta(minutes=MEAL_RETRY_MINUTES)

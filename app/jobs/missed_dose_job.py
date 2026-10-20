@@ -110,9 +110,9 @@ async def check_missed_doses():
             intk_ids = [r["id"] for r in group_rows]
             # Quick fix 4 of 20 Oct 2026: a dose a meal retry waits for (meal_retry_waiting_sql: Reachy comes back
             # after the patient said they had not eaten yet) gets no reminder, robot retry or missed mark of this
-            # job's own until that task has run. Its retries are still counted with the slot's (the flags below cover
-            # every dose of the slot), so afterwards the job goes on where the slot's timeline is: the missed alerts
-            # once its last retry has passed, never a burst of late "please take it" texts.
+            # job's own until Reachy is with the patient for it. Its retries are still counted with the slot's (the
+            # flags below cover every dose of the slot), so afterwards the job goes on where the slot's timeline is:
+            # the missed alerts once its last retry has passed, never a burst of late "please take it" texts.
             due_rows = [r for r in group_rows if not r["meal_retry_waiting"]]
             due_ids = [r["id"] for r in due_rows]
             med_names = [r["med_name"] for r in due_rows]

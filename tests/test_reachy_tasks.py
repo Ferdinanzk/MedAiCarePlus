@@ -127,6 +127,12 @@ class FakeDB:
                 and (not_before is None or (not_before <= self.now
                                             and any(self.is_open(i) for i in task["intk_ids"]))))
 
+    def meal_retry_waiting(self, intk_id):
+        """reachy_tasks.meal_retry_waiting_sql: a meal retry that has not reached the patient yet (queued, leased or
+        searching) holds the dose. One with the patient (in_progress) no longer does."""
+        return any(t.get("not_before") is not None and t["status"] in ("queued", "leased", "searching")
+                   and intk_id in t["intk_ids"] for t in self.tasks)
+
     # asyncpg surface
     async def fetchval(self, query, *args):
         if "SELECT device_id FROM reachy_device" in query:
@@ -215,11 +221,20 @@ class FakeDB:
             assert args[0] == 7
             self.due_checks.append(list(args[1]))
             return self.facts(args)
+        if "AS meal_retry_waiting" in query:   # missed_dose_job: the pending doses, each with its meal retry's hold
+            assert f"{reachy_tasks.meal_retry_waiting_sql('i')} AS meal_retry_waiting" in query
+            assert "meal.status IN ('queued','leased','searching')" in query   # what meal_retry_waiting models
+            return [{"id": i, "u_id": 7, "intake_time_stamp": d["intake_time_stamp"], "reminder_sent": True,
+                     "missed_reminders_sent": d.get("missed_reminders_sent", 0), "med_id": d["med_id"],
+                     "med_name": d["med_name"], "patient_name": self.users[7], "patient_line_id": "U1",
+                     "remind_before_minutes": 5, "remind_after_minutes": 10, "remind_after_retries": 3,
+                     "notify_family_on_missed": False, "meal_retry_waiting": self.meal_retry_waiting(i)}
+                    for i, d in sorted(self.doses.items()) if d["intake_stats"] == "pending"]
         if "SELECT intk_id FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[])" in query:   # retry_due's open doses
             return [{"intk_id": i} for i in sorted(args[1])
                     if i in self.doses and self.doses[i]["intake_stats"] in ("pending", "missed")]
         if "AS meal_retries" in query:   # _queue_meal_retry: the open doses not eaten for, their meal retries so far
-            assert f"{reachy_tasks.meal_retry_waiting_sql('i')} AS waiting" in query and args[0] == 7
+            assert f"{reachy_tasks._meal_retry_sql('i', reachy_tasks._OPEN_SQL)} AS waiting" in query and args[0] == 7
             meal = [t for t in self.tasks if t.get("not_before") is not None]
             return [{"intk_id": i, "intake_time_stamp": self.doses[i]["intake_time_stamp"],
                      "meal_retries": sum(i in t["intk_ids"] for t in meal),
@@ -266,6 +281,15 @@ class FakeDB:
             for t in self.tasks:
                 if t["lease_owner"] == args[0] and t["status"] in ("leased", "searching", "in_progress"):
                     t["lease_until"] = self.now + timedelta(seconds=60)
+        elif "SET expires_at = GREATEST(expires_at" in query:   # extend_for_companion: a companion heartbeat
+            assert "WHERE lease_owner = $1::uuid AND status = 'in_progress'" in query
+            for t in self.tasks:
+                if t["lease_owner"] == args[0] and t["status"] == "in_progress":
+                    t["expires_at"] = max(t["expires_at"], self.now + timedelta(
+                        seconds=reachy_tasks.COMPANION_TASK_EXTEND_SECONDS))
+        elif "UPDATE intake SET missed_reminders_sent = missed_reminders_sent + 1" in query:   # the job's retry count
+            for i in args[0]:
+                self.doses[i]["missed_reminders_sent"] = self.doses[i].get("missed_reminders_sent", 0) + 1
         elif "jsonb_build_object('retry_due'" in query:   # enqueue_reachy_task: a missed retry for a held task
             task = self.by_id(args[0])
             if task["status"] == "in_progress":
@@ -1178,6 +1202,26 @@ def _meal_retries(db):
     return [t for t in db.tasks if t.get("not_before") is not None]
 
 
+def _job_on(db, monkeypatch):
+    """check_missed_doses at db.now over the fake database itself (the real enqueue_reachy_task; the job's previous
+    run a minute before); returns the patient's LINE texts."""
+    sent = []
+    line = _Line()
+    line.send_text = lambda line_id, text: sent.append(text)
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return db.now
+
+    monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
+    monkeypatch.setattr(missed_dose_job, "_last_run_at", db.now - timedelta(minutes=1))
+    monkeypatch.setattr(missed_dose_job, "get_pool", lambda: db)
+    monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
+    run(missed_dose_job.check_missed_doses())
+    return sent
+
+
 def test_not_eaten_yet_queues_one_meal_retry_leasable_20_minutes_after_the_report(db):
     """The user, 20 Oct 2026: "yes reachy would remind after another 20min". The robot reports the 08:00 task
     completed with meal_not_eaten for both doses at 08:10: one task for both, leasable from 08:30 (not at 08:29), that
@@ -1313,6 +1357,39 @@ def test_only_a_completed_task_queues_a_meal_retry(db, status):
     run(reachy_tasks.set_status(7, DEVICE, task_id, "searching", None))
     run(reachy_tasks.set_status(7, DEVICE, task_id, status, {"outcomes": {"101": "meal_not_eaten"}}))
     assert _meal_retries(db) == []
+
+
+def test_a_dose_left_pending_in_a_meal_retry_gets_the_jobs_next_retry_and_ends_the_chat(db, monkeypatch):
+    """Review of quick fix 4: a meal retry holds its dose only until Reachy is with the patient. At 07:56 the patient
+    says "not yet", and the job's +10 min retry is counted silently while the meal retry waits. At 08:16 the meal
+    retry is leased, the patient says "eaten", the watch sees nothing and the dose is left pending; the robot goes on
+    to the check-in, whose heartbeats keep the task in progress (extend_for_companion). At +20 min the job handles
+    the dose as for any dose task: its LINE text and a robot retry for the slot, which is medicine first (task_due),
+    so Reachy ends the chat with 「該吃藥囉」 and leases it next."""
+    assert "in_progress" not in reachy_tasks.meal_retry_waiting_sql("i")
+    db.doses[102]["intake_stats"] = "taken"            # the slot's one dose to take: Metformin (101)
+    db.now = T0 - timedelta(minutes=4)
+    task_id = enqueue(db, intk_ids=(101,))
+    _completed_with(db, task_id, {"101": "meal_not_eaten"})
+    (meal,) = _meal_retries(db)
+    db.now = T0 + timedelta(minutes=10)
+    assert _job_on(db, monkeypatch) == [] and len(db.tasks) == 2   # held: no text and no robot, its retry counted
+    db.now = meal["not_before"]
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == meal["task_id"]
+    for status in ("searching", "in_progress"):
+        run(reachy_tasks.set_status(7, DEVICE, meal["task_id"], status, None))
+    db.now = T0 + timedelta(minutes=17)
+    run(reachy_tasks.extend_for_companion(db, DEVICE))   # the check-in's heartbeat, after the dose was left pending
+    db.now = T0 + timedelta(minutes=20)
+    (text,) = _job_on(db, monkeypatch)
+    assert "逾時 20 分鐘" in text and "Metformin" in text and "請盡快服用" in text
+    (retry,) = [t for t in db.tasks if t["task_id"] not in (task_id, meal["task_id"])]
+    assert (retry["reason"], retry["slot_time"], retry["intk_ids"], retry["status"]) == (
+        "missed_retry", T0, [101], "queued")
+    assert run(reachy_tasks.task_due(db, 7)) is True
+    run(reachy_tasks.set_status(7, DEVICE, meal["task_id"], "completed",
+                                {"outcomes": {"101": "help_left_pending", "checkin": "medicine"}}))
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
 
 
 def _waiting_rows(slot, retries_sent, waiting=(101,)):
