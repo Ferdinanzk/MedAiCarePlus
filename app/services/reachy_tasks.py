@@ -73,6 +73,14 @@ AFTER_MEAL_WORDS = ("飯後", "餐後")
 BEFORE_MEAL_WORDS = ("空腹", "飯前", "餐前")
 
 
+# Quick fix 4 of 20 Oct 2026: when the patient has not eaten yet (the robot reports a task completed with the outcome
+# meal_not_eaten for a dose), Reachy comes back MEAL_RETRY_MINUTES later: one task (a meal retry) that the lease hands
+# out only from its stored not_before on, at most MEAL_RETRY_LIMIT per dose. Only meal retries have a not_before.
+MEAL_RETRY_MINUTES = 20
+MEAL_RETRY_LIMIT = 3
+MANUAL_TASK_MIN_MINUTES = 15   # a manual task ('Use Reachy', 'Talk to Reachy now') stays open at least this long
+
+
 def after_meal(schedule_time, instructions: str | None, dose_time: datetime | None) -> bool:
     """The dose is taken after a meal (its medicine's schedule_time.after_meals is true, or its instructions say 飯後
     or 餐後) and its local time is at lunch or dinner (MEAL_WINDOWS). Never when schedule_time.before_meals is true
@@ -133,18 +141,30 @@ async def task_payload(conn, task) -> dict:
 
 
 async def enqueue_reachy_task(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at,
-                              at=None) -> str | None:
+                              at=None, not_before=None) -> str | None:
     """_enqueue (the task), then the patient's own lines in the live voice rendered ahead for the check-in the task
     ends with (services/voice_lines.py; nothing without a live voice target)."""
-    task_id = await _enqueue(conn, u_id, slot_time, intk_ids, reason, expires_at, at)
+    task_id = await _enqueue(conn, u_id, slot_time, intk_ids, reason, expires_at, at, not_before)
     if task_id is not None:
         from app.services import voice_lines   # here, not at the top: voice_lines uses this module's consent gate
         voice_lines.render_ahead_for_patient(u_id)
     return task_id
 
 
+async def manual_expires_at(conn, u_id: int, slot_time, start) -> datetime:
+    """When a manual task for the slot at slot_time, open from `start`, expires: at the end of the slot's missed window
+    (remind_after_minutes x (remind_after_retries + 1) after it) or MANUAL_TASK_MIN_MINUTES after `start`, whichever
+    is later."""
+    settings_row = await conn.fetchrow(
+        "SELECT COALESCE(remind_after_minutes, 10) AS after, COALESCE(remind_after_retries, 3) AS retries "
+        "FROM notification_settings WHERE u_id = $1", u_id)
+    after, retries = (settings_row["after"], settings_row["retries"]) if settings_row else (10, 3)
+    return max(slot_time + timedelta(minutes=after * (retries + 1)),
+               start + timedelta(minutes=MANUAL_TASK_MIN_MINUTES))
+
+
 async def _enqueue(conn, u_id: int, slot_time, intk_ids: list[int], reason: str, expires_at,
-                   at=None) -> str | None:
+                   at=None, not_before=None) -> str | None:
     """Open (or re-arm a queued) task for this slot inside the caller's transaction.
 
     Returns the open task id, or None when the patient has no active device or
@@ -156,6 +176,7 @@ async def _enqueue(conn, u_id: int, slot_time, intk_ids: list[int], reason: str,
     protection refuses a listed dose (dose_safety.check, judged at `at`, default
     now): the robot must never start a dose hours early, a second dose, or a
     missed one. Callers that picked the doses at a moment of their own pass it.
+    A meal retry passes not_before (_queue_meal_retry): stored with the task, the lease waits for it.
     """
     if reason not in ("upcoming", "missed_retry", "manual", "checkin") or (not intk_ids and reason != "checkin"):
         raise ValueError("Invalid task request")
@@ -169,9 +190,9 @@ async def _enqueue(conn, u_id: int, slot_time, intk_ids: list[int], reason: str,
     if intk_ids:
         await dose_safety.check(conn, u_id, list(intk_ids), at=at)
     task_id = await conn.fetchval(
-        "INSERT INTO reachy_task (task_id, u_id, slot_time, intk_ids, reason, expires_at) "
-        "VALUES ($1::uuid, $2, $3, $4::int[], $5, $6) ON CONFLICT DO NOTHING RETURNING task_id",
-        str(uuid.uuid4()), u_id, slot_time, list(intk_ids), reason, expires_at)
+        "INSERT INTO reachy_task (task_id, u_id, slot_time, intk_ids, reason, expires_at, not_before) "
+        "VALUES ($1::uuid, $2, $3, $4::int[], $5, $6, $7) ON CONFLICT DO NOTHING RETURNING task_id",
+        str(uuid.uuid4()), u_id, slot_time, list(intk_ids), reason, expires_at, not_before)
     if task_id is not None:
         return str(task_id)
     task_id = await conn.fetchval(
@@ -194,10 +215,21 @@ async def _enqueue(conn, u_id: int, slot_time, intk_ids: list[int], reason: str,
 
 def _leasable_sql() -> str:
     """When the robot may lease a queued task t of patient $1 now (the rules in _lease_once's comment). task_due asks
-    the same question, so the robot is never told of a task it could not lease."""
+    the same question, so the robot is never told of a task it could not lease. A meal retry (a not_before) only from
+    that time on, and only while one of its doses is still to take: the robot never wakes for one whose doses were
+    all taken, sent to family or skipped while it waited (the minute job then cancels it, maintenance)."""
     return ("t.u_id = $1 AND t.status = 'queued' AND t.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM intake i "
             "WHERE i.intk_id = ANY(t.intk_ids) "
-            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')}))")
+            f"AND i.intake_stats IN ('pending','missed') AND NOT ({dose_safety.startable_sql('i', 'NOW()')})) "
+            "AND (t.not_before IS NULL OR (t.not_before <= NOW() AND EXISTS (SELECT 1 FROM intake o "
+            "WHERE o.intk_id = ANY(t.intk_ids) AND o.intake_stats IN ('pending','missed'))))")
+
+
+def meal_retry_waiting_sql(dose: str) -> str:
+    """A meal retry still open (queued, or with the robot) holds the dose `dose` (an intake alias): Reachy comes back
+    for it after the meal, so the missed-dose job sends nothing of its own for it until that task has run."""
+    return (f"EXISTS (SELECT 1 FROM reachy_task meal WHERE meal.u_id = {dose}.u_id AND meal.not_before IS NOT NULL "
+            f"AND meal.status IN {_OPEN_SQL} AND {dose}.intk_id = ANY(meal.intk_ids))")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:
@@ -291,6 +323,8 @@ async def set_status(u_id: int, device_id: str, task_id: str, status: str, detai
                 "finished_at = NOW(), lease_until = NULL WHERE task_id = $1::uuid RETURNING *",
                 task_id, status, detail_json)
             await _queue_retry_due(conn, held, detail)
+            if status == "completed":
+                await _queue_meal_retry(conn, task, detail)
         else:
             task = await conn.fetchrow(
                 "UPDATE reachy_task SET status = $2, detail = COALESCE($3::jsonb, detail), "
@@ -336,6 +370,48 @@ async def _queue_retry_due(conn, held, ended: dict | None) -> None:
                  slot_label(held["slot_time"]), held["u_id"], refused.intk_id, refused.detail)
 
 
+async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
+    """Quick fix 4: the robot reported the task completed and its outcomes give doses meal_not_eaten (Reachy said
+    「等您吃過飯，我再來陪您吃藥。」 and rests). One meal retry is queued for those doses still open, inside the caller's
+    transaction and a savepoint: reason missed_retry (lease and payload treat every dose reason alike; the robot's
+    own fallback opening is then the reminder clip), its slot_time and its stored not_before MEAL_RETRY_MINUTES from
+    now, and it expires like a manual task from that time (manual_expires_at). Its own slot_time keeps it apart from
+    the slot's task, so neither the missed-dose job's retries nor _queue_retry_due for the slot's other doses ever
+    re-arm it. Left out: a dose another open meal retry already waits for, a dose with MEAL_RETRY_LIMIT meal retries
+    already (counted from the stored tasks), and one overdose protection would refuse at that time (one that will
+    have expired: the missed-dose job handles it at once)."""
+    outcomes = (ended or {}).get("outcomes")
+    if not isinstance(outcomes, dict):
+        return
+    not_eaten = [intk_id for intk_id in task["intk_ids"] if outcomes.get(str(intk_id)) == "meal_not_eaten"]
+    if not not_eaten:
+        return
+    rows = [row for row in await conn.fetch(
+        "SELECT i.intk_id, i.intake_time_stamp, (SELECT COUNT(*) FROM reachy_task meal WHERE meal.u_id = i.u_id "
+        "AND meal.not_before IS NOT NULL AND i.intk_id = ANY(meal.intk_ids)) AS meal_retries, "
+        f"{meal_retry_waiting_sql('i')} AS waiting FROM intake i WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) "
+        "AND i.intake_stats IN ('pending','missed') ORDER BY i.intk_id", task["u_id"], not_eaten)
+        if row["meal_retries"] < MEAL_RETRY_LIMIT and not row["waiting"]]
+    not_before = schedule.current_time() + timedelta(minutes=MEAL_RETRY_MINUTES)
+    allowed = set(await dose_safety.allowed(conn, task["u_id"], [row["intk_id"] for row in rows], at=not_before)
+                  if rows else ())
+    rows = [row for row in rows if row["intk_id"] in allowed]
+    if not rows:
+        log.info("no meal retry for patient %s after task %s: each dose not eaten for is resolved, already waiting, "
+                 "at its %d meal retries or refused by then", task["u_id"], task["task_id"], MEAL_RETRY_LIMIT)
+        return
+    from app.jobs.missed_dose_job import _slot_key   # here, not at the top: that job imports this module
+    slot = _slot_key(min(row["intake_time_stamp"] for row in rows))
+    expires_at = await manual_expires_at(conn, task["u_id"], slot, not_before)
+    try:
+        async with conn.transaction():
+            await enqueue_reachy_task(conn, task["u_id"], not_before, [row["intk_id"] for row in rows],
+                                      "missed_retry", expires_at, at=not_before, not_before=not_before)
+    except schedule.DoseRefused as refused:
+        log.info("no meal retry for the %s slot of patient %s: dose %s refused (%s)", slot_label(slot), task["u_id"],
+                 refused.intk_id, refused.detail)
+
+
 async def extend_leases(conn, device_id: str) -> None:
     await conn.execute(
         f"UPDATE reachy_task SET lease_until = NOW() + INTERVAL '{LEASE_SECONDS} seconds' "
@@ -375,7 +451,8 @@ async def notify_robot_offline(conn, u_id: int, slot_time, now: datetime) -> int
 
 
 async def maintenance(now=None) -> None:
-    """Expire tasks past expires_at, requeue expired leases, and send robot-offline notices."""
+    """Expire tasks past expires_at, requeue expired leases, cancel meal retries with nothing left to prompt, and send
+    robot-offline notices."""
     now = now or datetime.now(timezone.utc)
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute(
@@ -385,6 +462,14 @@ async def maintenance(now=None) -> None:
         await conn.execute(
             "UPDATE reachy_task SET status = 'queued', lease_owner = NULL, lease_until = NULL "
             "WHERE status IN ('leased','searching','in_progress') AND lease_until < $1",
+            now)
+        # A meal retry whose doses were all taken, sent to family or skipped while it waited is cancelled (quick fix
+        # 4): nothing is left to prompt, and the lease already skips it (_leasable_sql).
+        await conn.execute(
+            "UPDATE reachy_task t SET status = 'aborted', finished_at = $1, "
+            "detail = COALESCE(t.detail, '{}'::jsonb) || jsonb_build_object('reason', 'nothing_to_prompt') "
+            "WHERE t.status = 'queued' AND t.not_before IS NOT NULL AND NOT EXISTS (SELECT 1 FROM intake i "
+            "WHERE i.intk_id = ANY(t.intk_ids) AND i.intake_stats IN ('pending','missed'))",
             now)
         # A slot has come while its task is still queued and the robot has not
         # heartbeated for a minute: tell the caregivers (once per 6 h).
