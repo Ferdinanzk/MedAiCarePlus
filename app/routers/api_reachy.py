@@ -1,6 +1,7 @@
 """Robot pairing, status and settings for the signed-in patient (public port, user auth)."""
 
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,6 +17,7 @@ from app.services import consent_service, dose_confirmation, dose_safety, memory
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
+log = logging.getLogger(__name__)
 
 ONLINE_SECONDS = 60
 
@@ -29,6 +31,7 @@ DEMO_SCHEDULE = {"morning": False, "noon": False, "night": False, "bedtime": Fal
                  "after_meals": True, "before_meals": False, "custom_times": []}
 DEMO_STOCK = Decimal(30)       # its stock when made, and when topped up
 DEMO_STOCK_LOW = Decimal(10)   # topped up below this: an as-needed medicine's refill alert comes at 7 doses or fewer
+DEADLOCK = "40P01"             # PostgreSQL's deadlock_detected (asyncpg's DeadlockDetectedError.sqlstate)
 
 
 class SettingsPayload(BaseModel):
@@ -218,16 +221,26 @@ async def manual_task(payload: TaskPayload, user: dict = Depends(get_consented_u
 async def _clear_demo_doses(conn, u_id: int, intk_ids: list[int]) -> None:
     """The demo medicine's earlier doses go before a press makes a fresh one, so a press always works (a demo dose
     taken or waiting for family would refuse the next one as too soon under overdose protection): their open robot
-    tasks are aborted (reason demo_reset), their open family requests expired as one expires on its own (another dose
-    in such a request goes back to its previous status), then their rows are deleted, and their monitor_event and
-    dose_emotion rows with them (ON DELETE CASCADE). A family button pressed later on such a request is answered that
-    it has expired."""
+    tasks holding demo doses alone are aborted (reason demo_reset), their open family requests expired as one expires
+    on its own (another dose in such a request goes back to its previous status), then their rows are deleted, and
+    their monitor_event and dose_emotion rows with them (ON DELETE CASCADE). A family button pressed later on such a
+    request is answered that it has expired. An open task that also holds a real dose (the missed-dose job or 'Use
+    Reachy' made it for a slot holding both) only loses the demo doses, in order: aborting it would cancel Reachy's
+    visit for the real dose, mid-prompt when in progress (review of quick fix 6). The abort needs the overlap too, as
+    an empty array is inside every array: a check-in task holds no dose and is never touched."""
     if not intk_ids:
         return
     await conn.execute(
         "UPDATE reachy_task SET status = 'aborted', finished_at = NOW(), lease_until = NULL, "
         "detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('reason', 'demo_reset') "
-        "WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') AND intk_ids && $2::int[]",
+        "WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') AND intk_ids && $2::int[] "
+        "AND intk_ids <@ $2::int[]",
+        u_id, intk_ids)
+    await conn.execute(
+        "UPDATE reachy_task SET intk_ids = ARRAY(SELECT intk_id "
+        "FROM unnest(intk_ids) WITH ORDINALITY AS kept(intk_id, n) WHERE intk_id <> ALL($2::int[]) "
+        "ORDER BY n) WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') "
+        "AND intk_ids && $2::int[] AND NOT intk_ids <@ $2::int[]",
         u_id, intk_ids)
     now = datetime.now(timezone.utc)
     for row in await conn.fetch(
@@ -242,14 +255,31 @@ async def demo_dose(user: dict = Depends(get_consented_user)):
     """Quick fix 6, 'Demo dose: Acetal 500mg': one press, and Reachy comes at once for a dose of the demo medicine.
 
     One transaction, all or nothing. The robot must be paired (409 robot_not_paired). The demo medicine is made, or
-    made active again and topped up to DEMO_STOCK when below DEMO_STOCK_LOW; a medicine of the same name without the
-    demo flag is never touched. Its earlier doses are cleared (_clear_demo_doses). A fresh dose is made as Take Now
-    makes an ad-hoc one (never on a whole minute, so it never expires: dose_safety.is_ad_hoc), with reminder_sent set
-    (Reachy is sent now; no "upcoming" reminder), and overdose protection judges it as for 'Use Reachy'. Reachy is
-    sent as POST /api/reachy/tasks sends it: a manual task holding only that dose, for its 5-minute slot (403
-    robot_consent_required without the robot's consent; 409 slot_busy when another task already holds that slot,
-    which would not bring Reachy for this dose). From there on it is the normal flow of a dose."""
-    u_id = user["u_id"]
+    made active again, topped up to DEMO_STOCK when below DEMO_STOCK_LOW, and given back what makes it the demo (its
+    name, no dose time, after meals, one tablet, the default limits: the Medications edit form keeps the demo flag
+    through any edit); a medicine of the same name without the demo flag is never touched. Its earlier doses are
+    cleared (_clear_demo_doses). A fresh dose is made as Take Now makes an ad-hoc one (never on a whole minute, so it
+    never expires: dose_safety.is_ad_hoc), with reminder_sent set (Reachy is sent now; no "upcoming" reminder), and
+    overdose protection judges it as for 'Use Reachy'. Reachy is sent as POST /api/reachy/tasks sends it: a manual task
+    holding only that dose, for its 5-minute slot (403 robot_consent_required without the robot's consent). 409
+    slot_busy when that slot is not the demo's to take: another task already holds it, which would not bring Reachy
+    for this dose; or another dose of the patient's in it is still open (pending, missed, or waiting for family, which
+    'not taken' makes pending again), whose next visit, 'Use Reachy' or the missed-dose job's retry, would get the
+    demo task instead (one open task per slot; review of quick fix 6). From there on it is the normal flow of a dose.
+
+    A press that PostgreSQL ends to break a deadlock (with the robot's confirmation for the earlier demo dose, which
+    locks that dose and then its task, the other way round) starts once more; a second one is an error."""
+    try:
+        return await _demo_dose(user["u_id"])
+    except Exception as error:
+        if getattr(error, "sqlstate", None) != DEADLOCK:
+            raise
+        log.info("demo dose press of patient %s ended by a deadlock: trying once more", user["u_id"])
+    return await _demo_dose(user["u_id"])
+
+
+async def _demo_dose(u_id: int) -> dict:
+    """One attempt of demo_dose, in one transaction."""
     async with get_pool().acquire() as conn, conn.transaction():
         device = await conn.fetchval(
             "SELECT device_id FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
@@ -271,17 +301,27 @@ async def demo_dose(user: dict = Depends(get_consented_user)):
             await _clear_demo_doses(conn, u_id, [row["intk_id"] for row in await conn.fetch(
                 "SELECT intk_id FROM intake WHERE u_id = $1 AND med_id = $2 ORDER BY intk_id", u_id, med_id)])
             await conn.execute(
-                "UPDATE medication SET is_active = TRUE, archived_at = NULL, "
-                "pills_remaining = CASE WHEN pills_remaining < $2 THEN $3 ELSE pills_remaining END WHERE med_id = $1",
-                med_id, DEMO_STOCK_LOW, DEMO_STOCK)
+                "UPDATE medication SET med_name = $2, schedule_time = $3::jsonb, instructions = $4, "
+                "dose_form = 'solid_oral', units_per_dose = 1, min_interval_minutes = NULL, max_daily_doses = NULL, "
+                "is_active = TRUE, archived_at = NULL, "
+                "pills_remaining = CASE WHEN pills_remaining < $5 THEN $6 ELSE pills_remaining END WHERE med_id = $1",
+                med_id, DEMO_NAME, json.dumps(DEMO_SCHEDULE), DEMO_INSTRUCTIONS, DEMO_STOCK_LOW, DEMO_STOCK)
         now = schedule.current_time()
         if (now.second, now.microsecond) == (0, 0):
             now += timedelta(microseconds=1)
+        slot_time = _slot_key(now)
+        slot_end = slot_time + timedelta(minutes=5)
+        open_dose = await conn.fetchval(
+            "SELECT intk_id FROM intake WHERE u_id = $1 "
+            "AND intake_stats IN ('pending','missed','pending_confirmation') "
+            "AND intake_time_stamp >= $2 AND intake_time_stamp < $3 ORDER BY intk_id LIMIT 1",
+            u_id, slot_time, slot_end)
+        if open_dose is not None:
+            raise HTTPException(409, "slot_busy")   # another dose of this slot is still open (see the docstring)
         intk_id = await conn.fetchval(
             "INSERT INTO intake (u_id, med_id, intake_time_stamp, intake_stats, notify_stats, reminder_sent) "
             "VALUES ($1, $2, $3, 'pending', 'pending', TRUE) RETURNING intk_id", u_id, med_id, now)
         await dose_safety.check(conn, u_id, [intk_id], at=now)
-        slot_time = _slot_key(now)
         expires_at = await reachy_tasks.manual_expires_at(conn, u_id, slot_time, now)
         task_id = await reachy_tasks.enqueue_reachy_task(conn, u_id, slot_time, [intk_id], "manual", expires_at,
                                                          at=now)

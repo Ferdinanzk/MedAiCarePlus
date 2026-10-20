@@ -41,6 +41,12 @@ OPEN = ("queued", "leased", "searching", "in_progress")
 DEVICE_ID = uuid.uuid4()
 CONTACT = {"id": 31, "u_id": 7, "name": "Daughter", "line_id": "U-family", "verified": True,
            "relationship": "daughter"}
+NOON = json.dumps({"morning": False, "noon": True, "night": False, "bedtime": False})   # a real medicine at 12:00
+
+
+class FakeDeadlock(Exception):
+    """What asyncpg raises when PostgreSQL ends a transaction to break a deadlock (DeadlockDetectedError)."""
+    sqlstate = "40P01"
 
 
 class _Transaction:
@@ -75,6 +81,7 @@ class FakeDB:
         self.confirmations = {}          # confirmation_id (text) -> row
         self.events = []                 # monitor_event and dose_emotion rows: {"table", "intk_id"}
         self.statements = []             # (first words of each statement, transaction depth)
+        self.abort_errors = []           # raised, one per statement, by the press's abort of earlier demo tasks
         self._ids = {"med": 50, "intake": 900}   # sequences: never put back by a rollback, as in PostgreSQL
 
     def tables(self):
@@ -196,6 +203,15 @@ class FakeDB:
             return row["u_id"] if row else None
         if query == 'SELECT name FROM "user" WHERE u_id = $1':
             return "Pearl"
+        if query == "SELECT name FROM family_contacts WHERE id = $1":
+            return CONTACT["name"] if args[0] == CONTACT["id"] else None
+        if query.startswith("SELECT intk_id FROM intake WHERE u_id = $1 AND intake_stats IN "):   # the press's slot
+            assert ("intake_stats IN ('pending','missed','pending_confirmation') "
+                    "AND intake_time_stamp >= $2 AND intake_time_stamp < $3 ORDER BY intk_id LIMIT 1") in query
+            found = sorted(i for i, row in self.intakes.items() if row["u_id"] == args[0]
+                           and row["intake_stats"] in ("pending", "missed", "pending_confirmation")
+                           and args[1] <= row["intake_time_stamp"] < args[2])
+            return found[0] if found else None
         raise AssertionError(query)
 
     async def fetchrow(self, query, *args):
@@ -210,6 +226,10 @@ class FakeDB:
             return dict(row) if row else None
         if query.startswith("SELECT id, u_id, name, line_id, verified, relationship FROM family_contacts"):
             return dict(CONTACT) if args[0] == CONTACT["id"] else None
+        if query.startswith("SELECT intake_time_stamp FROM intake WHERE intk_id = $1 AND u_id = $2"):   # Use Reachy
+            row = self.intakes.get(args[0])
+            ok = row is not None and row["u_id"] == args[1] and row["intake_stats"] in ("pending", "missed")
+            return {"intake_time_stamp": row["intake_time_stamp"]} if ok else None
         raise AssertionError(query)
 
     async def fetch(self, query, *args):
@@ -234,6 +254,12 @@ class FakeDB:
                      "med_name": self.meds[row["med_id"]]["med_name"]}
                     for i, row in self.intakes.items() if i in args[0]]
             return sorted(rows, key=lambda r: (r["intake_time_stamp"], r["intk_id"]))
+        if query.startswith("SELECT i.intk_id FROM intake i JOIN medication m ON m.med_id = i.med_id"):
+            # Use Reachy's doses of the slot (dose_safety.allowed then judges them; startable_sql is not modelled).
+            rows = [(self.meds[row["med_id"]]["med_name"], row["med_id"], i) for i, row in self.intakes.items()
+                    if row["u_id"] == args[0] and row["intake_stats"] in ("pending", "missed")
+                    and args[1] <= row["intake_time_stamp"] < args[2]]
+            return [{"intk_id": i} for _, _, i in sorted(rows)]
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -242,13 +268,27 @@ class FakeDB:
             assert self.depth > 0   # held until the press commits or rolls back
             return "SELECT 1"
         if query.startswith("UPDATE reachy_task SET status = 'aborted'"):
+            # Only tasks whose doses are all demo doses (<@), and that hold one (&&: an empty array is inside any).
             assert ("WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') "
-                    "AND intk_ids && $2::int[]") in query and "jsonb_build_object('reason', 'demo_reset')" in query
+                    "AND intk_ids && $2::int[] AND intk_ids <@ $2::int[]") in query
+            assert "jsonb_build_object('reason', 'demo_reset')" in query
+            if self.abort_errors:
+                raise self.abort_errors.pop(0)
             for task in self.tasks:
-                if task["u_id"] == args[0] and task["status"] in OPEN and set(task["intk_ids"]) & set(args[1]):
+                ids, demo = set(task["intk_ids"]), set(args[1])
+                if task["u_id"] == args[0] and task["status"] in OPEN and ids & demo and ids <= demo:
                     detail = json.loads(task["detail"] or "{}")
                     task.update(status="aborted", finished_at=NOW, lease_until=None,
                                 detail=json.dumps({**detail, "reason": "demo_reset"}))
+            return "UPDATE"
+        if query.startswith("UPDATE reachy_task SET intk_ids = ARRAY("):   # a task that also holds a real dose
+            assert ("FROM unnest(intk_ids) WITH ORDINALITY AS kept(intk_id, n) WHERE intk_id <> ALL($2::int[]) "
+                    "ORDER BY n) WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') "
+                    "AND intk_ids && $2::int[] AND NOT intk_ids <@ $2::int[]") in query
+            for task in self.tasks:
+                ids, demo = set(task["intk_ids"]), set(args[1])
+                if task["u_id"] == args[0] and task["status"] in OPEN and ids & demo and not ids <= demo:
+                    task["intk_ids"] = [i for i in task["intk_ids"] if i not in demo]
             return "UPDATE"
         if query == "UPDATE intake SET intake_stats=$1 WHERE intk_id=$2":   # dose_confirmation._restore
             self.intakes[args[1]]["intake_stats"] = args[0]
@@ -262,12 +302,18 @@ class FakeDB:
             self.intakes = {i: row for i, row in self.intakes.items() if i not in gone}
             self.events = [e for e in self.events if e["intk_id"] not in gone]   # ON DELETE CASCADE
             return f"DELETE {len(gone)}"
-        if query.startswith("UPDATE medication SET is_active = TRUE, archived_at = NULL"):
-            assert "pills_remaining = CASE WHEN pills_remaining < $2 THEN $3 ELSE pills_remaining END" in query
-            med = self.meds[args[0]]
-            med.update(is_active=True, archived_at=None)
-            if med["pills_remaining"] < args[1]:
-                med["pills_remaining"] = args[2]
+        if query.startswith("UPDATE medication SET med_name = $2, schedule_time = $3::jsonb, instructions = $4, "):
+            assert ("dose_form = 'solid_oral', units_per_dose = 1, min_interval_minutes = NULL, "
+                    "max_daily_doses = NULL, is_active = TRUE, archived_at = NULL, "
+                    "pills_remaining = CASE WHEN pills_remaining < $5 THEN $6 ELSE pills_remaining END "
+                    "WHERE med_id = $1") in query
+            med_id, name, schedule_time, instructions, low, stock = args
+            med = self.meds[med_id]
+            med.update(med_name=name, schedule_time=schedule_time, instructions=instructions, dose_form="solid_oral",
+                       units_per_dose=Decimal("1.00"), min_interval_minutes=None, max_daily_doses=None,
+                       is_active=True, archived_at=None)
+            if med["pills_remaining"] < low:
+                med["pills_remaining"] = stock
             return "UPDATE 1"
         raise AssertionError(query)
 
@@ -407,8 +453,9 @@ def test_earlier_demo_doses_their_open_tasks_and_requests_are_cleared_first(env)
 
     assert set(_doses_of(env, med_id)) == {body["intk_id"]}            # every earlier demo dose is gone
     assert env.db.events == [{"table": "dose_emotion", "intk_id": real}]
-    for task in (held, queued):
-        assert task["status"] == "aborted" and json.loads(task["detail"])["reason"] == "demo_reset"
+    assert queued["status"] == "aborted" and json.loads(queued["detail"])["reason"] == "demo_reset"
+    # The task that also holds the real dose keeps it, and Reachy's visit for it (review of quick fix 6).
+    assert (held["status"], held["intk_ids"], held["detail"]) == ("in_progress", [real], None)
     assert done["status"] == "completed" and others["status"] == "queued"
     assert env.db.confirmations[request]["resolution"] == "expired"
     # The real dose in that request goes back to what it was, as when a request expires on its own.
@@ -440,7 +487,9 @@ def test_a_family_button_pressed_later_on_a_cleared_request_does_not_error(env, 
     assert result == {"status": "already_resolved", "resolution": "expired", "resolved_by": None}
     (reply,) = env.replies
     assert reply["recipient_line_id"] == CONTACT["line_id"] and reply["kind"] == "dose_confirm_reply"
-    assert "此確認請求已逾時" in reply["messages"][0]["text"] and "has expired" in reply["messages"][0]["text"]
+    # The request's doses are gone, so it has no slot to name, and the reply leaves that part out (review of quick
+    # fix 6: it read 「（Pearl ）」 and "Pearl's  dose").
+    assert reply["messages"][0]["text"] == "此確認請求已逾時（Pearl）。\nThis request for Pearl's dose has expired."
     assert waiting not in env.db.intakes                               # nothing recorded or brought back
     (fresh,) = _doses_of(env, med_id).values()
     assert fresh["intake_stats"] == "pending"
@@ -540,3 +589,195 @@ def test_the_demo_dose_asks_the_meal_question_at_lunch_and_dinner(env, local, ex
     hour, minute = map(int, local.split(":"))
     when = datetime(2026, 10, 20, hour, minute, 7, tzinfo=timezone(timedelta(hours=8)))
     assert reachy_tasks.after_meal(med["schedule_time"], med["instructions"], when) is expected
+
+
+# ── Review of quick fix 6 ────────────────────────────────────────────────────
+
+def _real_noon_dose(env, status="pending"):
+    """A real 12:00 dose still open after its upcoming task ended (the patient had not eaten yet, or declined: the
+    robot reported the task completed), with the press at 12:02, in the same 5-minute slot."""
+    real = env.db.add_dose(env.db.add_med("Metformin", demo=False, schedule_time=NOON), _slot_key(NOW), status,
+                           reminder_sent=True)
+    env.db.add_task([real], status="completed", slot=_slot_key(NOW), reason="upcoming")
+    return real
+
+
+def _locks(env):
+    """How many times the press began: each attempt takes the advisory lock first."""
+    return sum(1 for words, _ in env.db.statements if words.startswith("SELECT pg_advisory_xact_lock"))
+
+
+@pytest.mark.parametrize("status", ["pending", "missed", "pending_confirmation"])
+def test_a_real_dose_still_open_in_the_slot_is_409_slot_busy_and_rolls_back(env, status):
+    """The other way round from a task already holding the slot: no task holds it, but a real dose of the slot is still
+    open. A demo task there would hold the slot (one open task per slot), so the real dose's next visit, 'Use Reachy'
+    or the missed-dose job's retry, would get the demo task instead. A dose waiting for family counts too: family's
+    'not taken' or the request's expiry makes it pending again."""
+    real = _real_noon_dose(env)
+    if status == "pending_confirmation":
+        env.db.add_request([real], {str(real): "pending"})
+    else:
+        env.db.intakes[real]["intake_stats"] = status
+    med_id = env.db.add_med()
+    earlier = env.db.add_dose(med_id, NOW - timedelta(minutes=50, seconds=-1))
+    env.db.add_task([earlier], slot=_slot_key(NOW - timedelta(minutes=50)))
+    before = _state(env)
+    response = _press(env)
+    assert (response.status_code, response.json()) == (409, {"detail": "slot_busy"})
+    assert _state(env) == before and env.renders == []                 # earlier dose, its task, the stock: all kept
+
+
+@pytest.mark.parametrize("offset, status", [
+    (timedelta(0), "taken"), (timedelta(0), "skipped"),
+    (timedelta(minutes=-5), "pending"), (timedelta(minutes=5), "pending")])
+def test_a_real_dose_done_or_in_another_slot_leaves_the_press_alone(env, offset, status):
+    real = env.db.add_dose(env.db.add_med("Metformin", demo=False, schedule_time=NOON), _slot_key(NOW) + offset, status)
+    response = _press(env)
+    assert response.status_code == 200, response.json()
+    assert env.db.intakes[real]["intake_stats"] == status
+
+
+def test_use_reachy_on_the_real_dose_of_the_slot_brings_reachy_for_that_dose(env):
+    """Path (a) of the review: with the demo task open for the slot, 'Use Reachy' on the real 12:00 dose answered 200
+    with the demo task (enqueue_reachy_task re-armed it), and that task never held the real dose."""
+    real = _real_noon_dose(env)
+    _press(env)
+    response = env.browser.post("/api/reachy/tasks", json={"intk_id": real})
+    assert response.status_code == 200, response.json()
+    assert response.json()["intk_ids"] == [real]
+    (task,) = [t for t in env.db.tasks if t["status"] in OPEN]
+    assert task["intk_ids"] == [real] and task["reason"] == "manual"
+
+
+def test_the_missed_dose_jobs_retry_for_the_real_dose_of_the_slot_holds_that_dose(env):
+    """Path (b): the job's 12:10 retry (its send_robot) only re-armed a demo task still queued for the slot (the robot
+    busy or offline), so Reachy came and prompted Acetal alone."""
+    real = _real_noon_dose(env)
+    _press(env)
+    task_id = asyncio.run(reachy_tasks.enqueue_reachy_task(
+        env.db, 7, _slot_key(NOW), [real], "missed_retry", _slot_key(NOW) + timedelta(minutes=40),
+        at=_slot_key(NOW) + timedelta(minutes=10)))
+    task = next(t for t in env.db.tasks if str(t["task_id"]) == task_id)
+    assert (task["intk_ids"], task["reason"], task["status"]) == ([real], "missed_retry", "queued")
+
+
+@pytest.mark.parametrize("status", OPEN)
+def test_a_press_keeps_a_task_that_also_holds_a_real_dose_and_takes_only_the_demo_doses_out(env, status):
+    """Path (c): a task holding a real dose and a demo dose (made for their slot by the job or 'Use Reachy') was
+    aborted as a whole by the next press, which cancelled Reachy's visit for the real dose, mid-prompt when it was in
+    progress. Now the demo doses leave it, in order, and the rest of it stays as it was; a task holding demo doses
+    alone is aborted as before."""
+    real_med, other_med = env.db.add_med("Metformin", demo=False), env.db.add_med("Zinc", demo=False)
+    med_id = env.db.add_med()
+    slot = datetime(2026, 10, 20, 3, 30, tzinfo=timezone.utc)          # 11:30
+    first_demo = env.db.add_dose(med_id, slot + timedelta(seconds=7))
+    real = env.db.add_dose(real_med, slot)
+    second_demo = env.db.add_dose(med_id, slot + timedelta(minutes=2, seconds=3))
+    other_real = env.db.add_dose(other_med, slot)
+    mixed = env.db.add_task([first_demo, real, second_demo, other_real], status=status, slot=slot)
+    alone_dose = env.db.add_dose(med_id, slot - timedelta(minutes=30, seconds=-9))
+    alone = env.db.add_task([alone_dose], status=status, slot=slot - timedelta(minutes=30))
+    before = copy.deepcopy(mixed)
+    assert _press(env).status_code == 200
+    assert mixed["intk_ids"] == [real, other_real]
+    assert {k: v for k, v in mixed.items() if k != "intk_ids"} == {k: v for k, v in before.items() if k != "intk_ids"}
+    assert alone["status"] == "aborted" and json.loads(alone["detail"])["reason"] == "demo_reset"
+    assert env.db.intakes[real]["intake_stats"] == env.db.intakes[other_real]["intake_stats"] == "pending"
+
+
+@pytest.mark.parametrize("status", OPEN)
+def test_a_press_never_touches_an_open_check_in_task(env, status):
+    """A check-in task holds no dose, and an empty array is inside every array (<@): the abort also needs an overlap
+    (&&), or each press would end 'Talk to Reachy now' (checked on PostgreSQL too)."""
+    env.db.add_dose(env.db.add_med(), NOW - timedelta(minutes=50, seconds=-1))
+    checkin = env.db.add_task([], status=status, slot=NOW - timedelta(minutes=1), reason="checkin")
+    before = copy.deepcopy(checkin)
+    assert _press(env).status_code == 200
+    assert checkin == before
+
+
+def test_a_later_press_puts_back_what_makes_the_demo_medicine(env):
+    """The Medications edit form keeps prescription_meta, so an edited demo medicine kept its flag and was reused as it
+    was: renamed (the press still answered 'Acetal 500mg'), with dose times (whose generated doses every press then
+    deleted, future ones included), before meals, a liquid of 2 units, with limits of its own. Each press now puts
+    back what makes it the demo: Acetal 500mg, one tablet after meals, no dose time, the default limits."""
+    med_id = env.db.add_med(
+        "Acetal 1000mg", instructions="空腹服用", dose_form="liquid", units_per_dose=Decimal("2.00"),
+        min_interval_minutes=60, max_daily_doses=2, pills_remaining=Decimal("12.00"),
+        schedule_time=json.dumps({"morning": True, "noon": False, "night": False, "bedtime": False,
+                                  "after_meals": False, "before_meals": True, "custom_times": ["15:00"]}))
+    tomorrow = env.db.add_dose(med_id, datetime(2026, 10, 21, 0, 0, tzinfo=timezone.utc))   # generated, 08:00
+    response = _press(env)
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    med = env.db.meds[med_id]
+    assert (body["med_id"], body["med_name"]) == (med_id, "Acetal 500mg")
+    assert {key: med[key] for key in ("med_name", "instructions", "dose_form", "units_per_dose", "min_interval_minutes",
+                                      "max_daily_doses", "pills_remaining", "is_active")} == {
+        "med_name": "Acetal 500mg", "instructions": "示範藥物（飯後服用），用來測試服藥流程", "dose_form": "solid_oral",
+        "units_per_dose": Decimal("1.00"), "min_interval_minutes": None, "max_daily_doses": None,
+        "pills_remaining": Decimal("12.00"), "is_active": True}            # 10 or more: the stock is left as it is
+    assert json.loads(med["schedule_time"]) == api_reachy.DEMO_SCHEDULE
+    assert schedule.dose_times(med["schedule_time"]) == []
+    assert json.loads(med["prescription_meta"]) == {"demo": "acetal"}
+    assert tomorrow not in env.db.intakes and set(_doses_of(env, med_id)) == {body["intk_id"]}
+    assert reachy_tasks.after_meal(med["schedule_time"], med["instructions"], NOW) is True   # 12:02, lunch
+
+
+def test_a_press_that_meets_a_deadlock_is_tried_once_more(env):
+    """The press locks the earlier demo task, then that dose's rows; the robot's confirmation for the dose locks the
+    dose first, then the task. When the two meet, PostgreSQL ends one of them (deadlock_detected, 40P01). When that is
+    the press, it starts once more from the beginning and answers as one press, instead of a 500."""
+    med_id = env.db.add_med()
+    earlier = env.db.add_dose(med_id, NOW - timedelta(minutes=12, seconds=-5))
+    task_id = env.db.add_task([earlier], slot=NOW - timedelta(minutes=15))["task_id"]
+    env.db.abort_errors = [FakeDeadlock()]
+    response = _press(env)
+    assert response.status_code == 200, response.json()
+    assert _locks(env) == 2
+    assert len(env.db.demo_meds()) == 1 and set(_doses_of(env, med_id)) == {response.json()["intk_id"]}
+    (old,) = [t for t in env.db.tasks if t["task_id"] == task_id]
+    assert old["status"] == "aborted" and json.loads(old["detail"])["reason"] == "demo_reset"
+    assert len([t for t in env.db.tasks if t["status"] in OPEN]) == 1
+
+
+@pytest.mark.parametrize("errors, presses", [([FakeDeadlock(), FakeDeadlock()], 2), ([RuntimeError("lost")], 1)],
+                         ids=["second deadlock", "other error"])
+def test_a_second_deadlock_or_another_error_is_not_tried_again(env, errors, presses):
+    earlier = env.db.add_dose(env.db.add_med(), NOW - timedelta(minutes=12, seconds=-5))
+    env.db.add_task([earlier], slot=NOW - timedelta(minutes=15))
+    env.db.abort_errors = list(errors)
+    before = _state(env)
+    with pytest.raises(type(errors[0])):
+        _press(env)
+    assert _locks(env) == presses and _state(env) == before
+
+
+def test_a_late_answer_on_a_demo_request_already_answered_names_no_empty_slot(env):
+    """A request family answered 'taken' for a demo dose stays answered, but the next press deletes its dose: a second
+    press of the button then has no slot to name either."""
+    med_id = env.db.add_med()
+    taken = env.db.add_dose(med_id, NOW - timedelta(minutes=30, seconds=-7))
+    request = env.db.add_request([taken], {str(taken): "pending"})
+    env.db.confirmations[request].update(resolution="confirmed", resolved_by=CONTACT["id"], resolved_at=NOW)
+    env.db.intakes[taken].update(intake_stats="taken", actual_intake_time=NOW - timedelta(minutes=30))
+    assert _press(env).status_code == 200
+    data = dose_confirmation.sign_postback(dose_confirmation.ACTION, request, "taken", CONTACT["id"])
+    result = asyncio.run(dose_confirmation.handle_postback(env.db, data, CONTACT["line_id"]))
+    assert result["status"] == "already_resolved" and result["resolution"] == "confirmed"
+    (reply,) = env.replies
+    assert reply["messages"][0]["text"] == ("此確認已由 Daughter 回覆：已服用（Pearl）。\n"
+                                            "Already answered by Daughter: taken (Pearl's dose).")
+
+
+def test_a_late_answer_on_a_cleared_request_that_also_held_a_real_dose_names_its_slot(env):
+    med_id = env.db.add_med()
+    waiting = env.db.add_dose(med_id, NOW - timedelta(minutes=30, seconds=-7))
+    real = env.db.add_dose(env.db.add_med("Metformin", demo=False), NOW - timedelta(minutes=30))   # 11:32
+    request = env.db.add_request([waiting, real], {str(waiting): "pending", str(real): "missed"})
+    assert _press(env).status_code == 200
+    data = dose_confirmation.sign_postback(dose_confirmation.ACTION, request, "not_taken", CONTACT["id"])
+    asyncio.run(dose_confirmation.handle_postback(env.db, data, CONTACT["line_id"]))
+    (reply,) = env.replies
+    assert reply["messages"][0]["text"] == ("此確認請求已逾時（Pearl 10/20 11:32）。\n"
+                                            "This request for Pearl's 10/20 11:32 dose has expired.")
