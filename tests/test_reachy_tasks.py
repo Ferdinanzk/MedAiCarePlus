@@ -754,11 +754,16 @@ class _ReminderConn:
         self.queries = []
         self.facts_asked = []
         self.updated = []   # (the statement up to its WHERE, its arguments)
+        self.held_now = set()   # doses a meal retry holds by the time they are marked missed (queued during the run)
 
     def transaction(self):
         return _Transaction(self)
 
     async def fetch(self, query, *args):
+        if query.startswith("UPDATE intake SET intake_stats = 'missed'"):   # the missed mark, UPDATE ... RETURNING
+            assert f"AND NOT {reachy_tasks.meal_retry_waiting_sql('intake')} RETURNING intk_id" in query
+            await self.execute(query, *args)   # logged as a statement, like the others
+            return [{"intk_id": intk_id} for intk_id in args[0] if intk_id not in self.held_now]
         if dose_facts.is_facts(query):
             # The job's rows hold the facts a test needs (previous_time, and optionally the others).
             u_id, ids, at, zone = args
@@ -1001,10 +1006,10 @@ class _FamilyConn(_ReminderConn):
 _A_MINUTE_BEFORE = object()
 
 
-def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE):
+def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE, held_now=()):
     """check_missed_doses at `moment` over `rows` (family on), the job's previous run at `last_run` (default: a minute
-    before, as in normal operation; None: the first run since the process started); returns (robot calls, patient
-    texts, family alerts, the conn)."""
+    before, as in normal operation; None: the first run since the process started), and `held_now` the doses a meal
+    retry holds by the time they are marked missed; returns (robot calls, patient texts, family alerts, the conn)."""
     if last_run is _A_MINUTE_BEFORE:
         last_run = moment - timedelta(minutes=1)
     monkeypatch.setattr(missed_dose_job, "_last_run_at", last_run)
@@ -1017,6 +1022,7 @@ def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE):
     for row in rows:
         row["notify_family_on_missed"] = True
     conn = _FamilyConn(rows)
+    conn.held_now = set(held_now)
     calls, sent, family = [], [], []
 
     async def fake_enqueue(c, u_id, slot_time, intk_ids, reason, expires_at, at=None):
@@ -1519,6 +1525,23 @@ def test_the_missed_dose_job_handles_the_dose_as_before_once_the_meal_retry_has_
     rows = [row for row in _waiting_rows(SLOT_20, 1, waiting=()) if row["id"] == 101]   # it ended at +25 min
     calls, sent, family, conn = _run_at(monkeypatch, SLOT_20 + timedelta(minutes=25), rows)
     assert calls == [([101], "missed_retry")] and len(sent) == 1 and "請盡快服用" in sent[0] and family == []
+
+
+def test_a_meal_retry_queued_during_the_jobs_run_keeps_its_dose_from_the_missed_alerts(monkeypatch):
+    """Review of quick fix 4: the job reads meal_retry_waiting once, in its first query, and takes no row locks. A
+    robot report that queues a meal retry for Med 101 during the run (its "not yet" at +30 min) is seen again as the
+    doses are marked missed: only Med 102 is marked and reported, so Reachy never comes back 20 minutes later for a
+    dose family were just told was missed. When every dose is held by then, nothing is reported."""
+    moment = SLOT_20 + timedelta(minutes=30, seconds=20)
+    calls, sent, family, conn = _run_at(monkeypatch, moment, _waiting_rows(SLOT_20, 2, waiting=()), held_now={101})
+    retry, missed = sent
+    assert missed.startswith("❌ 用藥未完成") and "Med 102" in missed and "Med 101" not in missed
+    ((args, kwargs),) = family
+    assert args[2] == "Med 102"
+    calls, sent, family, conn = _run_at(monkeypatch, moment, _waiting_rows(SLOT_20, 2, waiting=()),
+                                        held_now={101, 102})
+    assert len(sent) == 1 and "請盡快服用" in sent[0] and family == []   # the third retry only
+    assert not any("missed_alert" in query for query, _ in conn.updated)
 
 
 # ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────

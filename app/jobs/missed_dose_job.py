@@ -237,11 +237,17 @@ async def check_missed_doses():
 
                 # --- 3. Final Missed Alert (one per slot per recipient) ---
                 if time_since_slot >= remind_after_retries * remind_after_secs and due_rows:
-                    await conn.execute(
+                    # The hold is read again as the doses are marked (review of quick fix 4): a meal retry that a robot
+                    # report queued since this run's first query keeps its dose, which gets no missed mark or alert.
+                    missed = {row["intk_id"] for row in await conn.fetch(
                         "UPDATE intake SET intake_stats = 'missed', notify_stats = 'sent' "
-                        "WHERE intk_id = ANY($1::int[])",
+                        f"WHERE intk_id = ANY($1::int[]) AND NOT {meal_retry_waiting_sql('intake')} RETURNING intk_id",
                         due_ids,
-                    )
+                    )}
+                    if not missed:
+                        continue
+                    med_names = [r["med_name"] for r in due_rows if r["id"] in missed]
+                    med_list_str = _format_med_list(med_names)
 
                     # Notify family contacts (one message per family member, listing
                     # all missed meds).
