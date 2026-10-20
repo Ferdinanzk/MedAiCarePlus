@@ -455,7 +455,7 @@ test('the Reachy card shows no camera warning when the camera works, the robot i
   api.camera = robotCamera('unavailable', 0);                               // last report of a robot now offline
   api.online = false;
   await page.reload();
-  await expect(reachyCard(page).getByText(/Offline|離線/)).toBeVisible();
+  await expect(reachyCard(page).getByText(/^(Offline|離線)$/)).toBeVisible();   // the status (the demo note says it too)
   await expect(reachyCard(page).getByText(CAMERA_WARNING)).toHaveCount(0);
 
   api.camera = undefined;                                                    // a robot older than 0.7.0
@@ -653,7 +653,7 @@ test('the Reachy card translations have the same keys in English and Traditional
   expect(keys[0]).toEqual(expect.arrayContaining([
     'callName', 'callNameHelp', 'callNamePlaceholder', 'callNameReset', 'callNameSaved', 'callNameInvalid',
     'liveVoice', 'liveVoiceHelp', 'mealRetry', 'mealRetryHelp',
-    'demoDose', 'demoDoseHelp', 'demoDoseSent', 'demoDoseNotPaired',
+    'demoDose', 'demoDoseHelp', 'demoDoseSent', 'demoDoseNotPaired', 'demoDoseSlotBusy', 'demoDoseOffline',
   ]));
 });
 
@@ -702,7 +702,8 @@ test("a refused demo dose is explained in the card's own words", async ({ page }
   const cases: [number, string, string][] = [
     [409, 'robot_not_paired', '機器人已取消配對，請先重新配對。'],
     [403, 'robot_consent_required', '請先同意 Reachy 聲明。'],
-    [409, 'slot_busy', '操作未成功，請再試一次。'],
+    // Not "try again": the press keeps failing until that 5-minute slot is over (review of quick fix 6).
+    [409, 'slot_busy', 'Reachy 這幾分鐘已有其他服藥提醒，請 5 分鐘後再試。'],
     [500, 'request_failed', '操作未成功，請再試一次。'],
   ];
   for (const [status, detail, words] of cases) {
@@ -727,6 +728,10 @@ test('the demo dose button in English, on a phone and a desktop screen', async (
   api.demoError = { status: 409, detail: 'robot_not_paired' };
   await clickCentred(demoButton(page));
   await expect(reachyCard(page).getByRole('alert')).toHaveText('The robot is no longer paired. Pair it again first.');
+  api.demoError = { status: 409, detail: 'slot_busy' };
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByRole('alert'))
+    .toHaveText('Reachy already has another dose in these few minutes. Try again in 5 minutes.');
   api.demoError = null;
   await clickCentred(demoButton(page));
   await expect(reachyCard(page).getByText('Demo dose created. Reachy is on the way.')).toBeVisible();
@@ -741,4 +746,54 @@ test('the demo dose button in English, on a phone and a desktop screen', async (
       await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-demo-dose-${width}.png` });
     }
   }
+});
+
+// ── Review of quick fix 6 ──
+
+const DEMO_OFFLINE_ZH = 'Reachy 目前離線：要等它重新上線才會來提醒示範劑量，家人也可能收到「機器人離線」的 LINE 通知。';
+const DEMO_OFFLINE_EN = 'Reachy is offline. It comes for a demo dose only once it is back online, and family may get a ' +
+  'LINE notice that the robot is offline.';
+
+test('a demo dose refused as not paired shows the card unpaired, with its Pair button', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');
+  await expect(demoButton(page)).toBeVisible();
+  // Unpaired meanwhile (another tab): the server refuses the press, and the card must not keep its paired view.
+  api.paired = false;
+  api.demoError = { status: 409, detail: 'robot_not_paired' };
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByRole('alert')).toHaveText('機器人已取消配對，請先重新配對。');
+  await expect(page.getByRole('button', { name: /Pair a Reachy robot|配對 Reachy 機器人/ })).toBeVisible();
+  await expect(demoButton(page)).toHaveCount(0);
+});
+
+test('while the robot is offline the demo dose button says what a press does', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, online: false });
+  await page.goto('/settings');
+  await expect(reachyCard(page).getByText(DEMO_OFFLINE_ZH)).toBeVisible();
+  await expect(demoButton(page)).toBeEnabled();   // a press still works: its task waits for the robot
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(reachyCard(page).getByText(DEMO_OFFLINE_EN)).toBeVisible();
+  api.demoError = { status: 409, detail: 'slot_busy' };
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByRole('alert'))
+    .toHaveText('Reachy already has another dose in these few minutes. Try again in 5 minutes.');
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(reachyCard(page).getByText(DEMO_OFFLINE_EN)).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    if (process.env.REACHY_SCREENSHOTS) {
+      await demoButton(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-demo-dose-offline-${width}.png` });
+    }
+  }
+  api.demoError = null;
+  api.online = true;
+  await page.reload();
+  await expect(demoButton(page)).toBeVisible();
+  await expect(reachyCard(page).getByText(DEMO_OFFLINE_EN)).toHaveCount(0);
+  await expect(reachyCard(page).getByText(DEMO_OFFLINE_ZH)).toHaveCount(0);
+  expect(api.demoPosts).toBe(1);
 });

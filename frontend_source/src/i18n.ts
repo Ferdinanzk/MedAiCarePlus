@@ -175,6 +175,8 @@ const resources = {
         demoDoseHelp: 'Creates a demo dose of Acetal 500mg (after meals) now. Reachy comes right away, and family get the LINE confirmation as for a real dose. Earlier demo doses are cleared first.',
         demoDoseSent: 'Demo dose created. Reachy is on the way.',
         demoDoseNotPaired: 'The robot is no longer paired. Pair it again first.',
+        demoDoseSlotBusy: 'Reachy already has another dose in these few minutes. Try again in 5 minutes.',
+        demoDoseOffline: 'Reachy is offline. It comes for a demo dose only once it is back online, and family may get a LINE notice that the robot is offline.',
       },
       legal: {
         gateTitle: 'Please review the updated terms',
@@ -923,6 +925,8 @@ const resources = {
         demoDoseHelp: '建立一份 Acetal 500mg（飯後）的示範劑量，Reachy 會馬上來提醒服藥，家人也會像真的服藥一樣收到 LINE 確認。之前的示範劑量會先清除。',
         demoDoseSent: '已建立示範劑量，Reachy 正在過來。',
         demoDoseNotPaired: '機器人已取消配對，請先重新配對。',
+        demoDoseSlotBusy: 'Reachy 這幾分鐘已有其他服藥提醒，請 5 分鐘後再試。',
+        demoDoseOffline: 'Reachy 目前離線：要等它重新上線才會來提醒示範劑量，家人也可能收到「機器人離線」的 LINE 通知。',
       },
       legal: {
         gateTitle: '請閱讀更新後的條款',
