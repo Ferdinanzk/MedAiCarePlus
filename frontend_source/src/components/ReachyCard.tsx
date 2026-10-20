@@ -11,6 +11,11 @@ import { ApiError, fetchReachyStatus, fetchTodayDoses, pairReachy, queueReachyTa
 const CHECKIN_SCOPES = ['robot_microphone', 'cloud_voice', 'conversation_analysis', 'safety_alerts'];
 /** Camera states the robot's watchdog reports when it gets no frames (robot app 0.7.0+). */
 const CAMERA_PROBLEMS: RobotCamera['state'][] = ['stalled', 'recovering', 'unavailable'];
+/** After the microphone switch changes, the card reads the status again every MIC_REREAD_MS, at most MIC_REREADS
+ *  times, while the switch and the robot's reported volume disagree: the robot applies the switch at its next
+ *  heartbeat (every 10 s) and reports the new volume at the one after. */
+const MIC_REREAD_MS = 3000;
+const MIC_REREADS = 12;
 
 /**
  * `key` and its values, or `text` already worded (the server's reply when it refuses the dose).
@@ -41,6 +46,8 @@ export default function ReachyCard() {
   /** The call name being typed; null shows the saved one. */
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   const [nameNotice, setNameNotice] = useState<'saved' | 'invalid' | null>(null);
+  /** Status reads left after a microphone change (quick fix 8). */
+  const [micRereads, setMicRereads] = useState(0);
 
   const load = useCallback(async () => {
     const [robot, consent] = await Promise.all([fetchReachyStatus(), fetchConsentStatus()]);
@@ -69,6 +76,22 @@ export default function ReachyCard() {
     );
     return () => { active = false; };
   }, [load]);
+
+  // The robot's microphone (quick fix 8). The robot reports the daemon's volume at each heartbeat (null: an older
+  // robot, or its daemon did not answer); while the switch and that volume disagree, the robot has not applied it yet.
+  const micVolume = status?.mic_volume ?? null;
+  const micApplying = micVolume !== null && (status?.mic_muted ? micVolume > 0 : micVolume === 0);
+
+  useEffect(() => {
+    if (!micApplying || micRereads <= 0) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      fetchReachyStatus()
+        .then(next => { if (active) setStatus(next); }, () => undefined)   // a failed read waits for the next one
+        .finally(() => { if (active) setMicRereads(left => left - 1); });
+    }, MIC_REREAD_MS);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [micApplying, micRereads]);
 
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -155,6 +178,13 @@ export default function ReachyCard() {
   const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await updateReachySettings({ auto_record: value })));
 
   const toggleMealRetry = (value: boolean) => run(async () => setStatus(await updateReachySettings({ meal_retry: value })));
+
+  // Checked = on. Off has the robot app set the daemon's microphone volume to 0; the card then reads the status again
+  // until the robot reports the new volume.
+  const toggleMic = (value: boolean) => run(async () => {
+    setStatus(await updateReachySettings({ mic_muted: !value }));
+    setMicRereads(MIC_REREADS);
+  });
 
   // "" goes back to the registered name. A name the server refuses (422 invalid_call_name) is explained next to the
   // field, and the typed name stays so it can be fixed.
@@ -375,6 +405,19 @@ export default function ReachyCard() {
               <span className="block text-xs text-gray-500 mt-1">{t('reachy.listenHelp')}</span>
             </span>
           </label>
+          {/* The volume lines sit under the switch's words, outside its label, so pressing them flips nothing. */}
+          <div className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
+            <input id="reachy-mic" type="checkbox" className="mt-1 w-5 h-5" checked={!status.mic_muted} disabled={busy}
+              onChange={event => void toggleMic(event.target.checked)} />
+            <div className="space-y-2">
+              <label htmlFor="reachy-mic" className="block">
+                <span className="block text-sm font-medium text-gray-900">{t('reachy.micSwitch')}</span>
+                <span className="block text-xs text-gray-500 mt-1">{t('reachy.micSwitchHelp')}</span>
+              </label>
+              {micVolume !== null && <p className="text-xs text-gray-700">{t('reachy.micVolume', { n: micVolume })}</p>}
+              {micApplying && <p role="status" className="text-xs text-amber-800">{t('reachy.micApplying')}</p>}
+            </div>
+          </div>
           <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
             <input type="checkbox" className="mt-1 w-5 h-5" checked={checkins} disabled={busy}
               onChange={event => void toggleCheckins(event.target.checked)} />
