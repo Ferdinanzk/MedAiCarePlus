@@ -60,6 +60,8 @@ interface MockOptions {
   /** The server's LIVE_VOICE_TEST, and this robot's live voice switch. */
   liveVoiceTest?: boolean;
   liveVoice?: boolean;
+  /** The meal retry switch ("user".reachy_meal_retry, quick fix 5); left out: off, as the server's default. */
+  mealRetry?: boolean;
 }
 
 async function mockApi(page: Page, options: MockOptions = {}) {
@@ -80,12 +82,16 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     callName: options.callName ?? null,
     liveVoiceTest: options.liveVoiceTest ?? false,
     liveVoice: options.liveVoice ?? false,
+    mealRetry: options.mealRetry ?? false,
+    /** While set, PATCH /api/reachy/settings answers only once it resolves; settingsError makes it fail. */
+    settingsGate: null as Promise<void> | null,
+    settingsError: null as number | null,
   };
   const robotStatus = () => state.paired
     ? { paired: true, device_id: 'd-1', label: 'Reachy Mini', auto_record: state.autoRecord, last_seen_at: new Date().toISOString(),
         online: state.online, robot_reachable: true, landmark_fps: 15.2, last_task: null, alert_contacts: 1,
         call_name: state.callName ?? REGISTERED_NAME, call_name_custom: state.callName !== null,
-        live_voice: state.liveVoice, live_voice_test: state.liveVoiceTest,
+        live_voice: state.liveVoice, live_voice_test: state.liveVoiceTest, meal_retry: state.mealRetry,
         ...(state.camera === undefined ? {} : { camera: state.camera }) }
     : { paired: false };
   const consentStatus = () => ({
@@ -132,6 +138,8 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     if (path === '/api/reachy/settings') {
       const body = request.postDataJSON();
       state.settingsPatches.push(body);
+      if (state.settingsGate) await state.settingsGate;
+      if (state.settingsError) return route.fulfill({ status: state.settingsError, json: { detail: 'request_failed' } });
       // As the server does: a field left out keeps its value, "" goes back to the registered name, and a name that
       // breaks the rules refuses the whole request with 422 invalid_call_name.
       if ('call_name' in body) {
@@ -141,6 +149,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       }
       if ('auto_record' in body) state.autoRecord = body.auto_record;
       if ('live_voice' in body) state.liveVoice = body.live_voice;
+      if ('meal_retry' in body) state.mealRetry = body.meal_retry;
       return route.fulfill({ json: robotStatus() });
     }
     if (path === '/api/reachy/tasks') {
@@ -569,6 +578,58 @@ test('the name field and the live switch fit a phone and a desktop screen', asyn
   }
 });
 
+// ── Quick fix 5 (20 Oct 2026): Reachy comes back 20 minutes after "not eaten yet" only while this switch is on ──
+
+const mealRetrySwitch = (page: Page) =>
+  page.getByRole('checkbox', { name: /Come back 20 minutes after 'not eaten yet'|還沒吃飯時，20 分鐘後再來提醒/ });
+
+test("the meal retry switch defaults off, saves only meal_retry and flips only on the server's answer", async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  await expect(mealRetrySwitch(page)).not.toBeChecked();
+  const help = reachyCard(page).locator('label').filter({ has: mealRetrySwitch(page) });
+  await expect(help).toContainText('還沒吃飯時，20 分鐘後再來提醒');
+  await expect(help).toContainText(
+    '長輩說還沒吃飯時，Reachy 會在 20 分鐘後回來再提醒一次（最多 3 次）。關閉時只提醒要飯後吃藥並結束這次服藥。');
+
+  // The switch mirrors the server's value: while the PATCH waits for its answer it stays off.
+  let answer = () => {};
+  api.settingsGate = new Promise<void>(resolve => { answer = resolve; });
+  await clickCentred(mealRetrySwitch(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ meal_retry: true }]);
+  await expect(mealRetrySwitch(page)).not.toBeChecked();
+  answer();
+  await expect(mealRetrySwitch(page)).toBeChecked();
+  api.settingsGate = null;
+
+  // A PATCH that fails leaves it as the server has it, and says so.
+  api.settingsError = 500;
+  await clickCentred(mealRetrySwitch(page));
+  await expect(reachyCard(page).getByRole('alert')).toHaveText('操作未成功，請再試一次。');
+  expect(api.settingsPatches).toEqual([{ meal_retry: true }, { meal_retry: false }]);
+  await expect(mealRetrySwitch(page)).toBeChecked();
+  api.settingsError = null;
+  await clickCentred(mealRetrySwitch(page));
+  await expect.poll(() => api.settingsPatches).toEqual([{ meal_retry: true }, { meal_retry: false }, { meal_retry: false }]);
+  await expect(mealRetrySwitch(page)).not.toBeChecked();
+});
+
+test('the meal retry switch shows the value the server has, in English too', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true, mealRetry: true });
+  await page.goto('/settings');
+  await expect(mealRetrySwitch(page)).toBeChecked();
+  await page.getByRole('button', { name: '中文' }).first().click();
+  const help = reachyCard(page).locator('label').filter({ has: mealRetrySwitch(page) });
+  await expect(help).toContainText("Come back 20 minutes after 'not eaten yet'");
+  await expect(help).toContainText("When the patient hasn't eaten yet, Reachy comes back 20 minutes later to remind them " +
+    'again (at most 3 times). When off, Reachy only reminds them to take it after a meal and ends this intake.');
+  expect(api.settingsPatches).toEqual([]);   // showing the card sends nothing
+  const source = readFileSync(new URL('../src/i18n.ts', import.meta.url), 'utf8');
+  expect(source).not.toContain('??');        // the Chinese words were saved as UTF-8, not as question marks
+});
+
 test('the Reachy card translations have the same keys in English and Traditional Chinese', () => {
   const source = readFileSync(new URL('../src/i18n.ts', import.meta.url), 'utf8');
   const blocks = [...source.matchAll(/^ {6}reachy: \{\r?\n([\s\S]*?)^ {6}\},/gm)];
@@ -577,6 +638,6 @@ test('the Reachy card translations have the same keys in English and Traditional
   expect(keys[0]).toEqual(keys[1]);
   expect(keys[0]).toEqual(expect.arrayContaining([
     'callName', 'callNameHelp', 'callNamePlaceholder', 'callNameReset', 'callNameSaved', 'callNameInvalid',
-    'liveVoice', 'liveVoiceHelp',
+    'liveVoice', 'liveVoiceHelp', 'mealRetry', 'mealRetryHelp',
   ]));
 });

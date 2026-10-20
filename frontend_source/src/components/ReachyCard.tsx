@@ -153,6 +153,8 @@ export default function ReachyCard() {
 
   const toggleAutoRecord = (value: boolean) => run(async () => setStatus(await updateReachySettings({ auto_record: value })));
 
+  const toggleMealRetry = (value: boolean) => run(async () => setStatus(await updateReachySettings({ meal_retry: value })));
+
   // "" goes back to the registered name. A name the server refuses (422 invalid_call_name) is explained next to the
   // field, and the typed name stays so it can be fixed.
   const saveCallName = (value: string) => run(async () => {
@@ -331,6 +333,14 @@ export default function ReachyCard() {
             <span>
               <span className="block text-sm font-medium text-gray-900">{t('reachy.autoRecord')}</span>
               <span className="block text-xs text-gray-500 mt-1">{t('reachy.autoRecordHelp')}</span>
+            </span>
+          </label>
+          <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
+            <input type="checkbox" className="mt-1 w-5 h-5" checked={!!status.meal_retry} disabled={busy}
+              onChange={event => void toggleMealRetry(event.target.checked)} />
+            <span>
+              <span className="block text-sm font-medium text-gray-900">{t('reachy.mealRetry')}</span>
+              <span className="block text-xs text-gray-500 mt-1">{t('reachy.mealRetryHelp')}</span>
             </span>
           </label>
           <label className="flex items-start gap-3 rounded-xl bg-gray-50 p-4">
