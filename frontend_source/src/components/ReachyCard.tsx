@@ -214,7 +214,8 @@ export default function ReachyCard() {
   });
 
   // A dose of the demo medicine, Acetal 500mg, made now; Reachy comes for it at once and family get the LINE
-  // confirmation as for a real dose (quick fix 6). Not paired is said in this card's words; run() words the rest.
+  // confirmation as for a real dose (quick fix 6). Not paired and a busy slot are said in this card's words; run()
+  // words the rest. Not paired also reloads the card, so it shows its Pair button again (review of quick fix 6).
   const sendDemoDose = () => run(async () => {
     setDemoSent(false);
     try {
@@ -222,6 +223,11 @@ export default function ReachyCard() {
     } catch (cause) {
       if (cause instanceof ApiError && cause.message === 'robot_not_paired') {
         setError('reachy.demoDoseNotPaired');
+        await refresh().catch(() => undefined);   // a failed reload keeps the words above
+        return;
+      }
+      if (cause instanceof ApiError && cause.message === 'slot_busy') {
+        setError('reachy.demoDoseSlotBusy');
         return;
       }
       throw cause;
@@ -451,6 +457,8 @@ export default function ReachyCard() {
               {busy ? <Loader2 className="w-4 h-4 shrink-0 animate-spin" /> : <Pill className="w-4 h-4 shrink-0" />}{t('reachy.demoDose')}
             </button>
             <p id="reachy-demo-dose-help" className="text-xs text-gray-500">{t('reachy.demoDoseHelp')}</p>
+            {/* Offline, a press queues a task that waits, and the minute job may send family a robot-offline notice. */}
+            {!status.online && <p className="text-xs text-amber-800">{t('reachy.demoDoseOffline')}</p>}
             {demoSent && <p role="status" className="rounded-xl bg-blue-50 p-3 text-sm text-blue-800">{t('reachy.demoDoseSent')}</p>}
           </div>
           {testNotice && (
