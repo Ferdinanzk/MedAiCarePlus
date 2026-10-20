@@ -155,6 +155,11 @@ class FakeConn:
         if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # reachy_tasks.task_due
             self.task_due_asked.append((args, self.depth))
             return self.task_due
+        if query.startswith("SELECT task_id::text FROM reachy_task WHERE lease_owner = $1::uuid"):   # companion_task
+            assert "AND status = 'in_progress'" in query and "FOR " not in query   # a plain read: it locks nothing
+            self.executed.append((query, args, self.depth))
+            t = self.task
+            return str(t["task_id"]) if t["lease_owner"] == args[0] and t["status"] == "in_progress" else None
         raise AssertionError(query)
 
     async def execute(self, query, *args):
@@ -472,6 +477,31 @@ def test_the_heartbeat_stores_whether_a_companion_session_runs(env, monkeypatch)
         assert env.robot.post("/api/device/heartbeat", json=body).status_code == 200
         update = [entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0]][-1]
         assert json.loads(update[1][3]).get("companion") is stored, body
+
+
+def test_a_companion_heartbeat_names_the_task_the_session_belongs_to(env, monkeypatch):
+    """Review of quick fixes 4 and 5: the companion flag belongs to the device and lags by up to one heartbeat, so a
+    flag left from one task's chat must not release another task's hold. With companion true the heartbeat also stores
+    the task the robot holds in progress (companion_task, its id as text), and none when no task is in progress. The
+    read locks nothing (the heartbeat still locks the device row first, then the task rows)."""
+    _no_leases(monkeypatch)
+
+    def beat(body):
+        assert env.robot.post("/api/device/heartbeat", json=body).status_code == 200
+        update = [entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0]][-1]
+        return json.loads(update[1][3])
+
+    detail = beat({"companion": True, "bridge_version": "0.17.0"})
+    assert (detail["companion"], detail["companion_task"]) == (True, TASK_ID)
+    (read,) = [entry for entry in env.conn.executed if entry[0].startswith("SELECT task_id::text")]
+    assert read[1] == (DEVICE_ID,) and read[2] == 1
+    env.conn.task["status"] = "searching"   # the robot is looking for the patient: no task in progress
+    assert beat({"companion": True}) == {"vision_fps": None, "bridge_version": None, "missing_clips": None,
+                                         "companion": True}
+    env.conn.task["status"] = "in_progress"
+    env.conn.executed.clear()
+    assert "companion_task" not in beat({"companion": False}) and "companion_task" not in beat({})
+    assert not [entry for entry in env.conn.executed if entry[0].startswith("SELECT task_id::text")]   # nor read
 
 
 # ── The robot's camera (robot app 0.7.0): stored with the heartbeat, shown on the Reachy card ──
