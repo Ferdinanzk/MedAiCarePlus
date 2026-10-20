@@ -353,3 +353,18 @@ def test_quick_fix_8_says_to_switch_the_microphone_on_before_the_app_stops_follo
                   "機器人的麥克風音量是 0，Reachy 聽不到聲音。請在 Reachy Mini Control 把麥克風音量調高。",
                   "The robot's microphone volume is 0, so Reachy hears nothing. Raise it in Reachy Mini Control."):
         assert words in quick_fix_8, f"CLAUDE.md's quick fix 8 bullet doesn't say {words}"
+
+
+def test_quick_fix_9_names_the_microphone_button_and_its_direct_call():
+    """Quick fix 9 of 21 Oct 2026: the microphone as a button that applies on the robot at once, through the robot
+    app's control address, after quick fix 8 in the live voice section."""
+    quick_fix_9 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 9", ("- ", "#")))
+    for name in ("`control`", "`reachy_device.status_detail`", "`robot_control.check`",
+                 "`robot_control.set_microphone`", "`MIC_DIRECT_TIMEOUT_SECONDS = 3`", "`mic_applied`", "`api_account._strip_secrets`",
+                 "`POST /api/device/heartbeat`", "`PATCH /api/reachy/settings`", "`MIC_APPLIED_MS`",
+                 "only while the robot is online", "never a 422", "關閉麥克風", "Turn microphone off", "開啟麥克風",
+                 "Turn microphone on", "已套用到機器人", "Applied on the robot", "已儲存，機器人約 10 秒內套用",
+                 "Saved. The robot applies it within about 10 seconds.", "CONTRACT9.md"):
+        assert name in quick_fix_9, f"CLAUDE.md's quick fix 9 bullet doesn't name {name}"
+    section = _section("CLAUDE.md")
+    assert section.index("- **Quick fix 8") < section.index("- **Quick fix 9") < section.index("- **Not in 2a")
