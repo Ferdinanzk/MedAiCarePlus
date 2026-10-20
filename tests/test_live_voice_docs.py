@@ -301,6 +301,13 @@ def test_quick_fix_4_re_review_holds_the_dose_while_reachy_prompts_it():
     assert "and also (review of quick fix 4) once Reachy is with the patient" not in quick_fix_4
 
 
+def test_the_companion_flag_names_its_task():
+    """Review of quick fixes 4 and 5: the companion chat releases only its own meal retry's hold, read from the task
+    the heartbeat names (status_detail's companion_task), so a flag left from another task's chat releases nothing."""
+    quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
+    assert "`companion_task`" in quick_fix_4, "CLAUDE.md's quick fix 4 bullet doesn't name `companion_task`"
+
+
 def test_quick_fix_5_names_the_meal_retry_switch():
     """Quick fix 5 of 20 Oct 2026: the Reachy card's switch for "come back 20 minutes after 'not eaten'", off by
     default. The quick fix 4 bullet says the meal retry is queued only while it is on."""
