@@ -24,6 +24,11 @@ export interface ReachyStatus {
   live_voice_test?: boolean;
   /** Reachy comes back 20 minutes after "not eaten yet" (at most 3 times); off by default. */
   meal_retry?: boolean;
+  /** The robot's microphone is off: the robot app sets the daemon's microphone volume to 0. False by default. */
+  mic_muted?: boolean;
+  /** The daemon's microphone volume (0-100) from the robot's last heartbeat; null: none reported (robot app before
+   *  0.17.1, or its daemon did not answer). */
+  mic_volume?: number | null;
   last_seen_at?: string | null;
   online?: boolean;
   robot_reachable?: boolean | null;
@@ -71,6 +76,8 @@ export interface ReachySettings {
   live_voice?: boolean;
   /** Off also cancels a meal retry still waiting. */
   meal_retry?: boolean;
+  /** True turns the robot's microphone off (its volume set to 0 at the robot's next heartbeat). */
+  mic_muted?: boolean;
 }
 
 /** Sends only the fields given: JSON.stringify leaves out the ones that are undefined. */
