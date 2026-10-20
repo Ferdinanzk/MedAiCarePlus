@@ -291,7 +291,8 @@ class FakeDB:
                                                                                        "reason": "nothing_to_prompt"}))
         elif "SET not_before = $3" in query:   # _queue_meal_retry: "not yet" again moves the waiting meal retry
             assert ("expires_at = GREATEST(expires_at, "
-                    f"$3 + INTERVAL '{reachy_tasks.MANUAL_TASK_MIN_MINUTES} minutes') WHERE u_id = $1 AND status = 'queued' AND not_before IS NOT NULL AND not_before < $3 "
+                    f"$3 + INTERVAL '{reachy_tasks.MANUAL_TASK_MIN_MINUTES} minutes') WHERE u_id = $1 "
+                    "AND status = 'queued' AND not_before IS NOT NULL AND not_before < $3 "
                     "AND intk_ids && $2::int[]") in query
             u_id, intk_ids, not_before = args
             for t in self.tasks:
@@ -1331,8 +1332,10 @@ def test_at_most_three_meal_retries_per_dose(db):
 
 
 def test_two_doses_in_one_slot_only_the_one_not_eaten_for_is_retried(db):
-    """Quick fixes 3's minor finding: in one slot, Reachy prompted the empty-stomach medicine (sent to family) and
-    the patient had not eaten for the after-meal one."""
+    """The server retries only the doses the robot's outcomes give meal_not_eaten. The robot gives it to every dose
+    still to prompt (it asks the meal question once, before the first prompt), so this mix arises only in a corner
+    case: a dose sent to family before a restart. A slot that mixes an after-meal dose with an empty-stomach one puts
+    both into the meal retry (review of quick fix 4; open: the user decides)."""
     task_id = enqueue(db, intk_ids=(101, 102))
     db.doses[102]["intake_stats"] = "pending_confirmation"
     _completed_with(db, task_id, {"101": "meal_not_eaten", "102": "confirmation_requested"})

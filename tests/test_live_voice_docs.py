@@ -277,3 +277,15 @@ def test_quick_fix_4_names_the_meal_retry_and_the_quiet_missed_dose_job():
         assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
     quick_fixes_3 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fixes 3", ("- ", "#")))
     assert "nothing waits for the meal" not in quick_fixes_3
+
+
+def test_quick_fix_4_review_names_when_the_hold_ends_and_the_open_mixed_slot_question():
+    """Review of quick fix 4: the hold ends once Reachy is with the patient or while the robot is offline, the missed
+    mark reads it again, an expired dose cancels the meal retry, and "not yet" again moves it. A slot that mixes an
+    after-meal dose with an empty-stomach one is an open question for the user (the robot gives meal_not_eaten to
+    every dose still to prompt), not "only the ones not eaten for are retried"."""
+    quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
+    for name in ("`in_progress`", "`task_due`", "`OFFLINE_AFTER_SECONDS`", "`RETURNING`", "`dose_expired`",
+                 "\"not yet\" again", "the user decides"):
+        assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
+    assert "only the ones not eaten for are retried" not in quick_fix_4
