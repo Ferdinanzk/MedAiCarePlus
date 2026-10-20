@@ -330,3 +330,15 @@ def test_quick_fix_6_names_the_demo_dose_button():
         assert name in quick_fix_6, f"CLAUDE.md's quick fix 6 bullet doesn't name {name}"
     section = _section("CLAUDE.md")
     assert section.index("- **Quick fix 5") < section.index("- **Quick fix 6") < section.index("- **Not in 2a")
+
+
+def test_quick_fix_8_names_the_microphone_switch():
+    """Quick fix 8 of 20 Oct 2026: the Reachy card's robot microphone switch (the robot app sets the daemon's
+    microphone volume to 0), after quick fix 7 in the live voice section."""
+    quick_fix_8 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 8", ("- ", "#")))
+    for name in ('`"user".reachy_mic_muted`', "`microphone_volume`", "`mic_muted`", "`mic_volume`",
+                 "`POST /api/device/heartbeat`", "`PATCH /api/reachy/settings`", "`StrictBool`", "機器人麥克風",
+                 "Robot microphone", "正在套用到機器人…", "Applying on the robot…", "CONTRACT8.md"):
+        assert name in quick_fix_8, f"CLAUDE.md's quick fix 8 bullet doesn't name {name}"
+    section = _section("CLAUDE.md")
+    assert section.index("- **Quick fix 7") < section.index("- **Quick fix 8") < section.index("- **Not in 2a")
