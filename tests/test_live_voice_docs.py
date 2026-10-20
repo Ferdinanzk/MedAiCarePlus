@@ -318,3 +318,15 @@ def test_quick_fix_5_names_the_meal_retry_switch():
         assert name in quick_fix_5, f"CLAUDE.md's quick fix 5 bullet doesn't name {name}"
     quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
     assert "only while the patient's switch is on" in quick_fix_4
+
+
+def test_quick_fix_6_names_the_demo_dose_button():
+    """Quick fix 6 of 20 Oct 2026: the Reachy card's "Demo dose: Acetal 500mg" button and its route, after quick fix 5
+    in the live voice section."""
+    quick_fix_6 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 6", ("- ", "#")))
+    for name in ("`POST /api/reachy/demo-dose`", "示範藥物：Acetal 500mg", "Demo dose: Acetal 500mg", "`demo_reset`",
+                 "`robot_not_paired`", "`robot_consent_required`", "`slot_busy`", "`dose_safety.is_ad_hoc`",
+                 "`reachy_tasks.enqueue_reachy_task`", "CONTRACT6.md"):
+        assert name in quick_fix_6, f"CLAUDE.md's quick fix 6 bullet doesn't name {name}"
+    section = _section("CLAUDE.md")
+    assert section.index("- **Quick fix 5") < section.index("- **Quick fix 6") < section.index("- **Not in 2a")
