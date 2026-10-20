@@ -388,6 +388,29 @@ def test_a_used_candidate_logs_its_use_and_no_expiry(clock, caplog):
     assert _lines(caplog, ": expired unread") == [] and _lines(caplog, "re-armed") == []
 
 
+def test_a_request_that_names_a_just_expired_candidate_logs_its_late_use(clock, caplog):
+    """The robot read the candidate at about 14.9 s and its request came after the 15.0 s expiry: the log says so."""
+    caplog.set_level(logging.INFO, logger="app.services.monitor_service")
+
+    async def scenario():
+        run = _Run(clock)
+        await run.rest(1.0)
+        await run.gesture()
+        event_id = run.state.candidate["event_id"]
+        await run.rest(15.2)
+        assert run.state.candidate is None
+        assert service.mark_candidate_used(run.state, event_id, "confirmation") is False
+        assert service.mark_candidate_used(run.state, event_id, "confirmation") is False   # a retried request
+        assert service.mark_candidate_used(run.state, "evt-other", "confirmation") is False
+        return run, event_id
+
+    run, event_id = asyncio.run(scenario())
+    late = _lines(caplog, "after it expired")
+    assert late == [f"intake candidate {event_id} of session {run.state.session_id}: used by confirmation "
+                    f"after it expired"]
+    assert run.state.candidate_used is None
+
+
 def test_a_timeout_reset_is_logged_once_with_its_stage(clock, caplog):
     """An approach that never reaches the mouth: the pipeline gives up after its 4.5 s (event_timeout)."""
     caplog.set_level(logging.INFO, logger="app.services.monitor_service")

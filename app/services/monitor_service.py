@@ -23,7 +23,8 @@ PACKET_HISTORY = 48
 CANDIDATE_TIMEOUT_SECONDS = 5.0
 # A robot session's ready candidate is kept this long from its creation (quick fix 7): the robot reads it only in
 # WATCHING, after its ~10-11 s medicine prompt, and a patient who takes the pill during the prompt makes one 1-2 s
-# into the session. Unready candidates, and every browser candidate, keep CANDIDATE_TIMEOUT_SECONDS.
+# into the session. Unready candidates, and every browser candidate, keep CANDIDATE_TIMEOUT_SECONDS. It equals
+# dose_video.EVENT_MAX_SECONDS: a longer window needs a longer event clip, or a late read's clip misses the approach.
 READY_CANDIDATE_SECONDS = 15.0
 
 # A session only auto-commits while landmark capture keeps up: fewer frames give the detector fewer samples per
@@ -203,6 +204,9 @@ class MonitorSession:
     # 'auto_commit', or the browser's 'confirmed_by_user' / 'not_taken'; None while nothing has. A dose candidate
     # that expires unused re-arms the detector (_expire_candidate); a used one keeps its latch.
     candidate_used: str | None = None
+    # The event of the last dose candidate that expired unused, until a late request names it (logged once): a robot
+    # that read it just before READY_CANDIDATE_SECONDS can file its request just after.
+    expired_event_id: str | None = None
     latest_detector: dict | None = None
     recorded: dict | None = None
     ended: bool = False
@@ -329,6 +333,9 @@ def mark_candidate_used(state: MonitorSession, event_id: str, by: str) -> bool:
     detector keeps its latch, so one gesture never gives two events. False when there is no such candidate."""
     candidate = state.candidate
     if not candidate or candidate.get("event_id") != event_id:
+        if event_id is not None and event_id == state.expired_event_id:
+            state.expired_event_id = None
+            log.info("intake candidate %s of session %s: used by %s after it expired", event_id, state.session_id, by)
         return False
     if state.candidate_used is None:
         state.candidate_used = by
@@ -360,6 +367,7 @@ async def _expire_candidate(state: MonitorSession, now: float) -> None:
         return
     log.info("intake candidate %s of session %s: expired unread (ready=%s, age %.1f s)",
              candidate.get("event_id"), state.session_id, ready, age)
+    state.expired_event_id = candidate.get("event_id")
     await _new_detector_session(state)
     state.emotion_event_start = None
     log.info("intake detector of session %s: re-armed with a fresh detector session", state.session_id)
