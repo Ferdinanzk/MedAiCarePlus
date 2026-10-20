@@ -266,3 +266,14 @@ def test_quick_fixes_3_names_the_empty_stomach_rule_and_meal_not_yet():
     lines = (REPO / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
     dose_lines = next(line for line in lines if line.startswith("  - **Dose lines with the name.**"))
     assert "`meal_not_yet`" in dose_lines
+
+
+def test_quick_fix_4_names_the_meal_retry_and_the_quiet_missed_dose_job():
+    """Quick fix 4 of 20 Oct 2026: Reachy comes back 20 minutes after "not eaten yet", and the missed-dose job waits
+    for it. The quick fixes 3 bullet no longer says nothing waits for the meal."""
+    quick_fix_4 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fix 4", ("- ", "#")))
+    for name in ("`MEAL_RETRY_MINUTES = 20`", "`MEAL_RETRY_LIMIT = 3`", "`not_before`", "`missed_retry`",
+                 "`reachy_tasks.meal_retry_waiting_sql`", "`nothing_to_prompt`", "CONTRACT4.md"):
+        assert name in quick_fix_4, f"CLAUDE.md's quick fix 4 bullet doesn't name {name}"
+    quick_fixes_3 = "\n".join(_lines_from("CLAUDE.md", "- **Quick fixes 3", ("- ", "#")))
+    assert "nothing waits for the meal" not in quick_fixes_3
