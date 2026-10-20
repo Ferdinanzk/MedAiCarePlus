@@ -31,6 +31,7 @@ TRANSITIONS = {
     "in_progress": {"completed", "not_found", "aborted"},
 }
 _OPEN_SQL = "('queued','leased','searching','in_progress')"
+_MEAL_WAITING_SQL = "('queued','leased','searching')"   # a meal retry that has not reached the patient yet
 _LOCAL_TZ = ZoneInfo(MEDCARE_TIMEZONE)
 
 
@@ -233,11 +234,15 @@ def _meal_retry_sql(dose: str, statuses: str) -> str:
 
 def meal_retry_waiting_sql(dose: str) -> str:
     """A meal retry that has not reached the patient yet (queued, leased or searching) holds the dose `dose` (an
-    intake alias): Reachy comes back for it after the meal, so the missed-dose job sends nothing of its own for it
-    meanwhile. Once Reachy is with the patient (in_progress) the job goes on as for any dose task (review of quick fix
-    4): a dose left pending there gets the job's next retry, a task of the slot's own that task_due reports, so the
-    check-in that follows ends for the medicine instead of holding the dose for as long as the chat runs."""
-    return _meal_retry_sql(dose, "('queued','leased','searching')")
+    intake alias) while the patient's robot is online (a heartbeat within OFFLINE_AFTER_SECONDS): Reachy comes back
+    for it after the meal, so the missed-dose job sends nothing of its own for it meanwhile. Review of quick fix 4:
+    once Reachy is with the patient (in_progress) the job goes on as for any dose task, so a dose left pending there
+    gets the job's next retry, a task of the slot's own that task_due reports, and the check-in that follows ends for
+    the medicine instead of holding the dose for as long as the chat runs. A robot offline holds nothing back either:
+    the patient gets the LINE reminders the robot-offline notice promises family."""
+    return (f"({_meal_retry_sql(dose, _MEAL_WAITING_SQL)} AND EXISTS (SELECT 1 FROM reachy_device meal_device "
+            f"WHERE meal_device.u_id = {dose}.u_id AND meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
+            f"NOW() - INTERVAL '{OFFLINE_AFTER_SECONDS} seconds'))")
 
 
 async def _lease_once(u_id: int, device_id: str) -> dict | None:

@@ -129,9 +129,13 @@ class FakeDB:
 
     def meal_retry_waiting(self, intk_id):
         """reachy_tasks.meal_retry_waiting_sql: a meal retry that has not reached the patient yet (queued, leased or
-        searching) holds the dose. One with the patient (in_progress) no longer does."""
-        return any(t.get("not_before") is not None and t["status"] in ("queued", "leased", "searching")
-                   and intk_id in t["intk_ids"] for t in self.tasks)
+        searching) holds the dose, while the patient's robot is online (a heartbeat within OFFLINE_AFTER_SECONDS).
+        One with the patient (in_progress) no longer does."""
+        device = self.devices.get(7)
+        online = (device is not None and not device["revoked"] and device["last_seen_at"] is not None
+                  and device["last_seen_at"] >= self.now - timedelta(seconds=reachy_tasks.OFFLINE_AFTER_SECONDS))
+        return online and any(t.get("not_before") is not None and t["status"] in ("queued", "leased", "searching")
+                              and intk_id in t["intk_ids"] for t in self.tasks)
 
     # asyncpg surface
     async def fetchval(self, query, *args):
@@ -224,6 +228,8 @@ class FakeDB:
         if "AS meal_retry_waiting" in query:   # missed_dose_job: the pending doses, each with its meal retry's hold
             assert f"{reachy_tasks.meal_retry_waiting_sql('i')} AS meal_retry_waiting" in query
             assert "meal.status IN ('queued','leased','searching')" in query   # what meal_retry_waiting models
+            assert ("meal_device.revoked_at IS NULL AND meal_device.last_seen_at >= "
+                    f"NOW() - INTERVAL '{reachy_tasks.OFFLINE_AFTER_SECONDS} seconds'") in query
             return [{"id": i, "u_id": 7, "intake_time_stamp": d["intake_time_stamp"], "reminder_sent": True,
                      "missed_reminders_sent": d.get("missed_reminders_sent", 0), "med_id": d["med_id"],
                      "med_name": d["med_name"], "patient_name": self.users[7], "patient_line_id": "U1",
@@ -1202,9 +1208,11 @@ def _meal_retries(db):
     return [t for t in db.tasks if t.get("not_before") is not None]
 
 
-def _job_on(db, monkeypatch):
+def _job_on(db, monkeypatch, online=True):
     """check_missed_doses at db.now over the fake database itself (the real enqueue_reachy_task; the job's previous
-    run a minute before); returns the patient's LINE texts."""
+    run a minute before; the robot's last heartbeat 10 s before, or 2 minutes before when not online); returns the
+    patient's LINE texts."""
+    db.devices[7]["last_seen_at"] = db.now - timedelta(seconds=10 if online else 120)
     sent = []
     line = _Line()
     line.send_text = lambda line_id, text: sent.append(text)
@@ -1390,6 +1398,27 @@ def test_a_dose_left_pending_in_a_meal_retry_gets_the_jobs_next_retry_and_ends_t
     run(reachy_tasks.set_status(7, DEVICE, meal["task_id"], "completed",
                                 {"outcomes": {"101": "help_left_pending", "checkin": "medicine"}}))
     assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
+
+
+def test_while_the_robot_is_offline_a_meal_retry_holds_nothing_back(db, monkeypatch):
+    """Review of quick fix 4: the robot went offline after the patient's "not yet". The queued meal retry held the dose
+    until it expired, so the patient got no LINE reminder before the missed alert, while the robot-offline notice
+    told family 「LINE 用藥提醒仍會照常發送」. The hold lasts only while the patient's robot is online (a heartbeat
+    within OFFLINE_AFTER_SECONDS): offline, the job's retry comes as before, and once it is back the hold is too."""
+    db.doses[102]["intake_stats"] = "taken"
+    db.now = T0 - timedelta(minutes=4)
+    task_id = enqueue(db, intk_ids=(101,))
+    _completed_with(db, task_id, {"101": "meal_not_eaten"})
+    db.now = T0 + timedelta(minutes=10)
+    (text,) = _job_on(db, monkeypatch, online=False)
+    assert "逾時 10 分鐘" in text and "Metformin" in text
+    (retry,) = [t for t in db.tasks if t["slot_time"] == T0 and t["status"] == "queued"]
+    assert (retry["reason"], retry["intk_ids"]) == ("missed_retry", [101])
+    run(reachy_tasks.maintenance(now=db.now))
+    (notice,) = db.notices
+    assert notice["kind"] == "robot_offline" and "LINE 用藥提醒仍會照常發送" in notice["messages"][0]["text"]
+    db.now = T0 + timedelta(minutes=20)
+    assert _job_on(db, monkeypatch) == []   # online again: held, its retry counted
 
 
 def _waiting_rows(slot, retries_sent, waiting=(101,)):
