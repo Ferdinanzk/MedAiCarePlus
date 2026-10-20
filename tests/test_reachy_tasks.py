@@ -1812,6 +1812,34 @@ def test_a_meal_retry_queued_during_the_jobs_run_keeps_its_dose_from_the_missed_
     assert not any("missed_alert" in query for query, _ in conn.updated)
 
 
+# ── Quick fix 6 (20 Oct 2026): the Reachy card's demo dose is an ad-hoc dose, and the job treats it like any ─────
+
+def test_the_missed_dose_job_reminds_sends_reachy_again_and_reports_an_ad_hoc_demo_dose(db, monkeypatch):
+    """The demo dose (api_reachy.demo_dose) is an ad-hoc row of an unscheduled medicine: pressed at 08:02:13.5, with
+    reminder_sent set and a manual task for the 08:00 slot. Reachy came and the dose was left pending. At +10 and
+    +20 min the job reminds the patient on LINE and sends Reachy again (a robot task the lease hands out: an ad-hoc
+    dose never expires); at +30 min it marks the dose missed and sends the missed alert, as for any dose of the slot."""
+    pressed = T0 + timedelta(minutes=2, seconds=13, microseconds=500000)
+    db.doses = {201: {"intk_id": 201, "med_id": 9, "med_name": "Acetal 500mg", "pill_description": None,
+                      "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
+                      "intake_time_stamp": pressed}}
+    assert dose_safety.is_ad_hoc(pressed) and missed_dose_job._slot_key(pressed) == T0
+    db.now = pressed
+    _completed_with(db, enqueue(db, reason="manual", intk_ids=(201,), expires=pressed + timedelta(minutes=38)), {})
+    for minutes in (10, 20):
+        db.now = T0 + timedelta(minutes=minutes, seconds=5)
+        (text,) = _job_on(db, monkeypatch)
+        assert f"您已逾時 {minutes} 分鐘未服用以下藥物：\nAcetal 500mg\n請盡快服用。" in text
+        retry = db.open_task(7, T0)
+        assert (retry["reason"], retry["intk_ids"], retry["status"]) == ("missed_retry", [201], "queued")
+        _completed_with(db, retry["task_id"], {})   # leased and run, and the dose is still not taken
+    db.now = T0 + timedelta(minutes=30, seconds=5)
+    retry_text, missed = _job_on(db, monkeypatch)
+    assert "逾時 30 分鐘" in retry_text
+    assert missed.startswith("❌ 用藥未完成") and "Acetal 500mg" in missed
+    assert db.doses[201]["intake_stats"] == "missed"
+
+
 # ── Live voice flag (spec 2026-10-12 E1) ─────────────────────────────────────
 
 CHECKIN_CONSENT = {**ROBOT_CONSENT, **{scope: {"granted": True, "terms_version": config.TERMS_VERSION}

@@ -3,6 +3,7 @@
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, StrictBool
@@ -11,12 +12,23 @@ from app import config
 from app.database import get_pool
 from app.dependencies import get_consented_user
 from app.jobs.missed_dose_job import _slot_key
-from app.services import consent_service, dose_safety, memory, reachy_tasks, schedule, voice_lines
+from app.services import consent_service, dose_confirmation, dose_safety, memory, reachy_tasks, schedule, voice_lines
 from app.services.device_auth import hash_token, issue_token
 
 router = APIRouter(prefix="/api/reachy", tags=["reachy"])
 
 ONLINE_SECONDS = 60
+
+# Quick fix 6 (20 Oct 2026): the Reachy card's "Demo dose: Acetal 500mg" button, for testing the intake flow. The demo
+# medicine is the patient's medication whose prescription_meta says {"demo": "acetal"}, made on the first press: taken
+# after meals, with no dose time, so no dose is ever generated for it (each press makes its one dose).
+DEMO_MEDICINE = "acetal"
+DEMO_NAME = "Acetal 500mg"
+DEMO_INSTRUCTIONS = "示範藥物（飯後服用），用來測試服藥流程"   # 飯後, and none of 空腹, 飯前, 餐前 (reachy_tasks.after_meal)
+DEMO_SCHEDULE = {"morning": False, "noon": False, "night": False, "bedtime": False,
+                 "after_meals": True, "before_meals": False, "custom_times": []}
+DEMO_STOCK = Decimal(30)       # its stock when made, and when topped up
+DEMO_STOCK_LOW = Decimal(10)   # topped up below this: an as-needed medicine's refill alert comes at 7 doses or fewer
 
 
 class SettingsPayload(BaseModel):
@@ -201,3 +213,83 @@ async def manual_task(payload: TaskPayload, user: dict = Depends(get_consented_u
             "SELECT task_id, status, slot_time, intk_ids FROM reachy_task WHERE task_id = $1::uuid", task_id)
     return {"task_id": str(task["task_id"]), "status": task["status"], "slot_time": _iso(task["slot_time"]),
             "intk_ids": list(task["intk_ids"])}
+
+
+async def _clear_demo_doses(conn, u_id: int, intk_ids: list[int]) -> None:
+    """The demo medicine's earlier doses go before a press makes a fresh one, so a press always works (a demo dose
+    taken or waiting for family would refuse the next one as too soon under overdose protection): their open robot
+    tasks are aborted (reason demo_reset), their open family requests expired as one expires on its own (another dose
+    in such a request goes back to its previous status), then their rows are deleted, and their monitor_event and
+    dose_emotion rows with them (ON DELETE CASCADE). A family button pressed later on such a request is answered that
+    it has expired."""
+    if not intk_ids:
+        return
+    await conn.execute(
+        "UPDATE reachy_task SET status = 'aborted', finished_at = NOW(), lease_until = NULL, "
+        "detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('reason', 'demo_reset') "
+        "WHERE u_id = $1 AND status IN ('queued','leased','searching','in_progress') AND intk_ids && $2::int[]",
+        u_id, intk_ids)
+    now = datetime.now(timezone.utc)
+    for row in await conn.fetch(
+            "SELECT confirmation_id FROM dose_confirmation WHERE u_id = $1 AND resolution IS NULL "
+            "AND intk_ids && $2::int[] ORDER BY created_at", u_id, intk_ids):
+        await dose_confirmation._expire(conn, str(row["confirmation_id"]), now)
+    await conn.execute("DELETE FROM intake WHERE u_id = $1 AND intk_id = ANY($2::int[])", u_id, intk_ids)
+
+
+@router.post("/demo-dose")
+async def demo_dose(user: dict = Depends(get_consented_user)):
+    """Quick fix 6, 'Demo dose: Acetal 500mg': one press, and Reachy comes at once for a dose of the demo medicine.
+
+    One transaction, all or nothing. The robot must be paired (409 robot_not_paired). The demo medicine is made, or
+    made active again and topped up to DEMO_STOCK when below DEMO_STOCK_LOW; a medicine of the same name without the
+    demo flag is never touched. Its earlier doses are cleared (_clear_demo_doses). A fresh dose is made as Take Now
+    makes an ad-hoc one (never on a whole minute, so it never expires: dose_safety.is_ad_hoc), with reminder_sent set
+    (Reachy is sent now; no "upcoming" reminder), and overdose protection judges it as for 'Use Reachy'. Reachy is
+    sent as POST /api/reachy/tasks sends it: a manual task holding only that dose, for its 5-minute slot (403
+    robot_consent_required without the robot's consent; 409 slot_busy when another task already holds that slot,
+    which would not bring Reachy for this dose). From there on it is the normal flow of a dose."""
+    u_id = user["u_id"]
+    async with get_pool().acquire() as conn, conn.transaction():
+        device = await conn.fetchval(
+            "SELECT device_id FROM reachy_device WHERE u_id = $1 AND revoked_at IS NULL", u_id)
+        if device is None:
+            raise HTTPException(409, "robot_not_paired")
+        # Two presses at once (two tabs) wait for each other, so they never make two demo medicines.
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext('reachy_demo_dose'), $1)", u_id)
+        med_id = await conn.fetchval(
+            "SELECT med_id FROM medication WHERE u_id = $1 AND prescription_meta->>'demo' = $2 "
+            "ORDER BY med_id LIMIT 1", u_id, DEMO_MEDICINE)
+        if med_id is None:
+            med_id = await conn.fetchval(
+                "INSERT INTO medication (u_id, med_name, schedule_time, instructions, pills_remaining, is_active, "
+                "prescription_meta, dose_form, units_per_dose) "
+                "VALUES ($1, $2, $3::jsonb, $4, $5, TRUE, $6::jsonb, 'solid_oral', 1) RETURNING med_id",
+                u_id, DEMO_NAME, json.dumps(DEMO_SCHEDULE), DEMO_INSTRUCTIONS, DEMO_STOCK,
+                json.dumps({"demo": DEMO_MEDICINE}))
+        else:
+            await _clear_demo_doses(conn, u_id, [row["intk_id"] for row in await conn.fetch(
+                "SELECT intk_id FROM intake WHERE u_id = $1 AND med_id = $2 ORDER BY intk_id", u_id, med_id)])
+            await conn.execute(
+                "UPDATE medication SET is_active = TRUE, archived_at = NULL, "
+                "pills_remaining = CASE WHEN pills_remaining < $2 THEN $3 ELSE pills_remaining END WHERE med_id = $1",
+                med_id, DEMO_STOCK_LOW, DEMO_STOCK)
+        now = schedule.current_time()
+        if (now.second, now.microsecond) == (0, 0):
+            now += timedelta(microseconds=1)
+        intk_id = await conn.fetchval(
+            "INSERT INTO intake (u_id, med_id, intake_time_stamp, intake_stats, notify_stats, reminder_sent) "
+            "VALUES ($1, $2, $3, 'pending', 'pending', TRUE) RETURNING intk_id", u_id, med_id, now)
+        await dose_safety.check(conn, u_id, [intk_id], at=now)
+        slot_time = _slot_key(now)
+        expires_at = await reachy_tasks.manual_expires_at(conn, u_id, slot_time, now)
+        task_id = await reachy_tasks.enqueue_reachy_task(conn, u_id, slot_time, [intk_id], "manual", expires_at,
+                                                         at=now)
+        if task_id is None:
+            raise HTTPException(403, "robot_consent_required")
+        task = await conn.fetchrow(
+            "SELECT task_id, status, slot_time, intk_ids FROM reachy_task WHERE task_id = $1::uuid", task_id)
+        if intk_id not in list(task["intk_ids"]):
+            raise HTTPException(409, "slot_busy")
+    return {"task_id": str(task["task_id"]), "status": task["status"], "intk_id": intk_id, "med_id": med_id,
+            "med_name": DEMO_NAME}
