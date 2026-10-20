@@ -22,6 +22,8 @@ export interface ReachyStatus {
   live_voice?: boolean;
   /** The server allows the live voice test (LIVE_VOICE_TEST=1 in its .env); the card shows the switch only then. */
   live_voice_test?: boolean;
+  /** Reachy comes back 20 minutes after "not eaten yet" (at most 3 times); off by default. */
+  meal_retry?: boolean;
   last_seen_at?: string | null;
   online?: boolean;
   robot_reachable?: boolean | null;
@@ -67,6 +69,8 @@ export interface ReachySettings {
   /** What Reachy calls the patient; "" goes back to the registered name. */
   call_name?: string;
   live_voice?: boolean;
+  /** Off also cancels a meal retry still waiting. */
+  meal_retry?: boolean;
 }
 
 /** Sends only the fields given: JSON.stringify leaves out the ones that are undefined. */
