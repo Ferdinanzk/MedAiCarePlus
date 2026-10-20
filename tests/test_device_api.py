@@ -68,6 +68,8 @@ class FakeConn:
         self.task_due = False      # what reachy_tasks.task_due finds: a medicine task waiting (companion spec 3.4)
         self.task_due_asked = []   # (arguments, transaction depth) of each task_due read
         self.requests = []         # dose_confirmation rows the family-answer route reads (newest found by created_at)
+        self.mic_muted = False     # "user".reachy_mic_muted: the Reachy card's microphone switch (quick fix 8)
+        self.mic_muted_asked = []  # (arguments, transaction depth) of each heartbeat read of it
 
     def transaction(self):
         return _Transaction(self)
@@ -105,7 +107,8 @@ class FakeConn:
         if "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1" in query:
             return None
         if query.startswith('SELECT reachy_call_name, name') and 'FROM "user" WHERE u_id = $1' in query:
-            return {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False}   # also api_reachy._status
+            return {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False,   # also api_reachy._status
+                    "reachy_mic_muted": self.mic_muted}
         if "SELECT m.med_name FROM intake i JOIN medication m" in query:   # the dose event route's medicine
             return {"med_name": "Allegra"} if args[0] in self.doses and args[1] == 7 else None
         if query == api_device.FAMILY_ANSWER_SQL:
@@ -153,6 +156,9 @@ class FakeConn:
             return None      # no alert for this dose within the hour
         if "FROM family_contacts" in query:
             return 1         # contacts that can receive family alerts (the Reachy card's status)
+        if query == 'SELECT reachy_mic_muted FROM "user" WHERE u_id = $1':   # the heartbeat's microphone switch
+            self.mic_muted_asked.append((args, self.depth))
+            return self.mic_muted
         if "SELECT EXISTS (SELECT 1 FROM reachy_task t WHERE" in query:   # reachy_tasks.task_due
             self.task_due_asked.append((args, self.depth))
             return self.task_due
@@ -562,6 +568,76 @@ def test_heartbeat_refuses_a_camera_number_that_is_not_finite(env, monkeypatch):
             response = env.robot.post("/api/device/heartbeat", content=body, headers={"content-type": "application/json"})
             assert response.status_code == 422, f"{field}={word} gave {response.status_code}"
     assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
+
+
+# ── Quick fix 8 (20 Oct 2026): the robot's microphone volume, and the Reachy card's microphone switch ──
+
+def _last_detail(env) -> dict:
+    update = [entry for entry in env.conn.executed if "last_seen_at = NOW()" in entry[0]][-1]
+    return json.loads(update[1][3])
+
+
+@pytest.mark.parametrize("volume", [0, 1, 55, 100])
+def test_heartbeat_stores_the_microphone_volume_and_status_returns_it(env, monkeypatch, volume):
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"bridge_version": "0.17.1", "microphone_volume": volume})
+    assert response.status_code == 200
+    assert _last_detail(env) == {"vision_fps": None, "bridge_version": "0.17.1", "missing_clips": None,
+                                 "microphone_volume": volume}
+    assert env.browser.get("/api/reachy/status").json()["mic_volume"] == volume
+
+
+def test_the_microphone_volume_is_kept_only_while_the_robot_reports_it(env, monkeypatch):
+    """Each heartbeat replaces status_detail: a robot older than 0.17.1 sends none, and a robot whose daemon did not
+    answer sends null; the card then shows no volume."""
+    _no_leases(monkeypatch)
+    assert env.browser.get("/api/reachy/status").json()["mic_volume"] is None   # no heartbeat yet
+    for body in ({"bridge_version": "0.17.0"}, {"microphone_volume": None}):
+        assert env.robot.post("/api/device/heartbeat", json={"microphone_volume": 80}).status_code == 200
+        assert env.browser.get("/api/reachy/status").json()["mic_volume"] == 80
+        assert env.robot.post("/api/device/heartbeat", json=body).status_code == 200
+        assert "microphone_volume" not in _last_detail(env)
+        assert env.browser.get("/api/reachy/status").json()["mic_volume"] is None
+
+
+@pytest.mark.parametrize("volume", [-1, 101, 50.5, 50.0, "50", True, False, [], {}, "muted"])
+def test_heartbeat_refuses_a_bad_microphone_volume(env, monkeypatch, volume):
+    """Only an integer from 0 to 100 (what the daemon's microphone volume answer carries), or null."""
+    _no_leases(monkeypatch)
+    response = env.robot.post("/api/device/heartbeat", json={"microphone_volume": volume})
+    assert response.status_code == 422
+    assert not any("last_seen_at = NOW()" in entry[0] for entry in env.conn.executed)
+
+
+def test_the_heartbeat_answer_gives_the_microphone_switch(env, monkeypatch):
+    """mic_muted is the patient's switch on the Reachy card, read after the heartbeat's write transaction; the robot
+    app (0.17.1) sets the daemon's microphone volume to 0 while it is true."""
+    _no_leases(monkeypatch)
+    assert env.robot.post("/api/device/heartbeat", json={"microphone_volume": 100}).json()["mic_muted"] is False
+    env.conn.mic_muted = True
+    assert env.robot.post("/api/device/heartbeat", json={"microphone_volume": 100}).json()["mic_muted"] is True
+    assert env.robot.post("/api/device/heartbeat", json={}).json()["mic_muted"] is True   # an older robot ignores it
+    assert env.conn.mic_muted_asked == [((7,), 0)] * 3   # this patient, after the write transaction ended
+
+
+def test_a_failing_microphone_switch_read_leaves_it_out_and_keeps_the_heartbeat(env, monkeypatch, caplog):
+    """Without mic_muted the robot changes nothing, as with an older server: a failed read never mutes or unmutes."""
+    _no_leases(monkeypatch)
+    original = env.conn.fetchval
+
+    async def fetchval(query, *args):
+        if "reachy_mic_muted" in query:
+            raise RuntimeError("database went away")
+        return await original(query, *args)
+
+    monkeypatch.setattr(env.conn, "fetchval", fetchval)
+    with caplog.at_level("WARNING"):
+        response = env.robot.post("/api/device/heartbeat", json={"microphone_volume": 0})
+    assert response.status_code == 200
+    body = response.json()
+    assert "mic_muted" not in body and body["stop_all"] is False and body["task_due"] is False
+    assert _last_detail(env)["microphone_volume"] == 0   # the heartbeat's writes stand
+    assert [r.levelname for r in caplog.records if "microphone switch" in r.getMessage()] == ["WARNING"]
 
 
 # ── Frame stream: the server computes the landmarks ─────────────────────────

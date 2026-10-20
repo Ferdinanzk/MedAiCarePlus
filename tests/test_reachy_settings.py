@@ -46,8 +46,9 @@ class FakeConn:
     COALESCE keeps the stored value when its argument is NULL (checked on PostgreSQL 16 when this was written)."""
 
     def __init__(self):
-        self.user = {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False}
+        self.user = {"reachy_call_name": None, "name": "Pearl", "reachy_meal_retry": False, "reachy_mic_muted": False}
         self.device = {"device_id": DEVICE_ID, "auto_record": False, "live_voice": False}
+        self.status_detail = None   # the robot's last heartbeat report (asyncpg hands JSONB back as text)
         self.depth = 0
         self.updates = []   # (query, args) of every UPDATE, in order
 
@@ -59,10 +60,10 @@ class FakeConn:
             if self.device is None or args[0] != 7:
                 return None
             return {**self.device, "label": "Reachy Mini", "last_seen_at": None, "robot_reachable": None,
-                    "landmark_fps": None, "status_detail": None}
+                    "landmark_fps": None, "status_detail": self.status_detail}
         if "FROM reachy_task WHERE u_id = $1" in query:
             return None
-        if query == 'SELECT reachy_call_name, name, reachy_meal_retry FROM "user" WHERE u_id = $1':
+        if query == 'SELECT reachy_call_name, name, reachy_meal_retry, reachy_mic_muted FROM "user" WHERE u_id = $1':
             return dict(self.user) if args[0] == 7 else None
         raise AssertionError(query)
 
@@ -94,6 +95,12 @@ class FakeConn:
             self.updates.append((query, args))
             if args[0] == 7:
                 self.user["reachy_meal_retry"] = args[1]
+            return "UPDATE 1"
+        if query == 'UPDATE "user" SET reachy_mic_muted = $2 WHERE u_id = $1':
+            assert self.depth > 0
+            self.updates.append((query, args))
+            if args[0] == 7:
+                self.user["reachy_mic_muted"] = args[1]
             return "UPDATE 1"
         raise AssertionError(query)
 
@@ -271,6 +278,71 @@ def test_the_schema_adds_the_meal_retry_switch_off_by_default():
     """Per patient, on "user" like the call name: re-pairing the robot keeps it, as it keeps the patient's tasks."""
     sql = (REPO / "sql" / "init.sql").read_text(encoding="utf-8")
     statement = 'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_meal_retry BOOLEAN NOT NULL DEFAULT FALSE;'
+    assert sql.count(statement) == 1 and sql.index(statement) > sql.index('CREATE TABLE IF NOT EXISTS "user"')
+
+
+# ── Quick fix 8 (20 Oct 2026): the robot's microphone switch ──
+
+def test_status_gives_the_microphone_switch_on_by_default_and_the_reported_volume(env):
+    status = env.client.get("/api/reachy/status").json()
+    assert (status["mic_muted"], status["mic_volume"]) == (False, None)   # not muted; no volume reported yet
+    env.conn.user["reachy_mic_muted"] = True
+    env.conn.status_detail = json.dumps({"vision_fps": None, "microphone_volume": 0})   # JSONB comes back as text
+    status = env.client.get("/api/reachy/status").json()
+    assert (status["mic_muted"], status["mic_volume"]) == (True, 0)
+    env.conn.status_detail = {"microphone_volume": 85}
+    assert env.client.get("/api/reachy/status").json()["mic_volume"] == 85
+
+
+@pytest.mark.parametrize("stored", [{}, {"camera": None}, {"microphone_volume": None}, {"microphone_volume": True},
+                                    {"microphone_volume": "85"}, "[]"])
+def test_status_gives_no_microphone_volume_when_none_was_reported(env, stored):
+    """An older robot (before 0.17.1) or one whose daemon did not answer reports none; anything else is no volume."""
+    env.conn.status_detail = stored if isinstance(stored, str) else json.dumps(stored)
+    assert env.client.get("/api/reachy/status").json()["mic_volume"] is None
+
+
+def test_the_microphone_switch_is_saved_and_a_field_left_out_keeps_it(env):
+    body = _settings(env, {"mic_muted": True}).json()   # what the card's switch sends to turn the microphone off
+    assert body["mic_muted"] is True and env.conn.user["reachy_mic_muted"] is True
+    for kept in ({}, {"auto_record": True}, {"meal_retry": True}, {"call_name": "阿嬤"}, {"mic_muted": None}):
+        response = _settings(env, kept)
+        assert response.status_code == 200 and response.json()["mic_muted"] is True
+    body = _settings(env, {"mic_muted": False}).json()   # on again
+    assert body["mic_muted"] is False and env.conn.user["reachy_mic_muted"] is False
+    assert [args for query, args in env.conn.updates if "reachy_mic_muted" in query] == [(7, True), (7, False)]
+    assert ("cancel_meal_retries", (7,)) not in env.conn.updates   # the microphone has nothing to cancel
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, "yes", "off", [], {}])
+def test_the_microphone_switch_takes_only_a_boolean(env, value):
+    response = _settings(env, {"mic_muted": value, "auto_record": True})
+    assert response.status_code == 422
+    assert env.conn.updates == []   # nothing is saved, not even the other fields
+    assert env.conn.user["reachy_mic_muted"] is False and env.conn.device["auto_record"] is False
+
+
+def test_the_microphone_switch_needs_a_paired_robot(env):
+    env.conn.device = None
+    response = _settings(env, {"mic_muted": True})
+    assert response.status_code == 409 and response.json() == {"detail": "robot_not_paired"}
+    assert env.conn.user["reachy_mic_muted"] is False
+
+
+def test_the_microphone_switch_needs_current_core_consent(env, monkeypatch):
+    async def no_consent(u_id):
+        return {}
+
+    monkeypatch.setattr(consent_service, "get_state", no_consent)
+    response = _settings(env, {"mic_muted": True})
+    assert response.status_code == 403 and response.json() == {"detail": "consent_required"}
+    assert env.conn.updates == [] and env.conn.user["reachy_mic_muted"] is False
+
+
+def test_the_schema_adds_the_microphone_switch_unmuted_by_default():
+    """Per patient, on "user" like reachy_meal_retry: re-pairing the robot (a new reachy_device row) never unmutes it."""
+    sql = (REPO / "sql" / "init.sql").read_text(encoding="utf-8")
+    statement = 'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_mic_muted BOOLEAN NOT NULL DEFAULT FALSE;'
     assert sql.count(statement) == 1 and sql.index(statement) > sql.index('CREATE TABLE IF NOT EXISTS "user"')
 
 

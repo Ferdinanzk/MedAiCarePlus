@@ -319,6 +319,10 @@ ALTER TABLE reachy_task ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
 -- Quick fix 5 (20 Oct 2026): the Reachy card's switch for that meal retry, per patient and off by default. Off,
 -- "not eaten yet" ends the intake with the after-meal line only (quick fix 3); on, Reachy also comes back later.
 ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_meal_retry BOOLEAN NOT NULL DEFAULT FALSE;
+-- Quick fix 8 (20 Oct 2026): the Reachy card's microphone switch, per patient and on (not muted) by default. While it
+-- is muted, the robot app (0.17.1) sets its daemon's microphone volume to 0. On "user" like reachy_meal_retry, so
+-- re-pairing the robot (a new reachy_device row) never unmutes it.
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_mic_muted BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Check-in conversations. Speech is turned into text on the robot; only text is stored.
 -- Retention (robot notice §5): turns 30 days, turns quoted in a safety alert 180 days,

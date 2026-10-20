@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile,
                      WebSocket)
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validator
 
 from app.database import get_pool
 from app.routers.api_monitor import EndPayload, LandmarkPayload, get_session
@@ -37,6 +37,7 @@ MAX_WAIT_SECONDS = 25
 MAX_FRAME_BYTES = 1_000_000
 FRAME_VISION_INTERVAL = 0.5   # identity + emotion on a streamed frame, as often as the server re-checks identity
 SLOW_FRAME_SECONDS = 0.25     # a frame held up longer is logged (a 0.25 s gap makes the stream degraded)
+MIC_MUTED_SQL = 'SELECT reachy_mic_muted FROM "user" WHERE u_id = $1'   # the Reachy card's microphone switch
 
 
 class EmotionReport(BaseModel):
@@ -99,6 +100,9 @@ class HeartbeatPayload(BaseModel):
     missing_clips: int | list[str] | None = None
     camera: CameraReport | None = None   # robots older than 0.7.0 send none
     companion: bool = False   # robot app 0.9.0: a companion session runs; keep its task from expiring
+    # Robot app 0.17.1 (quick fix 8): the daemon's microphone volume, null when the daemon did not answer. Only an
+    # integer: "50", 50.0 and true are a 422.
+    microphone_volume: StrictInt | None = Field(default=None, ge=0, le=100)
 
 
 class MonitorStartPayload(BaseModel):
@@ -861,6 +865,8 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         detail["camera"] = payload.camera.model_dump()   # the Reachy card reads it through /api/reachy/status
     if payload.companion:
         detail["companion"] = True   # a companion session runs; companion_task (below) names the task it belongs to
+    if payload.microphone_volume is not None:
+        detail["microphone_volume"] = payload.microphone_volume   # the Reachy card shows it (/api/reachy/status)
     async with get_pool().acquire() as conn, conn.transaction():
         if payload.companion:
             # The task the session belongs to (a plain read, no lock): the missed-dose job releases a meal retry's
@@ -884,7 +890,16 @@ async def heartbeat(payload: HeartbeatPayload, device: dict = Depends(get_device
         log.warning("heartbeat: the medicine-task check failed; answering task_due false", exc_info=True)
         task_due = False
     microphone = consent_service.is_current(await consent_service.get_state(device["u_id"]), "robot_microphone")
-    return {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}
+    answer = {"stop_all": False, "microphone": microphone, "server_time": server_time, "task_due": task_due}
+    # Quick fix 8: the Reachy card's microphone switch. While it is true, the robot app (0.17.1) sets the daemon's
+    # microphone volume to 0. A failing read leaves it out, which the robot takes as an older server's answer: nothing
+    # changes, so a failed read never mutes or unmutes it.
+    try:
+        async with get_pool().acquire() as conn:
+            answer["mic_muted"] = bool(await conn.fetchval(MIC_MUTED_SQL, device["u_id"]))
+    except Exception:
+        log.warning("heartbeat: the microphone switch read failed; answering without mic_muted", exc_info=True)
+    return answer
 
 
 # ── Monitor (same payloads as /api/intake/monitor/*) ─────────────────────────
