@@ -64,6 +64,9 @@ interface MockOptions {
   mealRetry?: boolean;
 }
 
+/** What POST /api/reachy/demo-dose answers when it succeeds (quick fix 6). */
+const demoDoseAnswer = { task_id: 't-demo', status: 'queued', intk_id: 901, med_id: 51, med_name: 'Acetal 500mg' };
+
 async function mockApi(page: Page, options: MockOptions = {}) {
   const state = {
     paired: options.paired ?? false,
@@ -86,6 +89,11 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     /** While set, PATCH /api/reachy/settings answers only once it resolves; settingsError makes it fail. */
     settingsGate: null as Promise<void> | null,
     settingsError: null as number | null,
+    /** POST /api/reachy/demo-dose: how many came; while demoGate is set it answers only once that resolves, and
+     *  demoError makes it fail with that status and detail. */
+    demoPosts: 0,
+    demoGate: null as Promise<void> | null,
+    demoError: null as { status: number; detail: string } | null,
   };
   const robotStatus = () => state.paired
     ? { paired: true, device_id: 'd-1', label: 'Reachy Mini', auto_record: state.autoRecord, last_seen_at: new Date().toISOString(),
@@ -151,6 +159,12 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       if ('live_voice' in body) state.liveVoice = body.live_voice;
       if ('meal_retry' in body) state.mealRetry = body.meal_retry;
       return route.fulfill({ json: robotStatus() });
+    }
+    if (path === '/api/reachy/demo-dose' && request.method() === 'POST') {
+      state.demoPosts += 1;
+      if (state.demoGate) await state.demoGate;
+      if (state.demoError) return route.fulfill({ status: state.demoError.status, json: { detail: state.demoError.detail } });
+      return route.fulfill({ json: demoDoseAnswer });
     }
     if (path === '/api/reachy/tasks') {
       state.taskPosts.push(request.postDataJSON());
@@ -639,5 +653,92 @@ test('the Reachy card translations have the same keys in English and Traditional
   expect(keys[0]).toEqual(expect.arrayContaining([
     'callName', 'callNameHelp', 'callNamePlaceholder', 'callNameReset', 'callNameSaved', 'callNameInvalid',
     'liveVoice', 'liveVoiceHelp', 'mealRetry', 'mealRetryHelp',
+    'demoDose', 'demoDoseHelp', 'demoDoseSent', 'demoDoseNotPaired',
   ]));
+});
+
+// ── Quick fix 6 (20 Oct 2026): a demo dose of Acetal 500mg, for testing the intake flow ──
+
+const demoButton = (page: Page) => page.getByRole('button', { name: /Demo dose: Acetal 500mg|示範藥物：Acetal 500mg/ });
+const DEMO_HELP_ZH = '建立一份 Acetal 500mg（飯後）的示範劑量，Reachy 會馬上來提醒服藥，家人也會像真的服藥一樣收到 LINE 確認。之前的示範劑量會先清除。';
+const DEMO_HELP_EN = 'Creates a demo dose of Acetal 500mg (after meals) now. Reachy comes right away, and family get the LINE ' +
+  'confirmation as for a real dose. Earlier demo doses are cleared first.';
+
+test('the demo dose button shows only while a robot is paired', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { robotConsent: true });
+  await page.goto('/settings');
+  const pair = page.getByRole('button', { name: /Pair a Reachy robot|配對 Reachy 機器人/ });
+  await expect(pair).toBeVisible();
+  await expect(demoButton(page)).toHaveCount(0);
+  await clickCentred(pair);
+  await expect(demoButton(page)).toBeVisible();   // for every account, not only in test mode
+  expect(api.demoPosts).toBe(0);
+});
+
+test('a demo dose press posts once, waits disabled and says Reachy is on the way', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');   // the app starts in Traditional Chinese
+  await expect(demoButton(page)).toBeVisible();
+  await expect(reachyCard(page)).toContainText(DEMO_HELP_ZH);
+  let answer = () => {};
+  api.demoGate = new Promise<void>(resolve => { answer = resolve; });
+  await clickCentred(demoButton(page));
+  await expect.poll(() => api.demoPosts).toBe(1);
+  await expect(demoButton(page)).toBeDisabled();   // while its request runs
+  await demoButton(page).click({ force: true });   // a second press meanwhile sends nothing
+  answer();
+  await expect(reachyCard(page).getByRole('status').filter({ hasText: '已建立示範劑量，Reachy 正在過來。' })).toBeVisible();
+  await expect(demoButton(page)).toBeEnabled();
+  expect(api.demoPosts).toBe(1);
+  await expect(reachyCard(page).getByRole('alert')).toHaveCount(0);
+});
+
+test("a refused demo dose is explained in the card's own words", async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');
+  const cases: [number, string, string][] = [
+    [409, 'robot_not_paired', '機器人已取消配對，請先重新配對。'],
+    [403, 'robot_consent_required', '請先同意 Reachy 聲明。'],
+    [409, 'slot_busy', '操作未成功，請再試一次。'],
+    [500, 'request_failed', '操作未成功，請再試一次。'],
+  ];
+  for (const [status, detail, words] of cases) {
+    api.demoError = { status, detail };
+    await clickCentred(demoButton(page));
+    await expect(reachyCard(page).getByRole('alert')).toHaveText(words);
+    await expect(reachyCard(page).getByText('已建立示範劑量，Reachy 正在過來。')).toHaveCount(0);
+  }
+  expect(api.demoPosts).toBe(cases.length);
+  api.demoError = null;
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByText('已建立示範劑量，Reachy 正在過來。')).toBeVisible();
+  await expect(reachyCard(page).getByRole('alert')).toHaveCount(0);   // a press that works clears the error
+});
+
+test('the demo dose button in English, on a phone and a desktop screen', async ({ page }) => {
+  await seedSession(page);
+  const api = await mockApi(page, { paired: true, robotConsent: true });
+  await page.goto('/settings');
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(reachyCard(page)).toContainText(DEMO_HELP_EN);
+  api.demoError = { status: 409, detail: 'robot_not_paired' };
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByRole('alert')).toHaveText('The robot is no longer paired. Pair it again first.');
+  api.demoError = null;
+  await clickCentred(demoButton(page));
+  await expect(reachyCard(page).getByText('Demo dose created. Reachy is on the way.')).toBeVisible();
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(demoButton(page)).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect((await demoButton(page).boundingBox())?.height).toBeGreaterThanOrEqual(48);   // min-h-12: easy to press
+    if (process.env.REACHY_SCREENSHOTS) {
+      // 'instant', because index.css scrolls smoothly and the picture would be taken mid-scroll.
+      await demoButton(page).evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await page.screenshot({ path: `${process.env.REACHY_SCREENSHOTS}/reachy-demo-dose-${width}.png` });
+    }
+  }
 });

@@ -171,6 +171,10 @@ const resources = {
         callNameInvalid: 'Reachy can\'t use this name. Use up to 8 Chinese characters, or up to 20 English letters and spaces, with no numbers, symbols, or words about health or medicine.',
         liveVoice: 'Live voice (test)',
         liveVoiceHelp: 'For testing only. When you chat with Reachy, your voice is sent to OpenAI\'s live voice model, which answers by itself, faster. Reachy uses it only after the live model passes its check on the AI connections card; until then, or if the connection fails, Reachy chats as before.',
+        demoDose: 'Demo dose: Acetal 500mg',
+        demoDoseHelp: 'Creates a demo dose of Acetal 500mg (after meals) now. Reachy comes right away, and family get the LINE confirmation as for a real dose. Earlier demo doses are cleared first.',
+        demoDoseSent: 'Demo dose created. Reachy is on the way.',
+        demoDoseNotPaired: 'The robot is no longer paired. Pair it again first.',
       },
       legal: {
         gateTitle: 'Please review the updated terms',
@@ -915,6 +919,10 @@ const resources = {
         callNameInvalid: 'Reachy 無法使用這個名字。請用最多 8 個中文字，或最多 20 個英文字母和空格，不能有數字、符號，或和健康、藥物有關的字。',
         liveVoice: '即時語音（測試）',
         liveVoiceHelp: '僅供測試。和 Reachy 聊天時，您的聲音會傳送到 OpenAI 的即時語音模型，由它直接回答，速度較快。「AI 連線」卡片上的即時語音模型通過檢查後，Reachy 才會使用它；在那之前，或連線失敗時，Reachy 會照原本的方式聊天。',
+        demoDose: '示範藥物：Acetal 500mg',
+        demoDoseHelp: '建立一份 Acetal 500mg（飯後）的示範劑量，Reachy 會馬上來提醒服藥，家人也會像真的服藥一樣收到 LINE 確認。之前的示範劑量會先清除。',
+        demoDoseSent: '已建立示範劑量，Reachy 正在過來。',
+        demoDoseNotPaired: '機器人已取消配對，請先重新配對。',
       },
       legal: {
         gateTitle: '請閱讀更新後的條款',

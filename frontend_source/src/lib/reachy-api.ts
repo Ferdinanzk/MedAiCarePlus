@@ -83,6 +83,12 @@ export const queueReachyTask = (intkId: number) =>
 export const startCheckin = () =>
   call<{ task_id: string; status: string }>('/api/reachy/checkin', { method: 'POST' });
 
+/** The Reachy card's demo dose (quick fix 6): a dose of Acetal 500mg made now, and Reachy sent for it at once. The
+ *  server clears the earlier demo doses first. 409 robot_not_paired, 403 robot_consent_required. */
+export const startDemoDose = () =>
+  call<{ task_id: string; status: string; intk_id: number; med_id: number; med_name: string }>(
+    '/api/reachy/demo-dose', { method: 'POST' });
+
 export type Mood = 'happy' | 'calm' | 'sad' | 'worried' | 'angry' | 'unknown';
 
 export interface ConversationSummary {
