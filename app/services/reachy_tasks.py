@@ -392,7 +392,10 @@ async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
     the slot's task, so neither the missed-dose job's retries nor _queue_retry_due for the slot's other doses ever
     re-arm it. Left out: a dose another open meal retry already waits for, a dose with MEAL_RETRY_LIMIT meal retries
     already (counted from the stored tasks), and one overdose protection would refuse at that time (one that will
-    have expired: the missed-dose job handles it at once)."""
+    have expired: the missed-dose job handles it at once). A queued meal retry that already waits for such a dose
+    ('Use Reachy' pressed meanwhile, and "not yet" again) comes MEAL_RETRY_MINUTES after this answer instead (review
+    of quick fix 4), with its expiry moved as manual_expires_at would set it from then; its slot_time stays, so two
+    retries moved at once never meet in the one-open-task-per-slot index."""
     outcomes = (ended or {}).get("outcomes")
     if not isinstance(outcomes, dict):
         return
@@ -404,11 +407,18 @@ async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
         "AND meal.not_before IS NOT NULL AND i.intk_id = ANY(meal.intk_ids)) AS meal_retries, "
         f"{_meal_retry_sql('i', _OPEN_SQL)} AS waiting FROM intake i WHERE i.u_id = $1 AND i.intk_id = ANY($2::int[]) "
         "AND i.intake_stats IN ('pending','missed') ORDER BY i.intk_id", task["u_id"], not_eaten)
-        if row["meal_retries"] < MEAL_RETRY_LIMIT and not row["waiting"]]
+        if row["waiting"] or row["meal_retries"] < MEAL_RETRY_LIMIT]
     not_before = schedule.current_time() + timedelta(minutes=MEAL_RETRY_MINUTES)
     allowed = set(await dose_safety.allowed(conn, task["u_id"], [row["intk_id"] for row in rows], at=not_before)
                   if rows else ())
-    rows = [row for row in rows if row["intk_id"] in allowed]
+    waiting = [row["intk_id"] for row in rows if row["waiting"] and row["intk_id"] in allowed]
+    if waiting:
+        await conn.execute(
+            "UPDATE reachy_task SET not_before = $3, "
+            f"expires_at = GREATEST(expires_at, $3 + INTERVAL '{MANUAL_TASK_MIN_MINUTES} minutes') "
+            "WHERE u_id = $1 AND status = 'queued' AND not_before IS NOT NULL AND not_before < $3 "
+            "AND intk_ids && $2::int[]", task["u_id"], waiting, not_before)
+    rows = [row for row in rows if not row["waiting"] and row["intk_id"] in allowed]
     if not rows:
         log.info("no meal retry for patient %s after task %s: each dose not eaten for is resolved, already waiting, "
                  "at its %d meal retries or refused by then", task["u_id"], task["task_id"], MEAL_RETRY_LIMIT)
