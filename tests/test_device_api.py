@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -970,6 +971,75 @@ def test_robot_confirmation_is_judged_from_when_its_dose_session_started(env):
     response = env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
                               json={"intk_id": 102, "source": "uncertain_detection"})
     assert response.status_code == 200 and env.confirmations[-1]["started_at"] is None
+
+
+def _candidate(event_id):
+    return {"event_id": event_id, "decision": "uncertain", "confidence": .48, "created_at": time.monotonic(),
+            "frame_seq": 1, "ready": True, "hold_reason": "auto_commit_off"}
+
+
+def test_a_confirmation_request_naming_the_candidate_uses_it(env):
+    """Quick fix 7: the robot's request carries the candidate's event (evidence.event_id, robot app
+    session._needs_confirm). That candidate is used, so when it goes the detector stays latched."""
+    assert _start(env, mode="dose", intk_id=101, task_id=TASK_ID).status_code == 200
+    (session,) = [s for s in env.registry.sessions.values() if not s.ended]
+    session.candidate = _candidate("evt-1")
+    for source in ("patient_claim", "uncertain_detection"):     # a claim names no event
+        assert env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                              json={"intk_id": 101, "source": source}).status_code == 200
+    assert env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                          json={"intk_id": 101, "source": "degraded",
+                                "evidence": {"event_id": "evt-other"}}).status_code == 200
+    assert env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                          json={"intk_id": 102, "source": "degraded",
+                                "evidence": {"event_id": "evt-1"}}).status_code == 200   # another dose
+    assert session.candidate_used is None
+    response = env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                              json={"intk_id": 101, "source": "degraded",
+                                    "evidence": {"event_id": "evt-1", "confidence": .48}})
+    assert response.status_code == 200 and session.candidate_used == "confirmation"
+
+
+def test_a_refused_request_still_used_its_candidate(env, monkeypatch):
+    """The robot acted on the candidate even when overdose protection refuses the dose: it moves on, and the
+    detector keeps its latch."""
+    assert _start(env, mode="dose", intk_id=101, task_id=TASK_ID).status_code == 200
+    (session,) = [s for s in env.registry.sessions.values() if not s.ended]
+    session.candidate = _candidate("evt-1")
+    now = datetime.now(timezone.utc)
+
+    async def create(c, *, u_id, task_id, intk_ids, source, evidence, started_at=None):
+        refused = dose_safety.DoseTooSoon(last_taken_at=now - timedelta(minutes=20), gap=timedelta(hours=1),
+                                          intk_id=intk_ids[0], med_name="allegra", scheduled_time=now, at=now,
+                                          u_id=u_id)
+        refused.after_intake = True
+        raise refused
+
+    monkeypatch.setattr(sys.modules["app.services.dose_confirmation"], "create", create)
+    response = env.robot.post(f"/api/device/tasks/{TASK_ID}/confirmation",
+                              json={"intk_id": 101, "source": "degraded", "evidence": {"event_id": "evt-1"}})
+    assert response.status_code == 409 and response.json()["detail"] == "dose_too_soon"
+    assert session.candidate_used == "confirmation"
+
+
+def test_the_browsers_answer_uses_its_candidate(env, monkeypatch):
+    browser = env.browser.post("/api/intake/monitor/start", json={"intk_id": 101}).json()
+    session = env.registry.sessions[browser["session_id"]]
+    ids = {"session_id": browser["session_id"], "generation": browser["generation"]}
+    session.candidate = _candidate("evt-no")
+    response = env.browser.post("/api/intake/monitor/outcome", json={**ids, "event_id": "evt-no",
+                                                                     "outcome": "not_taken"})
+    assert response.status_code == 200 and session.candidate is None and session.candidate_used == "not_taken"
+
+    async def commit(state, candidate, method):
+        return {"event_id": candidate["event_id"], "status": "taken"}
+
+    monkeypatch.setattr(api_monitor, "commit_monitored", commit)
+    session.candidate = _candidate("evt-yes")
+    session.candidate_used = None
+    response = env.browser.post("/api/intake/monitor/outcome", json={**ids, "event_id": "evt-yes",
+                                                                     "outcome": "taken_confirmed"})
+    assert response.status_code == 200 and session.candidate_used == "confirmed_by_user"
 
 
 @pytest.mark.parametrize("facts, detail", [
