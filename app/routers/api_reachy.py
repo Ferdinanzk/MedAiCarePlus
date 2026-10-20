@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from app import config
 from app.database import get_pool
@@ -24,6 +24,9 @@ class SettingsPayload(BaseModel):
     auto_record: bool | None = None
     call_name: str | None = Field(default=None, max_length=memory.CALL_NAME_MAX)   # "" = the registered name
     live_voice: bool | None = None
+    # Quick fix 5: Reachy comes back 20 minutes after "not eaten yet" (reachy_tasks._queue_meal_retry). Only true or
+    # false: "true", 1 and the like are a 422, so a client's slip never switches it.
+    meal_retry: StrictBool | None = None
 
 
 class TaskPayload(BaseModel):
@@ -53,7 +56,7 @@ async def _status(conn, u_id: int) -> dict:
     task = await conn.fetchrow(
         "SELECT task_id, status, slot_time, finished_at FROM reachy_task WHERE u_id = $1 "
         "ORDER BY created_at DESC LIMIT 1", u_id)
-    names = await conn.fetchrow('SELECT reachy_call_name, name FROM "user" WHERE u_id = $1', u_id)
+    names = await conn.fetchrow('SELECT reachy_call_name, name, reachy_meal_retry FROM "user" WHERE u_id = $1', u_id)
     stored = names["reachy_call_name"] if names else None
     last_seen = device["last_seen_at"]
     online = last_seen is not None and datetime.now(timezone.utc) - last_seen <= timedelta(seconds=ONLINE_SECONDS)
@@ -69,6 +72,8 @@ async def _status(conn, u_id: int) -> dict:
         "call_name": memory.call_name_of(stored, names["name"] if names else None),
         "call_name_custom": stored is not None,
         "live_voice": bool(device["live_voice"]), "live_voice_test": config.LIVE_VOICE_TEST,
+        # Reachy comes back 20 minutes after "not eaten yet" (quick fix 5; off by default).
+        "meal_retry": bool(names and names["reachy_meal_retry"]),
         "robot_reachable": device["robot_reachable"],
         "landmark_fps": float(device["landmark_fps"]) if device["landmark_fps"] is not None else None,
         "camera": _camera(device["status_detail"]),
@@ -111,7 +116,8 @@ async def status(user: dict = Depends(get_consented_user)):
 @router.patch("/settings")
 async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_user)):
     """A call name follows the rules of the patient's memory 'name' entry (422 invalid_call_name); an empty one goes
-    back to the registered name (NULL). A changed name renders the opening ahead in the live voice (voice_lines)."""
+    back to the registered name (NULL). A changed name renders the opening ahead in the live voice (voice_lines).
+    Switching meal_retry off cancels the meal retry still waiting, in the same transaction (quick fix 5)."""
     call_name = None
     if payload.call_name is not None and payload.call_name.strip():
         call_name = memory.clean_call_name(payload.call_name)
@@ -126,6 +132,11 @@ async def settings(payload: SettingsPayload, user: dict = Depends(get_consented_
             raise HTTPException(409, "robot_not_paired")
         if payload.call_name is not None:
             await conn.execute('UPDATE "user" SET reachy_call_name = $2 WHERE u_id = $1', user["u_id"], call_name)
+        if payload.meal_retry is not None:
+            await conn.execute('UPDATE "user" SET reachy_meal_retry = $2 WHERE u_id = $1', user["u_id"],
+                               payload.meal_retry)
+            if not payload.meal_retry:
+                await reachy_tasks.cancel_meal_retries(conn, user["u_id"])
         status = await _status(conn, user["u_id"])
     if payload.call_name is not None:   # after the commit: the render reads the new name on its own connection
         voice_lines.render_ahead_for_patient(user["u_id"])

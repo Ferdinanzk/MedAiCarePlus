@@ -316,6 +316,9 @@ ALTER TABLE reachy_task ADD CONSTRAINT reachy_task_reason_check
 -- Quick fix 4 (20 Oct 2026): a meal retry (the patient had not eaten yet) may be leased only from not_before on.
 -- Only meal retries have one, so it also tells them apart (reachy_tasks.MEAL_RETRY_LIMIT counts them per dose).
 ALTER TABLE reachy_task ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
+-- Quick fix 5 (20 Oct 2026): the Reachy card's switch for that meal retry, per patient and off by default. Off,
+-- "not eaten yet" ends the intake with the after-meal line only (quick fix 3); on, Reachy also comes back later.
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reachy_meal_retry BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Check-in conversations. Speech is turned into text on the robot; only text is stored.
 -- Retention (robot notice §5): turns 30 days, turns quoted in a safety alert 180 days,

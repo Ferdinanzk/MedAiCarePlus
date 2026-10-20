@@ -55,6 +55,9 @@ class FakeDB:
                             "revoked": False, "status_detail": None}}
         self.users = {7: "Pearl"}
         self.call_names = {}   # the Reachy card's call name per patient ("user".reachy_call_name)
+        # The Reachy card's meal retry switch per patient ("user".reachy_meal_retry, quick fix 5). Stored FALSE by
+        # default; on here, so the quick fix 4 tests run as the switch on gives them. The switch-off tests set False.
+        self.meal_retry = {7: True}
         self.doses = {
             101: {"intk_id": 101, "med_id": 2, "med_name": "Metformin", "pill_description": "white round",
                   "dose_form": "solid_oral", "units_per_dose": Decimal("1.00"), "intake_stats": "pending",
@@ -173,6 +176,8 @@ class FakeDB:
             return task["task_id"] if task and task["status"] != "queued" else None
         if 'SELECT name FROM "user"' in query:
             return self.users.get(args[0])
+        if query == 'SELECT reachy_meal_retry FROM "user" WHERE u_id = $1':   # _queue_meal_retry: the card's switch
+            return self.meal_retry.get(args[0], False)
         if "FROM notification_outbox" in query and "kind = 'robot_offline'" in query:
             self.outbox_now = args[1] + timedelta(hours=6)
             return 1 if any(n["u_id"] == args[0] and n["at"] > args[1] for n in self.notices) else None
@@ -322,6 +327,15 @@ class FakeDB:
                     detail = json.loads(t["detail"] or "{}")
                     t.update(status="aborted", finished_at=args[0], detail=json.dumps({**detail,
                                                                                        "reason": "dose_expired"}))
+        elif "'meal_retry_off'" in query:   # cancel_meal_retries: the card's switch went off
+            assert ("WHERE u_id = $1 AND status = 'queued' AND not_before IS NOT NULL" in query and self.depth > 0)
+            for t in self.tasks:
+                if t["u_id"] == args[0] and t["status"] == "queued" and t.get("not_before") is not None:
+                    detail = json.loads(t["detail"] or "{}")
+                    t.update(status="aborted", finished_at=self.now, detail=json.dumps({**detail,
+                                                                                       "reason": "meal_retry_off"}))
+        elif query == "SELECT task_id FROM reachy_task WHERE u_id = $1 AND status = 'in_progress' FOR UPDATE":
+            assert self.depth > 0   # cancel_meal_retries: a lock taken inside the caller's transaction
         elif "SET lease_until = NOW()" in query:
             for t in self.tasks:
                 if t["lease_owner"] == args[0] and t["status"] in ("leased", "searching", "in_progress"):
@@ -1595,6 +1609,83 @@ def test_a_meal_retry_whose_dose_expired_before_the_lease_is_cancelled(db, monke
     (text,) = _job_on(db, monkeypatch)
     assert "⚠️ Metformin：" in text and "已經錯過了" in text and "請盡快服用" not in text
     assert [t["task_id"] for t in db.tasks] == [task_id, meal["task_id"]]   # no robot for an expired dose
+
+
+# ── The meal retry switch (quick fix 5 of 20 Oct 2026) ───────────────────────
+
+def _switch_off(db):
+    """What PATCH /api/reachy/settings does with {"meal_retry": false}: the switch written, then
+    cancel_meal_retries, in one transaction."""
+    async def patch():
+        async with db.transaction():
+            db.meal_retry[7] = False
+            await reachy_tasks.cancel_meal_retries(db, 7)
+    run(patch())
+
+
+def test_with_the_switch_off_not_eaten_yet_queues_nothing_and_the_job_reminds_as_before(db, monkeypatch):
+    """The Reachy card's switch, off by default: after 「還沒吃飯」 at 07:56 Reachy says the after-meal line and the
+    task ends, nothing more (quick fix 3). No meal retry is queued, so nothing holds the dose: at +10 min the job sends
+    its LINE text and a robot retry for the slot, as before quick fix 4."""
+    db.meal_retry[7] = False
+    db.doses[102]["intake_stats"] = "taken"            # the slot's one dose to take: Metformin (101)
+    db.now = T0 - timedelta(minutes=4)
+    task_id = enqueue(db, intk_ids=(101,))
+    _completed_with(db, task_id, {"101": "meal_not_eaten"})
+    assert _meal_retries(db) == []
+    db.now = T0 + timedelta(minutes=10)
+    (text,) = _job_on(db, monkeypatch)
+    assert "逾時 10 分鐘" in text and "Metformin" in text and "請盡快服用" in text
+    (retry,) = [t for t in db.tasks if t["task_id"] != task_id]
+    assert (retry["reason"], retry["slot_time"], retry["intk_ids"], retry["status"]) == (
+        "missed_retry", T0, [101], "queued")
+
+
+def test_switching_off_cancels_the_waiting_meal_retry_and_lifts_the_jobs_hold(db, monkeypatch):
+    """Switched off at 08:05 while the meal retry waits for 08:16: it is cancelled at once (meal_retry_off), so the job
+    at +10 min sends its LINE text and a robot retry for the slot, as before quick fix 4, and the robot never leases
+    the cancelled meal retry."""
+    task_id, meal = _not_yet_for_metformin(db, T0 - timedelta(minutes=4))
+    db.now = T0 + timedelta(minutes=5)
+    _switch_off(db)
+    assert meal["status"] == "aborted" and json.loads(meal["detail"]) == {"reason": "meal_retry_off"}
+    db.now = T0 + timedelta(minutes=10)
+    (text,) = _job_on(db, monkeypatch)
+    assert "逾時 10 分鐘" in text and "Metformin" in text and "請盡快服用" in text
+    (retry,) = [t for t in db.tasks if t["task_id"] not in (task_id, meal["task_id"])]
+    assert (retry["reason"], retry["slot_time"], retry["intk_ids"]) == ("missed_retry", T0, [101])
+    db.now = meal["not_before"]
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0))["task_id"] == retry["task_id"]
+    assert run(reachy_tasks.lease_next(7, DEVICE, 0)) is None   # never the meal retry
+
+
+def test_switching_off_cancels_only_a_meal_retry_still_waiting(db):
+    """A meal retry Reachy is already with the patient for runs to its end, and a queued task that is no meal retry (a
+    check-in) stays. The patient's task in progress is locked first, inside the caller's transaction: a robot report
+    of "not yet" that read the switch still on commits its meal retry before the waiting ones are cancelled."""
+    task_id, meal = _not_yet_for_metformin(db, T0 - timedelta(minutes=4))
+    _reachy_with_the_patient(db, meal)
+    checkin = enqueue(db, reason="checkin", slot=db.now + timedelta(minutes=1), intk_ids=())   # 'Talk to Reachy now'
+    db.executed.clear()
+    _switch_off(db)
+    assert meal["status"] == "in_progress" and db.by_id(checkin)["status"] == "queued"
+    assert [query for query, args, depth in db.executed] == [
+        "SELECT task_id FROM reachy_task WHERE u_id = $1 AND status = 'in_progress' FOR UPDATE",
+        "UPDATE reachy_task SET status = 'aborted', finished_at = NOW(), detail = COALESCE(detail, '{}'::jsonb) "
+        "|| jsonb_build_object('reason', 'meal_retry_off') WHERE u_id = $1 AND status = 'queued' "
+        "AND not_before IS NOT NULL"]
+    assert all(depth > 0 for query, args, depth in db.executed)
+
+
+def test_after_switching_off_not_yet_again_queues_no_new_meal_retry(db):
+    """Switched off while the meal retry waits, then 'Use Reachy' pressed and "not yet" again: nothing is queued, so
+    no meal retry waits any more."""
+    task_id, meal = _not_yet_for_metformin(db, T0 - timedelta(minutes=4))
+    _switch_off(db)
+    db.now = T0 + timedelta(minutes=2)
+    manual = enqueue(db, reason="manual", slot=T0, intk_ids=(101,))   # 'Use Reachy' on the 08:00 dose
+    _completed_with(db, manual, {"101": "meal_not_eaten"})
+    assert [t["status"] for t in _meal_retries(db)] == ["aborted"]
 
 
 def _waiting_rows(slot, retries_sent, waiting=(101,)):

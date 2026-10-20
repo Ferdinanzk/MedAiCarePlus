@@ -80,6 +80,7 @@ BEFORE_MEAL_WORDS = ("空腹", "飯前", "餐前")
 # Quick fix 4 of 20 Oct 2026: when the patient has not eaten yet (the robot reports a task completed with the outcome
 # meal_not_eaten for a dose), Reachy comes back MEAL_RETRY_MINUTES later: one task (a meal retry) that the lease hands
 # out only from its stored not_before on, at most MEAL_RETRY_LIMIT per dose. Only meal retries have a not_before.
+# Quick fix 5: only while the patient's switch on the Reachy card is on ("user".reachy_meal_retry, off by default).
 MEAL_RETRY_MINUTES = 20
 MEAL_RETRY_LIMIT = 3
 MANUAL_TASK_MIN_MINUTES = 15   # a manual task ('Use Reachy', 'Talk to Reachy now') stays open at least this long
@@ -401,12 +402,18 @@ async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
     have expired: the missed-dose job handles it at once). A queued meal retry that already waits for such a dose
     ('Use Reachy' pressed meanwhile, and "not yet" again) comes MEAL_RETRY_MINUTES after this answer instead (review
     of quick fix 4), with its expiry moved as manual_expires_at would set it from then; its slot_time stays, so two
-    retries moved at once never meet in the one-open-task-per-slot index."""
+    retries moved at once never meet in the one-open-task-per-slot index. Quick fix 5: all of this only while the
+    patient's switch is on at this report ("user".reachy_meal_retry); off, nothing is queued or moved, so nothing
+    holds the doses and the missed-dose job handles them as before quick fix 4."""
     outcomes = (ended or {}).get("outcomes")
     if not isinstance(outcomes, dict):
         return
     not_eaten = [intk_id for intk_id in task["intk_ids"] if outcomes.get(str(intk_id)) == "meal_not_eaten"]
     if not not_eaten:
+        return
+    if not await conn.fetchval('SELECT reachy_meal_retry FROM "user" WHERE u_id = $1', task["u_id"]):
+        log.info("no meal retry for patient %s after task %s: the Reachy card's switch is off", task["u_id"],
+                 task["task_id"])
         return
     rows = [row for row in await conn.fetch(
         "SELECT i.intk_id, i.intake_time_stamp, (SELECT COUNT(*) FROM reachy_task meal WHERE meal.u_id = i.u_id "
@@ -439,6 +446,19 @@ async def _queue_meal_retry(conn, task, ended: dict | None) -> None:
     except schedule.DoseRefused as refused:
         log.info("no meal retry for the %s slot of patient %s: dose %s refused (%s)", slot_label(slot), task["u_id"],
                  refused.intk_id, refused.detail)
+
+
+async def cancel_meal_retries(conn, u_id: int) -> None:
+    """Quick fix 5: the patient's switch on the Reachy card went off. Every meal retry still waiting (queued) is
+    cancelled inside the caller's transaction (aborted, reason meal_retry_off), so the missed-dose job's hold on its
+    doses ends with it (meal_retry_waiting_sql). One the robot has already leased runs to its end, as any task. The
+    patient's task in progress is locked first: a robot report of "not yet" that read the switch still on
+    (_queue_meal_retry, under that task's lock) commits its meal retry before this cancels the waiting ones."""
+    await conn.execute("SELECT task_id FROM reachy_task WHERE u_id = $1 AND status = 'in_progress' FOR UPDATE", u_id)
+    await conn.execute(
+        "UPDATE reachy_task SET status = 'aborted', finished_at = NOW(), detail = COALESCE(detail, '{}'::jsonb) "
+        "|| jsonb_build_object('reason', 'meal_retry_off') WHERE u_id = $1 AND status = 'queued' "
+        "AND not_before IS NOT NULL", u_id)
 
 
 async def extend_leases(conn, device_id: str) -> None:
