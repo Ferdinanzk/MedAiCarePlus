@@ -1,8 +1,10 @@
 # Handoff — MedAiCarePlus + Reachy Mini
 
-Status as of **18 October 2026, evening**, GitHub branch **`tool-fixed-version-04`** (section 12 is new in it: Wi-Fi,
-the LINE test with a family confirmation, and the intake map; section 11, the live tests and the tool audit, came
-with `tool-fixed-version-03`; section 10 with `tool-fixed-version-02`; section 9 with `tool-fixed-version-01`; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
+Status as of **21 October 2026**, GitHub branch **`version-4-jingsi`** (section 13 is new in it: the quick fixes of
+19-21 October, from the GPT voice for every line to the robot microphone button, robot app 0.17.2; **start with
+[section 13](#13-version-4-jingsi-the-quick-fixes-of-19-21-october-2026)**). Before it, `tool-fixed-version-04`
+(section 12: Wi-Fi, the LINE test with a family confirmation, and the intake map; section 11, the live tests and the
+tool audit, came with `tool-fixed-version-03`; section 10 with `tool-fixed-version-02`; section 9 with `tool-fixed-version-01`; section 8 with `reachy-integration-0.3`, sections 6 and 7 with
 `reachy-integration-0.2`, and sections 1-5 describe `reachy-integration-0.1`). **Start with
 [section 12](#12-wi-fi-the-line-test-with-a-family-confirmation-and-the-intake-map-18-october-2026-afternoon)
 for what to do next.** No passwords, keys or tokens are written here; [step 4.3](#43-create-env-and-put-in-the-credentials) says
@@ -777,6 +779,36 @@ The map stays as a reference for how an intake works today.
 3. Then the face lock, the OCR test, and the new tools' plan (robot app 0.17.0), on `tool-fixed-version-05`.
    The whole list for version 5, with the patient voiceprint (planned, not built), is
    [docs/VERSION_05_IMPROVEMENTS.md](docs/VERSION_05_IMPROVEMENTS.md).
+
+## 13. version-4-jingsi: the quick fixes of 19-21 October 2026
+
+Version 5 was dropped for now (its plan and first commits stay on the local branch `tool-fixed-version-05`, not
+pushed). Instead the user asked for quick fixes, tested each on the robot and named the result **`version-4-jingsi`**.
+Server: this branch. Robot app **0.17.2**: the Hugging Face space `pearlyjam21/medcare_reachy`, branch
+`version-4-jingsi` (the GitHub robot repo is not writable from this laptop). The details of each are in `CLAUDE.md`
+(the "Quick fixes" bullets under live voice) and the robot repo's README.
+
+| Fix | What it does |
+|---|---|
+| 1 (19 Oct) | Every Reachy line in the GPT voice; the dose opening with the patient's name; after 「我吃完了」 or the camera's event Reachy waits 120 s for family's LINE answer ("not taken": intake again, at most 2; "taken": cheer, then the check-in or rest); the after-dose watch removed; reboot and rebuild resilience (`scripts/rebuild-app.ps1`, boot script fixes) |
+| 2 | Cloud speech-to-text for 「我吃完了」 (`POST /api/device/stt`); the meal question 「您有吃飯了嗎？」 for after-meal doses at lunch and dinner; the line after a camera event by its confidence |
+| 3 | The meal answer: "not eaten yet" ends the intake with the after-meal line; no meal question before an empty-stomach medicine |
+| 4, 5 | Reachy comes back 20 minutes after "not eaten yet" (at most 3 times), behind a Reachy card switch, off by default |
+| 6 | The Reachy card's "Demo dose: Acetal 500mg" button: a fresh demo dose and Reachy at once, with family's LINE confirmation as for a real dose |
+| 7 | The camera's intake detector re-arms after a candidate nobody read, and keeps a ready one 15 s (a pill taken during the medicine prompt counts) |
+| 8, 9 | A robot microphone button on the Reachy card: off sets the daemon's microphone volume to 0 (the daemon has no mute) and keeps it there; the server applies a press on the robot at once (about 0.2 s), the heartbeat within 10 s otherwise |
+
+Gates at the push: server 3566 passed; robot 1690 passed, 6 skipped; frontend `tsc` and build clean (two old
+live-voice Playwright tests fail as before: the card shows a note there since 13 Oct).
+
+**Running setup on 21 October:** the robot on this laptop's Mobile Hotspot (robot 192.168.137.104, laptop
+192.168.137.1, `DEVICE_BIND=192.168.137.1`); LINE pushes go through a fourth channel (the other three used their 200
+messages for October). Deploy the robot app with `tools/deploy_to_robot.py --host <robot>` and restart it through the
+daemon; the robot app does not start by itself after the robot reboots (start it through the daemon).
+
+**Open, for the user:** the microphone switch while unpairing or stopping the app (the robot stays at volume 0); a
+slot that mixes an after-meal and an empty-stomach dose; classifying the meal answer with the AI model; pushing robot
+app 0.17.2 to the space's `main` (the dashboard still installs 0.15.0 from it: never reinstall from the dashboard).
 
 ---
 
