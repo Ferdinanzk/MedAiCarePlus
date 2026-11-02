@@ -41,13 +41,14 @@ def _jpeg():
 JPEG = _jpeg()
 
 
-def _packet(frame_seq, timestamp, distance=None):
+def _packet(frame_seq, timestamp, distance=None, owned=True):
     # The hand sits below the mouth (y 0.6), so the face is never "covered" and a candidate can become ready.
+    # owned=False: no body for the face, so select_owned_observations can't tie the hand to the patient.
     hand = None if distance is None else [distance / 4, 0.6]
     return {"frame_seq": frame_seq, "timestamp": float(timestamp), "width": 100, "height": 100,
             "faces": [{"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}],
             "poses": [{"nose": [0.3, 0.3], "shoulders": [[0.2, 0.5], [0.4, 0.5]],
-                       "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}],
+                       "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}] if owned else [],
             "hands": [] if hand is None else [[hand] * 13]}
 
 
@@ -112,7 +113,7 @@ class _Run:
         self.seq = 0
         self.candidates = []   # event ids, in the order they appeared
 
-    async def frame(self, distance=None, vision=True, verified=True):
+    async def frame(self, distance=None, vision=True, verified=True, owned=True):
         self.seq += 1
         self.clock.t += 1 / FPS
         state = self.state
@@ -121,7 +122,7 @@ class _Run:
             state.target_box = [0.1, 0.1, 0.4, 0.4]
         else:
             state.identity_hits, state.target_box = 0, None
-        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance))
+        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned))
         if vision and verified:
             result = await self.registry.vision(state, self.seq, JPEG, self.commits)
         candidate = state.candidate
@@ -431,7 +432,8 @@ def test_a_timeout_reset_is_logged_once_with_its_stage(clock, caplog):
 
 
 def test_a_gate_reset_is_logged_once_with_its_stage(clock, caplog):
-    """Identity lost in the middle of a gesture: the monitor ends that detector session (the identity gate)."""
+    """Identity lost in the middle of a gesture for longer than OWNERSHIP_GRACE_SECONDS: the monitor ends that
+    detector session (the identity gate), once, at the stage the gap began."""
     caplog.set_level(logging.INFO, logger="app.services.monitor_service")
 
     async def scenario():
@@ -441,13 +443,75 @@ def test_a_gate_reset_is_logged_once_with_its_stage(clock, caplog):
             await run.frame(distance)
         assert run.state.latest_detector["stage"] in ("AT_MOUTH", "APPROACHING")
         stage = run.state.latest_detector["stage"]
-        for _ in range(5):
+        detector_session = run.state.detector_session_id
+        for _ in range(5):                # 0.33 s: within the grace, the event is kept
             await run.frame(0.5, verified=False)
+        assert run.state.latest_detector["stage"] == "WAITING_FOR_PEARL"
+        assert run.state.detector_session_id == detector_session
+        for _ in range(10):               # 1.0 s: past it
+            await run.frame(0.5, verified=False)
+        assert run.state.detector_session_id != detector_session
         return run, stage
 
     run, stage = asyncio.run(scenario())
     resets = _lines(caplog, ": reset at stage ")
     assert resets == [f"intake detector of session {run.state.session_id}: reset at stage {stage} (identity)"]
+
+
+def test_a_short_gap_in_ownership_keeps_the_event_but_never_auto_logs_it(clock):
+    """The hand's owner is unclear for 0.27 s while the hand is at the mouth (the frames where it crosses the face,
+    on the C:\\pilldetector clips): the event survives, the detector still rates it confirmed, and the policy caps it
+    at uncertain, so an auto-commit session makes a prompt instead of a record. Without the gap it auto-commits."""
+    async def scenario():
+        gapped = _Run(clock, auto_commit=True)
+        await gapped.rest(1.0)
+        for distance in GESTURE[:15]:
+            await gapped.frame(distance)
+        detector_session = gapped.state.detector_session_id
+        for _ in range(4):
+            await gapped.frame(0.5, owned=False)
+        assert gapped.state.detector_session_id == detector_session     # no reset
+        for distance in GESTURE[15:]:
+            await gapped.frame(distance)
+        summary = await clock.detector.get_session(7, gapped.state.detector_session_id)
+
+        plain = _Run(clock, auto_commit=True)
+        await plain.rest(1.0)
+        await plain.gesture()
+        return gapped, summary, plain
+
+    gapped, summary, plain = asyncio.run(scenario())
+    latest = summary["latest_result"]
+    assert latest["policy"]["detector_band"] == "confirmed"
+    assert (latest["decision"], latest["decision_reason"]) == ("uncertain", "ownership_gap_needs_confirmation")
+    assert gapped.state.candidate is not None and gapped.state.candidate["decision"] == "uncertain"
+    assert gapped.commits.calls == []
+    assert plain.state.candidate is not None and plain.state.candidate["decision"] == "confirmed"
+    assert [method for _, method in plain.commits.calls] == ["auto"]
+
+
+def test_a_gap_in_ownership_past_the_grace_resets_and_the_rest_of_the_gesture_makes_nothing(clock, caplog):
+    """The same gesture with 0.6 s of unclear ownership at the mouth: the detector session is reset (the ownership
+    gate), and the withdrawal alone is not an event."""
+    caplog.set_level(logging.INFO, logger="app.services.monitor_service")
+
+    async def scenario():
+        run = _Run(clock, auto_commit=True)
+        await run.rest(1.0)
+        for distance in GESTURE[:15]:
+            await run.frame(distance)
+        stage = run.state.latest_detector["stage"]
+        for _ in range(9):
+            await run.frame(0.5, owned=False)
+        for distance in GESTURE[15:]:
+            await run.frame(distance)
+        await run.rest(1.0)
+        return run, stage
+
+    run, stage = asyncio.run(scenario())
+    resets = _lines(caplog, ": reset at stage ")
+    assert resets == [f"intake detector of session {run.state.session_id}: reset at stage {stage} (ownership)"]
+    assert run.candidates == [] and run.commits.calls == []
 
 
 def _closed_mouth_observations(detector, face_landmarks, hand_landmarks, width, height, **kwargs):

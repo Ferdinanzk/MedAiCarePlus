@@ -9,6 +9,11 @@ The safety invariant, enforced by `decide()` and covered by the test suite:
 
 A band can be downgraded or left alone. It can never be upgraded, and an event
 is never invented when the detector reported none.
+
+`ownership_gap` (3 Nov 2026): the monitor lost the patient's hand for part of
+the event (identity not fresh, or whose hand it was unclear, for under
+`monitor_service.OWNERSHIP_GRACE_SECONDS`) and pieced the event together across
+the gap. Such an event may prompt, never auto-log, in every mode.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ class PolicyOutcome:
     mode: str
     downgraded: bool
     safety_contradiction: bool
+    ownership_gap: bool = False
 
 
 def is_safety_contradiction(detector_reason: str, explicit: Optional[bool] = None) -> bool:
@@ -79,6 +85,7 @@ def decide(
     mode: Optional[str] = None,
     auto_confirm_min: Optional[float] = None,
     prompt_min: Optional[float] = None,
+    ownership_gap: bool = False,
 ) -> PolicyOutcome:
     """Re-band one detection event under the v1 policy.
 
@@ -99,6 +106,7 @@ def decide(
             mode=mode,
             downgraded=rank(band) < rank(detector_band),
             safety_contradiction=safety_contradiction,
+            ownership_gap=ownership_gap,
         )
 
     # Invariant, checked first: an event the detector did not report is never
@@ -112,6 +120,8 @@ def decide(
     if mode == config.MODE_AUTONOMOUS:
         if safety_contradiction and detector_band == BAND_CONFIRMED:
             return outcome(BAND_UNCERTAIN, "safety_contradiction_blocks_auto_confirm")
+        if ownership_gap and detector_band == BAND_CONFIRMED:
+            return outcome(BAND_UNCERTAIN, "ownership_gap_blocks_auto_confirm")
         return outcome(detector_band, "autonomous_passthrough")
 
     # Nothing auto-logs in manual-only mode; a real event still earns a prompt.
@@ -126,6 +136,10 @@ def decide(
 
     if safety_contradiction:
         return outcome(BAND_UNCERTAIN, "safety_contradiction_needs_confirmation")
+
+    # The patient's hand was lost for part of this event: a prompt at most.
+    if ownership_gap:
+        return outcome(BAND_UNCERTAIN, "ownership_gap_needs_confirmation")
 
     # Auto-confirm requires BOTH strong evidence and the detector's own top band.
     # Requiring the detector band keeps the invariant intact: a high-confidence

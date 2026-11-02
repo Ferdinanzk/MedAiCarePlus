@@ -264,7 +264,7 @@ This rule decides which hands belong to the verified patient, so another person'
 | Hands | Each hand's wrist must match one of this pose's wrists (visibility ≥ 0.5), within max(0.06, 0.8 × shoulder width). If another person's wrist is within a margin of max(0.02, 0.15 × shoulder width), the whole frame is rejected |
 | Output | At most 2 owned hands, or `None` |
 
-When it returns `None`, the stage becomes `WAITING_FOR_PEARL` and any active event is reset (`monitor_service.py:429-437`).
+When it returns `None` (or identity is not fresh), the stage becomes `WAITING_FOR_PEARL`. An active event survives such a gap for `OWNERSHIP_GRACE_SECONDS` (0.5 s on the packets' capture clock; the detector never sees the gap's frames) and is reset once the gap lasts longer. An event that crossed any gap is capped at `uncertain` by the policy (`ownership_gap`): it can prompt, never auto-log. Before 3 Nov 2026 the first such frame reset the event, which lost 9 of 20 real intakes on the `C:\pilldetector` clips.
 
 ## 7. Pill-intake detector
 

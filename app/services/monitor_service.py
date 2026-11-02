@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 
 import cv2
 import numpy as np
@@ -33,6 +34,16 @@ FPS_WINDOW_SECONDS = 3.0
 FPS_MIN_SPAN_SECONDS = 1.0
 FPS_MIN = 12.0
 FPS_MAX_GAP_SECONDS = 0.25
+
+# A gap in the patient's hand ownership during a hand-to-mouth event (identity not fresh, or the hand and body can't
+# be tied to the face: typically the frames where the hand crosses the face) no longer resets the detector at once.
+# The event survives a gap shorter than this (on the packets' capture clock); the detector's own grace windows
+# (intake_temporal.py: occlusion_grace_seconds 0.55, track_grace_seconds 0.65) decide what to make of the missing
+# frames, which it never sees. An event that crossed any gap can prompt but never auto-log (intake_v1.policy's
+# ownership_gap). Measured on 33 labelled clips (C:\pilldetector, 3 Nov 2026): the immediate reset threw away 9 of
+# 20 real intakes after the pill had reached the mouth; with 0.55 s of grace and this cap, 11 of 20 raise a prompt
+# or a record and no "not taken" clip is auto-logged.
+OWNERSHIP_GRACE_SECONDS = 0.5
 
 MODES = ("dose", "observe")
 CLIENT_TYPES = ("browser", "reachy")
@@ -199,6 +210,12 @@ class MonitorSession:
     dose_emotion_done: bool = False
     # Kept for dose_video: set at the first APPROACHING of the session.
     event_started_at: float | None = None
+    # A gap in the patient's hand ownership during an active detector stage: when it began (the packets' capture
+    # clock) and the stage then, until OWNERSHIP_GRACE_SECONDS pass (a reset) or an owned frame arrives (the event
+    # goes on). event_ownership_gap says the event under way crossed such a gap: the policy caps it at 'uncertain'.
+    ownership_lost_at: float | None = None
+    ownership_lost_stage: str | None = None
+    event_ownership_gap: bool = False
     candidate: dict | None = None
     # What used the current candidate (mark_candidate_used): 'confirmation' (the robot's request named its event),
     # 'auto_commit', or the browser's 'confirmed_by_user' / 'not_taken'; None while nothing has. A dose candidate
@@ -348,6 +365,8 @@ async def _new_detector_session(state: MonitorSession) -> None:
     await IntakeDetectionService.get_instance().end_session(state.u_id, state.detector_session_id)
     state.detector_session_id = str(uuid.uuid4())
     state.event_started_at = None
+    state.ownership_lost_at = state.ownership_lost_stage = None
+    state.event_ownership_gap = False
 
 
 async def _expire_candidate(state: MonitorSession, now: float) -> None:
@@ -570,20 +589,31 @@ class MonitorRegistry:
             verified = state.verified(now)
             selected = select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box) if verified else None
             if not selected:
-                stage = (state.latest_detector or {}).get("stage")
-                if stage in ("APPROACHING", "AT_MOUTH", "OCCLUDED", "WITHDRAWING"):
+                timestamp = float(packet["timestamp"])
+                if state.ownership_lost_at is None:
+                    stage = (state.latest_detector or {}).get("stage")
+                    if stage in ACTIVE_EVENT_STAGES:
+                        # The first frame of a gap in an active event: it survives OWNERSHIP_GRACE_SECONDS.
+                        state.ownership_lost_at, state.ownership_lost_stage = timestamp, stage
+                        state.event_ownership_gap = True
+                    else:
+                        state.emotion_event_start = None
+                if state.ownership_lost_at is not None and timestamp - state.ownership_lost_at >= OWNERSHIP_GRACE_SECONDS:
+                    stage = state.ownership_lost_stage
                     await _new_detector_session(state)
                     log.info("intake detector of session %s: reset at stage %s (%s)", state.session_id, stage,
                              "ownership" if verified else "identity")
-                state.emotion_event_start = None
+                    state.emotion_event_start = None
                 state.latest_detector = {"stage": "WAITING_FOR_PEARL", "decision": "none"}
                 return state.public()
+            state.ownership_lost_at = state.ownership_lost_stage = None
             payload = {"frame_seq": frame_seq, "timestamp": float(packet["timestamp"]),
                        "width": packet["width"], "height": packet["height"],
                        "face_landmarks": full_points(selected["face"], FACE_INDICES),
                        "hand_landmarks": [full_points(hand, HAND_INDICES) for hand in selected["hands"]]}
             result = await IntakeDetectionService.get_instance().process_frame(
-                state.u_id, state.detector_session_id, payload, result_transform=apply_policy)
+                state.u_id, state.detector_session_id, payload,
+                result_transform=partial(apply_policy, ownership_gap=state.event_ownership_gap))
             if result.get("reset_reason"):
                 # The temporal pipeline gave up on an event (a timeout, or a closed-mouth sequence): once per event.
                 log.info("intake detector of session %s: reset at stage %s (%s)", state.session_id,
@@ -604,6 +634,8 @@ class MonitorRegistry:
                 state.emotion_event_start = None     # the next event starts at its own first active stage
             elif stage not in EVENT_STAGES:
                 state.emotion_event_start = None     # an approach that came to nothing
+            if stage not in EVENT_STAGES:
+                state.event_ownership_gap = False    # the event closed, or the detector gave it up
             if is_event and state.mode != "dose":
                 # Observe mode: report the event, never turn it into a candidate.
                 if all(event["event_id"] != event_id for event in state.extra_events):
