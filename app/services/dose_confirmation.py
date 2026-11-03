@@ -390,7 +390,8 @@ def _ignored(why: str) -> None:
     return None
 
 
-async def handle_postback(conn, data: str, sender_line_id: str) -> dict | None:
+async def handle_postback(conn, data: str, sender_line_id: str, reply_token: str | None = None,
+                          received_at: datetime.datetime | None = None) -> dict | None:
     """Webhook entry point. Returns None (and changes nothing) unless the payload HMAC is valid,
     the sender is that verified contact, and the contact belongs to the confirmation's patient."""
     parsed = verify_postback(data)
@@ -415,7 +416,7 @@ async def handle_postback(conn, data: str, sender_line_id: str) -> dict | None:
         if owner is None or owner != contact["u_id"]:
             return _ignored("the request is unknown or not that contact's patient's")
         result = await resolve(conn, parsed["id"], contact["id"], parsed["answer"])
-        await _enqueue_replies(conn, parsed, contact, result)
+        await _enqueue_replies(conn, parsed, contact, result, reply_token, received_at)
     outbox.wake()
     return result
 
@@ -430,7 +431,8 @@ def _refused_reasons(result: dict) -> tuple[str, str] | None:
     return "、".join(zh for zh, _ in texts), "; ".join(en for _, en in texts)
 
 
-async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
+async def _enqueue_replies(conn, parsed: dict, contact, result: dict, reply_token: str | None = None,
+                           received_at: datetime.datetime | None = None) -> None:
     confirmation_id, u_id = parsed["id"], contact["u_id"]
     row = await _lock(conn, confirmation_id)
     details = await _details(conn, u_id, list(row["intk_ids"]))
@@ -450,7 +452,8 @@ async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
                     f"Already answered by {by}: {en} ({whose} dose).")
         await outbox.enqueue(conn, u_id=u_id, recipient_line_id=contact["line_id"], kind="dose_confirm_reply",
                              priority=1, messages=_text(text), recipient_contact_id=contact["id"],
-                             dedupe_key=f"dose_confirm_late:{confirmation_id}:{contact['id']}")
+                             dedupe_key=f"dose_confirm_late:{confirmation_id}:{contact['id']}",
+                             reply_token=reply_token, received_at=received_at)
         return
     if result["status"] != "resolved":
         return
@@ -470,7 +473,8 @@ async def _enqueue_replies(conn, parsed: dict, contact, result: dict) -> None:
         ack += "\n注意：藥量已為 0，請補充藥物。 / Note: stock was already 0, please refill."
     await outbox.enqueue(conn, u_id=u_id, recipient_line_id=contact["line_id"], kind="dose_confirm_reply",
                          priority=1, messages=_text(ack), recipient_contact_id=contact["id"],
-                         dedupe_key=f"dose_confirm_ack:{confirmation_id}:{contact['id']}")
+                         dedupe_key=f"dose_confirm_ack:{confirmation_id}:{contact['id']}",
+                         reply_token=reply_token, received_at=received_at)
     notice = (f"{contact['name']} 已回覆：{zh}（{patient} {slot}）。\n"
               f"{contact['name']} answered: {en} ({patient}'s {slot} dose).")
     # The other contacts must not read "answered: taken" for a dose that was not recorded.

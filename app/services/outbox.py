@@ -5,6 +5,7 @@ delivers queued rows with retries so a crash between commit and send loses nothi
 """
 
 import asyncio
+import datetime
 import json
 
 _wake: asyncio.Event | None = None
@@ -31,13 +32,21 @@ async def wait_for_wake(timeout: float) -> None:
 
 
 async def enqueue(conn, *, u_id: int, recipient_line_id: str, kind: str, priority: int,
-                  messages: list[dict], dedupe_key: str, recipient_contact_id: int | None = None) -> bool:
+                  messages: list[dict], dedupe_key: str, recipient_contact_id: int | None = None,
+                  reply_token: str | None = None, received_at: datetime.datetime | None = None) -> bool:
+    payload = {"messages": messages}
+    if reply_token:
+        # LINE's reply token is valid about a minute and works once: the dispatcher tries it while it is fresh.
+        from app.services.outbox_dispatcher import REPLY_WINDOW_SECONDS
+        received_at = received_at or datetime.datetime.now(datetime.timezone.utc)
+        payload["reply_token"] = reply_token
+        payload["reply_until"] = (received_at + datetime.timedelta(seconds=REPLY_WINDOW_SECONDS)).isoformat()
     inserted = await conn.fetchval(
         "INSERT INTO notification_outbox (dedupe_key, u_id, recipient_contact_id, recipient_line_id, "
         "kind, priority, payload) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) "
         "ON CONFLICT (dedupe_key) DO NOTHING RETURNING outbox_id",
         dedupe_key, u_id, recipient_contact_id, recipient_line_id, kind, priority,
-        json.dumps({"messages": messages}, ensure_ascii=False))
+        json.dumps(payload, ensure_ascii=False))
     if inserted is not None and priority == 0:
         wake()
     return inserted is not None

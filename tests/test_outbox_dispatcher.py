@@ -33,12 +33,15 @@ class OutboxDB:
         self.next_id = 1
 
     def add(self, *, priority=1, status="queued", attempts=0, next_attempt_at=NOW, line_id="U-family",
-            messages=None, kind="other"):
+            messages=None, kind="other", reply_until=None):
         outbox_id = self.next_id
         self.next_id += 1
+        payload = {"messages": messages or [{"type": "text", "text": f"m{outbox_id}"}]}
+        if reply_until is not None:
+            payload.update(reply_token="tok-secret", reply_until=reply_until.isoformat())
         self.rows[outbox_id] = {
             "outbox_id": outbox_id, "recipient_line_id": line_id, "priority": priority,
-            "payload": json.dumps({"messages": messages or [{"type": "text", "text": f"m{outbox_id}"}]}),
+            "payload": json.dumps(payload),
             "status": status, "attempts": attempts, "next_attempt_at": next_attempt_at,
             "line_request_id": None, "last_error": None, "accepted_at": None, "kind": kind,
         }
@@ -107,9 +110,17 @@ class _Pool:
 
 
 class FakeLine:
-    def __init__(self, results=None):
+    def __init__(self, results=None, reply_results=None):
         self.calls = []
         self.results = list(results or [])
+        self.replies = []
+        self.reply_results = list(reply_results or [])
+
+    def reply_messages(self, reply_token, messages):
+        self.replies.append((reply_token, messages))
+        if self.reply_results:
+            return self.reply_results.pop(0)
+        return {"status": "accepted", "http_status": 200, "request_id": "reply-req", "error": None}
 
     def push_messages(self, to, messages, retry_key, *, kind):
         if line_pause.blocks(kind):
@@ -372,3 +383,34 @@ def test_other_kinds_send_while_paused(db, monkeypatch, paused):
     asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
     assert db.rows[row]["status"] == "accepted"
     assert fake.kinds == ["dose_confirm"]
+
+
+def test_fresh_reply_token_uses_reply(db, monkeypatch):
+    row = db.add(kind="dose_confirm_reply", reply_until=NOW + datetime.timedelta(seconds=30))
+    fake = FakeLine()
+    _use_line(monkeypatch, fake)
+    monkeypatch.setattr(outbox_dispatcher, "_stopping", False)   # an earlier test's stop leaves it set
+    assert asyncio.run(outbox_dispatcher.dispatch_once(now=NOW)) == 1
+    assert db.rows[row]["status"] == "accepted"
+    assert len(fake.replies) == 1 and fake.replies[0][0] == "tok-secret" and fake.calls == []
+
+
+def test_invalid_reply_token_falls_back_to_push(db, monkeypatch):
+    row = db.add(kind="dose_confirm_reply", reply_until=NOW + datetime.timedelta(seconds=30))
+    fake = FakeLine(reply_results=[{"status": "invalid_token", "http_status": 400, "request_id": None,
+                                    "error": None}])
+    _use_line(monkeypatch, fake)
+    monkeypatch.setattr(outbox_dispatcher, "_stopping", False)   # an earlier test's stop leaves it set
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert len(fake.replies) == 1 and len(fake.calls) == 1
+    assert db.rows[row]["status"] == "accepted" and db.rows[row]["last_error"] is None
+
+
+def test_old_reply_token_goes_by_push(db, monkeypatch):
+    row = db.add(kind="dose_confirm_reply", reply_until=NOW - datetime.timedelta(seconds=1))
+    fake = FakeLine()
+    _use_line(monkeypatch, fake)
+    monkeypatch.setattr(outbox_dispatcher, "_stopping", False)   # an earlier test's stop leaves it set
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert fake.replies == [] and len(fake.calls) == 1
+    assert db.rows[row]["status"] == "accepted"

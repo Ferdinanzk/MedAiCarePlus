@@ -49,7 +49,8 @@ def db(monkeypatch):
     monkeypatch.setattr(api_notify, "get_pool", lambda: FakePool(database))
     sent = []
     service = types.SimpleNamespace(send_text=lambda *args, **kw: sent.append(args),
-                                    send_verification_success=lambda *args: sent.append(args))
+                                    send_verification_success=lambda *args: sent.append(args),
+                                    reply_text=lambda token, to, text: sent.append((to, text)))
     monkeypatch.setattr(api_notify.LineService, "get_instance", classmethod(lambda cls: service))
     database.direct_sends = sent
     return database

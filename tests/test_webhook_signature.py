@@ -14,6 +14,7 @@ _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
 from app.routers import api_notify
+from app.services.line_service import verification_success_text
 
 
 def _request(body, signature=None):
@@ -65,7 +66,7 @@ def test_valid_signature_processes_verification_code(monkeypatch):
             return False
 
     pool = types.SimpleNamespace(acquire=lambda: Acquire())
-    service = types.SimpleNamespace(send_verification_success=lambda *args: calls.append(("sent", args)))
+    service = types.SimpleNamespace(reply_text=lambda token, to, text: calls.append(("sent", (to, text))))
     monkeypatch.setattr(api_notify, "get_pool", lambda: pool)
     monkeypatch.setattr(api_notify.LineService, "get_instance", classmethod(lambda cls: service))
     monkeypatch.setattr(api_notify, "LINE_CHANNEL_SECRET", "secret")
@@ -74,4 +75,4 @@ def test_valid_signature_processes_verification_code(monkeypatch):
     signature = base64.b64encode(hmac.new(b"secret", body, hashlib.sha256).digest()).decode()
     result = asyncio.run(api_notify.line_webhook(_request(body, signature)))
     assert result == {"status": "ok"}
-    assert calls == [("verified", ("line-family", 3)), ("sent", ("line-family", "Pearl"))]
+    assert calls == [("verified", ("line-family", 3)), ("sent", ("line-family", verification_success_text("Pearl")))]

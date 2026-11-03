@@ -19,6 +19,7 @@ from app.services.line_service import LineService
 BATCH_SIZE = 20
 POLL_SECONDS = 5
 STOP_TIMEOUT_SECONDS = 5
+REPLY_WINDOW_SECONDS = 50     # LINE: use a reply token within a minute, once
 _BACKOFF_SECONDS = (5, 15, 30)
 
 _task: asyncio.Task | None = None
@@ -47,13 +48,31 @@ async def recover_stuck() -> int:
         return 0
 
 
-async def _send(row) -> dict:
+def _reply_is_fresh(payload: dict, now: datetime.datetime) -> bool:
+    if not payload.get("reply_token") or not payload.get("reply_until"):
+        return False
+    try:
+        until = datetime.datetime.fromisoformat(payload["reply_until"])
+    except (TypeError, ValueError):
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=datetime.timezone.utc)
+    return now < until and len(payload["messages"]) <= 5
+
+
+async def _send(row, now: datetime.datetime) -> dict:
     payload = row["payload"]
     if isinstance(payload, str):
         payload = json.loads(payload)
     service = LineService.get_instance()
     loop = asyncio.get_running_loop()
     try:
+        if _reply_is_fresh(payload, now):
+            # Free reply first; anything but 'accepted' goes to push in this same attempt (the token is spent).
+            replied = await loop.run_in_executor(None, service.reply_messages, payload["reply_token"],
+                                                 payload["messages"])
+            if replied.get("status") == "accepted":
+                return replied
         return await loop.run_in_executor(
             None, functools.partial(service.push_messages, row["recipient_line_id"], payload["messages"],
                                     retry_key(row["outbox_id"]), kind=row["kind"]))
@@ -87,7 +106,7 @@ async def dispatch_once(now: datetime.datetime | None = None) -> int:
                     "UPDATE notification_outbox SET status='queued' "
                     "WHERE outbox_id = ANY($1::bigint[]) AND status='sending'", unsent)
             break
-        result = await _send(row)
+        result = await _send(row, now)
         finished = fixed_now or datetime.datetime.now(datetime.timezone.utc)
         async with pool.acquire() as conn:
             if result.get("status") in ("accepted", "duplicate"):

@@ -3,6 +3,18 @@ from typing import List
 from app.config import LINE_CHANNEL_ACCESS_TOKEN, LINE_API_URL
 from app.services import line_pause
 
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+MAX_REPLY_MESSAGES = 5
+REPLY_TIMEOUT_SECONDS = 10
+
+
+def verification_success_text(patient_name: str) -> str:
+    return (
+        f"✅ 驗證成功！\n"
+        f"您已被設為 {patient_name} 的家人聯絡人。\n"
+        f"當有重要健康提醒時，您將收到通知。"
+    )
+
 
 class LineService:
     """LINE Messaging API wrapper for sending notifications to family contacts."""
@@ -46,6 +58,40 @@ class LineService:
             return {"sent": False, "error": f"LINE API {resp.status_code}: {resp.text}"}
         except Exception as exc:
             return {"sent": False, "error": str(exc)}
+
+    def reply_messages(self, reply_token: str, messages: list[dict]) -> dict:
+        """Answer an event with its reply token (free, not counted in the monthly quota).
+
+        Status is 'accepted' on 2xx, 'invalid_token' on 400 (used up, expired or wrong), else 'failed'.
+        Never raises, and never puts the token, the text or a LINE user id into its result.
+        """
+        if not LineService._available:
+            return {"status": "failed", "http_status": None, "request_id": None, "error": "LINE not configured"}
+        if not reply_token or not messages or len(messages) > MAX_REPLY_MESSAGES:
+            return {"status": "failed", "http_status": None, "request_id": None, "error": "bad_reply_request"}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        }
+        try:
+            resp = requests.post(LINE_REPLY_URL, json={"replyToken": reply_token, "messages": messages},
+                                 headers=headers, timeout=REPLY_TIMEOUT_SECONDS)
+        except Exception as exc:
+            return {"status": "failed", "http_status": None, "request_id": None, "error": type(exc).__name__}
+        request_id = resp.headers.get("x-line-request-id") or None
+        if 200 <= resp.status_code < 300:
+            return {"status": "accepted", "http_status": resp.status_code, "request_id": request_id, "error": None}
+        status = "invalid_token" if resp.status_code == 400 else "failed"
+        return {"status": status, "http_status": resp.status_code, "request_id": request_id,
+                "error": f"LINE reply {resp.status_code}"}
+
+    def reply_text(self, reply_token: str | None, to: str, message: str) -> dict:
+        """Reply with the event's token; on anything but 'accepted' (or without a token) push instead."""
+        if reply_token:
+            result = self.reply_messages(reply_token, [{"type": "text", "text": message}])
+            if result.get("status") == "accepted":
+                return {"sent": True, "replied": True, "message_id": result.get("request_id") or ""}
+        return self.send_text(to, message, kind=line_pause.OTHER)
 
     def push_messages(self, to: str, messages: list[dict], retry_key: str, *, kind: str) -> dict:
         """Push up to five messages with an idempotency key (used by the outbox dispatcher).
@@ -125,12 +171,7 @@ class LineService:
         return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_verification_success(self, to: str, patient_name: str) -> dict:
-        text = (
-            f"✅ 驗證成功！\n"
-            f"您已被設為 {patient_name} 的家人聯絡人。\n"
-            f"當有重要健康提醒時，您將收到通知。"
-        )
-        return self.send_text(to, text, kind=line_pause.OTHER)
+        return self.send_text(to, verification_success_text(patient_name), kind=line_pause.OTHER)
 
     def send_sync_success_to_patient(self, to: str, contact_name: str) -> dict:
         text = (

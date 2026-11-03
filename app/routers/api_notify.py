@@ -1,4 +1,5 @@
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -9,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_consented_user
-from app.services.line_service import LineService
+from app.services.line_service import LineService, verification_success_text
 from app.services import dose_confirmation, dose_safety, dose_video, line_pause, outbox
 from app.database import get_pool
 from pydantic import BaseModel
@@ -69,6 +70,7 @@ async def line_webhook(request: Request):
     Handle incoming messages from LINE bot.
     Caregivers send verification codes here to link their LINE user_id.
     """
+    received_at = datetime.datetime.now(datetime.timezone.utc)   # when we got it, never LINE's event timestamp
     raw_body = await request.body()
 
     # Verify X-Line-Signature before processing any events
@@ -98,6 +100,8 @@ async def line_webhook(request: Request):
                         conn,
                         (event.get("postback") or {}).get("data", ""),
                         (event.get("source") or {}).get("userId", ""),
+                        event.get("replyToken"),
+                        received_at=received_at,
                     )
                 if result is not None:
                     log.info("[LINE] postback applied: %s", result.get("status"))
@@ -123,6 +127,7 @@ async def line_webhook(request: Request):
 
         text = msg.get("text", "").strip().upper()
         line_user_id = event["source"].get("userId", "")
+        reply_token = event.get("replyToken")
 
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -156,15 +161,16 @@ async def line_webhook(request: Request):
                         'UPDATE "user" SET line_id = $1 WHERE u_id = $2',
                         line_user_id, row["u_id"],
                     )
-                    line_svc.send_text(
+                    line_svc.reply_text(
+                        reply_token,
                         line_user_id,
                         "✅ 連結成功！\n您的 LINE 已連結，將接收您的用藥提醒。\n"
                         "Your LINE is now linked to receive your medication reminders.",
-                        kind=line_pause.OTHER,
                     )
                 else:
                     # Family member verified
-                    line_svc.send_verification_success(line_user_id, patient_name)
+                    line_svc.reply_text(reply_token, line_user_id,
+                                        verification_success_text(patient_name))
                     # Notify patient that someone successfully synced with them
                     if patient and patient.get("line_id"):
                         line_svc.send_sync_success_to_patient(
@@ -172,10 +178,10 @@ async def line_webhook(request: Request):
                             row["name"],
                         )
             else:
-                line_svc.send_text(
+                line_svc.reply_text(
+                    reply_token,
                     line_user_id,
                     "驗證碼無效，請確認後重新輸入。/ Invalid verification code.",
-                    kind=line_pause.OTHER,
                 )
 
     return {"status": "ok"}
