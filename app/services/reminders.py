@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from app import config
 from app.database import get_pool
-from app.services import ai_settings, consent_service, context_info, dose_status, med_clips, outbox, reachy_tasks
+from app.services import ai_settings, consent_service, context_info, dose_status, line_pause, med_clips, outbox, reachy_tasks
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +166,11 @@ def sentence(kind: str, language: str, *, name: str | None = None, position: int
 def _mentions_medicine(text: str | None) -> bool:
     low = (text or "").lower()
     return any(word in low for word in MEDICINE_WORDS)
+
+
+def line_kind(text: str) -> str:
+    """The outbox kind of a reminder sent on LINE: a medicine reminder is the one the admin switch pauses."""
+    return line_pause.MED_REMINDER if _mentions_medicine(text) else "reminder"
 
 
 async def _resolve_medicine(conn, u_id: int, due: datetime, medication_name: str | None, position: int | None) -> dict:
@@ -342,7 +347,7 @@ async def _line(reminder_id: str, u_id: int, text: str) -> bool:
         line_id = await conn.fetchval(PATIENT_LINE_SQL, u_id)
         if not line_id:
             return False
-        return await outbox.enqueue(conn, u_id=u_id, recipient_line_id=line_id, kind="reminder", priority=0,
+        return await outbox.enqueue(conn, u_id=u_id, recipient_line_id=line_id, kind=line_kind(text), priority=0,
                                     messages=[{"type": "text", "text": text}], dedupe_key=f"reminder:{reminder_id}")
 
 

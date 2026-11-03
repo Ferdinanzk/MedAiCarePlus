@@ -34,7 +34,7 @@ def test_every_send_text_call_names_a_kind():
 
 
 def test_only_reminder_sends_use_med_reminder():
-    """Ruling R2: exactly two references, both in missed_dose_job.py (Task 3 widens this to reminders.py)."""
+    """Ruling R2: exactly two references in missed_dose_job.py, plus the one in reminders.py (line_kind)."""
     found = []
     for path in _files():
         if path == PAUSE_FILE:
@@ -44,7 +44,7 @@ def test_only_reminder_sends_use_med_reminder():
                (isinstance(node, ast.Attribute) and node.attr == "MED_REMINDER") or \
                (isinstance(node, ast.Constant) and node.value == "med_reminder"):
                 found.append(_rel(path))
-    assert sorted(found) == ["app/jobs/missed_dose_job.py"] * 2, found
+    assert sorted(found) == ["app/jobs/missed_dose_job.py"] * 2 + ["app/services/reminders.py"], found
 
 
 def test_send_text_refuses_med_reminder_while_paused(monkeypatch):

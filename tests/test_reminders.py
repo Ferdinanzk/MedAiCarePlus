@@ -372,3 +372,28 @@ def test_audio_needs_a_live_connection_and_caches_what_it_rendered(monkeypatch, 
     assert asyncio.run(reminders.audio("時間到了", "zh-TW")) == first and len(renders) == 1   # cached
     reminders._audio.clear()
     assert asyncio.run(reminders.audio("時間到了", "zh-TW")) == first and len(renders) == 1   # from disk
+
+
+# ── the LINE fallback and the admin switch for medication reminders ──
+
+def test_line_kind_by_text():
+    assert reminders.line_kind(reminders.sentence("medicine", "zh-TW")) == "med_reminder"
+    assert reminders.line_kind(reminders.sentence("named", "en", name="Adapalene")) == "med_reminder"
+    assert reminders.line_kind(reminders.sentence("named_position", "zh-TW", name="Adapalene", position=1)) == "med_reminder"
+    assert reminders.line_kind(reminders.sentence("plain", "zh-TW", what="打電話給女兒")) == "reminder"
+
+
+def test_line_fallback_enqueues_med_reminder_kind(monkeypatch):
+    conn = FireConn({})
+    conn.line = "U123"
+    enqueued = []
+
+    async def enqueue(c, **kwargs):
+        enqueued.append(kwargs)
+        return True
+
+    monkeypatch.setattr(reminders, "get_pool", lambda: Pool(conn))
+    monkeypatch.setattr(reminders.outbox, "enqueue", enqueue)
+    assert asyncio.run(reminders._line("r-1", 7, reminders.sentence("medicine", "zh-TW"))) is True
+    assert asyncio.run(reminders._line("r-2", 7, reminders.sentence("plain", "zh-TW", what="打電話給女兒"))) is True
+    assert [e["kind"] for e in enqueued] == ["med_reminder", "reminder"]
