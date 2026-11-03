@@ -131,3 +131,25 @@ def test_admin_user_ids_parsing(monkeypatch, caplog):
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+def _missed_alert_texts(**kwargs):
+    from app.services.line_service import LineService
+    service = LineService.__new__(LineService)
+    sent = []
+    service.send_text = lambda to, text, *, kind: sent.append((text, kind)) or {}
+    service.send_missed_dose_alert("UF", "Pearl", "Med 1", "2026-10-16 18:05", **kwargs)
+    return sent
+
+
+def test_missed_alert_to_family_says_when_reminders_were_paused(monkeypatch):
+    """Final review F2: family are told the patient got no LINE reminder; the alert itself is never paused."""
+    note = "（管理員已暫停 LINE 用藥提醒，Pearl 沒有收到 LINE 提醒。）"
+    ((text, kind),) = _missed_alert_texts()
+    assert note not in text and kind == line_pause.OTHER
+    monkeypatch.setitem(line_pause._state, "paused", True)
+    ((text, kind),) = _missed_alert_texts()
+    assert kind == line_pause.OTHER and note in text
+    assert text.index("預定時間：") < text.index(note) < text.index("請關心確認狀況。")
+    ((text, _),) = _missed_alert_texts(offline=True)
+    assert text.index("系統離線") < text.index(note)

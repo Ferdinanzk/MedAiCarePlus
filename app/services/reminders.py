@@ -309,7 +309,7 @@ async def fire(reminder_id: str) -> None:
         log.info("[REMINDER] %s handed to check-in task %s (the robot says it once it finds the patient)",
                  reminder_id[:8], task_id[:8])
         return
-    if await _line(reminder_id, u_id, text):
+    if await _line_if_allowed(reminder_id, u_id, text):
         await _mark(reminder_id, "fired", "line")
         return
     await _mark(reminder_id, "undelivered", None)
@@ -351,6 +351,13 @@ async def _line(reminder_id: str, u_id: int, text: str) -> bool:
                                     messages=[{"type": "text", "text": text}], dedupe_key=f"reminder:{reminder_id}")
 
 
+async def _line_if_allowed(reminder_id: str, u_id: int, text: str) -> bool:
+    """_line, unless the admin switch pauses this reminder: it then goes nowhere, so the caller marks it undelivered."""
+    if line_pause.blocks(line_kind(text)):
+        return False
+    return await _line(reminder_id, u_id, text)
+
+
 async def take_for_robot(reminder_id: str) -> dict | None:
     """The reminder a check-in task carries, for the relay or the text chat that opens it: its row while it still
     waits (queued_robot), else None (cancelled meanwhile, or already said)."""
@@ -387,7 +394,7 @@ async def sweep() -> dict:
             await _mark(reminder_id, "undelivered", None)
             counts["undelivered"] += 1
         elif row["status"] == "queued_robot" and row["fired_at"] and (now - row["fired_at"]).total_seconds() > ROBOT_WAIT_SECONDS:
-            if await _line(reminder_id, row["u_id"], row["text"]):
+            if await _line_if_allowed(reminder_id, row["u_id"], row["text"]):
                 await _mark(reminder_id, "fired", "line")
             else:
                 await _mark(reminder_id, "undelivered", None)

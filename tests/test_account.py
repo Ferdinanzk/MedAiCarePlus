@@ -267,6 +267,21 @@ def test_export_strips_the_robots_control_key():
     assert [row["status_detail"] for row in rows["reachy_device"][2:]] == [None, "[]"]
 
 
+def test_export_strips_the_reply_token_from_outbox_payloads():
+    """Final review F5: rows written before the dispatcher dropped the spent token still hold one."""
+    from app.routers import api_account
+    rows = {"notification_outbox": [
+        {"outbox_id": 1, "payload": json.dumps({"messages": [], "reply_token": "tok", "reply_until": "t"})},
+        {"outbox_id": 2, "payload": {"messages": [], "reply_token": "tok", "reply_until": "t"}},
+        {"outbox_id": 3, "payload": json.dumps({"messages": []})},
+        {"outbox_id": 4, "payload": None}]}
+    api_account._strip_secrets(rows)
+    assert "tok" not in json.dumps(rows)
+    assert json.loads(rows["notification_outbox"][0]["payload"]) == {"messages": [], "reply_until": "t"}
+    assert rows["notification_outbox"][1]["payload"] == {"messages": [], "reply_until": "t"}
+    assert json.loads(rows["notification_outbox"][2]["payload"]) == {"messages": []}
+
+
 def test_export_reads_dose_video_links_through_their_video():
     query = api_account.EXPORT_QUERIES["dose_video_link"]
     assert "JOIN dose_video v" in query and query.endswith("WHERE v.u_id=$1")

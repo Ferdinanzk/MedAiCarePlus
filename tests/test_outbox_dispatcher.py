@@ -50,6 +50,13 @@ class OutboxDB:
     def transaction(self):
         return _Transaction()
 
+    def _drop_token(self, query, outbox_id):
+        """The statement `payload = payload - 'reply_token'` (JSONB minus a key)."""
+        if "payload = payload - 'reply_token'" in query:
+            payload = json.loads(self.rows[outbox_id]["payload"])
+            payload.pop("reply_token", None)
+            self.rows[outbox_id]["payload"] = json.dumps(payload)
+
     async def fetch(self, query, *args):
         assert "FOR UPDATE SKIP LOCKED" in query
         now, limit = args
@@ -65,17 +72,20 @@ class OutboxDB:
             return "UPDATE"
         if "SET status='accepted'" in query:
             outbox_id, request_id, accepted_at = args
+            self._drop_token(query, outbox_id)
             row = self.rows[outbox_id]
             row.update(status="accepted", line_request_id=request_id, accepted_at=accepted_at,
                        attempts=row["attempts"] + 1, last_error=None)
             return "UPDATE"
         if "SET status='cancelled'" in query:
             outbox_id, error = args
+            self._drop_token(query, outbox_id)
             row = self.rows[outbox_id]
             row.update(status="cancelled", attempts=row["attempts"] + 1, last_error=error)
             return "UPDATE"
         if "SET status='failed'" in query:
             outbox_id, attempts, next_attempt_at, error = args
+            self._drop_token(query, outbox_id)
             self.rows[outbox_id].update(status="failed", attempts=attempts, next_attempt_at=next_attempt_at,
                                         last_error=error)
             return "UPDATE"
@@ -414,3 +424,28 @@ def test_old_reply_token_goes_by_push(db, monkeypatch):
     asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
     assert fake.replies == [] and len(fake.calls) == 1
     assert db.rows[row]["status"] == "accepted"
+
+
+def test_the_spent_reply_token_leaves_the_row_whatever_the_outcome(db, monkeypatch):
+    """Final review F5: the token is spent after the attempt, and rows go into account exports and backups."""
+    accepted = db.add(kind="dose_confirm_reply", reply_until=NOW + datetime.timedelta(seconds=30))
+    failed = db.add(kind="dose_confirm_reply", reply_until=NOW + datetime.timedelta(seconds=30))
+    fake = FakeLine(reply_results=[{"status": "accepted", "http_status": 200, "request_id": None, "error": None},
+                                   {"status": "invalid_token", "http_status": 400, "request_id": None,
+                                    "error": None}],
+                    results=[{"status": "failed", "http_status": 500, "request_id": None, "error": "boom"}])
+    _use_line(monkeypatch, fake)
+    monkeypatch.setattr(outbox_dispatcher, "_stopping", False)   # an earlier test's stop leaves it set
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert db.rows[accepted]["status"] == "accepted" and db.rows[failed]["status"] == "failed"
+    for row_id in (accepted, failed):
+        payload = json.loads(db.rows[row_id]["payload"])
+        assert "reply_token" not in payload and "tok-secret" not in db.rows[row_id]["payload"]
+        assert "reply_until" in payload and payload["messages"]
+
+
+def test_a_paused_row_loses_its_reply_token_too(db, monkeypatch, paused):
+    row = db.add(kind=line_pause.MED_REMINDER, reply_until=NOW - datetime.timedelta(seconds=1))   # token still stored
+    _use_line(monkeypatch, FakeLine())
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert db.rows[row]["status"] == "cancelled" and "reply_token" not in json.loads(db.rows[row]["payload"])

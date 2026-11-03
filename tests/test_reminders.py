@@ -397,3 +397,17 @@ def test_line_fallback_enqueues_med_reminder_kind(monkeypatch):
     assert asyncio.run(reminders._line("r-1", 7, reminders.sentence("medicine", "zh-TW"))) is True
     assert asyncio.run(reminders._line("r-2", 7, reminders.sentence("plain", "zh-TW", what="打電話給女兒"))) is True
     assert [e["kind"] for e in enqueued] == ["med_reminder", "reminder"]
+
+
+def test_a_medicine_reminder_is_undelivered_while_line_is_paused(firing, monkeypatch):
+    """Final review F6: no LINE call and no `fired`/`line` status while the switch is off; a plain reminder still
+    goes by LINE."""
+    from app.services import line_pause
+    monkeypatch.setitem(line_pause._state, "paused", True)
+    firing.conn.line = "U123"
+    asyncio.run(reminders.fire("r-1"))
+    assert firing.lines == [] and firing.conn.marks == [("undelivered", None)]
+    firing.conn.marks.clear()
+    firing.conn.row["text"] = reminders.sentence("plain", "zh-TW", what="打電話給女兒")
+    asyncio.run(reminders.fire("r-1"))
+    assert len(firing.lines) == 1 and firing.conn.marks == [("fired", "line")]

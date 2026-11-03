@@ -112,20 +112,20 @@ async def dispatch_once(now: datetime.datetime | None = None) -> int:
             if result.get("status") in ("accepted", "duplicate"):
                 await conn.execute(
                     "UPDATE notification_outbox SET status='accepted', line_request_id=$2, accepted_at=$3, "
-                    "attempts=attempts+1, last_error=NULL WHERE outbox_id=$1",
+                    "attempts=attempts+1, last_error=NULL, payload = payload - 'reply_token' WHERE outbox_id=$1",
                     row["outbox_id"], result.get("request_id"), finished)
             elif result.get("status") == "paused":
                 # A paused reminder is never sent later: cancelled for good, not retried
                 await conn.execute(
-                    "UPDATE notification_outbox SET status='cancelled', attempts=attempts+1, last_error=$2 "
-                    "WHERE outbox_id=$1", row["outbox_id"], "reminders_paused")
+                    "UPDATE notification_outbox SET status='cancelled', attempts=attempts+1, last_error=$2, "
+                    "payload = payload - 'reply_token' WHERE outbox_id=$1", row["outbox_id"], "reminders_paused")
             else:
                 attempts = row["attempts"] + 1
                 delay = backoff_seconds(attempts, row["priority"])
                 error = result.get("error") or f"LINE status {result.get('status')}"
                 await conn.execute(
                     "UPDATE notification_outbox SET status='failed', attempts=$2, next_attempt_at=$3, "
-                    "last_error=$4 WHERE outbox_id=$1",
+                    "last_error=$4, payload = payload - 'reply_token' WHERE outbox_id=$1",
                     row["outbox_id"], attempts, finished + datetime.timedelta(seconds=delay), error[:1000])
     return len(rows)
 

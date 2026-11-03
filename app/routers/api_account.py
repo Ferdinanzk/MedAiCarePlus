@@ -38,6 +38,17 @@ def _strip_secrets(account: dict) -> None:
                           ("dose_video_link", "token_sha256")):
         for row in account.get(table, []):
             row.pop(column, None)
+    for row in account.get("notification_outbox", []):
+        # A spent reply token (rows written before the dispatcher dropped it; asyncpg hands JSONB back as text).
+        payload = row.get("payload")
+        is_text = isinstance(payload, str)
+        try:
+            data = json.loads(payload) if is_text else payload
+        except ValueError:
+            continue
+        if isinstance(data, dict) and "reply_token" in data:
+            data = {key: value for key, value in data.items() if key != "reply_token"}
+            row["payload"] = json.dumps(data) if is_text else data
     for row in account.get("reachy_device", []):
         text = isinstance(row.get("status_detail"), str)   # asyncpg hands JSONB back as text
         detail = json.loads(row["status_detail"]) if text else row.get("status_detail")

@@ -827,6 +827,14 @@ The rules are in `CLAUDE.md` ("LINE reminder switch"); the plan is `docs/superpo
 | dfe38e2, 1368c34 | Admin routes (`api_line_admin.py`), `require_admin`, `LineService.quota()` |
 | e3541ab | Frontend: banner, admin card, API helper, i18n, `tests/line-admin.spec.ts` |
 
+**Final review fixes (4 Nov 2026, new commit on top of 7c0ce73).**
+- F1: the robot-offline notice no longer promises a LINE reminder while paused (`app/services/reachy_tasks.py:509`).
+- F2: the family missed-dose alert says when LINE reminders were paused (`app/services/line_service.py:172-185`).
+- F4: the webhook's synchronous LINE calls run in `asyncio.to_thread` (`app/routers/api_notify.py:174-195`).
+- F5: the outbox drops the spent `reply_token` in each outcome UPDATE (`app/services/outbox_dispatcher.py:115-128`) and the account export strips it from old rows (`app/routers/api_account.py:41`).
+- F6: a paused medicine reminder is `undelivered` (`app/services/reminders.py:312`, `:397`), and the patient's link reply says reminders are paused (`app/routers/api_notify.py:176-181`).
+- F3 is tests only: `SEND_KINDS` in `tests/test_reachy_tasks.py` pins which texts are `med_reminder`.
+
 **Decisions that differ from the plan.**
 - Admins are named by account number in `.env` `ADMIN_USER_IDS`, not by email (`ADMIN_EMAILS` in the plan and the design
   doc). `/api/auth/register` stores any email unverified, so an admin email nobody had registered could be claimed.

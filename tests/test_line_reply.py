@@ -178,3 +178,35 @@ def test_one_to_one_chat_still_uses_the_token(monkeypatch):
     event = {"type": "postback", "postback": {"data": "d"}, "replyToken": "RT",
              "source": {"type": "user", "userId": "U-x"}}
     assert _webhook(monkeypatch, [event]) == [("postback", "RT")]
+
+
+# ── Final review F4 / F6: the link reply ─────────────────────────────────────
+
+def _link_reply(monkeypatch, paused):
+    import threading
+    from app.services import line_pause
+    monkeypatch.setitem(line_pause._state, "paused", paused)
+    seen = []
+    monkeypatch.setattr(LineService, "reply_text",
+                        lambda self, token, to, text: seen.append((threading.get_ident(), text)) or {})
+    event = {"type": "message", "message": {"type": "text", "text": "abc123"}, "replyToken": "RT",
+             "source": {"type": "user", "userId": "U-x"}}
+    _webhook(monkeypatch, [event], row={"id": 1, "u_id": 7, "name": "Pearl", "relationship": "user"})
+    return seen, threading.get_ident()
+
+
+def test_the_webhook_calls_line_off_the_event_loop(monkeypatch):
+    """F4: reply_text is synchronous (requests, a 10 s reply and a 30 s push fallback); on the event loop it stalls the
+    robot's camera frames and live voice."""
+    seen, main = _link_reply(monkeypatch, paused=False)
+    assert len(seen) == 1 and seen[0][0] != main
+
+
+def test_the_link_reply_says_when_reminders_are_paused(monkeypatch):
+    seen, _ = _link_reply(monkeypatch, paused=False)
+    assert "（目前管理員已暫停 LINE 用藥提醒。）" not in seen[0][1] and "paused" not in seen[0][1]
+    seen, _ = _link_reply(monkeypatch, paused=True)
+    text = seen[0][1]
+    assert "將接收您的用藥提醒。（目前管理員已暫停 LINE 用藥提醒。）\n" in text
+    assert text.endswith("receive your medication reminders. (LINE medication reminders are paused by the admin "
+                         "right now.)")

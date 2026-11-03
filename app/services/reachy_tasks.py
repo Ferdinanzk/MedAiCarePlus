@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from app import config
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import ai_settings, consent_service, dose_safety, ocr_parsing, outbox, schedule
+from app.services import ai_settings, consent_service, dose_safety, line_pause, ocr_parsing, outbox, schedule
 
 log = logging.getLogger(__name__)
 
@@ -506,9 +506,17 @@ async def notify_robot_offline(conn, u_id: int, slot_time, now: datetime) -> int
         return 0
     name = await conn.fetchval('SELECT name FROM "user" WHERE u_id = $1', u_id) or ""
     slot = slot_label(slot_time)
-    text = (f"Reachy 目前離線，無法在 {slot} 協助 {name} 服藥。LINE 用藥提醒仍會照常發送，請確認機器人的電源與網路。\n"
-            f"Reachy is offline and could not help {name} with the {slot} medicines. "
-            f"The LINE reminder was still sent. Please check the robot's power and network.")
+    if line_pause.state()["paused"]:
+        # The admin switch is off: no LINE reminder went out, so the notice must not promise one.
+        text = (f"Reachy 目前離線，無法在 {slot} 協助 {name} 服藥。管理員已暫停 LINE 用藥提醒，這次不會用 LINE 提醒{name}，"
+                f"請直接提醒{name}服藥。請確認機器人的電源與網路。\n"
+                f"Reachy is offline and could not help {name} with the {slot} medicines. "
+                f"The admin has paused LINE medication reminders, so {name} gets no LINE reminder this time. "
+                f"Please remind {name} directly. Please check the robot's power and network.")
+    else:
+        text = (f"Reachy 目前離線，無法在 {slot} 協助 {name} 服藥。LINE 用藥提醒仍會照常發送，請確認機器人的電源與網路。\n"
+                f"Reachy is offline and could not help {name} with the {slot} medicines. "
+                f"The LINE reminder was still sent. Please check the robot's power and network.")
     window = int(now.timestamp() // OFFLINE_NOTICE_WINDOW_SECONDS)
     return await outbox.enqueue_to_contacts(
         conn, u_id, kind="robot_offline", priority=1, messages=[{"type": "text", "text": text}],

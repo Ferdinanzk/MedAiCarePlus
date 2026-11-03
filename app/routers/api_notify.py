@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -169,24 +170,30 @@ async def line_webhook(request: Request):
                         'UPDATE "user" SET line_id = $1 WHERE u_id = $2',
                         line_user_id, row["u_id"],
                     )
-                    line_svc.reply_text(
+                    paused = line_pause.state()["paused"]
+                    await asyncio.to_thread(
+                        line_svc.reply_text,
                         reply_token,
                         line_user_id,
-                        "✅ 連結成功！\n您的 LINE 已連結，將接收您的用藥提醒。\n"
-                        "Your LINE is now linked to receive your medication reminders.",
+                        "✅ 連結成功！\n您的 LINE 已連結，將接收您的用藥提醒。"
+                        + ("（目前管理員已暫停 LINE 用藥提醒。）" if paused else "") + "\n"
+                        "Your LINE is now linked to receive your medication reminders."
+                        + (" (LINE medication reminders are paused by the admin right now.)" if paused else ""),
                     )
                 else:
                     # Family member verified
-                    line_svc.reply_text(reply_token, line_user_id,
-                                        verification_success_text(patient_name))
+                    await asyncio.to_thread(line_svc.reply_text, reply_token, line_user_id,
+                                            verification_success_text(patient_name))
                     # Notify patient that someone successfully synced with them
                     if patient and patient.get("line_id"):
-                        line_svc.send_sync_success_to_patient(
+                        await asyncio.to_thread(
+                            line_svc.send_sync_success_to_patient,
                             patient["line_id"],
                             row["name"],
                         )
             else:
-                line_svc.reply_text(
+                await asyncio.to_thread(
+                    line_svc.reply_text,
                     reply_token,
                     line_user_id,
                     "驗證碼無效，請確認後重新輸入。/ Invalid verification code.",

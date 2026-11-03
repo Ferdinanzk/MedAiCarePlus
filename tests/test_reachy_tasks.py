@@ -21,7 +21,7 @@ import dose_facts  # noqa: E402
 
 from app import config  # noqa: E402
 from app.jobs import missed_dose_job, reachy_task_job  # noqa: E402
-from app.services import ai_settings, consent_service, dose_safety, outbox, reachy_tasks, schedule  # noqa: E402
+from app.services import ai_settings, consent_service, dose_safety, line_pause, outbox, reachy_tasks, schedule  # noqa: E402
 
 T0 = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)          # 08:00 in Taipei
 OPEN = ("queued", "leased", "searching", "in_progress")
@@ -848,6 +848,9 @@ class _ReminderPool:
         return _Acquire()
 
 
+SEND_KINDS = []   # (text, kind) of the patient texts the last _run_reminders / _run_at sent
+
+
 class _Line:
     def send_text(self, *args, **kw):
         pass
@@ -959,6 +962,7 @@ def test_upcoming_robot_task_waits_for_halfway_from_the_same_medicines_previous_
 def _run_reminders(monkeypatch, conn, enqueue=None):
     """check_missed_doses over `conn`; returns (the robot's dose lists, the patient's LINE texts)."""
     calls, sent = [], []
+    SEND_KINDS.clear()
 
     async def fake_enqueue(c, u_id, slot_time, intk_ids, reason, expires_at, at=None):
         calls.append(list(intk_ids))
@@ -966,7 +970,7 @@ def _run_reminders(monkeypatch, conn, enqueue=None):
             await enqueue(c)
 
     line = _Line()
-    line.send_text = lambda line_id, text, **kw: sent.append(text)
+    line.send_text = lambda line_id, text, **kw: (sent.append(text), SEND_KINDS.append((text, kw.get("kind"))))
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
     monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
     monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
@@ -1071,12 +1075,13 @@ def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE, held_now=()):
     conn = _FamilyConn(rows)
     conn.held_now = set(held_now)
     calls, sent, family = [], [], []
+    SEND_KINDS.clear()
 
     async def fake_enqueue(c, u_id, slot_time, intk_ids, reason, expires_at, at=None):
         calls.append((list(intk_ids), reason))
 
     line = _Line()
-    line.send_text = lambda line_id, text, **kw: sent.append(text)
+    line.send_text = lambda line_id, text, **kw: (sent.append(text), SEND_KINDS.append((text, kw.get("kind"))))
     line.send_missed_dose_alert = lambda *args, **kwargs: family.append((args, kwargs))
     monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
@@ -1127,6 +1132,33 @@ def test_a_slot_reached_on_time_keeps_its_last_retry_and_plain_missed_alerts(mon
     assert "請盡快服用" in retry and missed.startswith("❌ 用藥未完成") and "系統離線" not in missed
     ((args, kwargs),) = family
     assert kwargs == {"offline": False}
+
+
+def test_which_patient_texts_are_medication_reminders(monkeypatch):
+    """Final review F3: the fakes used to drop `kind`, so moving MED_REMINDER from the "take it now" text to the
+    missed text would have paused 「❌ 用藥未完成」 with every test green."""
+    now = datetime.now(timezone.utc)
+    slot = missed_dose_job._slot_key(now) + timedelta(minutes=5)
+    _run_reminders(monkeypatch, _ReminderConn(_reminder_rows(slot)))
+    ((text, kind),) = SEND_KINDS
+    assert text.startswith("🔔 用藥提醒") and kind == line_pause.MED_REMINDER == "med_reminder"
+    rows = _reminder_rows(SLOT_20, reminder_sent=True, retries_sent=2)
+    _run_at(monkeypatch, SLOT_20 + timedelta(minutes=30, seconds=20), rows)
+    (retry, retry_kind), (missed, missed_kind) = SEND_KINDS
+    assert retry.startswith("⚠️ 逾時用藥提醒") and retry_kind == "med_reminder"
+    assert missed.startswith("❌ 用藥未完成") and missed_kind == "other"
+
+
+def test_the_family_missed_alert_is_still_sent_while_paused(monkeypatch):
+    """F3: the alert to family is never paused, and it is sent as kind `other`."""
+    from app.services.line_service import LineService
+    monkeypatch.setitem(line_pause._state, "paused", True)
+    service = LineService.__new__(LineService)
+    kinds = []
+    monkeypatch.setattr(service, "send_text", lambda to, text, *, kind: kinds.append((text, kind)) or {})
+    service.send_missed_dose_alert("UF", "Pearl", "Med 1", "2026-10-16 18:05")
+    ((text, kind),) = kinds
+    assert kind == "other" and text.startswith("⚠️ 用藥提醒")
 
 
 def test_a_dose_back_from_family_confirmation_late_is_not_called_missed_while_offline(monkeypatch):
@@ -1632,6 +1664,21 @@ def test_while_the_robot_is_offline_a_meal_retry_holds_nothing_back(db, monkeypa
     assert notice["kind"] == "robot_offline" and "LINE 用藥提醒仍會照常發送" in notice["messages"][0]["text"]
     db.now = T0 + timedelta(minutes=20)
     assert _job_on(db, monkeypatch) == []   # online again: held, its retry counted
+
+
+def test_the_robot_offline_notice_says_the_reminder_is_paused_while_the_switch_is_off(db, monkeypatch):
+    """Final review F1: while the admin paused LINE reminders, the notice must not promise one."""
+    monkeypatch.setitem(line_pause._state, "paused", True)
+    task_id = enqueue(db)
+    run(reachy_tasks.lease_next(7, DEVICE, 0))
+    run(reachy_tasks.set_status(7, DEVICE, task_id, "aborted", {"reason": "robot_offline"}))
+    (notice,) = db.notices
+    text = notice["messages"][0]["text"]
+    assert "LINE 用藥提醒仍會照常發送" not in text and "The LINE reminder was still sent." not in text
+    assert "管理員已暫停 LINE 用藥提醒，這次不會用 LINE 提醒" in text and "請直接提醒" in text
+    assert "請確認機器人的電源與網路。" in text
+    assert "The admin has paused LINE medication reminders, so" in text and "gets no LINE reminder this time. Please remind" in text
+    assert "directly. Please check the robot's power and network." in text
 
 
 def test_a_meal_retry_whose_dose_expired_before_the_lease_is_cancelled(db, monkeypatch):

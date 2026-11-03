@@ -177,7 +177,9 @@ class LineService:
             f"{patient_name} 錯過了預定用藥\n"
             f"藥物：\n{medication_name}\n"
             f"預定時間：{scheduled_time}\n"
-            + ("（這段時間系統離線，沒能及時提醒。）\n" if offline else "") +
+            + ("（這段時間系統離線，沒能及時提醒。）\n" if offline else "")
+            + (f"（管理員已暫停 LINE 用藥提醒，{patient_name} 沒有收到 LINE 提醒。）\n"
+               if line_pause.state()["paused"] else "") +
             f"請關心確認狀況。"
         )
         return self.send_text(to, text, kind=line_pause.OTHER)
