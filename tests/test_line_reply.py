@@ -100,3 +100,81 @@ def test_postback_ack_carries_reply_token_others_do_not(clock):
     assert ack["payload"]["reply_until"] == (received + datetime.timedelta(seconds=50)).isoformat()
     others = [r for r in db.outbox if r["dedupe_key"].startswith("dose_confirm_answered:")]
     assert others and all("reply_token" not in r["payload"] and "reply_until" not in r["payload"] for r in others)
+
+
+# ── The reply token is used only in a one-to-one chat ────────────────────────
+
+def _webhook(monkeypatch, events, *, row=None):
+    import asyncio
+    import base64
+    import hashlib
+    import hmac
+    import json
+    from starlette.requests import Request
+    from app.routers import api_notify
+
+    calls = []
+
+    class Connection:
+        async def fetchrow(self, query, *args):
+            if "FROM family_contacts" in query:
+                return row
+            return {"name": "Pearl", "line_id": None}
+
+        async def execute(self, query, *args):
+            pass
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *args):
+            return False
+
+    service = LineService()
+    monkeypatch.setattr(LineService, "_available", True)
+    monkeypatch.setattr(service, "reply_messages",
+                        lambda token, messages: calls.append(("reply", token)) or {"status": "accepted"})
+    monkeypatch.setattr(service, "send_text",
+                        lambda to, message, *, kind: calls.append(("push", to)) or {"sent": True})
+
+    async def handle_postback(conn, data, sender, reply_token=None, received_at=None):
+        calls.append(("postback", reply_token))
+
+    monkeypatch.setattr(api_notify, "get_pool", lambda: types.SimpleNamespace(acquire=lambda: Acquire()))
+    monkeypatch.setattr(api_notify.LineService, "get_instance", classmethod(lambda cls: service))
+    monkeypatch.setattr(api_notify.dose_confirmation, "handle_postback", handle_postback)
+    monkeypatch.setattr(api_notify, "LINE_CHANNEL_SECRET", "secret")
+    body = json.dumps({"events": events}).encode()
+    signature = base64.b64encode(hmac.new(b"secret", body, hashlib.sha256).digest()).decode()
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({"type": "http", "headers": [(b"x-line-signature", signature.encode())]}, receive)
+    asyncio.run(api_notify.line_webhook(request))
+    return calls
+
+
+def _text(source_type):
+    return {"type": "message", "message": {"type": "text", "text": "nope"}, "replyToken": "RT",
+            "source": {"type": source_type, "userId": "U-x"}}
+
+
+def test_text_in_a_group_is_answered_by_push_not_reply(monkeypatch):
+    assert _webhook(monkeypatch, [_text("group")]) == [("push", "U-x")]
+
+
+def test_postback_in_a_room_gets_no_reply_token(monkeypatch):
+    event = {"type": "postback", "postback": {"data": "d"}, "replyToken": "RT",
+             "source": {"type": "room", "userId": "U-x", "roomId": "R"}}
+    assert _webhook(monkeypatch, [event]) == [("postback", None)]
+    event["source"] = {"userId": "U-x"}                     # no source type at all
+    assert _webhook(monkeypatch, [event]) == [("postback", None)]
+
+
+def test_one_to_one_chat_still_uses_the_token(monkeypatch):
+    assert _webhook(monkeypatch, [_text("user")]) == [("reply", "RT")]
+    event = {"type": "postback", "postback": {"data": "d"}, "replyToken": "RT",
+             "source": {"type": "user", "userId": "U-x"}}
+    assert _webhook(monkeypatch, [event]) == [("postback", "RT")]

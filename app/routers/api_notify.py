@@ -36,6 +36,14 @@ router = APIRouter(prefix="/api/notify", tags=["notify-api"])
 line_router = APIRouter(prefix="/line", tags=["line-webhook"])
 
 
+def _usable_reply_token(event: dict) -> str | None:
+    """A reply lands in the chat the event came from: use the token only in a one-to-one chat, so an answer
+    typed or pressed in a group or room is never shown to the whole group (it goes by push instead)."""
+    if (event.get("source") or {}).get("type") != "user":
+        return None
+    return event.get("replyToken")
+
+
 def _generate_code(length: int = 8) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
@@ -100,7 +108,7 @@ async def line_webhook(request: Request):
                         conn,
                         (event.get("postback") or {}).get("data", ""),
                         (event.get("source") or {}).get("userId", ""),
-                        event.get("replyToken"),
+                        _usable_reply_token(event),
                         received_at=received_at,
                     )
                 if result is not None:
@@ -127,7 +135,7 @@ async def line_webhook(request: Request):
 
         text = msg.get("text", "").strip().upper()
         line_user_id = event["source"].get("userId", "")
-        reply_token = event.get("replyToken")
+        reply_token = _usable_reply_token(event)
 
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
