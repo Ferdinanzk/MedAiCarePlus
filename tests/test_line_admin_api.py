@@ -82,9 +82,8 @@ class FakeResponse:
 def env(monkeypatch):
     conn = FakeConn()
     user = {"u_id": ADMIN_ID, "name": "Boss"}
-    monkeypatch.setattr(dependencies, "get_pool", lambda: FakePool(conn))
     monkeypatch.setattr(api_line_admin, "get_pool", lambda: FakePool(conn))
-    monkeypatch.setattr(dependencies, "ADMIN_EMAILS", frozenset({"boss@example.com"}))
+    monkeypatch.setattr(dependencies, "ADMIN_USER_IDS", frozenset({ADMIN_ID}))
     monkeypatch.setitem(line_pause._state, "paused", False)
     monkeypatch.setitem(line_pause._state, "since", None)
     monkeypatch.setitem(line_pause._state, "by", None)
@@ -143,14 +142,21 @@ def test_non_admin_gets_403(env):
 
 
 def test_no_admin_configured_is_403(env):
-    env.monkeypatch.setattr(dependencies, "ADMIN_EMAILS", frozenset())
+    env.monkeypatch.setattr(dependencies, "ADMIN_USER_IDS", frozenset())
     assert env.client.get("/api/admin/line").status_code == 403
-    env.monkeypatch.setattr(dependencies, "ADMIN_EMAILS", frozenset({""}))
-    env.conn.users[ADMIN_ID]["email"] = None
     response = env.client.put("/api/admin/line/reminders", json={"paused": True})
     assert response.status_code == 403 and response.json() == {"detail": "admin_only"}
-    env.conn.users[ADMIN_ID]["email"] = ""
+    assert line_pause.state()["paused"] is False and env.conn.log_rows == []
+
+
+def test_admin_email_alone_is_not_admin(env):
+    # An account whose email looks like an admin's but whose number is not listed (anyone can register any email)
+    env.user["u_id"] = OTHER_ID
+    env.conn.users[OTHER_ID]["email"] = "boss@example.com"
     assert env.client.get("/api/admin/line").status_code == 403
+    response = env.client.put("/api/admin/line/reminders", json={"paused": True})
+    assert response.status_code == 403 and response.json() == {"detail": "admin_only"}
+    assert env.conn.log_rows == []
 
 
 @pytest.mark.parametrize("value", ["true", 1, 0, None, "yes"])

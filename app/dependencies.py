@@ -1,8 +1,7 @@
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from itsdangerous import URLSafeTimedSerializer, BadSignature
-from app.config import SECRET_KEY, ADMIN_EMAILS
-from app.database import get_pool
+from app.config import SECRET_KEY, ADMIN_USER_IDS
 from app.services import consent_service
 
 security = HTTPBearer(auto_error=False)
@@ -35,9 +34,7 @@ async def get_consented_user(user: dict = Depends(get_current_user)) -> dict:
 
 
 async def require_admin(user: dict = Depends(get_consented_user)) -> dict:
-    """The LINE reminder switch's only gate: the account's email is listed in ADMIN_EMAILS (compared lower-cased)."""
-    async with get_pool().acquire() as conn:
-        email = await conn.fetchval('SELECT email FROM "user" WHERE u_id = $1', user["u_id"])
-    if not email or email.lower() not in ADMIN_EMAILS:
+    """The LINE reminder switch's only gate: the account number is listed in ADMIN_USER_IDS."""
+    if user["u_id"] not in ADMIN_USER_IDS:
         raise HTTPException(status_code=403, detail="admin_only")
     return user

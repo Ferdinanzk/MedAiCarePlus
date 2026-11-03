@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -71,8 +72,22 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"
 LINE_WEBHOOK_ENDPOINT_URL = "https://api.line.me/v2/bot/channel/webhook/endpoint"
-# Accounts (by email, comma-separated, compared lower-cased) that may switch LINE medication reminders off and on
-ADMIN_EMAILS = frozenset(e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip())
+def parse_admin_user_ids(raw: str) -> frozenset[int]:
+    """Account numbers (u_id), comma-separated; an entry that is not a positive whole number is ignored."""
+    ids = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.isascii() and entry.isdigit() and int(entry) > 0:
+            ids.add(int(entry))
+        else:
+            logging.getLogger(__name__).warning("ADMIN_USER_IDS: ignored an entry that is not an account number")
+    return frozenset(ids)
+
+
+# Accounts (by u_id) that may switch LINE medication reminders off and on. Not emails: registration does not verify them.
+ADMIN_USER_IDS = parse_admin_user_ids(os.getenv("ADMIN_USER_IDS", ""))
 
 # Dose videos for family (opt-in, consent kind 'video'). LINE has no upload API: the family's LINE app downloads
 # each clip from PUBLIC_BASE_URL (https). Empty = the address of the LINE webhook (scripts/line-tunnel.ps1 sets it).

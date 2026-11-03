@@ -112,12 +112,22 @@ def test_failed_write_leaves_memory_unchanged():
     assert line_pause.blocks("med_reminder") is False
 
 
-def test_admin_emails_parsing(monkeypatch):
+def test_admin_user_ids_parsing(monkeypatch, caplog):
     import importlib
     from app import config
-    monkeypatch.setenv("ADMIN_EMAILS", " A@x.com, ,b@Y.com ")
-    importlib.reload(config)
-    assert config.ADMIN_EMAILS == frozenset({"a@x.com", "b@y.com"})
-    monkeypatch.delenv("ADMIN_EMAILS")
-    importlib.reload(config)
-    assert config.ADMIN_EMAILS == frozenset()
+    try:
+        assert config.parse_admin_user_ids("7, 12") == frozenset({7, 12})
+        assert config.parse_admin_user_ids("") == frozenset()
+        with caplog.at_level("WARNING", logger="app.config"):
+            assert config.parse_admin_user_ids("abc, 0, -3, 5, 1.5, ") == frozenset({5})
+        warnings = [r.getMessage() for r in caplog.records if r.name == "app.config"]
+        assert warnings == ["ADMIN_USER_IDS: ignored an entry that is not an account number"] * 4
+        monkeypatch.setenv("ADMIN_USER_IDS", " 7 ,x, 12")
+        importlib.reload(config)
+        assert config.ADMIN_USER_IDS == frozenset({7, 12})
+        monkeypatch.delenv("ADMIN_USER_IDS")
+        importlib.reload(config)
+        assert config.ADMIN_USER_IDS == frozenset()
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
