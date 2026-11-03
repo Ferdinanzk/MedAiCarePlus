@@ -812,6 +812,47 @@ app 0.17.2 to the space's `main` (the dashboard still installs 0.15.0 from it: n
 
 ---
 
+## 14. The LINE medication-reminder switch (2-4 November 2026)
+
+An admin can pause the LINE medication reminders from the Settings page. Reachy still reminds on the robot, and every
+other LINE message still goes out. Branch `line-reminder-switch` from `983a6ba`, local commits only, nothing pushed.
+The rules are in `CLAUDE.md` ("LINE reminder switch"); the plan is `docs/superpowers/plans/2026-11-02-line-reminder-switch.md`.
+
+| Commit | What it does |
+|---|---|
+| b0bc725 | `app/services/line_pause.py`: the switch in memory, `ops_state` key `line_reminders_paused` (only while paused), table `line_switch_log`, loaded in the lifespan; an unreadable row keeps it paused |
+| 75873c4 | Every `send_text` / `push_messages` call needs `kind`; only the two `missed_dose_job.py` reminder texts are `med_reminder`; a paused outbox row becomes `cancelled` / `reminders_paused`; `tests/test_line_kinds.py` enforces both |
+| 0a55bdc | `reminders.line_kind`: a `set_reminder` medicine reminder on LINE is `med_reminder`, any other is `reminder` |
+| bd47ce1, 2ec260f | Free replies for the webhook's answers (`reply_messages`, `reply_text`, `reply_until` = receive time + 50 s, push fallback); a token is used only in a one-to-one chat |
+| dfe38e2, 1368c34 | Admin routes (`api_line_admin.py`), `require_admin`, `LineService.quota()` |
+| e3541ab | Frontend: banner, admin card, API helper, i18n, `tests/line-admin.spec.ts` |
+
+**Decisions that differ from the plan.**
+- Admins are named by account number in `.env` `ADMIN_USER_IDS`, not by email (`ADMIN_EMAILS` in the plan and the design
+  doc). `/api/auth/register` stores any email unverified, so an admin email nobody had registered could be claimed.
+- In a group or room the webhook answers by push, never by reply token, because a LINE reply is shown to the whole chat.
+- `received_at` is the server's own receive time, not LINE's event timestamp.
+
+**Checked:** backend gate at e3541ab: 3605 passed, 1 skipped. Frontend `tsc` and build, and `tests/line-admin.spec.ts`.
+semgrep was **not run** (not installed on this PC); the webhook and token code were not scanned.
+
+**Still to do (the real check, with the user's OK for LINE sends).**
+1. Rebuild with `.\scriptsebuild-app.ps1` only while no dose session runs; confirm `/health` answers and the
+   `[STARTUP]` lines show no FAILED. Not done yet.
+2. Put the admin's account number in `.env` `ADMIN_USER_IDS`, then `docker compose up -d app`. Not done yet.
+3. Pause from the card, give the patient a demo dose with a reminder due, and check `notification_outbox` and the job made
+   no medication-reminder request (`SELECT kind, status, last_error FROM notification_outbox ORDER BY outbox_id DESC LIMIT 5;`).
+4. Check a family confirmation still arrives on LINE and its answer comes back as a reply; resume from the card; record
+   the card's usage number before and after. Not done yet.
+
+**Open.**
+- `frontend_source/playwright.config.ts` points `testDir` at `../playwright_test`, which does not exist (before this
+  branch too), so `npx playwright test tests/<spec>` finds nothing without a config whose `testDir` is `./tests`.
+- Two live-voice tests in `reachy.spec.ts` (`:575`, `:599`) fail before and after this branch.
+- Merging or pushing the branch is the user's decision.
+
+---
+
 # History: handoff of 2 October 2026
 
 Kept as it was written. Parts of it are out of date (robot app version, SenseVoice, the publishing and
