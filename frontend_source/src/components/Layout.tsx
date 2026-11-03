@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import BottomNav from './BottomNav';
 import Sidebar from './Sidebar';
 import LanguageSwitcher from './LanguageSwitcher';
+import LinePausedBanner from './LinePausedBanner';
 import { faceLogout, type FaceAuthUser } from '../lib/face-auth';
 import { LogOut, Settings } from 'lucide-react';
 
@@ -68,6 +69,7 @@ export default function Layout({ faceUser }: LayoutProps) {
 
         {/* Page Content */}
         <main className="flex-1 px-4 py-6 pb-28 lg:px-6 lg:py-8 lg:pb-8 max-w-5xl mx-auto w-full">
+          <LinePausedBanner />
           <Outlet />
         </main>
 
