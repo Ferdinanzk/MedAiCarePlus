@@ -1,3 +1,5 @@
+import time
+
 import requests
 from typing import List
 from app.config import LINE_CHANNEL_ACCESS_TOKEN, LINE_API_URL
@@ -6,6 +8,10 @@ from app.services import line_pause
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 MAX_REPLY_MESSAGES = 5
 REPLY_TIMEOUT_SECONDS = 10
+QUOTA_URL = "https://api.line.me/v2/bot/message/quota"
+QUOTA_CONSUMPTION_URL = "https://api.line.me/v2/bot/message/quota/consumption"
+QUOTA_TIMEOUT_SECONDS = 10
+QUOTA_CACHE_SECONDS = 300
 
 
 def verification_success_text(patient_name: str) -> str:
@@ -84,6 +90,47 @@ class LineService:
         status = "invalid_token" if resp.status_code == 400 else "failed"
         return {"status": status, "http_status": resp.status_code, "request_id": request_id,
                 "error": f"LINE reply {resp.status_code}"}
+
+    _quota_cache: "tuple[float, dict] | None" = None
+
+    def quota(self) -> dict:
+        """This month's push limit and use: {"limit": int | None, "used": int | None, "error": str | None}.
+
+        limit None with error None means unlimited. A good answer is cached QUOTA_CACHE_SECONDS; a failure is not.
+        Never raises, and never puts the token or a response body into its result.
+        """
+        if not LineService._available:
+            return {"limit": None, "used": None, "error": "line_unavailable"}
+        cached = LineService._quota_cache
+        if cached and time.monotonic() - cached[0] < QUOTA_CACHE_SECONDS:
+            return dict(cached[1])
+        headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        try:
+            first = requests.get(QUOTA_URL, headers=headers, timeout=QUOTA_TIMEOUT_SECONDS)
+            if not 200 <= first.status_code < 300:
+                return {"limit": None, "used": None, "error": f"http_{first.status_code}"}
+            second = requests.get(QUOTA_CONSUMPTION_URL, headers=headers, timeout=QUOTA_TIMEOUT_SECONDS)
+            if not 200 <= second.status_code < 300:
+                return {"limit": None, "used": None, "error": f"http_{second.status_code}"}
+        except Exception:
+            return {"limit": None, "used": None, "error": "request_failed"}
+        try:
+            quota, usage = first.json(), second.json()
+            used = usage["totalUsage"]
+            if quota["type"] == "limited":
+                limit = quota["value"]
+            elif quota["type"] == "none":
+                limit = None
+            else:
+                raise ValueError(quota["type"])
+            if not isinstance(used, int) or isinstance(used, bool) or (
+                    limit is not None and (not isinstance(limit, int) or isinstance(limit, bool))):
+                raise ValueError("not a number")
+        except (ValueError, KeyError, TypeError):
+            return {"limit": None, "used": None, "error": "bad_response"}
+        result = {"limit": limit, "used": used, "error": None}
+        LineService._quota_cache = (time.monotonic(), result)
+        return dict(result)
 
     def reply_text(self, reply_token: str | None, to: str, message: str) -> dict:
         """Reply with the event's token; on anything but 'accepted' (or without a token) push instead."""
