@@ -56,6 +56,29 @@ PROMPT_MIN: float = _env_float("INTAKE_V1_PROMPT_MIN", 0.30)
 ADAPTIVE_MOUTH: bool = _env_flag("INTAKE_V1_ADAPTIVE_MOUTH", True)
 TONGUE_SUPPORT: bool = _env_flag("INTAKE_V1_TONGUE_SUPPORT", True)
 
+# ── Objects in the hand (services/landmarks/objects.py, robot frames) ────────
+# What a veto object at the mouth means for the event: "prompt" caps it at
+# uncertain (a one-tap question, never an auto-log); "drop" makes it no event.
+OBJECT_VETO_PROMPT = "prompt"
+OBJECT_VETO_DROP = "drop"
+VALID_OBJECT_VETOS = (OBJECT_VETO_PROMPT, OBJECT_VETO_DROP)
+
+
+def _env_object_veto() -> str:
+    raw = (os.getenv("INTAKE_OBJECT_VETO") or OBJECT_VETO_PROMPT).strip().lower()
+    return raw if raw in VALID_OBJECT_VETOS else OBJECT_VETO_PROMPT
+
+
+OBJECT_VETO: str = _env_object_veto()
+
+# The COCO labels that cannot be part of taking a pill. A cup or a bottle is
+# not one: pills are taken with water, sometimes straight from a cup.
+OBJECT_VETO_LABELS: frozenset = frozenset(
+    label.strip().lower()
+    for label in (os.getenv("INTAKE_OBJECT_VETO_LABELS") or "cell phone,remote,toothbrush").split(",")
+    if label.strip()
+)
+
 # ── Training corpus collection ───────────────────────────────────────────────
 COLLECT: bool = _env_flag("INTAKE_V1_COLLECT", True)
 

@@ -44,6 +44,7 @@ COPY models/face_recognition/ /models/face_recognition/
 COPY models/emotion_seed43/ /models/emotion_seed43/
 COPY models/landmarks/ /models/landmarks/
 COPY models/depth/ /models/depth/
+COPY models/objects/ /models/objects/
 
 # Copy built frontend from Stage 1
 COPY --from=frontend-builder /frontend/dist /app/static/web

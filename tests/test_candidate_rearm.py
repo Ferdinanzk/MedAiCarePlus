@@ -41,10 +41,11 @@ def _jpeg():
 JPEG = _jpeg()
 
 
-def _packet(frame_seq, timestamp, distance=None, owned=True, front=None):
+def _packet(frame_seq, timestamp, distance=None, owned=True, front=None, held=None):
     # The hand sits below the mouth (y 0.6), so the face is never "covered" and a candidate can become ready.
     # owned=False: no body for the face, so select_owned_observations can't tie the hand to the patient.
     # front: the depth model's reading of the hand against the face (a robot frame's hand_depth).
+    # held: what the object detector saw in the hand (hand_objects): a label, or "" for a checked empty hand.
     hand = None if distance is None else [distance / 4, 0.6]
     packet = {"frame_seq": frame_seq, "timestamp": float(timestamp), "width": 100, "height": 100,
               "faces": [{"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}],
@@ -53,18 +54,23 @@ def _packet(frame_seq, timestamp, distance=None, owned=True, front=None):
               "hands": [] if hand is None else [[hand] * 13]}
     if front is not None and hand is not None:
         packet["hand_depth"] = [{"face": 0, "front": front}]
+    if held is not None and hand is not None:
+        packet["hand_objects"] = [{"label": held or None}]
     return packet
 
 
-def _observations(detector, face_landmarks, hand_landmarks, width, height, hand_depth=None, **kwargs):
+def _observations(detector, face_landmarks, hand_landmarks, width, height, hand_depth=None, hand_objects=None,
+                  **kwargs):
     """build_temporal_observations with the geometry read from the packet: mouth open, a pinch, distance = 4 x,
-    and the depth reading's `front` when the packet carried one."""
+    the depth reading's `front` and the object detector's label when the packet carried them."""
     geometry = {"mouth_open": True, "mouth_open_ratio": .3, "mouth_open_baseline": .1, "mouth_open_delta": .2,
                 "mouth_opened_at": None, "mouth_motion_cycles": 0, "tongue_score": None, "tongue_quality": 0.0,
                 "tongue_frame_support": False}
     return geometry, [Observation(center=(hand[0]["x"], hand[0]["y"]), distance=hand[0]["x"] * 4, mouth_open=True,
                                   pinch=True, flat_palm=False, occlusion=0.0,
-                                  front=(hand_depth[index] or {}).get("front") if hand_depth else None)
+                                  front=(hand_depth[index] or {}).get("front") if hand_depth else None,
+                                  object_checked=bool(hand_objects) and isinstance(hand_objects[index], dict),
+                                  held_object=(hand_objects[index] or {}).get("label") if hand_objects else None)
                       for index, hand in enumerate(hand_landmarks)]
 
 
@@ -120,7 +126,7 @@ class _Run:
         self.seq = 0
         self.candidates = []   # event ids, in the order they appeared
 
-    async def frame(self, distance=None, vision=True, verified=True, owned=True, front=None):
+    async def frame(self, distance=None, vision=True, verified=True, owned=True, front=None, held=None):
         self.seq += 1
         self.clock.t += 1 / FPS
         state = self.state
@@ -129,7 +135,7 @@ class _Run:
             state.target_box = [0.1, 0.1, 0.4, 0.4]
         else:
             state.identity_hits, state.target_box = 0, None
-        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned, front))
+        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned, front, held))
         if vision and verified:
             result = await self.registry.vision(state, self.seq, JPEG, self.commits)
         candidate = state.candidate
@@ -575,3 +581,37 @@ def test_fingers_the_depth_model_saw_in_front_of_the_face_make_a_prompt_not_a_re
     run, summary = runs["at_lips"]
     assert summary["latest_result"]["depth_no_contact"] is False
     assert run.state.candidate["decision"] == "confirmed" and [method for _, method in run.commits.calls] == ["auto"]
+
+
+def test_a_phone_in_the_hand_makes_a_prompt_or_nothing_and_a_cup_changes_nothing(clock, monkeypatch):
+    """The robot's frames carry what the object detector saw in the hand (hand_objects,
+    services/landmarks/objects.py). A phone held through the contact keeps the detector's confirmed band, and the
+    policy caps the event at uncertain (INTAKE_OBJECT_VETO=prompt, the default) so an auto-commit session prompts
+    instead of recording; with INTAKE_OBJECT_VETO=drop the gesture makes no candidate at all. A cup is not a veto
+    object: the gesture records as before."""
+    from app.intake_v1 import config as policy_config
+
+    async def scenario(held):
+        run = _Run(clock, auto_commit=True)
+        await run.rest(1.0)
+        for distance in GESTURE:
+            await run.frame(distance, held=held)
+        return run, await clock.detector.get_session(7, run.state.detector_session_id)
+
+    run, summary = asyncio.run(scenario("cell phone"))
+    latest = summary["latest_result"]
+    assert latest["policy"]["detector_band"] == "confirmed" and latest["object_in_hand"] == "cell phone"
+    assert (latest["decision"], latest["decision_reason"]) == ("uncertain", "object_in_hand_needs_confirmation")
+    assert run.state.candidate["decision"] == "uncertain" and run.commits.calls == []
+    assert run.state.candidate["evidence"]["objects"]["object_in_hand"] == "cell phone"
+
+    run, summary = asyncio.run(scenario("cup"))
+    assert summary["latest_result"]["object_in_hand"] == "cup"
+    assert run.state.candidate["decision"] == "confirmed" and [method for _, method in run.commits.calls] == ["auto"]
+
+    monkeypatch.setattr(policy_config, "OBJECT_VETO", policy_config.OBJECT_VETO_DROP)
+    run, summary = asyncio.run(scenario("cell phone"))
+    # The gesture completed (the detector is in its cooldown) and the policy dropped it: no candidate, so the
+    # session kept detecting and the latest result is a later idle frame.
+    assert run.state.latest_detector["stage"] == "COOLDOWN"
+    assert run.candidates == [] and run.state.candidate is None and run.commits.calls == []

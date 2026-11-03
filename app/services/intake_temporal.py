@@ -51,6 +51,10 @@ class TemporalConfig:
     depth_front_threshold: float = 0.8
     depth_min_samples: int = 2
     depth_front_ratio: float = 0.6
+    # What the hand holds (services/landmarks/objects.py), read over the contact zone: with at least
+    # object_min_samples checked observations, the label seen in object_ratio or more of them is `object_in_hand`.
+    object_min_samples: int = 2
+    object_ratio: float = 0.5
 
 
 @dataclass
@@ -71,6 +75,8 @@ class Observation:
     contradiction: bool = False
     style: str = "unknown"
     front: Optional[float] = None   # hand depth against the face; None without the depth model
+    object_checked: bool = False    # the object detector ran on this frame
+    held_object: Optional[str] = None   # what it saw in this hand
 
     def __post_init__(self) -> None:
         if self.delivery_like is None:
@@ -119,6 +125,8 @@ class TemporalEvent:
     depth_samples: int = 0          # contact-zone observations with a depth reading
     depth_front_samples: int = 0    # of which the fingers were in front of the face
     depth_fronts: List[float] = field(default_factory=list)
+    object_samples: int = 0         # contact-zone observations the object detector checked
+    object_counts: Dict[str, int] = field(default_factory=dict)
 
 
 class TemporalIntakePipeline:
@@ -399,6 +407,10 @@ class TemporalIntakePipeline:
             event.depth_front_samples += int(obs.front >= self.config.depth_front_threshold)
             if len(event.depth_fronts) < 64:
                 event.depth_fronts.append(obs.front)
+        if obs.object_checked and event.contact_at is not None and obs.distance <= self.config.exit_distance:
+            event.object_samples += 1
+            if obs.held_object:
+                event.object_counts[obs.held_object] = event.object_counts.get(obs.held_object, 0) + 1
         if event.contact_at is None:
             event.pre_contact_mouth_open |= obs.mouth_open
         else:
@@ -499,6 +511,13 @@ class TemporalIntakePipeline:
         return (event.depth_samples >= self.config.depth_min_samples
                 and event.depth_front_samples >= self.config.depth_front_ratio * event.depth_samples)
 
+    def _object_in_hand(self, event: TemporalEvent) -> Optional[str]:
+        """The object the detector saw in the hand for most of the contact, or None."""
+        if event.object_samples < self.config.object_min_samples or not event.object_counts:
+            return None
+        label, count = max(event.object_counts.items(), key=lambda item: item[1])
+        return label if count >= self.config.object_ratio * event.object_samples else None
+
     def result(
         self,
         missing: Optional[str] = None,
@@ -575,4 +594,6 @@ class TemporalIntakePipeline:
             "depth_front_median": (round(sorted(event.depth_fronts)[len(event.depth_fronts) // 2], 4)
                                    if event.depth_fronts else None),
             "depth_no_contact": self._depth_no_contact(event),
+            "object_samples": event.object_samples,
+            "object_in_hand": self._object_in_hand(event),
         }

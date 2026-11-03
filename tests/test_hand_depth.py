@@ -137,7 +137,8 @@ def _engine(hand_near, depth_model, every=1):
     hand[0] = (45.0, 90.0, 0)
     vision = object.__new__(engine.VisionEngine)
     vision._executor = ThreadPoolExecutor(max_workers=4)
-    vision._depth, vision._depth_every, vision._depth_wanted, vision._frames = depth_model, every, False, 0
+    vision._depth, vision._depth_every, vision._objects, vision._objects_every = depth_model, every, None, 1
+    vision._near_face, vision._frames = False, 0
     vision.trackers = {"face": _Tracker([face]), "hand": _Tracker([hand]), "pose": _Tracker([])}
     return vision
 

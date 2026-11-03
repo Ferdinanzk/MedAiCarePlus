@@ -19,6 +19,13 @@ the gap. Such an event may prompt, never auto-log, in every mode.
 fingers in front of the face rather than at the lips for most of the contact
 (`intake_temporal.TemporalConfig`, the depth_* fields). Such an event may
 prompt, never auto-log, in every mode.
+
+`object_in_hand` (3 Nov 2026): on the robot's frames, the object detector saw
+this COCO object in the hand for most of the contact. One of
+`config.OBJECT_VETO_LABELS` (a phone, a remote, a toothbrush) is a veto: by
+`config.OBJECT_VETO` the event may prompt, never auto-log ("prompt", the
+default), or is no event at all ("drop"), in every mode. Any other object (a
+cup) changes nothing.
 """
 
 from __future__ import annotations
@@ -68,6 +75,7 @@ class PolicyOutcome:
     safety_contradiction: bool
     ownership_gap: bool = False
     depth_no_contact: bool = False
+    object_in_hand: Optional[str] = None
 
 
 def is_safety_contradiction(detector_reason: str, explicit: Optional[bool] = None) -> bool:
@@ -93,6 +101,8 @@ def decide(
     prompt_min: Optional[float] = None,
     ownership_gap: bool = False,
     depth_no_contact: bool = False,
+    object_in_hand: Optional[str] = None,
+    object_veto: Optional[str] = None,
 ) -> PolicyOutcome:
     """Re-band one detection event under the v1 policy.
 
@@ -102,6 +112,8 @@ def decide(
     mode = mode or config.MODE
     auto_confirm_min = config.AUTO_CONFIRM_MIN if auto_confirm_min is None else auto_confirm_min
     prompt_min = config.PROMPT_MIN if prompt_min is None else prompt_min
+    object_veto = object_veto or config.OBJECT_VETO
+    vetoed = bool(object_in_hand) and str(object_in_hand).lower() in config.OBJECT_VETO_LABELS
 
     def outcome(band: str, reason: str) -> PolicyOutcome:
         return PolicyOutcome(
@@ -115,12 +127,18 @@ def decide(
             safety_contradiction=safety_contradiction,
             ownership_gap=ownership_gap,
             depth_no_contact=depth_no_contact,
+            object_in_hand=object_in_hand or None,
         )
 
     # Invariant, checked first: an event the detector did not report is never
     # invented, in any mode.
     if rank(detector_band) == 0:
         return outcome(BAND_NONE, "detector_reported_no_event")
+
+    # A veto object in the hand through the contact (a phone, a remote, a
+    # toothbrush): with INTAKE_OBJECT_VETO=drop it is no event, in every mode.
+    if vetoed and object_veto == config.OBJECT_VETO_DROP:
+        return outcome(BAND_NONE, "object_in_hand_no_event")
 
     # Pass-through mode keeps v0 behaviour so the policy can be A/B'd or reverted
     # without a code change — except that a safety contradiction still blocks an
@@ -132,6 +150,8 @@ def decide(
             return outcome(BAND_UNCERTAIN, "ownership_gap_blocks_auto_confirm")
         if depth_no_contact and detector_band == BAND_CONFIRMED:
             return outcome(BAND_UNCERTAIN, "depth_no_contact_blocks_auto_confirm")
+        if vetoed and detector_band == BAND_CONFIRMED:
+            return outcome(BAND_UNCERTAIN, "object_in_hand_blocks_auto_confirm")
         return outcome(detector_band, "autonomous_passthrough")
 
     # Nothing auto-logs in manual-only mode; a real event still earns a prompt.
@@ -154,6 +174,10 @@ def decide(
     # The depth model saw the fingers in front of the face, not at the lips: a prompt at most.
     if depth_no_contact:
         return outcome(BAND_UNCERTAIN, "depth_no_contact_needs_confirmation")
+
+    # A veto object in the hand: a prompt at most.
+    if vetoed:
+        return outcome(BAND_UNCERTAIN, "object_in_hand_needs_confirmation")
 
     # Auto-confirm requires BOTH strong evidence and the detector's own top band.
     # Requiring the detector band keeps the invariant intact: a high-confidence
@@ -194,7 +218,8 @@ def apply_policy(result: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
         safety_contradiction=is_safety_contradiction(
             detector_reason, result.get("safety_contradiction")
         ),
-        **{"depth_no_contact": bool(result.get("depth_no_contact")), **overrides},
+        **{"depth_no_contact": bool(result.get("depth_no_contact")),
+           "object_in_hand": result.get("object_in_hand") or None, **overrides},
     )
 
     out = dict(result)

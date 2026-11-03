@@ -30,6 +30,7 @@ This document lists every model and decision algorithm in MedAiCarePlus: what ea
 | 4e | pose_detector.onnx | Person detection | MediaPipe pose detector (OpenCV Zoo export) | 1×3×224×224 | 2254 anchors × 12 + scores | ONNX Runtime CPU | laptop | `models/landmarks/` |
 | 4f | pose_landmarks_detector.onnx | 39 body points | MediaPipe pose landmark, lite | 1×256×256×3 | 195 values + heatmap, segmentation, world | ONNX Runtime CPU | laptop | `models/landmarks/` |
 | 4g | depth_anything_v2_small.onnx (optional, 3 Nov 2026) | Hand depth against the face: at the lips or in front of the face | Depth Anything V2 Small, DINOv2 ViT-S (ext) | 1×3×H×W, H and W multiples of 14 (long side 266) | H×W relative inverse depth | ONNX Runtime CPU, 4 threads | laptop (robot frames), every 3rd frame while a hand is near a face | `models/depth/` (not committed, see its README) |
+| 4h | yolox_s.onnx (optional, 3 Nov 2026; or yolox_tiny.onnx) | What the hand at the mouth holds: a phone, a cup, a toothbrush | YOLOX-S, COCO 80 classes (ext) | 1×3×640×640 BGR 0-255, letterboxed (tiny: 416) | 1×8400×85 (cx, cy, w, h, objectness, 80 scores) | ONNX Runtime CPU, 4 threads | laptop (robot frames), every 3rd frame while a hand is near a face | `models/objects/` (not committed, see its README) |
 | 5 | MediaPipe Tasks (3 models) | Face, hand, pose landmarks in the browser | same networks as 4a-4f, original TFLite | ≤ 640×480 video frame | landmarks | `@mediapipe/tasks-vision` 0.10.18, WASM, GPU or CPU | browser Web Worker | `frontend_source/public/models/*.task` |
 | 6 | Owned-hand association | Which hands belong to the verified patient | geometry rules | landmark packet + verified face box | ≤ 2 hands or skip | Python | laptop | `app/services/monitor_service.py:76-126` |
 | 7 | Pill-intake detector | Hand-to-mouth event | geometry features + temporal state machine, **no neural net** | owned face and hand landmarks with timestamps | none / uncertain 0.48 / confirmed 0.82 | Python | laptop | `app/services/intake_detection.py`, `app/services/intake_temporal.py` |
@@ -251,6 +252,18 @@ The landmarks say where a hand is in the image, not whether a hand that covers t
 - **Where it goes:** the packet's `hand_depth` list (in step with `hands`; `LandmarkPayload.hand_depth`, robot frames only), then the owned hands' entries ride with the detector payload (`monitor_service.landmarks`, `select_owned_observations` now also returns `hand_indices`), become `Observation.front` (`build_temporal_observations`), and are counted over the contact zone (section 7.3, `depth_no_contact`). The policy lets such an event prompt, never auto-log (section 8.1).
 - **Measured on the `C:\pilldetector` clips (33 clips, 3 Nov 2026):** the reading behaves like a depth sensor (a hand approaching reads 0.5-0.6, then 0.1-0.3 at the lips), but it does not separate the false alarms from real intakes: the cough has the hand on the mouth and the phone call has the hand on the cheek, both at the face's depth, and real intakes read the same or higher (up to 0.6 on the first contact frames). With `depth_front_threshold` 0.25 it vetoed both real auto-logs; at the shipped 0.8 it changes no verdict on these clips. Details in `C:\pilldetector\REPORT.md`.
 
+### 4.2 What the hand holds (optional, 3 Nov 2026)
+
+A phone held to the cheek, a cup or a toothbrush at the mouth makes the same hand-to-mouth geometry as a pill. `app/services/landmarks/objects.py` runs a COCO detector on the same frame and says which detected object each hand holds. A COCO detector cannot see a pill (no such class; a pill is a few pixels), so it only ever removes alerts.
+
+- **Model:** YOLOX from Megvii's release 0.1.1rc0 (Apache-2.0): `yolox_s.onnx` (640 px, 35,858,002 B) by default, `yolox_tiny.onnx` (416 px) accepted too; SHA-256 pinned in `LandmarkService` (`OBJECT_MODEL_SHA256`). Not committed (`models/objects/README.md`); without the file `LandmarkService` logs "hand objects off" and nothing changes.
+- **Config:** `OBJECT_MODEL_PATH`, `OBJECT_SCORE` (detection threshold, default 0.5) and `OBJECT_EVERY` (default 3) in `app/config.py`; `docker-compose.yml` sets the path.
+- **When it runs:** as the depth model (section 4.1): beside the trackers, on the frames after one with a hand near a face, every `OBJECT_EVERY`th such frame, on the whole frame. Measured in the app container on this laptop (4 threads): yolox_s about 170 ms, yolox_tiny about 50 ms, yolox_nano about 20 ms. On the `C:\pilldetector` clips only yolox_s saw the phone reliably (0.7-0.8); tiny saw it at 0.46 in one frame of two, and nano put a false phone on a pill hand.
+- **Pre- and post-processing** follow the YOLOX ONNX demo: letterbox to the input size with 114, BGR 0-255, no normalisation; the output's cell offsets and strides (8, 16, 32) are applied, scores are objectness × class, class-agnostic NMS at IoU 0.45. Only the `WATCHED` labels are kept (phone, remote, toothbrush, cup, bottle, wine glass, bowl, fork, knife, spoon, scissors, hair drier, book), with boxes normalised to the frame.
+- **Which hand holds what** (`held_objects`): each hand's box (the 13 points, grown by 25 %, at least 2 % of the frame) against each object's box; an overlap of at least 30 % of the smaller box counts, the largest wins. The packet carries `objects` (the frame's detections) and `hand_objects` (in step with `hands`: `{"label", "score"}` or `{"label": None}`); `LandmarkPayload` accepts both, robot frames only.
+- **Where it goes:** the owned hands' entries ride with the detector payload (`monitor_service.landmarks`), become `Observation.held_object` / `object_checked` (`build_temporal_observations`), and are counted over the contact zone (section 7.3, `object_in_hand`). The policy (section 8.1) makes a veto object a prompt at most, or no event (`INTAKE_OBJECT_VETO`).
+- **Measured on the `C:\pilldetector` clips (3 Nov 2026):** the phone call (`f_w1`) is read as `cell phone` through its contact; with `INTAKE_OBJECT_VETO=prompt` (the default) its verdict stays a prompt, with `drop` it becomes no event. No other verdict changes. Details in `C:\pilldetector\REPORT.md`.
+
 ## 5. Browser landmark models (MediaPipe Tasks)
 
 - **Library:** `@mediapipe/tasks-vision` 0.10.18 (`frontend_source/package.json:13`). WASM runtime and models are served locally from `/wasm` and `/models` (`frontend_source/src/workers/monitorWorker.ts:21-34`).
@@ -392,6 +405,8 @@ Detector session store (in memory): 600 frames, 5 min active TTL, 15 min complet
 
 **Hand depth evidence** (3 Nov 2026, robot frames with the depth model, section 4.1): `_accumulate` counts the observations in the contact zone (after the first contact, distance ≤ `exit_distance`) that carry a `front`, and how many of them are at or above `depth_front_threshold` (0.8). With at least `depth_min_samples` (2) readings of which `depth_front_ratio` (0.6) or more are in front, the result says `depth_no_contact` (also `depth_samples` and `depth_front_median`). The band and confidence above are unchanged; the policy caps such an event at `uncertain`.
 
+**Object evidence** (3 Nov 2026, robot frames with the object detector, section 4.2): the same way, `_accumulate` counts the contact-zone observations the detector checked (`object_checked`) and what it saw in the hand (`held_object`). With at least `object_min_samples` (2) checked observations, the label seen in `object_ratio` (0.5) or more of them is the result's `object_in_hand` (also `object_samples`). The band and confidence are unchanged; the policy decides what a veto object means.
+
 ### 7.4 Calibration notes and limitations
 
 - **The confidences are fixed band values, not calibrated probabilities** (`app/services/dose_report.py:3-5`). Live output is only 0.82, 0.48 or none.
@@ -417,6 +432,7 @@ Detector session store (in memory): 600 frames, 5 min active TTL, 15 min complet
 - confidence < 0.30 → `none`;
 - a safety contradiction → `uncertain`;
 - an event that crossed an ownership gap (section 6, `ownership_gap`) or whose contact the depth model read as in front of the face (section 4.1, `depth_no_contact`) → `uncertain` (3 Nov 2026; in autonomous mode these block the auto-confirm the same way);
+- an event whose hand held a veto object through the contact (section 4.2, `object_in_hand` in `OBJECT_VETO_LABELS`: `cell phone`, `remote`, `toothbrush` by default, `INTAKE_OBJECT_VETO_LABELS`) → `uncertain` with `INTAKE_OBJECT_VETO=prompt` (the default; blocks the auto-confirm in autonomous mode too), or `none` with `INTAKE_OBJECT_VETO=drop`, in every mode (3 Nov 2026). A cup or a bottle is deliberately not a veto: pills are taken with water;
 - the detector said `confirmed` and confidence ≥ 0.75 → `confirmed`;
 - otherwise → `uncertain`.
 

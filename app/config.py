@@ -35,6 +35,15 @@ DEPTH_MODEL_PATH = Path(os.getenv(
 DEPTH_INPUT_SIZE = int(os.getenv("DEPTH_INPUT_SIZE", "") or "266")
 DEPTH_EVERY = int(os.getenv("DEPTH_EVERY", "") or "3")
 
+# COCO object detector for what the hand at the mouth holds (services/landmarks/objects.py). Optional: a missing
+# file turns it off. OBJECT_SCORE is the detection threshold; OBJECT_EVERY as DEPTH_EVERY.
+OBJECT_MODEL_PATH = Path(os.getenv(
+    "OBJECT_MODEL_PATH",
+    str(_HERE / "models" / "objects" / "yolox_s.onnx")
+))
+OBJECT_SCORE = float(os.getenv("OBJECT_SCORE", "") or "0.5")
+OBJECT_EVERY = int(os.getenv("OBJECT_EVERY", "") or "3")
+
 YOLO_MODEL_PATH = Path(os.getenv(
     "YOLO_MODEL_PATH",
     str(_AI_ROOT / "segmentation" / "prescription_best_100_epo.pt")

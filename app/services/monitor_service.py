@@ -288,6 +288,8 @@ EVIDENCE_KEYS = {
                    "withdrawal_contribution", "fingertip_delivery_contribution"),
     # The depth model's reading of the contact (robot frames; services/landmarks/depth.py, intake_temporal.py)
     "depth": ("depth_front_median", "depth_samples", "depth_no_contact"),
+    # What the hand held through the contact (robot frames; services/landmarks/objects.py)
+    "objects": ("object_in_hand", "object_samples"),
 }
 
 
@@ -621,6 +623,11 @@ class MonitorRegistry:
                 # with hand_landmarks (services/landmarks/depth.py).
                 payload["hand_depth"] = [hand_depth[index] if index < len(hand_depth) else None
                                          for index in selected["hand_indices"]]
+            hand_objects = packet.get("hand_objects")
+            if hand_objects is not None:
+                # Robot frames with the object detector: what each owned hand holds (services/landmarks/objects.py).
+                payload["hand_objects"] = [hand_objects[index] if index < len(hand_objects) else None
+                                           for index in selected["hand_indices"]]
             result = await IntakeDetectionService.get_instance().process_frame(
                 state.u_id, state.detector_session_id, payload,
                 result_transform=partial(apply_policy, ownership_gap=state.event_ownership_gap))

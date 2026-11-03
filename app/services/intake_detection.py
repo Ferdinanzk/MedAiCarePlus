@@ -1138,11 +1138,14 @@ def build_temporal_observations(
     temporal_stage: str = "CALIBRATING",
     mouth_cues: Optional[dict] = None,
     hand_depth: Optional[List[Optional[dict]]] = None,
+    hand_objects: Optional[List[Optional[dict]]] = None,
 ) -> Tuple[dict, List[Observation]]:
     """Convert raw MediaPipe landmarks into the live temporal contract.
 
     `hand_depth`, in step with `hand_landmarks`, is the depth model's reading of each hand against the face
     (services/landmarks/depth.py, robot frames only): its `front` becomes the observation's `front`.
+    `hand_objects`, the same way, is what the object detector saw in each hand ({"label": None} when nothing;
+    services/landmarks/objects.py): the observation's `held_object`, with `object_checked` when it ran.
     """
     mouth_geom = detector.compute_mouth_geometry(face_landmarks, width, height)
     hand_features = []
@@ -1155,6 +1158,10 @@ def build_temporal_observations(
         depth = hand_depth[position] if hand_depth and position < len(hand_depth) else None
         front = depth.get("front") if isinstance(depth, dict) else None
         features["front"] = float(front) if isinstance(front, (int, float)) and math.isfinite(front) else None
+        held = hand_objects[position] if hand_objects and position < len(hand_objects) else None
+        features["object_checked"] = isinstance(held, dict)
+        label = held.get("label") if isinstance(held, dict) else None
+        features["held_object"] = str(label) if label else None
         hand_features.append(features)
 
     cues = mouth_cues if isinstance(mouth_cues, dict) else {}
@@ -1223,6 +1230,8 @@ def build_temporal_observations(
             contradiction=flat_cover or palm_touch,
             style=style,
             front=features["front"],
+            object_checked=features["object_checked"],
+            held_object=features["held_object"],
         ))
     return mouth_geom, observations
 
@@ -1473,6 +1482,7 @@ class IntakeDetectionService:
             "mouth_motion_cycles", "tongue_score", "tongue_quality",
             "tongue_peak_score", "tongue_support",
             "depth_samples", "depth_front_median", "depth_no_contact",
+            "object_in_hand", "object_samples",
         )
         compact = {name: deepcopy(result.get(name)) for name in fields if name in result}
         policy = result.get("policy")
@@ -1611,6 +1621,7 @@ class IntakeDetectionService:
             temporal_stage=pipeline.event.stage.value,
             mouth_cues=payload.get("mouth_cues"),
             hand_depth=payload.get("hand_depth"),
+            hand_objects=payload.get("hand_objects"),
         )
 
         result = pipeline.process(timestamp, True, observations)
