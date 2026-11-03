@@ -849,7 +849,7 @@ class _ReminderPool:
 
 
 class _Line:
-    def send_text(self, *args):
+    def send_text(self, *args, **kw):
         pass
 
     def send_missed_dose_alert(self, *args, **kwargs):
@@ -914,7 +914,7 @@ def test_reminder_further_ahead_than_the_early_window_sends_line_but_no_robot_ta
         calls.append(args)
 
     line = _Line()
-    line.send_text = lambda *args: sent.append(args)
+    line.send_text = lambda *args, **kw: sent.append(args)
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
     monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
     monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
@@ -945,7 +945,7 @@ def test_upcoming_robot_task_waits_for_halfway_from_the_same_medicines_previous_
         calls.append(args)
 
     line = _Line()
-    line.send_text = lambda *args: sent.append(args)
+    line.send_text = lambda *args, **kw: sent.append(args)
     monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
     monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
@@ -966,7 +966,7 @@ def _run_reminders(monkeypatch, conn, enqueue=None):
             await enqueue(c)
 
     line = _Line()
-    line.send_text = lambda line_id, text: sent.append(text)
+    line.send_text = lambda line_id, text, **kw: sent.append(text)
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
     monkeypatch.setattr(missed_dose_job, "enqueue_reachy_task", fake_enqueue)
     monkeypatch.setattr(missed_dose_job.LineService, "get_instance", classmethod(lambda cls: line))
@@ -1076,7 +1076,7 @@ def _run_at(monkeypatch, moment, rows, last_run=_A_MINUTE_BEFORE, held_now=()):
         calls.append((list(intk_ids), reason))
 
     line = _Line()
-    line.send_text = lambda line_id, text: sent.append(text)
+    line.send_text = lambda line_id, text, **kw: sent.append(text)
     line.send_missed_dose_alert = lambda *args, **kwargs: family.append((args, kwargs))
     monkeypatch.setattr(missed_dose_job, "datetime", _Clock)
     monkeypatch.setattr(missed_dose_job, "get_pool", lambda: _ReminderPool(conn))
@@ -1151,7 +1151,7 @@ def test_the_family_alert_says_the_dose_was_missed_while_the_system_was_offline(
 
     sent = []
     svc = LineService.__new__(LineService)
-    svc.send_text = lambda to, text: sent.append(text) or {}
+    svc.send_text = lambda to, text, **kw: sent.append(text) or {}
     svc.send_missed_dose_alert("UF", "Pearl", "Med 101", "2026-10-16 18:05", offline=True)
     svc.send_missed_dose_alert("UF", "Pearl", "Med 101", "2026-10-16 18:05")
     offline, plain = sent
@@ -1284,7 +1284,7 @@ def _job_on(db, monkeypatch, online=True):
     db.devices[7]["last_seen_at"] = db.now - timedelta(seconds=10 if online else 120)
     sent = []
     line = _Line()
-    line.send_text = lambda line_id, text: sent.append(text)
+    line.send_text = lambda line_id, text, **kw: sent.append(text)
 
     class _Clock(datetime):
         @classmethod

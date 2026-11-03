@@ -8,6 +8,7 @@ crash between commit and send is de-duplicated by LINE (409 → accepted).
 
 import asyncio
 import datetime
+import functools
 import json
 import uuid
 
@@ -54,7 +55,8 @@ async def _send(row) -> dict:
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
-            None, service.push_messages, row["recipient_line_id"], payload["messages"], retry_key(row["outbox_id"]))
+            None, functools.partial(service.push_messages, row["recipient_line_id"], payload["messages"],
+                                    retry_key(row["outbox_id"]), kind=row["kind"]))
     except Exception as exc:
         return {"status": "failed", "http_status": None, "request_id": None, "error": str(exc)}
 
@@ -67,7 +69,7 @@ async def dispatch_once(now: datetime.datetime | None = None) -> int:
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch(
-                "SELECT outbox_id, recipient_line_id, priority, payload, attempts FROM notification_outbox "
+                "SELECT outbox_id, recipient_line_id, priority, kind, payload, attempts FROM notification_outbox "
                 "WHERE status IN ('queued','failed') AND next_attempt_at <= $1 "
                 "ORDER BY priority, next_attempt_at, outbox_id LIMIT $2 FOR UPDATE SKIP LOCKED",   # same time: queue order
                 now, BATCH_SIZE)
@@ -93,6 +95,11 @@ async def dispatch_once(now: datetime.datetime | None = None) -> int:
                     "UPDATE notification_outbox SET status='accepted', line_request_id=$2, accepted_at=$3, "
                     "attempts=attempts+1, last_error=NULL WHERE outbox_id=$1",
                     row["outbox_id"], result.get("request_id"), finished)
+            elif result.get("status") == "paused":
+                # A paused reminder is never sent later: cancelled for good, not retried
+                await conn.execute(
+                    "UPDATE notification_outbox SET status='cancelled', attempts=attempts+1, last_error=$2 "
+                    "WHERE outbox_id=$1", row["outbox_id"], "reminders_paused")
             else:
                 attempts = row["attempts"] + 1
                 delay = backoff_seconds(attempts, row["priority"])

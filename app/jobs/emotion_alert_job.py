@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from app.database import get_pool
+from app.services import line_pause
 from app.services.line_service import LineService
 
 
@@ -74,6 +75,7 @@ async def check_negative_emotions():
                         f"我們檢測到您今天的情緒較低落 ({row['emotion_type']})。\n"
                         f"請多加關注自己的身心狀況，適時休息或與家人聊聊。"
                     ),
+                    kind=line_pause.OTHER,
                 )
                 await conn.execute(
                     "INSERT INTO notification (u_id, category, type, message) VALUES ($1, 'user', 'emotion_alert', $2)",

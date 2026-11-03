@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import dose_safety, schedule
+from app.services import dose_safety, line_pause, schedule
 from app.services.line_service import LineService
 from app.services.reachy_tasks import enqueue_reachy_task, meal_retry_waiting_sql
 
@@ -194,7 +194,7 @@ async def check_missed_doses():
                 if patient_line_id and due_rows:
                     msg = _reminder_text("🔔 用藥提醒", f"您預定於 {slot_label} 服用以下藥物：", "請準時服用。",
                                          names, held)
-                    line_svc.send_text(patient_line_id, msg)
+                    line_svc.send_text(patient_line_id, msg, kind=line_pause.MED_REMINDER)
                     await conn.execute(
                         "INSERT INTO notification (u_id, category, type, message) "
                         "VALUES ($1, 'user', 'upcoming_reminder', $2)",
@@ -221,7 +221,7 @@ async def check_missed_doses():
                     if patient_line_id and due_rows:
                         msg = _reminder_text("⚠️ 逾時用藥提醒", f"您已逾時 {time_passed_mins} 分鐘未服用以下藥物：",
                                              "請盡快服用。", names, held)
-                        line_svc.send_text(patient_line_id, msg)
+                        line_svc.send_text(patient_line_id, msg, kind=line_pause.MED_REMINDER)
                         await conn.execute(
                             "INSERT INTO notification (u_id, category, type, message) "
                             "VALUES ($1, 'user', 'missed_reminder', $2)",
@@ -287,7 +287,7 @@ async def check_missed_doses():
                             f"時間：{local_slot.strftime('%Y-%m-%d %H:%M')}\n"
                             f"系統已通知您的家人聯絡人。"
                         )
-                        line_svc.send_text(patient_line_id, msg)
+                        line_svc.send_text(patient_line_id, msg, kind=line_pause.OTHER)
                         await conn.execute(
                             "INSERT INTO notification (u_id, category, type, message) "
                             "VALUES ($1, 'user', 'missed_alert', $2)",

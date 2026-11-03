@@ -11,7 +11,7 @@ _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
 sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
-from app.services import line_service, outbox, outbox_dispatcher
+from app.services import line_pause, line_service, outbox, outbox_dispatcher
 
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 9, 30, 8, 0, tzinfo=UTC)
@@ -33,14 +33,14 @@ class OutboxDB:
         self.next_id = 1
 
     def add(self, *, priority=1, status="queued", attempts=0, next_attempt_at=NOW, line_id="U-family",
-            messages=None):
+            messages=None, kind="other"):
         outbox_id = self.next_id
         self.next_id += 1
         self.rows[outbox_id] = {
             "outbox_id": outbox_id, "recipient_line_id": line_id, "priority": priority,
             "payload": json.dumps({"messages": messages or [{"type": "text", "text": f"m{outbox_id}"}]}),
             "status": status, "attempts": attempts, "next_attempt_at": next_attempt_at,
-            "line_request_id": None, "last_error": None, "accepted_at": None,
+            "line_request_id": None, "last_error": None, "accepted_at": None, "kind": kind,
         }
         return outbox_id
 
@@ -65,6 +65,11 @@ class OutboxDB:
             row = self.rows[outbox_id]
             row.update(status="accepted", line_request_id=request_id, accepted_at=accepted_at,
                        attempts=row["attempts"] + 1, last_error=None)
+            return "UPDATE"
+        if "SET status='cancelled'" in query:
+            outbox_id, error = args
+            row = self.rows[outbox_id]
+            row.update(status="cancelled", attempts=row["attempts"] + 1, last_error=error)
             return "UPDATE"
         if "SET status='failed'" in query:
             outbox_id, attempts, next_attempt_at, error = args
@@ -106,8 +111,11 @@ class FakeLine:
         self.calls = []
         self.results = list(results or [])
 
-    def push_messages(self, to, messages, retry_key):
+    def push_messages(self, to, messages, retry_key, *, kind):
+        if line_pause.blocks(kind):
+            return {"status": "paused", "http_status": None, "request_id": None, "error": "reminders_paused"}
         self.calls.append((to, messages, retry_key))
+        self.kinds = getattr(self, "kinds", []) + [kind]
         if self.results:
             result = self.results.pop(0)
             if isinstance(result, BaseException):
@@ -239,9 +247,9 @@ def test_stop_request_releases_unsent_claimed_rows(db, monkeypatch):
     second = db.add()
 
     class StoppingLine(FakeLine):
-        def push_messages(self, to, messages, retry_key):
+        def push_messages(self, to, messages, retry_key, *, kind):
             outbox_dispatcher._stopping = True
-            return super().push_messages(to, messages, retry_key)
+            return super().push_messages(to, messages, retry_key, kind=kind)
 
     fake = StoppingLine()
     _use_line(monkeypatch, fake)
@@ -305,18 +313,18 @@ def test_push_messages_sends_retry_key_and_maps_statuses(monkeypatch):
     service = line_service.LineService.__new__(line_service.LineService)
     messages = [{"type": "text", "text": "hi"}]
 
-    first = service.push_messages("U1", messages, "key-1")
+    first = service.push_messages("U1", messages, "key-1", kind="other")
     assert first == {"status": "accepted", "http_status": 200, "request_id": "r1", "error": None}
     assert sent[0][0] == line_service.LINE_API_URL
     assert sent[0][1] == {"to": "U1", "messages": messages}
     assert sent[0][2]["X-Line-Retry-Key"] == "key-1"
     assert sent[0][2]["Authorization"] == "Bearer token"
 
-    duplicate = service.push_messages("U1", messages, "key-1")
+    duplicate = service.push_messages("U1", messages, "key-1", kind="other")
     assert duplicate["status"] == "duplicate"
     assert duplicate["request_id"] == "r1"
 
-    failed = service.push_messages("U1", messages, "key-2")
+    failed = service.push_messages("U1", messages, "key-2", kind="other")
     assert failed["status"] == "failed"
     assert failed["http_status"] == 429
     assert "rate limited" in failed["error"]
@@ -325,5 +333,42 @@ def test_push_messages_sends_retry_key_and_maps_statuses(monkeypatch):
 def test_push_messages_disabled_without_token(monkeypatch):
     monkeypatch.setattr(line_service.LineService, "_available", False)
     service = line_service.LineService.__new__(line_service.LineService)
-    result = service.push_messages("U1", [], "key")
+    result = service.push_messages("U1", [], "key", kind="other")
     assert result["status"] == "disabled"
+
+
+@pytest.fixture
+def paused(monkeypatch):
+    monkeypatch.setattr(outbox_dispatcher, "_stopping", False)  # an earlier test's stop leaves it set
+    monkeypatch.setitem(line_pause._state, "paused", True)
+
+
+def test_paused_kind_is_cancelled_not_retried(db, monkeypatch, paused):
+    row = db.add(kind=line_pause.MED_REMINDER)
+    fake = FakeLine()
+    _use_line(monkeypatch, fake)
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert db.rows[row]["status"] == "cancelled"
+    assert db.rows[row]["last_error"] == "reminders_paused"
+    assert db.rows[row]["attempts"] == 1
+    assert fake.calls == []
+
+
+def test_paused_row_stays_cancelled_after_resume(db, monkeypatch, paused):
+    row = db.add(kind=line_pause.MED_REMINDER)
+    fake = FakeLine()
+    _use_line(monkeypatch, fake)
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    monkeypatch.setitem(line_pause._state, "paused", False)
+    assert asyncio.run(outbox_dispatcher.dispatch_once(now=NOW + datetime.timedelta(hours=1))) == 0
+    assert db.rows[row]["status"] == "cancelled"
+    assert fake.calls == []
+
+
+def test_other_kinds_send_while_paused(db, monkeypatch, paused):
+    row = db.add(kind="dose_confirm")
+    fake = FakeLine()
+    _use_line(monkeypatch, fake)
+    asyncio.run(outbox_dispatcher.dispatch_once(now=NOW))
+    assert db.rows[row]["status"] == "accepted"
+    assert fake.kinds == ["dose_confirm"]

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_consented_user
 from app.services.line_service import LineService
-from app.services import dose_confirmation, dose_safety, dose_video, outbox
+from app.services import dose_confirmation, dose_safety, dose_video, line_pause, outbox
 from app.database import get_pool
 from pydantic import BaseModel
 from typing import Optional
@@ -160,6 +160,7 @@ async def line_webhook(request: Request):
                         line_user_id,
                         "✅ 連結成功！\n您的 LINE 已連結，將接收您的用藥提醒。\n"
                         "Your LINE is now linked to receive your medication reminders.",
+                        kind=line_pause.OTHER,
                     )
                 else:
                     # Family member verified
@@ -174,6 +175,7 @@ async def line_webhook(request: Request):
                 line_svc.send_text(
                     line_user_id,
                     "驗證碼無效，請確認後重新輸入。/ Invalid verification code.",
+                    kind=line_pause.OTHER,
                 )
 
     return {"status": "ok"}
@@ -273,7 +275,7 @@ async def send_manual_medication_reminder(user: dict = Depends(get_consented_use
                        "請依照處方與排定時間服藥；若已服用，請勿重複服用。\n"
                        "Please follow your prescription and scheduled time. "
                        "Do not take an extra dose if you already took it.")
-        results.append(svc.send_text(line_id, message))
+        results.append(svc.send_text(line_id, message, kind=line_pause.OTHER))
     sent = sum(bool(result.get("sent")) for result in results)
     if not sent:
         return JSONResponse({"detail": "LINE could not send the reminder"}, status_code=502)

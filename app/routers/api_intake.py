@@ -7,6 +7,7 @@ from app.dependencies import get_consented_user
 from app.database import get_pool
 from app.services.intake_detection import IntakeDetectionService
 from app.services.intake_repository import transition_intake
+from app.services import line_pause
 from app.services.line_service import LineService
 
 router = APIRouter(prefix="/api/intake", tags=["api-intake"])
@@ -112,6 +113,7 @@ async def skip_intake(payload: RecordPayload, user: dict = Depends(get_consented
                         f"藥物: {med_row['med_name']}\n"
                         f"請關心確認狀況。"
                     ),
+                    kind=line_pause.OTHER,
                 )
 
     return {"success": True, "intk_id": payload.intk_id, "status": "skipped"}

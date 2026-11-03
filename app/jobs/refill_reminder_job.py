@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import MEDCARE_TIMEZONE
 from app.database import get_pool
-from app.services import schedule
+from app.services import line_pause, schedule
 from app.services.line_service import LineService
 
 REFILL_DAYS = 7          # warn when the stock lasts this many days or fewer
@@ -67,4 +67,4 @@ async def check_refill_reminders():
                         f"請安排領藥或購買。")
             for contact in family:
                 if contact["line_id"]:
-                    line_svc.send_text(contact["line_id"], text)
+                    line_svc.send_text(contact["line_id"], text, kind=line_pause.OTHER)

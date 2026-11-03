@@ -1,6 +1,7 @@
 import requests
 from typing import List
 from app.config import LINE_CHANNEL_ACCESS_TOKEN, LINE_API_URL
+from app.services import line_pause
 
 
 class LineService:
@@ -23,8 +24,10 @@ class LineService:
             cls._instance = cls()
         return cls._instance
 
-    def send_text(self, to: str, message: str) -> dict:
+    def send_text(self, to: str, message: str, *, kind: str) -> dict:
         """Send a text message to a LINE user by their user ID."""
+        if line_pause.blocks(kind):
+            return {"sent": False, "paused": True, "error": "reminders_paused"}
         if not LineService._available:
             return {"sent": False, "error": "LINE not configured"}
 
@@ -44,12 +47,14 @@ class LineService:
         except Exception as exc:
             return {"sent": False, "error": str(exc)}
 
-    def push_messages(self, to: str, messages: list[dict], retry_key: str) -> dict:
+    def push_messages(self, to: str, messages: list[dict], retry_key: str, *, kind: str) -> dict:
         """Push up to five messages with an idempotency key (used by the outbox dispatcher).
 
         LINE answers 409 when a request with the same X-Line-Retry-Key was
         already accepted, so a duplicate counts as accepted by the caller.
         """
+        if line_pause.blocks(kind):
+            return {"status": "paused", "http_status": None, "request_id": None, "error": "reminders_paused"}
         if not LineService._available:
             return {"status": "disabled", "http_status": None, "request_id": None, "error": "LINE not configured"}
 
@@ -82,7 +87,7 @@ class LineService:
             + ("（這段時間系統離線，沒能及時提醒。）\n" if offline else "") +
             f"請關心確認狀況。"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_taken_confirmation(self, to: str, patient_name: str, medication_names: str, slot_time: str) -> dict:
         text = (
@@ -91,7 +96,7 @@ class LineService:
             f"{medication_names}\n"
             f"感謝您的關心。"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_emotion_alert(self, to: str, patient_name: str, emotion: str, score: float) -> dict:
         text = (
@@ -100,7 +105,7 @@ class LineService:
             f"檢測結果: {emotion} ({score:.0%})\n"
             f"請多加關心。"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_weekly_summary(self, to: str, patient_name: str, adherence: float, emotion_summary: str) -> dict:
         text = (
@@ -109,7 +114,7 @@ class LineService:
             f"情緒狀態: {emotion_summary}\n"
             f"保持健康！"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_test_notification(self, to: str, patient_name: str) -> dict:
         text = (
@@ -117,7 +122,7 @@ class LineService:
             f"如果您看到這則訊息，代表您的 LINE 已成功連結為 {patient_name} 的家人聯絡人。\n"
             f"If you can see this message, your LINE is synced as a family contact of {patient_name}."
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_verification_success(self, to: str, patient_name: str) -> dict:
         text = (
@@ -125,7 +130,7 @@ class LineService:
             f"您已被設為 {patient_name} 的家人聯絡人。\n"
             f"當有重要健康提醒時，您將收到通知。"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
 
     def send_sync_success_to_patient(self, to: str, contact_name: str) -> dict:
         text = (
@@ -133,4 +138,4 @@ class LineService:
             f"{contact_name} 已成功與您同步，\n"
             f"現在可以接收您的健康提醒通知。"
         )
-        return self.send_text(to, text)
+        return self.send_text(to, text, kind=line_pause.OTHER)
