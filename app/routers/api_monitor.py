@@ -47,6 +47,8 @@ class LandmarkPayload(BaseModel):
     faces: list[dict] = Field(default_factory=list, max_length=4)
     poses: list[dict] = Field(default_factory=list, max_length=4)
     hands: list[list] = Field(default_factory=list, max_length=8)
+    # Robot frames with the depth model only: each hand's depth against the face (services/landmarks/depth.py).
+    hand_depth: list[dict | None] | None = None
 
 
 class OutcomePayload(BaseModel):

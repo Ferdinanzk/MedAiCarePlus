@@ -41,24 +41,31 @@ def _jpeg():
 JPEG = _jpeg()
 
 
-def _packet(frame_seq, timestamp, distance=None, owned=True):
+def _packet(frame_seq, timestamp, distance=None, owned=True, front=None):
     # The hand sits below the mouth (y 0.6), so the face is never "covered" and a candidate can become ready.
     # owned=False: no body for the face, so select_owned_observations can't tie the hand to the patient.
+    # front: the depth model's reading of the hand against the face (a robot frame's hand_depth).
     hand = None if distance is None else [distance / 4, 0.6]
-    return {"frame_seq": frame_seq, "timestamp": float(timestamp), "width": 100, "height": 100,
-            "faces": [{"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}],
-            "poses": [{"nose": [0.3, 0.3], "shoulders": [[0.2, 0.5], [0.4, 0.5]],
-                       "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}] if owned else [],
-            "hands": [] if hand is None else [[hand] * 13]}
+    packet = {"frame_seq": frame_seq, "timestamp": float(timestamp), "width": 100, "height": 100,
+              "faces": [{"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}],
+              "poses": [{"nose": [0.3, 0.3], "shoulders": [[0.2, 0.5], [0.4, 0.5]],
+                         "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}] if owned else [],
+              "hands": [] if hand is None else [[hand] * 13]}
+    if front is not None and hand is not None:
+        packet["hand_depth"] = [{"face": 0, "front": front}]
+    return packet
 
 
-def _observations(detector, face_landmarks, hand_landmarks, width, height, **kwargs):
-    """build_temporal_observations with the geometry read from the packet: mouth open, a pinch, distance = 4 x."""
+def _observations(detector, face_landmarks, hand_landmarks, width, height, hand_depth=None, **kwargs):
+    """build_temporal_observations with the geometry read from the packet: mouth open, a pinch, distance = 4 x,
+    and the depth reading's `front` when the packet carried one."""
     geometry = {"mouth_open": True, "mouth_open_ratio": .3, "mouth_open_baseline": .1, "mouth_open_delta": .2,
                 "mouth_opened_at": None, "mouth_motion_cycles": 0, "tongue_score": None, "tongue_quality": 0.0,
                 "tongue_frame_support": False}
     return geometry, [Observation(center=(hand[0]["x"], hand[0]["y"]), distance=hand[0]["x"] * 4, mouth_open=True,
-                                  pinch=True, flat_palm=False, occlusion=0.0) for hand in hand_landmarks]
+                                  pinch=True, flat_palm=False, occlusion=0.0,
+                                  front=(hand_depth[index] or {}).get("front") if hand_depth else None)
+                      for index, hand in enumerate(hand_landmarks)]
 
 
 class _Clock:
@@ -113,7 +120,7 @@ class _Run:
         self.seq = 0
         self.candidates = []   # event ids, in the order they appeared
 
-    async def frame(self, distance=None, vision=True, verified=True, owned=True):
+    async def frame(self, distance=None, vision=True, verified=True, owned=True, front=None):
         self.seq += 1
         self.clock.t += 1 / FPS
         state = self.state
@@ -122,7 +129,7 @@ class _Run:
             state.target_box = [0.1, 0.1, 0.4, 0.4]
         else:
             state.identity_hits, state.target_box = 0, None
-        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned))
+        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned, front))
         if vision and verified:
             result = await self.registry.vision(state, self.seq, JPEG, self.commits)
         candidate = state.candidate
@@ -541,3 +548,30 @@ def test_a_closed_mouth_rejection_is_logged_once_with_its_stage(clock, caplog, m
     assert resets[0] in (f"{prefix}AT_MOUTH (closed_mouth_sequence_rejected)",
                          f"{prefix}WITHDRAWING (closed_mouth_sequence_rejected)")
     assert run.candidates == [] and run.state.latest_detector["stage"] == "READY"
+
+
+def test_fingers_the_depth_model_saw_in_front_of_the_face_make_a_prompt_not_a_record(clock):
+    """The robot's frames carry the depth model's reading (hand_depth, services/landmarks/depth.py). Fingers in
+    front of the face through the contact (front 0.9, against the 0.8 threshold) keep the detector's confirmed
+    band, and the policy caps the event at uncertain, so an auto-commit session prompts instead of recording. The
+    same gesture read at the lips (front 0.05) records as before."""
+    async def scenario():
+        runs = {}
+        for name, front in (("in_front", 0.9), ("at_lips", 0.05)):
+            run = _Run(clock, auto_commit=True)
+            await run.rest(1.0)
+            for distance in GESTURE:
+                await run.frame(distance, front=front)
+            runs[name] = (run, await clock.detector.get_session(7, run.state.detector_session_id))
+        return runs
+
+    runs = asyncio.run(scenario())
+    run, summary = runs["in_front"]
+    latest = summary["latest_result"]
+    assert latest["policy"]["detector_band"] == "confirmed" and latest["depth_no_contact"] is True
+    assert (latest["decision"], latest["decision_reason"]) == ("uncertain", "depth_no_contact_needs_confirmation")
+    assert run.state.candidate["decision"] == "uncertain" and run.commits.calls == []
+    assert run.state.candidate["evidence"]["depth"]["depth_no_contact"] is True
+    run, summary = runs["at_lips"]
+    assert summary["latest_result"]["depth_no_contact"] is False
+    assert run.state.candidate["decision"] == "confirmed" and [method for _, method in run.commits.calls] == ["auto"]

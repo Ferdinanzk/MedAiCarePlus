@@ -125,8 +125,8 @@ def select_owned_observations(faces: list, poses: list, hands: list, target_box:
     shoulder_width = point_distance(shoulders[0], shoulders[1])
     if shoulder_width < .04:
         return None
-    owned = []
-    for hand in hands:
+    owned, owned_indices = [], []
+    for hand_index, hand in enumerate(hands):
         if len(hand) != len(HAND_INDICES):
             continue
         root = hand[0]
@@ -146,7 +146,9 @@ def select_owned_observations(faces: list, poses: list, hands: list, target_box:
             return None
         if owner == pose_index:
             owned.append(hand)
-    return {"face": face["points"], "hands": owned[:2], "box": face["box"], "face_index": target_index}
+            owned_indices.append(hand_index)
+    return {"face": face["points"], "hands": owned[:2], "hand_indices": owned_indices[:2], "box": face["box"],
+            "face_index": target_index}
 
 
 @dataclass
@@ -284,6 +286,8 @@ EVIDENCE_KEYS = {
     "withdrawal": ("withdrew_enough", "partial_withdrawal_seen"),
     "trajectory": ("trajectory_contribution", "mouth_contact_contribution", "dwell_contribution",
                    "withdrawal_contribution", "fingertip_delivery_contribution"),
+    # The depth model's reading of the contact (robot frames; services/landmarks/depth.py, intake_temporal.py)
+    "depth": ("depth_front_median", "depth_samples", "depth_no_contact"),
 }
 
 
@@ -611,6 +615,12 @@ class MonitorRegistry:
                        "width": packet["width"], "height": packet["height"],
                        "face_landmarks": full_points(selected["face"], FACE_INDICES),
                        "hand_landmarks": [full_points(hand, HAND_INDICES) for hand in selected["hands"]]}
+            hand_depth = packet.get("hand_depth")
+            if hand_depth is not None:
+                # Robot frames with the depth model: the owned hands' depth against the patient's face, in step
+                # with hand_landmarks (services/landmarks/depth.py).
+                payload["hand_depth"] = [hand_depth[index] if index < len(hand_depth) else None
+                                         for index in selected["hand_indices"]]
             result = await IntakeDetectionService.get_instance().process_frame(
                 state.u_id, state.detector_session_id, payload,
                 result_transform=partial(apply_policy, ownership_gap=state.event_ownership_gap))

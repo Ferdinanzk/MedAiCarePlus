@@ -11,7 +11,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from app.config import LANDMARK_MODEL_DIR
+from app.config import DEPTH_EVERY, DEPTH_INPUT_SIZE, DEPTH_MODEL_PATH, LANDMARK_MODEL_DIR
+from app.services.landmarks.depth import DepthModel
 from app.services.landmarks.engine import VisionEngine, load_models
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ MODEL_SHA256 = {
     "pose_detector.onnx": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f",
     "pose_landmarks_detector.onnx": "cd7c2b67e1275239b80b17eab9cd861422ef6ac291370baf512c3022409a248d",
 }
+# Hand depth against the face (services/landmarks/depth.py): onnx-community/depth-anything-v2-small, the fp32
+# onnx/model.onnx (Apache-2.0), 99,060,839 B. Optional: without the file the engine runs as before and no packet
+# carries hand_depth. models/depth/README.md says where it comes from.
+DEPTH_MODEL_SHA256 = "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c"
 
 
 def _sha256(path: Path) -> str:
@@ -38,9 +43,11 @@ class LandmarkService:
     _instance = None
     _available = False
 
-    def __init__(self, models_dir: Path = LANDMARK_MODEL_DIR):
+    def __init__(self, models_dir: Path = LANDMARK_MODEL_DIR, depth_path: Path | None = DEPTH_MODEL_PATH):
         self.error = None
         self.models = None
+        self.depth = None          # DepthModel, when its file is present and intact
+        self.depth_error = None
         # Three trackers per frame; a few sessions may overlap briefly when one replaces another.
         self.executor = ThreadPoolExecutor(max_workers=min(12, os.cpu_count() or 4), thread_name_prefix="landmarks")
         try:
@@ -57,6 +64,19 @@ class LandmarkService:
             log.exception("landmark models unavailable")
             self.error = str(exc)
             LandmarkService._available = False
+        try:
+            depth_path = None if depth_path is None else Path(depth_path)
+            if depth_path is None or not depth_path.is_file():
+                self.depth_error = f"Depth model missing at {depth_path}"
+                log.info("hand depth off: %s", self.depth_error)
+            elif _sha256(depth_path) != DEPTH_MODEL_SHA256:
+                raise ValueError(f"Depth model {depth_path.name} failed its integrity check")
+            elif self.models is not None:
+                self.depth = DepthModel(depth_path, long_side=DEPTH_INPUT_SIZE, threads=4)
+                log.info("hand depth on: %s at %d px, every %d frames", depth_path.name, DEPTH_INPUT_SIZE, DEPTH_EVERY)
+        except Exception as exc:
+            log.exception("depth model unavailable")
+            self.depth_error = str(exc)
 
     @classmethod
     def get_instance(cls):
@@ -67,4 +87,4 @@ class LandmarkService:
     def new_engine(self) -> VisionEngine:
         if not LandmarkService._available:
             raise RuntimeError(self.error or "Landmark models unavailable")
-        return VisionEngine(self.models, self.executor)
+        return VisionEngine(self.models, self.executor, depth=self.depth, depth_every=DEPTH_EVERY)

@@ -14,6 +14,11 @@ is never invented when the detector reported none.
 the event (identity not fresh, or whose hand it was unclear, for under
 `monitor_service.OWNERSHIP_GRACE_SECONDS`) and pieced the event together across
 the gap. Such an event may prompt, never auto-log, in every mode.
+
+`depth_no_contact` (3 Nov 2026): on the robot's frames, the depth model read the
+fingers in front of the face rather than at the lips for most of the contact
+(`intake_temporal.TemporalConfig`, the depth_* fields). Such an event may
+prompt, never auto-log, in every mode.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ class PolicyOutcome:
     downgraded: bool
     safety_contradiction: bool
     ownership_gap: bool = False
+    depth_no_contact: bool = False
 
 
 def is_safety_contradiction(detector_reason: str, explicit: Optional[bool] = None) -> bool:
@@ -86,6 +92,7 @@ def decide(
     auto_confirm_min: Optional[float] = None,
     prompt_min: Optional[float] = None,
     ownership_gap: bool = False,
+    depth_no_contact: bool = False,
 ) -> PolicyOutcome:
     """Re-band one detection event under the v1 policy.
 
@@ -107,6 +114,7 @@ def decide(
             downgraded=rank(band) < rank(detector_band),
             safety_contradiction=safety_contradiction,
             ownership_gap=ownership_gap,
+            depth_no_contact=depth_no_contact,
         )
 
     # Invariant, checked first: an event the detector did not report is never
@@ -122,6 +130,8 @@ def decide(
             return outcome(BAND_UNCERTAIN, "safety_contradiction_blocks_auto_confirm")
         if ownership_gap and detector_band == BAND_CONFIRMED:
             return outcome(BAND_UNCERTAIN, "ownership_gap_blocks_auto_confirm")
+        if depth_no_contact and detector_band == BAND_CONFIRMED:
+            return outcome(BAND_UNCERTAIN, "depth_no_contact_blocks_auto_confirm")
         return outcome(detector_band, "autonomous_passthrough")
 
     # Nothing auto-logs in manual-only mode; a real event still earns a prompt.
@@ -140,6 +150,10 @@ def decide(
     # The patient's hand was lost for part of this event: a prompt at most.
     if ownership_gap:
         return outcome(BAND_UNCERTAIN, "ownership_gap_needs_confirmation")
+
+    # The depth model saw the fingers in front of the face, not at the lips: a prompt at most.
+    if depth_no_contact:
+        return outcome(BAND_UNCERTAIN, "depth_no_contact_needs_confirmation")
 
     # Auto-confirm requires BOTH strong evidence and the detector's own top band.
     # Requiring the detector band keeps the invariant intact: a high-confidence
@@ -180,7 +194,7 @@ def apply_policy(result: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
         safety_contradiction=is_safety_contradiction(
             detector_reason, result.get("safety_contradiction")
         ),
-        **overrides,
+        **{"depth_no_contact": bool(result.get("depth_no_contact")), **overrides},
     )
 
     out = dict(result)

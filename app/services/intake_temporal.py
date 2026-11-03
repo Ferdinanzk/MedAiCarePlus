@@ -42,6 +42,15 @@ class TemporalConfig:
     reacquire_match_distance: float = 0.75
     lost_event_close_seconds: float = 0.85
     min_withdraw_delta: float = 0.22
+    # Hand depth (services/landmarks/depth.py), read while the hand is in the contact zone: a `front` at or
+    # above depth_front_threshold means the fingers were in front of the face, not at the lips. With at least
+    # depth_min_samples readings, of which depth_front_ratio or more say so, the event is `depth_no_contact`.
+    # 0.8 = the fingers at most 56 % of the face's distance from the camera. On the C:\pilldetector clips
+    # (3 Nov 2026) real intakes read 0.1-0.3 at the lips and up to 0.6 on the first contact frames, and the
+    # false alarms read the same or lower, so no threshold separates them; this one can't veto a real contact.
+    depth_front_threshold: float = 0.8
+    depth_min_samples: int = 2
+    depth_front_ratio: float = 0.6
 
 
 @dataclass
@@ -61,6 +70,7 @@ class Observation:
     delivery_like: Optional[bool] = None
     contradiction: bool = False
     style: str = "unknown"
+    front: Optional[float] = None   # hand depth against the face; None without the depth model
 
     def __post_init__(self) -> None:
         if self.delivery_like is None:
@@ -106,6 +116,9 @@ class TemporalEvent:
     tongue_support: bool = False
     candidate_id: int = 0
     occluded_since: Optional[float] = None
+    depth_samples: int = 0          # contact-zone observations with a depth reading
+    depth_front_samples: int = 0    # of which the fingers were in front of the face
+    depth_fronts: List[float] = field(default_factory=list)
 
 
 class TemporalIntakePipeline:
@@ -381,6 +394,11 @@ class TemporalIntakePipeline:
         )
         event.tongue_samples.append((now, obs.tongue_support))
         event.style_counts[obs.style] = event.style_counts.get(obs.style, 0) + 1
+        if obs.front is not None and event.contact_at is not None and obs.distance <= self.config.exit_distance:
+            event.depth_samples += 1
+            event.depth_front_samples += int(obs.front >= self.config.depth_front_threshold)
+            if len(event.depth_fronts) < 64:
+                event.depth_fronts.append(obs.front)
         if event.contact_at is None:
             event.pre_contact_mouth_open |= obs.mouth_open
         else:
@@ -476,6 +494,11 @@ class TemporalIntakePipeline:
         self.reset_reason = reason
         self.transition_reason = reason
 
+    def _depth_no_contact(self, event: TemporalEvent) -> bool:
+        """The depth model saw the fingers in front of the face, not at the lips, for most of the contact."""
+        return (event.depth_samples >= self.config.depth_min_samples
+                and event.depth_front_samples >= self.config.depth_front_ratio * event.depth_samples)
+
     def result(
         self,
         missing: Optional[str] = None,
@@ -548,4 +571,8 @@ class TemporalIntakePipeline:
             "flat_palm_ratio": round(flat_ratio, 3),
             "peak_mouth_occlusion": round(event.max_occlusion, 3),
             "event_style": event_style,
+            "depth_samples": event.depth_samples,
+            "depth_front_median": (round(sorted(event.depth_fronts)[len(event.depth_fronts) // 2], 4)
+                                   if event.depth_fronts else None),
+            "depth_no_contact": self._depth_no_contact(event),
         }

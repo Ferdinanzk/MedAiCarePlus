@@ -25,6 +25,16 @@ LANDMARK_MODEL_DIR = Path(os.getenv(
     str(_HERE / "models" / "landmarks")
 ))
 
+# Monocular depth for the hand-at-the-lips check on the robot's frames (services/landmarks/depth.py). Optional:
+# a missing file turns the check off. DEPTH_INPUT_SIZE is the model input's long side in pixels (a multiple of
+# 14); DEPTH_EVERY is how often it runs while a hand is near a face (every Nth frame).
+DEPTH_MODEL_PATH = Path(os.getenv(
+    "DEPTH_MODEL_PATH",
+    str(_HERE / "models" / "depth" / "depth_anything_v2_small.onnx")
+))
+DEPTH_INPUT_SIZE = int(os.getenv("DEPTH_INPUT_SIZE", "") or "266")
+DEPTH_EVERY = int(os.getenv("DEPTH_EVERY", "") or "3")
+
 YOLO_MODEL_PATH = Path(os.getenv(
     "YOLO_MODEL_PATH",
     str(_AI_ROOT / "segmentation" / "prescription_best_100_epo.pt")

@@ -1137,16 +1137,24 @@ def build_temporal_observations(
     timestamp: float = 0.0,
     temporal_stage: str = "CALIBRATING",
     mouth_cues: Optional[dict] = None,
+    hand_depth: Optional[List[Optional[dict]]] = None,
 ) -> Tuple[dict, List[Observation]]:
-    """Convert raw MediaPipe landmarks into the live temporal contract."""
+    """Convert raw MediaPipe landmarks into the live temporal contract.
+
+    `hand_depth`, in step with `hand_landmarks`, is the depth model's reading of each hand against the face
+    (services/landmarks/depth.py, robot frames only): its `front` becomes the observation's `front`.
+    """
     mouth_geom = detector.compute_mouth_geometry(face_landmarks, width, height)
     hand_features = []
-    for hand_lm in hand_landmarks:
+    for position, hand_lm in enumerate(hand_landmarks):
         if len(hand_lm) < 21:
             continue
         features = detector.compute_hand_features(
             hand_lm, mouth_geom, width, height
         )
+        depth = hand_depth[position] if hand_depth and position < len(hand_depth) else None
+        front = depth.get("front") if isinstance(depth, dict) else None
+        features["front"] = float(front) if isinstance(front, (int, float)) and math.isfinite(front) else None
         hand_features.append(features)
 
     cues = mouth_cues if isinstance(mouth_cues, dict) else {}
@@ -1214,6 +1222,7 @@ def build_temporal_observations(
             delivery_like=bool(features["holding_object"]),
             contradiction=flat_cover or palm_touch,
             style=style,
+            front=features["front"],
         ))
     return mouth_geom, observations
 
@@ -1463,6 +1472,7 @@ class IntakeDetectionService:
             "mouth_open_ratio", "mouth_open_baseline", "mouth_open_delta",
             "mouth_motion_cycles", "tongue_score", "tongue_quality",
             "tongue_peak_score", "tongue_support",
+            "depth_samples", "depth_front_median", "depth_no_contact",
         )
         compact = {name: deepcopy(result.get(name)) for name in fields if name in result}
         policy = result.get("policy")
@@ -1600,6 +1610,7 @@ class IntakeDetectionService:
             timestamp=timestamp,
             temporal_stage=pipeline.event.stage.value,
             mouth_cues=payload.get("mouth_cues"),
+            hand_depth=payload.get("hand_depth"),
         )
 
         result = pipeline.process(timestamp, True, observations)

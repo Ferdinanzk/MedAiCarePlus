@@ -20,6 +20,7 @@ from typing import Callable
 import numpy as np
 
 from app.services.landmarks import geometry as geo
+from app.services.landmarks.depth import DepthModel, hand_depth, near_face
 from app.services.landmarks.packets import MAX_FACES, MAX_HANDS, MAX_POSES, build_packet
 
 MODEL_FILES = (
@@ -29,6 +30,7 @@ MODEL_FILES = (
 )
 DETECT_EVERY = 3
 POSE_EVERY = 2
+DEPTH_EVERY = 3          # the depth model (depth.py), while a hand is near a face: every Nth frame
 MIN_DETECTION = 0.5      # Tasks defaults: min_*_detection_confidence, min_*_presence_confidence
 MIN_PRESENCE = 0.5
 SAME_INSTANCE_IOU = 0.5  # AssociationNormRectCalculator's min_similarity_threshold
@@ -241,8 +243,11 @@ class VisionEngine:
     """
 
     def __init__(self, models: dict[str, OnnxModel], executor: Executor, detect_every: int = DETECT_EVERY,
-                 pose_every: int = POSE_EVERY):
+                 pose_every: int = POSE_EVERY, depth: DepthModel | None = None, depth_every: int = DEPTH_EVERY):
         self._executor = executor
+        self._depth, self._depth_every = depth, max(1, int(depth_every))
+        self._depth_wanted = False   # a hand was near a face on the last frame
+        self._frames = 0
         self.trackers = {
             name: Tracker(spec, models[spec.detector_file], models[spec.landmark_file], detect_every,
                           pose_every if name == "pose" else 1)
@@ -252,11 +257,23 @@ class VisionEngine:
     def process(self, image, frame_seq: int, timestamp_ms: float) -> dict:
         """Pillow RGB image -> landmark packet (without session_id/generation)."""
         width, height = image.size
+        # The depth model runs beside the trackers, on the frames after one with a hand near a face (its reading
+        # is only used while a hand is at the mouth) and at most every depth_every frames: it costs several
+        # landmark runs. The packet then carries hand_depth, in step with hands.
+        depth_future = None
+        if self._depth is not None and self._depth_wanted and self._frames % self._depth_every == 0:
+            depth_future = self._executor.submit(self._depth.disparity, image)
+        self._frames += 1
         # ONNX Runtime and Pillow release the GIL, so the three trackers run on separate cores.
         futures = {name: self._executor.submit(tracker.step, image) for name, tracker in self.trackers.items()}
         faces, hands, poses = (futures[name].result() for name in ("face", "hand", "pose"))
-        return build_packet(
+        packet = build_packet(
             SimpleNamespace(face_landmarks=[_normalised(p, width, height) for p in faces]),
             SimpleNamespace(hand_landmarks=[_normalised(p, width, height) for p in hands]),
             SimpleNamespace(pose_landmarks=[_normalised(p, width, height, visibility=True) for p in poses]),
             frame_seq, timestamp_ms, width, height)
+        if self._depth is not None:
+            self._depth_wanted = near_face(packet["faces"], packet["hands"])
+            if depth_future is not None:
+                packet["hand_depth"] = hand_depth(depth_future.result(), packet["faces"], packet["hands"])
+        return packet

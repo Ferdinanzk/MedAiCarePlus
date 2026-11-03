@@ -29,6 +29,7 @@ This document lists every model and decision algorithm in MedAiCarePlus: what ea
 | 4d | hand_landmarks_detector.onnx | 21 hand points | MediaPipe hand landmark | 1×224×224×3 | 63 values + presence, handedness, world | ONNX Runtime CPU | laptop | `models/landmarks/` |
 | 4e | pose_detector.onnx | Person detection | MediaPipe pose detector (OpenCV Zoo export) | 1×3×224×224 | 2254 anchors × 12 + scores | ONNX Runtime CPU | laptop | `models/landmarks/` |
 | 4f | pose_landmarks_detector.onnx | 39 body points | MediaPipe pose landmark, lite | 1×256×256×3 | 195 values + heatmap, segmentation, world | ONNX Runtime CPU | laptop | `models/landmarks/` |
+| 4g | depth_anything_v2_small.onnx (optional, 3 Nov 2026) | Hand depth against the face: at the lips or in front of the face | Depth Anything V2 Small, DINOv2 ViT-S (ext) | 1×3×H×W, H and W multiples of 14 (long side 266) | H×W relative inverse depth | ONNX Runtime CPU, 4 threads | laptop (robot frames), every 3rd frame while a hand is near a face | `models/depth/` (not committed, see its README) |
 | 5 | MediaPipe Tasks (3 models) | Face, hand, pose landmarks in the browser | same networks as 4a-4f, original TFLite | ≤ 640×480 video frame | landmarks | `@mediapipe/tasks-vision` 0.10.18, WASM, GPU or CPU | browser Web Worker | `frontend_source/public/models/*.task` |
 | 6 | Owned-hand association | Which hands belong to the verified patient | geometry rules | landmark packet + verified face box | ≤ 2 hands or skip | Python | laptop | `app/services/monitor_service.py:76-126` |
 | 7 | Pill-intake detector | Hand-to-mouth event | geometry features + temporal state machine, **no neural net** | owned face and hand landmarks with timestamps | none / uncertain 0.48 / confirmed 0.82 | Python | laptop | `app/services/intake_detection.py`, `app/services/intake_temporal.py` |
@@ -239,6 +240,17 @@ On a 90-frame moving clip, the mouth and fingertip points differ by 0.6-0.8 px o
 
 **Limitations:** pose is the lite model. Hand landmarks degrade when the hand covers the mouth, which is exactly the moment of interest. The detector logic (section 7) treats a lost hand near the mouth as occlusion.
 
+### 4.1 Hand depth (optional, 3 Nov 2026)
+
+The landmarks say where a hand is in the image, not whether a hand that covers the mouth in 2D is at the lips or in front of the face. `app/services/landmarks/depth.py` reads that from a monocular depth model on the same frame.
+
+- **Model:** Depth Anything V2 Small, the fp32 ONNX export `onnx-community/depth-anything-v2-small` (Apache-2.0; 99,060,839 B, SHA-256 `afb6a5c2…1df10c`, checked at load by `LandmarkService`, `DEPTH_MODEL_SHA256`). It predicts relative inverse depth per pixel: larger is nearer, with an unknown scale and offset per frame. The file is not committed (`models/depth/README.md` has the download); without it `LandmarkService` logs "hand depth off" and nothing changes.
+- **Config:** `DEPTH_MODEL_PATH`, `DEPTH_INPUT_SIZE` (long side, default 266; the other side keeps the aspect ratio, both multiples of 14) and `DEPTH_EVERY` (default 3) in `app/config.py`; `docker-compose.yml` sets the path.
+- **When it runs** (`VisionEngine.process`, `engine.py`): beside the three trackers, on the frames after one with a fingertip within 0.6 box sizes of a face box (`near_face`), every `DEPTH_EVERY`th such frame. Measured in the app container on this laptop (4 threads): about 170 ms at 266 px, 340 ms at 364 px, 730 ms at 518 px. The fp16 export is twice as slow on CPU.
+- **The reading** (`hand_depth`): per hand, `front = (disparity on the finger − disparity of the face) / disparity of the face`. The face reference is the median of the face box with every hand's box (plus a 10 % margin) cut out, so a hand over the mouth never becomes its own reference, and needs at least 25 % of the box uncovered and a box of at least 12 map pixels. The finger sample is a small patch 15 % of the way from the mouth-nearest tip (thumb, index or middle) toward the wrist. With the far background at about 0, `front` is about (face depth − finger depth) / finger depth: 0 at the lips, about 0.3 for a hand 20 cm in front of a face 80 cm away, negative behind the face. The entry also carries the raw readings (`tip`, `ref`, `lip`, `spread`, `far`, `cover`) for analysis.
+- **Where it goes:** the packet's `hand_depth` list (in step with `hands`; `LandmarkPayload.hand_depth`, robot frames only), then the owned hands' entries ride with the detector payload (`monitor_service.landmarks`, `select_owned_observations` now also returns `hand_indices`), become `Observation.front` (`build_temporal_observations`), and are counted over the contact zone (section 7.3, `depth_no_contact`). The policy lets such an event prompt, never auto-log (section 8.1).
+- **Measured on the `C:\pilldetector` clips (33 clips, 3 Nov 2026):** the reading behaves like a depth sensor (a hand approaching reads 0.5-0.6, then 0.1-0.3 at the lips), but it does not separate the false alarms from real intakes: the cough has the hand on the mouth and the phone call has the hand on the cheek, both at the face's depth, and real intakes read the same or higher (up to 0.6 on the first contact frames). With `depth_front_threshold` 0.25 it vetoed both real auto-logs; at the shipped 0.8 it changes no verdict on these clips. Details in `C:\pilldetector\REPORT.md`.
+
 ## 5. Browser landmark models (MediaPipe Tasks)
 
 - **Library:** `@mediapipe/tasks-vision` 0.10.18 (`frontend_source/package.json:13`). WASM runtime and models are served locally from `/wasm` and `/models` (`frontend_source/src/workers/monitorWorker.ts:21-34`).
@@ -378,6 +390,8 @@ Transitions are at `intake_temporal.py:217-318`.
 
 Detector session store (in memory): 600 frames, 5 min active TTL, 15 min completed TTL, capacity 32 (`intake_detection.py:1224-1227`).
 
+**Hand depth evidence** (3 Nov 2026, robot frames with the depth model, section 4.1): `_accumulate` counts the observations in the contact zone (after the first contact, distance ≤ `exit_distance`) that carry a `front`, and how many of them are at or above `depth_front_threshold` (0.8). With at least `depth_min_samples` (2) readings of which `depth_front_ratio` (0.6) or more are in front, the result says `depth_no_contact` (also `depth_samples` and `depth_front_median`). The band and confidence above are unchanged; the policy caps such an event at `uncertain`.
+
 ### 7.4 Calibration notes and limitations
 
 - **The confidences are fixed band values, not calibrated probabilities** (`app/services/dose_report.py:3-5`). Live output is only 0.82, 0.48 or none.
@@ -402,6 +416,7 @@ Detector session store (in memory): 600 frames, 5 min active TTL, 15 min complet
 `decide()` (`policy.py:73-139`) can only downgrade a result. In assisted mode:
 - confidence < 0.30 → `none`;
 - a safety contradiction → `uncertain`;
+- an event that crossed an ownership gap (section 6, `ownership_gap`) or whose contact the depth model read as in front of the face (section 4.1, `depth_no_contact`) → `uncertain` (3 Nov 2026; in autonomous mode these block the auto-confirm the same way);
 - the detector said `confirmed` and confidence ≥ 0.75 → `confirmed`;
 - otherwise → `uncertain`.
 
