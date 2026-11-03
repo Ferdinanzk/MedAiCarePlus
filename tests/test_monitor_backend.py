@@ -120,18 +120,25 @@ def test_stale_candidate_expires_on_landmark_request_without_vision(monkeypatch)
     asyncio.run(scenario())
 
 
-def test_owned_observations_reject_bystander_ambiguity_and_hand_saturation():
+def test_owned_observations_handle_a_crowd_a_twin_pose_and_a_second_body_over_the_face():
+    """3 Nov 2026: the rule no longer refuses a frame for being crowded (4 poses, 8 hands), and a pose a hair
+    from the patient's is the patient seen twice. A second body with its nose in the face box as near its
+    centre as the patient's still can't be told apart: the face is kept and no hand is owned."""
     packet = _packet(1)
-    target = packet["faces"][0]["box"]
-    bystander_pose = {
-        "nose": [0.31, 0.31],
-        "shoulders": [[0.2, 0.5], [0.4, 0.5]],
-        "wrists": [],
-    }
-    assert select_owned_observations(
-        packet["faces"], packet["poses"] + [bystander_pose], [], target) is None
-    assert select_owned_observations(
-        packet["faces"], packet["poses"], [_hand() for _ in range(8)], target) is None
+    faces, target = packet["faces"], packet["faces"][0]["box"]          # box [0.1, 0.1, 0.4, 0.4], centre (0.3, 0.3)
+    patient = {"nose": [0.3, 0.3], "shoulders": [[0.2, 0.5], [0.4, 0.5]], "wrists": [[0.3, 0.6, 0.9]]}
+    hand = [[0.3, 0.6]] * 13
+    twin = {"nose": [0.31, 0.31], "shoulders": [[0.22, 0.5], [0.38, 0.5]], "wrists": []}
+    selected = select_owned_observations(faces, [patient, twin], [hand], target)
+    assert selected is not None and selected["hands"] == [hand]
+    crowd = [{"nose": [0.9, 0.9], "shoulders": [[0.8, 0.95], [1.0, 0.95]], "wrists": [[0.9, 0.99, 0.9]]}] * 3
+    many = [[[0.9, 0.99]] * 13] * 7
+    selected = select_owned_observations(faces, [patient] + crowd, [hand] + many, target)
+    assert selected is not None and selected["hands"] == [hand]
+    near = dict(patient, nose=[0.24, 0.3])
+    far = {"nose": [0.36, 0.3], "shoulders": [[0.5, 0.7], [0.7, 0.7]], "wrists": [[0.3, 0.6, 0.9]]}
+    selected, reason = select_owned_observations(faces, [near, far], [hand], target, explain=True)
+    assert selected is not None and selected["hands"] == [] and reason == "two_bodies"
 
 
 def test_candidate_requires_fresh_identity_match_before_commit(monkeypatch):

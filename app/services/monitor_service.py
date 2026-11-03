@@ -96,59 +96,206 @@ def full_points(compact, indices):
     return points
 
 
-def select_owned_observations(faces: list, poses: list, hands: list, target_box: list | None):
-    """Associate the enrolled face to exactly one pose, then its visible wrists to hands."""
-    if target_box is None or len(faces) >= 4 or len(poses) >= 4 or len(hands) >= 8:
+# The hand-to-body rule remembers what it confirmed (OwnershipMemory, one per session, on the packets' capture
+# clock). A hand confirmed as the patient's within OWNERSHIP_CARRY_SECONDS stays theirs while it moves on smoothly
+# (within OWNERSHIP_CARRY_DISTANCE + OWNERSHIP_CARRY_SPEED x the time since it was last seen) on the frames where
+# this frame's own vote fails: the patient's pose lost or its wrists hidden (a hand over the face does both),
+# another person's wrist nearly as close, or a neighbour's wrist a little closer. The patient's body likewise: when
+# no pose has its nose in the face box, the pose whose shoulders stay within POSE_CARRY_DISTANCE of the last
+# matched ones, for POSE_CARRY_SECONDS. A frame that rests on memory is marked `carried`: an event that uses one
+# may prompt, never auto-log (monitor_service.landmarks sets event_ownership_gap). Before 3 Nov 2026 the rule had
+# no memory, refused any frame with 4 faces, poses or 8 hands, and refused the whole frame when one hand's owner
+# was unclear: on the C:\pilldetector clips that cost 4 of the 5 real intakes still missed after the grace.
+OWNERSHIP_CARRY_SECONDS = 3.0
+OWNERSHIP_CARRY_DISTANCE = 0.06
+OWNERSHIP_CARRY_SPEED = 0.4           # frame widths per second
+POSE_CARRY_SECONDS = 2.0
+POSE_CARRY_DISTANCE = 0.12
+SAME_POSE_FACE_WIDTHS = 0.25          # two poses whose noses are this close (in face widths) are one person twice
+WEAK_RIVAL_MIN = 0.04                 # a neighbour's wrist nearer than this to a hand's root is that neighbour's hand
+
+
+@dataclass
+class OwnershipMemory:
+    """What select_owned_observations remembers between a session's frames (times are the packets' timestamps)."""
+    shoulders: tuple | None = None          # the patient's shoulder midpoint when a nose last matched the face
+    shoulders_at: float = 0.0
+    hands: list = field(default_factory=list)   # [[wrist (x, y), confirmed_at, seen_at]] of the patient's hands
+
+    def clear(self) -> None:
+        self.shoulders, self.shoulders_at, self.hands = None, 0.0, []
+
+    def update(self, selected: dict | None, timestamp: float) -> None:
+        """Record a frame's selection: the shoulders a nose matched, each owned hand (a confirmed one afresh, a
+        carried one at its new place with its old confirmation), and forget hands confirmed too long ago."""
+        if selected is not None:
+            if selected.get("shoulders") is not None and not selected.get("pose_carried"):
+                self.shoulders, self.shoulders_at = selected["shoulders"], timestamp
+            for hand, carried, index in zip(selected["hands"], selected["carried_hands"], selected["memory_indices"]):
+                wrist = (float(hand[0][0]), float(hand[0][1]))
+                if index is not None and index < len(self.hands):
+                    entry = self.hands[index]
+                    entry[0], entry[2] = wrist, timestamp
+                    if not carried:
+                        entry[1] = timestamp
+                elif not carried:
+                    self.hands.append([wrist, timestamp, timestamp])
+        self.hands = [entry for entry in self.hands if timestamp - entry[1] <= OWNERSHIP_CARRY_SECONDS][-4:]
+
+
+def _shoulder_mid(pose: dict):
+    shoulders = pose.get("shoulders") or []
+    if len(shoulders) != 2:
         return None
+    return ((shoulders[0][0] + shoulders[1][0]) / 2, (shoulders[0][1] + shoulders[1][1]) / 2)
+
+
+def _shoulder_width(pose: dict) -> float:
+    shoulders = pose.get("shoulders") or []
+    return point_distance(shoulders[0], shoulders[1]) if len(shoulders) == 2 else 0.0
+
+
+def _distinct_poses(poses: list, face_width: float) -> list:
+    """(index, pose) for every person once: a pose whose nose is within SAME_POSE_FACE_WIDTHS of an earlier
+    pose's is the same person seen twice, and the one with the wider shoulders is kept."""
+    kept = []
+    for index, pose in enumerate(poses):
+        nose = pose.get("nose")
+        if not nose:
+            continue
+        twin = next((k for k, (_, other) in enumerate(kept)
+                     if point_distance(nose, other["nose"]) <= SAME_POSE_FACE_WIDTHS * max(face_width, 1e-6)), None)
+        if twin is None:
+            kept.append((index, pose))
+        elif _shoulder_width(pose) > _shoulder_width(kept[twin][1]):
+            kept[twin] = (index, pose)
+    return kept
+
+
+def _continuations(memory, root, now: float) -> list:
+    """(distance, index) of every remembered hand this root may continue: confirmed within the carry time, and
+    within the continuity distance of where it was last seen."""
+    out = []
+    for index, (wrist, confirmed_at, seen_at) in enumerate(memory.hands):
+        if now - confirmed_at > OWNERSHIP_CARRY_SECONDS:
+            continue
+        distance = point_distance(root, wrist)
+        if distance <= OWNERSHIP_CARRY_DISTANCE + OWNERSHIP_CARRY_SPEED * max(0.0, now - seen_at):
+            out.append((distance, index))
+    return out
+
+
+def select_owned_observations(faces: list, poses: list, hands: list, target_box: list | None,
+                              memory: OwnershipMemory | None = None, timestamp: float | None = None,
+                              explain: bool = False):
+    """Associate the enrolled face to one pose, then its visible wrists to hands; with `memory`, carry what an
+    earlier frame confirmed (OwnershipMemory, above). Returns the selection (at most 2 owned hands, possibly
+    none), or None when the patient's face can't be told from the others. With explain=True, (selection, reason):
+    the reason of a None, or why a selection has no hands ('' when it has)."""
+    def fail(reason):
+        return (None, reason) if explain else None
+
+    if target_box is None:
+        return fail("identity")
     face_matches = sorted(((overlap(face["box"], target_box), i) for i, face in enumerate(faces)), reverse=True)
     if not face_matches or face_matches[0][0] < .20 or (len(face_matches) > 1 and face_matches[0][0] - face_matches[1][0] < .12):
-        return None
+        return fail("face_ambiguous")
     target_index = face_matches[0][1]
     face = faces[target_index]
     if len(face.get("points", [])) != len(FACE_INDICES):
-        return None
+        return fail("face_points")
     x, y, width, height = face["box"]
     center = (x + width / 2, y + height / 2)
-    pose_matches = []
-    for i, pose in enumerate(poses):
-        nose = pose.get("nose")
-        if nose and x - .04 <= nose[0] <= x + width + .04 and y - .04 <= nose[1] <= y + height + .04:
-            pose_matches.append((point_distance(nose, center), i))
-    pose_matches.sort()
-    if not pose_matches or (len(pose_matches) > 1 and pose_matches[1][0] - pose_matches[0][0] < .03):
-        return None
-    pose_index = pose_matches[0][1]
-    pose = poses[pose_index]
-    shoulders = pose.get("shoulders", [])
-    if len(shoulders) != 2:
-        return None
-    shoulder_width = point_distance(shoulders[0], shoulders[1])
-    if shoulder_width < .04:
-        return None
-    owned, owned_indices = [], []
+    now = float(timestamp or 0.0)
+    bodies = _distinct_poses(poses, width)
+    remembered = (memory.shoulders if memory is not None and memory.shoulders is not None
+                  and now - memory.shoulders_at <= POSE_CARRY_SECONDS else None)
+    # The patient's body: the pose with its nose in the face box (two of them: the remembered shoulders decide);
+    # none: the pose whose shoulders stayed where the last matched ones were.
+    note = ""
+    pose_index, pose_carried = None, False
+    nose_matches = sorted((point_distance(pose["nose"], center), index) for index, pose in bodies
+                          if x - .04 <= pose["nose"][0] <= x + width + .04 and y - .04 <= pose["nose"][1] <= y + height + .04)
+    if nose_matches and (len(nose_matches) == 1 or nose_matches[1][0] - nose_matches[0][0] >= .03):
+        pose_index = nose_matches[0][1]
+    elif nose_matches:
+        near = [index for _, index in nose_matches[:2] if remembered is not None and _shoulder_mid(poses[index]) is not None
+                and point_distance(_shoulder_mid(poses[index]), remembered) <= POSE_CARRY_DISTANCE]
+        if len(near) == 1:
+            pose_index = near[0]
+        else:
+            note = "two_bodies"
+    else:
+        candidates = sorted((point_distance(mid, remembered), index) for index, pose in bodies
+                            for mid in [_shoulder_mid(pose)]
+                            if remembered is not None and mid is not None and point_distance(mid, remembered) <= POSE_CARRY_DISTANCE)
+        if candidates:
+            pose_index, pose_carried = candidates[0][1], True
+        else:
+            note = "no_body"
+    shoulders, shoulder_width = None, 0.0
+    if pose_index is not None:
+        shoulder_width = _shoulder_width(poses[pose_index])
+        if shoulder_width < .04:
+            pose_index, note = None, "shoulders"
+        else:
+            shoulders = _shoulder_mid(poses[pose_index])
+    # Hands: each to the nearest visible wrist of any body, unless another body's wrist is nearly as close (that
+    # hand alone is then undecided). A hand the memory carries stays the patient's when undecided, or when a
+    # neighbour's wrist won it by little; a neighbour's wrist right on the root is that neighbour's hand.
+    reach = max(.06, shoulder_width * .8) if pose_index is not None else .06
+    margin = max(.02, shoulder_width * .15) if pose_index is not None else .02
+    votes = []   # (hand_index, hand, confirmed by this frame, may be carried)
     for hand_index, hand in enumerate(hands):
         if len(hand) != len(HAND_INDICES):
             continue
         root = hand[0]
-        distances = []
-        for other_index, other_pose in enumerate(poses):
-            for wrist in other_pose.get("wrists", []):
-                if wrist and len(wrist) >= 3 and wrist[2] >= .5:
-                    distances.append((point_distance(root, wrist), other_index))
-        distances.sort()
-        if not distances:
+        distances = sorted((point_distance(root, wrist), index) for index, pose in bodies
+                           for wrist in pose.get("wrists", []) if wrist and len(wrist) >= 3 and wrist[2] >= .5)
+        tie = tie_distance = None
+        if distances and distances[0][0] <= reach:
+            nearest, owner = distances[0]
+            rival = next((d for d, index in distances[1:] if index != owner), None)
+            if rival is None or rival - nearest >= margin:
+                tie, tie_distance = owner, nearest
+        patient_distance = min((d for d, index in distances if index == pose_index), default=None)
+        confirmed = tie is not None and tie == pose_index
+        weak = tie is None or tie_distance >= max(WEAK_RIVAL_MIN,
+                                                   0.5 * patient_distance if patient_distance is not None else 0.0)
+        votes.append((hand_index, hand, confirmed, weak))
+    # Each remembered hand continues at most one hand of this frame, the nearest; the hands this frame confirmed
+    # claim theirs first (so a carried hand never takes a confirmed one's memory).
+    claims = {}
+    if memory is not None:
+        used = set()
+        for confirmed_first in (True, False):
+            candidates = sorted((distance, hand_index, entry)
+                                for hand_index, hand, confirmed, weak in votes
+                                if confirmed == confirmed_first and (confirmed or weak)
+                                for distance, entry in _continuations(memory, hand[0], now))
+            for _, hand_index, entry in candidates:
+                if hand_index not in claims and entry not in used:
+                    claims[hand_index] = entry
+                    used.add(entry)
+    owned, owned_indices, carried_flags, memory_indices = [], [], [], []
+    for hand_index, hand, confirmed, weak in votes:
+        if confirmed:
+            carried = False
+        elif hand_index in claims:
+            carried = True
+        else:
             continue
-        nearest, owner = distances[0]
-        margin = max(.02, shoulder_width * .15)
-        if nearest > max(.06, shoulder_width * .8):
-            continue
-        if len(distances) > 1 and distances[1][1] != owner and distances[1][0] - nearest < margin:
-            return None
-        if owner == pose_index:
-            owned.append(hand)
-            owned_indices.append(hand_index)
-    return {"face": face["points"], "hands": owned[:2], "hand_indices": owned_indices[:2], "box": face["box"],
-            "face_index": target_index}
+        owned.append(hand)
+        owned_indices.append(hand_index)
+        carried_flags.append(carried)
+        memory_indices.append(claims.get(hand_index))
+    selection = {"face": face["points"], "hands": owned[:2], "hand_indices": owned_indices[:2], "box": face["box"],
+                 "face_index": target_index, "pose_index": pose_index, "pose_carried": pose_carried,
+                 "shoulders": shoulders, "carried_hands": carried_flags[:2], "memory_indices": memory_indices[:2],
+                 "carried": pose_carried or any(carried_flags[:2])}
+    if explain:
+        return selection, (note if not owned else "")
+    return selection
 
 
 @dataclass
@@ -218,6 +365,8 @@ class MonitorSession:
     ownership_lost_at: float | None = None
     ownership_lost_stage: str | None = None
     event_ownership_gap: bool = False
+    # What the hand-to-body rule remembers between frames (OwnershipMemory); cleared when identity is lost.
+    ownership: OwnershipMemory = field(default_factory=OwnershipMemory)
     candidate: dict | None = None
     # What used the current candidate (mark_candidate_used): 'confirmation' (the robot's request named its event),
     # 'auto_commit', or the browser's 'confirmed_by_user' / 'not_taken'; None while nothing has. A dose candidate
@@ -593,9 +742,14 @@ class MonitorRegistry:
             if state.mode == "dose" and (state.recorded or state.candidate):
                 return state.public()
             verified = state.verified(now)
-            selected = select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box) if verified else None
+            timestamp = float(packet["timestamp"])
+            if not verified:
+                state.ownership.clear()
+            selected = (select_owned_observations(packet["faces"], packet["poses"], packet["hands"], state.target_box,
+                                                  memory=state.ownership, timestamp=timestamp) if verified else None)
+            if selected is not None:
+                state.ownership.update(selected, timestamp)
             if not selected:
-                timestamp = float(packet["timestamp"])
                 if state.ownership_lost_at is None:
                     stage = (state.latest_detector or {}).get("stage")
                     if stage in ACTIVE_EVENT_STAGES:
@@ -613,6 +767,10 @@ class MonitorRegistry:
                 state.latest_detector = {"stage": "WAITING_FOR_PEARL", "decision": "none"}
                 return state.public()
             state.ownership_lost_at = state.ownership_lost_stage = None
+            if selected.get("carried"):
+                # This frame's ownership rests partly on memory, not on its own vote: an event that uses it may
+                # prompt, never auto-log (the ownership-gap cap).
+                state.event_ownership_gap = True
             payload = {"frame_seq": frame_seq, "timestamp": float(packet["timestamp"]),
                        "width": packet["width"], "height": packet["height"],
                        "face_landmarks": full_points(selected["face"], FACE_INDICES),

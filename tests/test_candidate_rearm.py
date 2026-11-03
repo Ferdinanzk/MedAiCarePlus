@@ -41,16 +41,19 @@ def _jpeg():
 JPEG = _jpeg()
 
 
-def _packet(frame_seq, timestamp, distance=None, owned=True, front=None, held=None):
+def _packet(frame_seq, timestamp, distance=None, owned=True, front=None, held=None, body=True):
     # The hand sits below the mouth (y 0.6), so the face is never "covered" and a candidate can become ready.
-    # owned=False: no body for the face, so select_owned_observations can't tie the hand to the patient.
-    # front: the depth model's reading of the hand against the face (a robot frame's hand_depth).
-    # held: what the object detector saw in the hand (hand_objects): a label, or "" for a checked empty hand.
+    # owned=False: a second face over the identity box, so select_owned_observations can't tell the patient's
+    # face (the frame belongs to nobody). body=False: no pose at all, so the hand has no wrist to be tied by (the
+    # rule's memory may still carry it). front: the depth model's reading of the hand against the face (a robot
+    # frame's hand_depth). held: what the object detector saw in the hand (hand_objects): a label, or "" for a
+    # checked empty hand.
     hand = None if distance is None else [distance / 4, 0.6]
+    face = {"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}
     packet = {"frame_seq": frame_seq, "timestamp": float(timestamp), "width": 100, "height": 100,
-              "faces": [{"box": [0.1, 0.1, 0.4, 0.4], "points": [[0.3, 0.3]] * 9}],
+              "faces": [face] if owned else [face, dict(face)],
               "poses": [{"nose": [0.3, 0.3], "shoulders": [[0.2, 0.5], [0.4, 0.5]],
-                         "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}] if owned else [],
+                         "wrists": [] if hand is None else [[hand[0], hand[1], 0.9]]}] if body else [],
               "hands": [] if hand is None else [[hand] * 13]}
     if front is not None and hand is not None:
         packet["hand_depth"] = [{"face": 0, "front": front}]
@@ -126,7 +129,7 @@ class _Run:
         self.seq = 0
         self.candidates = []   # event ids, in the order they appeared
 
-    async def frame(self, distance=None, vision=True, verified=True, owned=True, front=None, held=None):
+    async def frame(self, distance=None, vision=True, verified=True, owned=True, front=None, held=None, body=True):
         self.seq += 1
         self.clock.t += 1 / FPS
         state = self.state
@@ -135,7 +138,8 @@ class _Run:
             state.target_box = [0.1, 0.1, 0.4, 0.4]
         else:
             state.identity_hits, state.target_box = 0, None
-        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned, front, held))
+        result = await self.registry.landmarks(state, _packet(self.seq, self.clock.t, distance, owned, front, held,
+                                                              body))
         if vision and verified:
             result = await self.registry.vision(state, self.seq, JPEG, self.commits)
         candidate = state.candidate
@@ -472,9 +476,9 @@ def test_a_gate_reset_is_logged_once_with_its_stage(clock, caplog):
 
 
 def test_a_short_gap_in_ownership_keeps_the_event_but_never_auto_logs_it(clock):
-    """The hand's owner is unclear for 0.27 s while the hand is at the mouth (the frames where it crosses the face,
-    on the C:\\pilldetector clips): the event survives, the detector still rates it confirmed, and the policy caps it
-    at uncertain, so an auto-commit session makes a prompt instead of a record. Without the gap it auto-commits."""
+    """The frame can't be tied to the patient for 0.27 s while the hand is at the mouth (a second face over the
+    identity box): the event survives, the detector still rates it confirmed, and the policy caps it at uncertain,
+    so an auto-commit session makes a prompt instead of a record. Without the gap it auto-commits."""
     async def scenario():
         gapped = _Run(clock, auto_commit=True)
         await gapped.rest(1.0)
@@ -615,3 +619,35 @@ def test_a_phone_in_the_hand_makes_a_prompt_or_nothing_and_a_cup_changes_nothing
     # session kept detecting and the latest result is a later idle frame.
     assert run.state.latest_detector["stage"] == "COOLDOWN"
     assert run.candidates == [] and run.state.candidate is None and run.commits.calls == []
+
+
+def test_a_hand_the_body_rule_loses_mid_gesture_is_carried_and_the_event_can_only_prompt(clock):
+    """The patient's pose drops out for 0.6 s while the hand is at the mouth (on the C:\\pilldetector clips the
+    pose model loses the body when the hand covers the face, for up to 2.5 s): with no wrist to tie it by, the
+    hand-to-body rule carries the hand it confirmed on the frames before, so the event goes on, and the frames
+    that rest on memory cap it at a prompt (the ownership-gap cap). The same gesture with the body present
+    auto-commits."""
+    async def scenario():
+        carried = _Run(clock, auto_commit=True)
+        await carried.rest(1.0)
+        for distance in GESTURE[:14]:
+            await carried.frame(distance)
+        detector_session = carried.state.detector_session_id
+        for distance in GESTURE[14:23]:
+            await carried.frame(distance, body=False)
+        assert carried.state.detector_session_id == detector_session     # no reset: the hand was carried
+        for distance in GESTURE[23:]:
+            await carried.frame(distance)
+        summary = await clock.detector.get_session(7, carried.state.detector_session_id)
+        plain = _Run(clock, auto_commit=True)
+        await plain.rest(1.0)
+        await plain.gesture()
+        return carried, summary, plain
+
+    carried, summary, plain = asyncio.run(scenario())
+    latest = summary["latest_result"]
+    assert latest["policy"]["detector_band"] == "confirmed"
+    assert (latest["decision"], latest["decision_reason"]) == ("uncertain", "ownership_gap_needs_confirmation")
+    assert carried.state.candidate is not None and carried.state.candidate["decision"] == "uncertain"
+    assert carried.commits.calls == []
+    assert plain.state.candidate["decision"] == "confirmed" and [method for _, method in plain.commits.calls] == ["auto"]
