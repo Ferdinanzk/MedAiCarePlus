@@ -220,6 +220,14 @@ CREATE TABLE IF NOT EXISTS ops_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Who switched LINE medication reminders off or on, and when (the current state is ops_state 'line_reminders_paused')
+CREATE TABLE IF NOT EXISTS line_switch_log (
+    log_id     BIGSERIAL PRIMARY KEY,
+    paused     BOOLEAN NOT NULL,
+    changed_by INTEGER REFERENCES "user"(u_id) ON DELETE SET NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ─────────────────────────────────────────────
 -- Reachy robot: devices, tasks, confirmations, outbox (Phase 2)
 -- ─────────────────────────────────────────────

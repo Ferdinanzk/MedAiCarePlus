@@ -71,6 +71,8 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"
 LINE_WEBHOOK_ENDPOINT_URL = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+# Accounts (by email, comma-separated, compared lower-cased) that may switch LINE medication reminders off and on
+ADMIN_EMAILS = frozenset(e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip())
 
 # Dose videos for family (opt-in, consent kind 'video'). LINE has no upload API: the family's LINE app downloads
 # each clip from PUBLIC_BASE_URL (https). Empty = the address of the LINE webhook (scripts/line-tunnel.ps1 sets it).

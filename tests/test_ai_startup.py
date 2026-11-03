@@ -75,6 +75,7 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
     monkeypatch.setattr(ai_store, "seed_from_env", seed)
     monkeypatch.setattr(ai_store, "fill_openrouter_keys_from_env", fill)
     monkeypatch.setattr(ai_store, "load", load)
+    monkeypatch.setattr(main.line_pause, "load", nothing)
     for service in ("FaceRecognitionService", "EmotionService", "OCRService", "LineService",
                     "IntakeDetectionService", "LandmarkService"):
         monkeypatch.setattr(main, service, types.SimpleNamespace(get_instance=lambda: None))

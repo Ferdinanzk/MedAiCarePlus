@@ -27,7 +27,7 @@ from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.services import ai_settings, ai_store, reminders
+from app.services import ai_settings, ai_store, line_pause, reminders
 from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
         await ai_store.seed_from_env(conn)   # first start only; checks .env (check_ai_settings) before copying it
         await ai_store.fill_openrouter_keys_from_env(config.OPENROUTER_API_KEY)   # every start: keyless ones only
         ai_settings.set_current(await ai_store.load(conn))
+        await line_pause.load(conn)
         unusable = []
         for job in ai_settings.JOBS:   # before check_ai_settings, which can stop a prod start
             if not ai_settings.job_usable(ai_settings.current(), job):
