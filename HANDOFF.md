@@ -837,7 +837,7 @@ The rules are in `CLAUDE.md` ("LINE reminder switch"); the plan is `docs/superpo
 semgrep was **not run** (not installed on this PC); the webhook and token code were not scanned.
 
 **Still to do (the real check, with the user's OK for LINE sends).**
-1. Rebuild with `.\scriptsebuild-app.ps1` only while no dose session runs; confirm `/health` answers and the
+1. Rebuild with `.\scripts\rebuild-app.ps1` only while no dose session runs; confirm `/health` answers and the
    `[STARTUP]` lines show no FAILED. Not done yet.
 2. Put the admin's account number in `.env` `ADMIN_USER_IDS`, then `docker compose up -d app`. Not done yet.
 3. Pause from the card, give the patient a demo dose with a reminder due, and check `notification_outbox` and the job made
