@@ -97,6 +97,7 @@ models/face_recognition/face_gallery/*.jpeg
 # Models the app needs at run time, committed so a fresh clone builds and runs as is
 !models/emotion_seed43/model_fp32.onnx
 !models/landmarks/*.onnx
+!models/liveness/*.onnx
 !frontend_source/public/models/*.task
 !reachy_app/medcare_reachy/vision_models/*.onnx
 

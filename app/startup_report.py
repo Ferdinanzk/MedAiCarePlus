@@ -29,8 +29,8 @@ from app.services import ai_settings
 
 log = logging.getLogger("app.startup")
 
-STAGES = ("environment", "database", "ai_settings", "gpt_live", "models", "scheduler", "outbox", "line", "reminders",
-          "device_api", "network", "clock", "voice_lines")
+STAGES = ("environment", "database", "ai_settings", "gpt_live", "models", "liveness", "scheduler", "outbox", "line",
+          "reminders", "device_api", "network", "clock", "voice_lines")
 PROBE_TIMEOUT = 4.0
 PROBES = {"openai": "https://api.openai.com/v1/models", "line": "https://api.line.me/v2/bot/info"}
 CLOCK_SKEW_WARN_SECONDS = 60.0
@@ -93,6 +93,15 @@ def ai_jobs(snapshot, unusable: list[str]) -> str:
         detail += "; a job without a usable model gives Reachy's fixed line / no safety model check / no summaries: " \
                   "choose a tested model whose connection has a key on the AI connections card"
     return detail
+
+
+def liveness(service) -> tuple[bool, str]:
+    """Face login's liveness model (services/liveness_service.py) and the mode it is used in."""
+    use = "scores only logged" if config.FACE_LIVENESS_MODE == "log" else "a low score refuses the frame"
+    mode = f"mode {config.FACE_LIVENESS_MODE} ({use}), threshold {config.FACE_LIVENESS_THRESHOLD}"
+    if service.available:
+        return True, f"{service.model_path.name} loaded, {mode}"
+    return False, f"{service.problem} ({service.model_path}): every liveness score is None, {mode}"
 
 
 def gpt_live(snapshot) -> tuple[str, str]:

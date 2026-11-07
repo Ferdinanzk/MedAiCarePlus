@@ -66,7 +66,14 @@ FACE_SECOND_FACE_RATIO = float(os.getenv("FACE_SECOND_FACE_RATIO", "0.70"))
 FACE_LOGIN_FRAMES      = int(os.getenv("FACE_LOGIN_FRAMES",        "5"))
 FACE_LOGIN_MIN_MATCHES = int(os.getenv("FACE_LOGIN_MIN_MATCHES",   "3"))
 FACE_LIVENESS_MODE     = os.getenv("FACE_LIVENESS_MODE", "log")
-# Placeholder until Task 2 chooses the liveness model; then use that model's published default.
+# Passive liveness model (services/liveness_service.py): MiniFASNetV2 of Silent-Face-Anti-Spoofing, models/liveness/
+# SOURCE.md. Its score is the probability the face is real. The source publishes no probability threshold: it calls a
+# face real when "real" is the most likely of its 3 classes (argmax). 0.5 is the lowest threshold that always means
+# that, so it is the default.
+FACE_LIVENESS_MODEL = Path(os.getenv(
+    "FACE_LIVENESS_MODEL",
+    str(_HERE / "models" / "liveness" / "MiniFASNetV2.onnx")
+))
 FACE_LIVENESS_THRESHOLD = float(os.getenv("FACE_LIVENESS_THRESHOLD", "0.5"))
 OLLAMA_TIMEOUT       = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 OLLAMA_MODELS        = ["gemini-3-flash-preview", "minicpm-v", "llama3.2-vision", "llava", "gemma3"]

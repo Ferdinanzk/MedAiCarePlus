@@ -19,6 +19,7 @@ from app.services.ocr_service import OCRService
 from app.services.line_service import LineService
 from app.services.intake_detection import IntakeDetectionService
 from app.services.landmark_service import LandmarkService
+from app.services.liveness_service import LivenessService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
 from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations, api_memory
@@ -84,6 +85,9 @@ async def lifespan(app: FastAPI):
         ("intake_detection", IntakeDetectionService), ("landmarks", LandmarkService))}
     startup_report.mark("models", all(models.values()),
                         ", ".join(f"{name} {'ok' if ok else 'MISSING'}" for name, ok in models.items()), warn=True)
+    liveness = LivenessService.get_instance()
+    liveness.warm_up()
+    startup_report.mark("liveness", *startup_report.liveness(liveness), warn=True)
     start_scheduler()
     from app.jobs.scheduler import scheduler
     jobs = [job.id for job in scheduler.get_jobs()]
@@ -241,6 +245,7 @@ async def health():
         "line": LineService._available,
         "intake_detection": IntakeDetectionService._available,
         "landmarks": LandmarkService._available,
+        "liveness": LivenessService.get_instance().available,
         "startup": startup_report.summary(),   # the [STARTUP] stages, for scripts/medcare-boot.ps1
     }
 
