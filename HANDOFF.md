@@ -859,6 +859,31 @@ semgrep was **not run** (not installed on this PC); the webhook and token code w
 - Two live-voice tests in `reachy.spec.ts` (`:575`, `:599`) fail before and after this branch.
 - Merging or pushing the branch is the user's decision.
 
+## 15. Face login picks the biggest face (8 November 2026)
+
+**What changed** (branch `version-4-competition`, commits `7bec6ae` to `b191523`, on top of `b4c4a97`; nothing pushed, nothing rebuilt yet):
+
+- Face login now looks at the biggest face in the frame. A second face at least 70% as big (`FACE_SECOND_FACE_RATIO`) gives `two_faces`; a biggest face under 5% of the frame (`FACE_MIN_AREA_RATIO`) gives `come_closer` (`app/services/face_login.py:46-56`). Registration photos follow the same rule.
+- One login is 5 frames in one request; 3 must match the same person (`FACE_LOGIN_FRAMES`, `FACE_LOGIN_MIN_MATCHES`), and any frame with two faces fails it (`face_login.py:59-91`). `/api/face/identify`, `/api/face/login`, `/api/auth/face-login` and `/auth/face-frame` take `files` instead of `file`. `/auth/confirm-login` takes a 60-second `ticket` from `/auth/face-frame`, not a name (`auth.py:69`); the ticket is not single-use.
+- A passive liveness check (MiniFASNetV2, `models/liveness/`, source and licence in `models/liveness/SOURCE.md`) scores the main face. `FACE_LIVENESS_MODE` is `log`: the scores are written to the log and nothing is refused. The login pages show a reason in plain words (`i18n.ts` `login.face.*`, `static/js/face_login.js`).
+- When the face model is unavailable the answer is `no_face` with the error `Model not loaded` (`api_face.py:74-85`).
+- For `/health` to show `"liveness": true` the app image must be rebuilt (`.\scripts\rebuild-app.ps1`, only while no dose session runs). Until then the running container has no liveness model.
+
+**Checked with the real models on 8 November** (controller, in the `medcareai2-app` image): a selfie of two people gave `two_faces`; Ferdinan alone matched at distance 0.141 with liveness 0.9997; an unregistered face was `unknown` at 0.416; a 5-frame login took 134 ms.
+
+**Measurement still to do with the user (before `block`):** log in on this laptop's webcam in `log` mode in four cases: normal light, dim light, a photo shown on a phone, and a printout. Read the scores from the log line `face login: reason=... liveness=[...] mode=log` (`docker logs`), record them here, and only then choose `FACE_LIVENESS_THRESHOLD`. The default 0.5 is only the model source's argmax rule (`models/liveness/SOURCE.md`); it is not measured on this camera. The model's source expects 3:4 frames and this webcam is 4:3 landscape, so dim light and a phone photo are the cases to look at closely.
+
+| Case | Liveness scores (5 frames) | Result |
+| --- | --- | --- |
+| Normal light | to measure | |
+| Dim light | to measure | |
+| Phone photo | to measure | |
+| Printout | to measure | |
+
+**Switching to `block`** (the user's call, after the table is filled in): set `FACE_LIVENESS_MODE=block` (and `FACE_LIVENESS_THRESHOLD` if the measurement says so) in `.env`, then recreate the container (`docker compose up -d app`; an environment change needs a recreate). In `block`, a frame coded `match` or `unknown` with a score below the threshold, or no score, makes the login `not_live`; `come_closer` and `no_face` frames are not judged for liveness (`face_login.py:70-74`). Any value other than `block` means `log`, so check the `[STARTUP]` liveness line (`mode block (a low score refuses the frame)`). To go back, set `log`.
+
+**Open:** whether the core notice must mention the liveness check before real patients (the user decides). Minor items found in review and deferred are listed in `.superpowers/sdd/2026-11-08-face-login/progress.md`.
+
 ---
 
 # History: handoff of 2 October 2026
