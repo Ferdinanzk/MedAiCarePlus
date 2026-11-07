@@ -9,6 +9,13 @@ const resources = {
         title: 'Login',
         faceRecognition: 'Face Recognition',
         welcome: 'Welcome to MedAiCarePlus',
+        face: {
+          scanning: 'Scanning…',
+          comeCloser: 'Please come closer to the camera.',
+          twoFaces: 'Two people are close to the camera. Please let one person come closer.',
+          notLive: 'Please look at the camera yourself.',
+          unknown: 'Face not recognised. Try email login below.',
+        },
       },
       lineAdmin: {
         banner: 'LINE medication reminders paused by the admin since {{time}}. Reachy still reminds on the robot, and other LINE messages still go out.',
@@ -783,6 +790,13 @@ const resources = {
         title: '登入',
         faceRecognition: '臉部辨識',
         welcome: '歡迎使用 MedAiCarePlus',
+        face: {
+          scanning: '掃描中…',
+          comeCloser: '請靠近鏡頭一點。',
+          twoFaces: '有兩個人靠近鏡頭，請讓一個人靠近一點。',
+          notLive: '請本人看著鏡頭。',
+          unknown: '無法辨識臉部，請改用下方的電子郵件登入。',
+        },
       },
       lineAdmin: {
         banner: '管理員已暫停 LINE 用藥提醒（自 {{time}} 起）。Reachy 仍會在機器人上提醒，其他 LINE 訊息照常發送。',

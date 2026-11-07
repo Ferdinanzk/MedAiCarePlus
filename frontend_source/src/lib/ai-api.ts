@@ -27,18 +27,22 @@ export function aiFetch(path: string, options?: RequestInit): Promise<Response> 
   });
 }
 
+export type FaceReason = 'match' | 'unknown' | 'no_face' | 'come_closer' | 'two_faces' | 'not_live';
+
+export interface FaceAnswer {
+  identified: boolean;
+  name?: string;
+  distance?: number;
+  face_count?: number;
+  error?: string;
+  reason?: FaceReason;
+  frames?: unknown;
+}
+
 export const aiApi = {
-  async faceLogin(imageFile: File): Promise<{
-    identified: boolean;
-    name?: string;
-    token?: string;
-    u_id?: number;
-    distance?: number;
-    face_count?: number;
-    error?: string;
-  }> {
+  async faceLogin(frames: File[]): Promise<FaceAnswer & { token?: string; u_id?: number }> {
     const form = new FormData();
-    form.append('file', imageFile);
+    frames.forEach((f) => form.append('files', f));
     const resp = await fetch('/api/face/login', { method: 'POST', body: form });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
@@ -47,15 +51,9 @@ export const aiApi = {
     return resp.json();
   },
 
-  async identifyFace(imageFile: File): Promise<{
-    identified: boolean;
-    name?: string;
-    distance?: number;
-    face_count?: number;
-    error?: string;
-  }> {
+  async identifyFace(frames: File[]): Promise<FaceAnswer> {
     const form = new FormData();
-    form.append('file', imageFile);
+    frames.forEach((f) => form.append('files', f));
     const resp = await aiFetch('/api/face/identify', {
       method: 'POST',
       body: form,

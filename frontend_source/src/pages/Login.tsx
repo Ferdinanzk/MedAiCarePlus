@@ -6,6 +6,16 @@ import { Camera, ScanFace, Loader2, Mail, Lock, LogIn } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import LanguageSwitcher from '../components/LanguageSwitcher';
 
+const FRAME_COUNT = 5;
+const FRAME_GAP_MS = 200;
+const REASON_KEYS: Record<string, string> = {
+  come_closer: 'login.face.comeCloser',
+  no_face: 'login.face.comeCloser',
+  two_faces: 'login.face.twoFaces',
+  not_live: 'login.face.notLive',
+  unknown: 'login.face.unknown',
+};
+
 export default function Login() {
   const { t } = useTranslation();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -98,16 +108,21 @@ export default function Login() {
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Canvas not available');
-      ctx.drawImage(video, 0, 0);
 
-      const blob = await new Promise<Blob>((resolve) =>
-        canvas.toBlob((b) => resolve(b!), 'image/jpeg', 0.9)
-      );
-      const file = new File([blob], 'face.jpg', { type: 'image/jpeg' });
+      // 5 frames, 200 ms apart (about 1 s), then one request.
+      const frames: File[] = [];
+      for (let i = 0; i < FRAME_COUNT; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, FRAME_GAP_MS));
+        ctx.drawImage(video, 0, 0);
+        const blob = await new Promise<Blob>((resolve) =>
+          canvas.toBlob((b) => resolve(b!), 'image/jpeg', 0.9)
+        );
+        frames.push(new File([blob], `face${i}.jpg`, { type: 'image/jpeg' }));
+      }
 
       let result;
       try {
-        result = await aiApi.faceLogin(file);
+        result = await aiApi.faceLogin(frames);
       } catch (e: unknown) {
         console.error('[faceLogin] network/parse error:', e);
         throw e;
@@ -121,7 +136,7 @@ export default function Login() {
       } else if (result.identified && result.name) {
         setError('Login error: session token missing. Please try again.');
       } else {
-        setError('Face not recognized. Try email login below.');
+        setError(t(REASON_KEYS[result.reason ?? 'unknown'] ?? 'login.face.unknown'));
       }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Face recognition failed');
@@ -242,7 +257,7 @@ export default function Login() {
                     {loading ? (
                       <>
                         <Loader2 className="w-5 h-5 animate-spin" />
-                        {t('common.loading')}
+                        {t('login.face.scanning')}
                       </>
                     ) : (
                       <>
