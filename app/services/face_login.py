@@ -7,6 +7,19 @@ from collections import Counter
 from dataclasses import dataclass
 
 
+def blocks_liveness(mode: str) -> bool:
+    """The one test of "block mode", used by decide() and the startup line. Anything but block (after trimming and
+    lower-casing) is log mode, so a typo never refuses anyone."""
+    return mode.strip().lower() == "block"
+
+
+def liveness_mode_problem(mode: str) -> str | None:
+    """Why a FACE_LIVENESS_MODE value is not understood, else None. An unknown value is treated as log."""
+    if mode.strip().lower() in ("log", "block"):
+        return None
+    return f"unknown FACE_LIVENESS_MODE {mode.strip()}: treated as log, nothing is refused"
+
+
 @dataclass(frozen=True)
 class FaceBox:
     x: float
@@ -67,7 +80,7 @@ def decide(verdicts: list[FrameVerdict], *, min_matches: int, liveness_mode: str
     if any(v.code == "two_faces" for v in verdicts):
         return fail("two_faces")
 
-    if liveness_mode == "block":
+    if blocks_liveness(liveness_mode):
         # Only frames that judged a face (match / unknown) carry a liveness score.
         judged = [v for v in verdicts if v.code in ("match", "unknown")]
         if any(v.liveness is None or v.liveness < liveness_threshold for v in judged):

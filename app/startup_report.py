@@ -97,8 +97,12 @@ def ai_jobs(snapshot, unusable: list[str]) -> str:
 
 def liveness(service) -> tuple[bool, str]:
     """Face login's liveness model (services/liveness_service.py) and the mode it is used in."""
-    use = "scores only logged" if config.FACE_LIVENESS_MODE == "log" else "a low score refuses the frame"
+    from app.services.face_login import blocks_liveness, liveness_mode_problem
+    use = "a low score refuses the frame" if blocks_liveness(config.FACE_LIVENESS_MODE) else "scores only logged"
     mode = f"mode {config.FACE_LIVENESS_MODE} ({use}), threshold {config.FACE_LIVENESS_THRESHOLD}"
+    bad = liveness_mode_problem(config.FACE_LIVENESS_MODE)
+    if bad:
+        return False, bad
     if service.available:
         return True, f"{service.model_path.name} loaded, {mode}"
     return False, f"{service.problem} ({service.model_path}): every liveness score is None, {mode}"

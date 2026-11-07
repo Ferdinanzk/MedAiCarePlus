@@ -56,7 +56,7 @@ async function attempt(video, canvas, status) {
         `Welcome back, ${data.name}! Click Confirm Login to continue.`;
       document.getElementById('confirmForm').classList.remove('d-none');
       return true;
-    } else if (!resp.ok) {
+    } else if (!resp.ok || data.error === 'Model not loaded') {
       status.textContent = 'Server unavailable. Trying again…';
     } else if (data.error) {
       status.textContent = 'Model: ' + data.error;

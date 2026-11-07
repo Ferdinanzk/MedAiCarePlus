@@ -99,3 +99,37 @@ def test_face_count_is_the_most_faces_in_one_frame():
     assert dec([m(), m(), two, v("no_face")]).face_count == 2
     assert dec([m(), m(), m()]).face_count == 1
     assert dec([]).face_count == 0
+
+
+def test_liveness_mode_is_normalised_and_a_typo_is_log():
+    from app.services.face_login import blocks_liveness, liveness_mode_problem
+    assert blocks_liveness("Block") and blocks_liveness(" block ") and blocks_liveness("block")
+    assert not blocks_liveness("blok") and not blocks_liveness("log")
+    assert liveness_mode_problem("log") is None and liveness_mode_problem(" Block ") is None
+    assert liveness_mode_problem("blok") == "unknown FACE_LIVENESS_MODE blok: treated as log, nothing is refused"
+    spoof = [m(0.1, liveness=0.1)] * 5
+    for mode, refused in (("Block", True), (" block ", True), ("blok", False)):
+        d = decide(spoof, min_matches=3, liveness_mode=mode, liveness_threshold=0.5)
+        assert (d.reason == "not_live") is refused
+
+
+def test_frame_settings_are_clamped(monkeypatch):
+    import importlib
+    from app import config
+    try:
+        monkeypatch.setenv("FACE_LOGIN_MIN_MATCHES", "0")
+        importlib.reload(config)
+        assert config.FACE_LOGIN_MIN_MATCHES == 1
+        monkeypatch.setenv("FACE_LOGIN_MIN_MATCHES", "9")
+        importlib.reload(config)
+        assert config.FACE_LOGIN_MIN_MATCHES == config.FACE_LOGIN_FRAMES == 5
+        monkeypatch.setenv("FACE_LOGIN_FRAMES", "0")
+        monkeypatch.setenv("FACE_LOGIN_MIN_MATCHES", "3")
+        importlib.reload(config)
+        assert config.FACE_LOGIN_FRAMES == 1 and config.FACE_LOGIN_MIN_MATCHES == 1
+        monkeypatch.setenv("FACE_LIVENESS_MODE", " Block ")
+        importlib.reload(config)
+        assert config.FACE_LIVENESS_MODE == "block"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

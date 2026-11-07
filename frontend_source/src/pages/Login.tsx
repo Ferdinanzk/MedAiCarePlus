@@ -128,7 +128,7 @@ export default function Login() {
         throw e;
       }
 
-      if (result.error && result.error.includes('HTTP')) {
+      if (result.error && (result.error.includes('HTTP') || result.error === 'Model not loaded')) {
         setError('Face recognition server unavailable. Please try again later.');
       } else if (result.identified && result.name && result.token) {
         setFaceSession({ name: result.name, loginAt: new Date().toISOString(), u_id: result.u_id }, result.token);

@@ -63,9 +63,11 @@ FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.3"))
 # faces), frames per login, matches needed, liveness mode ("log" | "block") and its threshold.
 FACE_MIN_AREA_RATIO    = float(os.getenv("FACE_MIN_AREA_RATIO",    "0.05"))
 FACE_SECOND_FACE_RATIO = float(os.getenv("FACE_SECOND_FACE_RATIO", "0.70"))
-FACE_LOGIN_FRAMES      = int(os.getenv("FACE_LOGIN_FRAMES",        "5"))
-FACE_LOGIN_MIN_MATCHES = int(os.getenv("FACE_LOGIN_MIN_MATCHES",   "3"))
-FACE_LIVENESS_MODE     = os.getenv("FACE_LIVENESS_MODE", "log")
+FACE_LOGIN_FRAMES      = max(1, int(os.getenv("FACE_LOGIN_FRAMES", "5")))
+# Clamped to 1..FACE_LOGIN_FRAMES: 0 would log anyone in without a match, more than the frames never matches.
+FACE_LOGIN_MIN_MATCHES = min(FACE_LOGIN_FRAMES, max(1, int(os.getenv("FACE_LOGIN_MIN_MATCHES", "3"))))
+# Lower-cased and trimmed; services.face_login.blocks_liveness / liveness_mode_problem say what a value means.
+FACE_LIVENESS_MODE     = os.getenv("FACE_LIVENESS_MODE", "log").strip().lower()
 # Passive liveness model (services/liveness_service.py): MiniFASNetV2 of Silent-Face-Anti-Spoofing, models/liveness/
 # SOURCE.md. Its score is the probability the face is real. The source publishes no probability threshold: it calls a
 # face real when "real" is the most likely of its 3 classes (argmax). 0.5 is the lowest threshold that always means

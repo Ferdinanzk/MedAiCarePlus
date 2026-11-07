@@ -85,3 +85,11 @@ test('a server error keeps the unavailable message', async ({ page }) => {
   await button.click();
   await expect(page.getByText('Face recognition server unavailable. Please try again later.')).toBeVisible();
 });
+
+test('model not loaded shows the unavailable message, not "come closer"', async ({ page }) => {
+  await mockLogin(page, { identified: false, reason: 'no_face', error: 'Model not loaded', frames: [] });
+  const button = await openFaceLogin(page, 'en');
+  await button.click();
+  await expect(page.getByText('Face recognition server unavailable. Please try again later.')).toBeVisible();
+  await expect(page.getByText(COPY.no_face.en)).toHaveCount(0);
+});

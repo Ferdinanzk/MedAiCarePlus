@@ -212,3 +212,13 @@ def test_init_pool_gives_up_with_the_real_reason(monkeypatch):
     with pytest.raises(RuntimeError, match="postgres did not answer in 2 attempts: ConnectionRefusedError"):
         asyncio.run(database.init_pool(attempts=2, retry_seconds=0, sleep=sleep))
     database._pool = None
+
+
+def test_liveness_stage_fails_on_an_unknown_mode_and_says_log(monkeypatch):
+    service = types.SimpleNamespace(available=True, model_path=types.SimpleNamespace(name="m.onnx"))
+    monkeypatch.setattr(config, "FACE_LIVENESS_MODE", "blok")
+    ok, detail = startup_report.liveness(service)
+    assert not ok and detail == "unknown FACE_LIVENESS_MODE blok: treated as log, nothing is refused"
+    monkeypatch.setattr(config, "FACE_LIVENESS_MODE", "block")
+    ok, detail = startup_report.liveness(service)
+    assert ok and "a low score refuses the frame" in detail

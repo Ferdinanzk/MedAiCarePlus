@@ -43,7 +43,7 @@ From `src/generate_patches.py`, `src/anti_spoof_predict.py`, `src/data_io/functi
 `b6d5f04`:
 
 - **Box:** `[x, y, w, h]` in pixels, top-left corner (the source's detector gives `[left, top, right-left+1,
-  bottom-top+1]`). `FaceBox` is the same.
+  bottom-top+1]`). `FaceBox` is the same shape, but not the same box: the detector widens every box 1.15 times (`models/face_recognition/face_detector.py:52` and its postprocess), so our crop is about 3.1 times a tight face box, not the 2.7 the model was trained with. The measurement should also try a crop scale of 2.7/1.15 before block mode.
 - **Crop scale 2.7:** `scale = min((H-1)/h, (W-1)/w, 2.7)`; the box is scaled by it around its centre; a side that
   falls outside the frame is shifted back inside, keeping the crop's size; the crop is
   `frame[y1:y2+1, x1:x2+1]`, corners inclusive (`_get_new_box`, `crop`).
