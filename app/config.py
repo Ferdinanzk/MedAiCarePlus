@@ -59,6 +59,15 @@ DOSE_EARLY_MINUTES = max(0, int(os.getenv("DOSE_EARLY_MINUTES", "") or "120"))
 
 FACE_DET_CONFIDENCE  = float(os.getenv("FACE_DET_CONFIDENCE",  "0.6"))
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.3"))
+# Face login rules (services/face_login.py): main face area / frame area, second-largest / largest area (>= means two
+# faces), frames per login, matches needed, liveness mode ("log" | "block") and its threshold.
+FACE_MIN_AREA_RATIO    = float(os.getenv("FACE_MIN_AREA_RATIO",    "0.05"))
+FACE_SECOND_FACE_RATIO = float(os.getenv("FACE_SECOND_FACE_RATIO", "0.70"))
+FACE_LOGIN_FRAMES      = int(os.getenv("FACE_LOGIN_FRAMES",        "5"))
+FACE_LOGIN_MIN_MATCHES = int(os.getenv("FACE_LOGIN_MIN_MATCHES",   "3"))
+FACE_LIVENESS_MODE     = os.getenv("FACE_LIVENESS_MODE", "log")
+# Placeholder until Task 2 chooses the liveness model; then use that model's published default.
+FACE_LIVENESS_THRESHOLD = float(os.getenv("FACE_LIVENESS_THRESHOLD", "0.5"))
 OLLAMA_TIMEOUT       = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 OLLAMA_MODELS        = ["gemini-3-flash-preview", "minicpm-v", "llama3.2-vision", "llava", "gemma3"]
 
