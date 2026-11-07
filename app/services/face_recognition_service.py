@@ -1,4 +1,5 @@
 import copy
+import logging
 import sys
 import threading
 from functools import wraps
@@ -6,8 +7,14 @@ import numpy as np
 from app.config import (
     FACE_REC_BASE, FACE_DET_MODEL, FACE_REID_MODEL,
     LANDMARKS_MODEL, FACE_GALLERY_DIR,
-    FACE_DET_CONFIDENCE, FACE_MATCH_THRESHOLD, DEVICE
+    FACE_DET_CONFIDENCE, FACE_MATCH_THRESHOLD, DEVICE,
+    FACE_MIN_AREA_RATIO, FACE_SECOND_FACE_RATIO, FACE_LOGIN_MIN_MATCHES,
+    FACE_LIVENESS_MODE, FACE_LIVENESS_THRESHOLD,
 )
+from app.services.face_login import FaceBox, FrameVerdict, LoginDecision, decide, main_face
+from app.services.liveness_service import LivenessService
+
+log = logging.getLogger(__name__)
 
 # Lazy imports — only resolved when models are available
 _models_loaded = False
@@ -196,6 +203,67 @@ class FaceRecognitionService:
         except Exception as exc:
             return {"identified": False, "name": None, "distance": None,
                     "face_count": 0, "error": str(exc)}
+
+    @synchronized
+    def detect(self, frame_bgr: np.ndarray) -> list[FaceBox]:
+        """Every face the detector finds, as pixel boxes (the detector clips them to the frame)."""
+        rois = self.face_det.infer((frame_bgr,))
+        return [FaceBox(float(r.position[0]), float(r.position[1]), float(r.size[0]), float(r.size[1]),
+                        float(r.confidence)) for r in rois]
+
+    @synchronized
+    def match_box(self, frame_bgr: np.ndarray, box: FaceBox) -> tuple[str | None, float | None]:
+        """Match one face against the gallery: (label within FACE_MATCH_THRESHOLD or None, distance or None).
+
+        The same landmarks and identifier steps as match_enrollment_face, on a single ROI. An empty gallery
+        gives (None, None).
+        """
+        gallery = self.face_id.faces_database
+        if not gallery or len(gallery) == 0:
+            return None, None
+        roi = FaceDetector.Result([0, 0, box.confidence, box.x, box.y, box.w, box.h])
+        landmarks = self.lm_det.infer((frame_bgr, [roi]))
+        self.face_id.clear()
+        self.face_id.start_async(frame_bgr, [roi], landmarks)
+        descriptors = self.face_id.get_descriptors()
+        if not descriptors:
+            return None, None
+        index, distance = gallery.match_faces(descriptors[:1], self.face_id.match_algo)[0]
+        distance = float(distance)
+        if self.face_id.match_threshold < distance:
+            return None, distance
+        return gallery[index].label, distance
+
+    def judge_frame(self, frame_bgr: np.ndarray) -> FrameVerdict:
+        """One verdict for one frame: the biggest face is scored for liveness and matched; no other face is."""
+        if not FaceRecognitionService._available:
+            return FrameVerdict("no_face")
+        try:
+            boxes = self.detect(frame_bgr)
+            frame_h, frame_w = frame_bgr.shape[:2]
+            code, main = main_face(boxes, frame_w, frame_h, min_area_ratio=FACE_MIN_AREA_RATIO,
+                                   second_ratio=FACE_SECOND_FACE_RATIO)
+            if main is None:
+                return FrameVerdict(code, face_count=len(boxes))
+            liveness = LivenessService.get_instance().score(frame_bgr, main)
+            if code != "ok":
+                return FrameVerdict(code, liveness=liveness, face_count=len(boxes))
+            label, distance = self.match_box(frame_bgr, main)
+            return FrameVerdict("match" if label is not None else "unknown", label, distance,
+                                liveness, len(boxes))
+        except Exception as exc:
+            log.error("face login frame failed: %s", type(exc).__name__)
+            return FrameVerdict("no_face")
+
+    def login(self, frames: list[np.ndarray]) -> LoginDecision:
+        """Judge each frame, then decide the login from all of them. Logs one line (no names)."""
+        verdicts = [self.judge_frame(f) for f in frames]
+        decision = decide(verdicts, min_matches=FACE_LOGIN_MIN_MATCHES, liveness_mode=FACE_LIVENESS_MODE,
+                          liveness_threshold=FACE_LIVENESS_THRESHOLD)
+        scores = [None if v.liveness is None else round(v.liveness, 2) for v in verdicts]
+        log.info("face login: reason=%s frames=%d matches=%d liveness=%s mode=%s", decision.reason,
+                 len(verdicts), sum(v.code == "match" for v in verdicts), scores, FACE_LIVENESS_MODE)
+        return decision
 
     @synchronized
     def match_enrollment_face(self, frame_bgr: np.ndarray, own_label: str | None = None) -> dict:
