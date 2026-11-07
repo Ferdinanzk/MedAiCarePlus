@@ -102,3 +102,86 @@ def test_model_unavailable_gives_no_face_and_error(svc, monkeypatch):
     assert svc.judge_frame(FRAME).code == "no_face"
     decision = svc.login([FRAME] * 5)
     assert not decision.identified and decision.reason == "no_face"
+
+
+# --- match_box itself, with fake face_id / lm_det / gallery (no models) ---
+
+class FakeResult:
+    def __init__(self, output):
+        self.confidence = output[2]
+        self.position = np.array((output[3], output[4]))
+        self.size = np.array((output[5], output[6]))
+
+
+class FakeGallery:
+    def __init__(self, labels, distance):
+        self.labels = labels
+        self.distance = distance
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, i):
+        return type("Identity", (), {"label": self.labels[i]})()
+
+    def match_faces(self, descriptors, algo):
+        return [(0, self.distance)]
+
+
+class FakeFaceId:
+    match_threshold = 0.3
+    match_algo = "MIN_DIST"
+
+    def __init__(self, gallery, descriptors):
+        self.faces_database = gallery
+        self.descriptors = descriptors
+
+    def clear(self):
+        pass
+
+    def start_async(self, frame, rois, landmarks):
+        pass
+
+    def get_descriptors(self):
+        return self.descriptors
+
+
+class FakeLandmarks:
+    def __init__(self):
+        self.rois = None
+
+    def infer(self, args):
+        self.rois = args[1]
+        return ["lm"]
+
+
+def real_match_service(monkeypatch, gallery, descriptors=("d",)):
+    monkeypatch.setattr(frs, "FaceDetector", type("FD", (), {"Result": FakeResult}))
+    service = object.__new__(FaceRecognitionService)
+    service.lock = threading.RLock()
+    service.face_id = FakeFaceId(gallery, list(descriptors))
+    service.lm_det = FakeLandmarks()
+    return service
+
+
+def test_match_box_gives_landmarks_the_box_as_a_roi(monkeypatch):
+    service = real_match_service(monkeypatch, FakeGallery(["ferdi"], 0.1))
+    assert service.match_box(FRAME, BIG) == ("ferdi", 0.1)
+    (roi,) = service.lm_det.rois
+    assert list(roi.position) == [100, 50] and list(roi.size) == [100, 100]
+    assert roi.confidence == 0.9
+
+
+def test_match_box_threshold_boundary(monkeypatch):
+    at = real_match_service(monkeypatch, FakeGallery(["ferdi"], 0.3))
+    assert at.match_box(FRAME, BIG) == ("ferdi", 0.3)
+    above = real_match_service(monkeypatch, FakeGallery(["ferdi"], 0.3001))
+    assert above.match_box(FRAME, BIG) == (None, 0.3001)
+
+
+def test_match_box_empty_descriptors_and_empty_gallery(monkeypatch):
+    none_computed = real_match_service(monkeypatch, FakeGallery(["ferdi"], 0.1), descriptors=())
+    assert none_computed.match_box(FRAME, BIG) == (None, None)
+    empty = real_match_service(monkeypatch, FakeGallery([], 0.1))
+    assert empty.match_box(FRAME, BIG) == (None, None)
+    assert empty.lm_det.rois is None   # returned before any model ran
