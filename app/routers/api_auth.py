@@ -1,5 +1,4 @@
-import cv2
-import numpy as np
+from typing import List
 from fastapi import APIRouter, UploadFile, File, Request, Response, Depends
 from fastapi.responses import JSONResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature
@@ -7,6 +6,7 @@ import bcrypt as _bcrypt
 from app.config import SECRET_KEY
 from app.database import get_pool
 from app.dependencies import get_current_user, get_consented_user
+from app.routers.api_face import FrameUploadError, log_login, read_login_frames, run_login
 from app.services.face_recognition_service import FaceRecognitionService
 from app.services import consent_service
 
@@ -43,33 +43,26 @@ def _unsign(token: str) -> dict | None:
 async def face_login(
     request: Request,
     response: Response,
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
 ):
     """
-    Upload a face photo; if recognized and the user exists in the local DB,
-    create a session and return user info.
+    Upload up to FACE_LOGIN_FRAMES face photos; if the face login identifies someone who exists in the
+    local DB, create a session and return user info.
     """
-    image_bytes = await file.read()
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return JSONResponse(
-            {"success": False, "error": "Invalid image"},
-            status_code=400,
-        )
+    try:
+        frames = await read_login_frames(files)
+    except FrameUploadError as exc:
+        return JSONResponse({"success": False, "error": exc.error}, status_code=exc.status)
 
-    svc = FaceRecognitionService.get_instance()
-    import asyncio
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, svc.identify_frame, frame)
+    decision = await run_login(frames)
+    face = {"reason": decision.reason, "frames": decision.frames}
 
-    if not result.get("identified") or not result.get("name"):
-        return JSONResponse(
-            {"success": False, "error": "Face not recognized"},
-            status_code=401,
-        )
+    if not decision.identified:
+        log_login(None, decision.reason)
+        error = "Face not recognized" if FaceRecognitionService._available else "Model not loaded"
+        return JSONResponse({"success": False, "error": error, **face}, status_code=401)
 
-    face_label = result["name"]
+    face_label = decision.label
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -78,15 +71,18 @@ async def face_login(
         )
 
     if not row:
+        log_login(None, decision.reason)
         return JSONResponse(
             {
                 "success": False,
                 "error": "Face recognized but no account found",
                 "face_label": face_label,
+                **face,
             },
             status_code=404,
         )
 
+    log_login(row["u_id"], decision.reason)
     token = _sign({"u_id": row["u_id"], "name": row["name"]})
 
     # Also set a cookie for legacy compatibility
@@ -101,6 +97,7 @@ async def face_login(
             "face_label": face_label,
             "line_id": row["line_id"],
         },
+        **face,
     }
 
 

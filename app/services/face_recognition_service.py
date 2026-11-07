@@ -171,40 +171,6 @@ class FaceRecognitionService:
             return {"detected": False, "direction": "none", "stub": True, "face_size_ratio": 0.0}
 
     @synchronized
-    def identify_frame(self, frame_bgr: np.ndarray) -> dict:
-        """
-        Returns:
-            {identified, name, distance, face_count, error}
-        """
-        if not FaceRecognitionService._available:
-            return {"identified": False, "name": None, "distance": None,
-                    "face_count": 0, "error": "Model not loaded"}
-        try:
-            face_rois = self.face_det.infer((frame_bgr,))
-            if not face_rois:
-                return {"identified": False, "name": None, "distance": None,
-                        "face_count": 0, "error": None}
-
-            landmarks = self.lm_det.infer((frame_bgr, face_rois))
-            self.face_id.clear()
-            self.face_id.start_async(frame_bgr, face_rois, landmarks)
-            results, _ = self.face_id.postprocess()
-
-            best = min(results, key=lambda r: r.distance, default=None)
-            unknown_label = FaceIdentifier.UNKNOWN_ID_LABEL
-
-            if best is None or self.face_id.get_identity_label(best.id) == unknown_label:
-                return {"identified": False, "name": None, "distance": None,
-                        "face_count": len(face_rois), "error": None}
-
-            name = self.face_id.get_identity_label(best.id)
-            return {"identified": True, "name": name, "distance": float(best.distance),
-                    "face_count": len(face_rois), "error": None}
-        except Exception as exc:
-            return {"identified": False, "name": None, "distance": None,
-                    "face_count": 0, "error": str(exc)}
-
-    @synchronized
     def detect(self, frame_bgr: np.ndarray) -> list[FaceBox]:
         """Every face the detector finds, as pixel boxes (the detector clips them to the frame)."""
         rois = self.face_det.infer((frame_bgr,))
@@ -234,9 +200,10 @@ class FaceRecognitionService:
             return None, distance
         return gallery[index].label, distance
 
-    def judge_frame(self, frame_bgr: np.ndarray) -> FrameVerdict:
-        """One verdict for one frame: the biggest face is scored for liveness and matched; no other face is."""
-        if not FaceRecognitionService._available:
+    def judge_frame(self, frame_bgr: np.ndarray | None) -> FrameVerdict:
+        """One verdict for one frame: the biggest face is scored for liveness and matched; no other face is.
+        None (an upload that was not an image) is a frame without a face."""
+        if frame_bgr is None or not FaceRecognitionService._available:
             return FrameVerdict("no_face")
         try:
             boxes = self.detect(frame_bgr)
@@ -255,7 +222,7 @@ class FaceRecognitionService:
             log.error("face login frame failed: %s", type(exc).__name__)
             return FrameVerdict("no_face")
 
-    def login(self, frames: list[np.ndarray]) -> LoginDecision:
+    def login(self, frames: list[np.ndarray | None]) -> LoginDecision:
         """Judge each frame, then decide the login from all of them. Logs one line (no names)."""
         verdicts = [self.judge_frame(f) for f in frames]
         decision = decide(verdicts, min_matches=FACE_LOGIN_MIN_MATCHES, liveness_mode=FACE_LIVENESS_MODE,
@@ -269,7 +236,7 @@ class FaceRecognitionService:
     def match_enrollment_face(self, frame_bgr: np.ndarray, own_label: str | None = None) -> dict:
         """Find the face an enrollment photo will store, and which other gallery label login would take it for.
 
-        It runs on the full photo, as face login (identify_frame) and the monitor (identify_faces) do:
+        It runs on the full photo, as face login (detect) and the monitor (identify_faces) do:
         the same detector, landmarks and descriptor, for the face enrollment crops (rois[0], the most
         confident), and login's matching rule: FacesDatabase.match_faces (each label's closest photo, then
         the closest label, MIN_DIST) and FaceIdentifier.postprocess's threshold (a distance above

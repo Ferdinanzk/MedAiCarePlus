@@ -10,8 +10,9 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from itsdangerous import URLSafeTimedSerializer
 from app.dependencies import get_consented_user
-from app.config import SECRET_KEY
+from app.config import SECRET_KEY, FACE_LOGIN_FRAMES
 from app.database import get_pool
+from app.services.face_login import LoginDecision
 from app.services.face_recognition_service import FaceRecognitionService
 
 router = APIRouter(prefix="/api/face", tags=["face-api"])
@@ -30,41 +31,91 @@ FACE_LABEL_TAKEN = ("This face ID is already in use. Choose another name, or sig
                     "enroll the face there.")
 
 
-@router.post("/identify")
-async def identify_face(
-    file: UploadFile = File(...),
-):
-    """Upload a photo, return face recognition result as JSON.
-    Public endpoint — no auth required, used during login flow."""
-    image_bytes = await file.read()
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return JSONResponse({"identified": False, "error": "Invalid image"}, status_code=400)
+MAX_FRAME_BYTES = 2 * 1024 * 1024
 
+
+class FrameUploadError(Exception):
+    """Why a face login upload was refused: the HTTP status and the answer's error text."""
+
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status = status
+        self.error = error
+
+
+async def read_login_frames(files: List[UploadFile]) -> list[np.ndarray | None]:
+    """Decode 1 to FACE_LOGIN_FRAMES uploads. An upload that is not an image becomes None, which login judges
+    as a frame without a face. Raises FrameUploadError: 422 too_many_frames, 413 for a file over 2 MB,
+    400 Invalid image when no upload is an image."""
+    if len(files) > FACE_LOGIN_FRAMES:
+        raise FrameUploadError(422, "too_many_frames")
+    frames: list[np.ndarray | None] = []
+    for upload in files:
+        data = await upload.read(MAX_FRAME_BYTES + 1)
+        if len(data) > MAX_FRAME_BYTES:
+            raise FrameUploadError(413, "frame_too_large")
+        frame = None
+        if data:
+            try:
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            except cv2.error:
+                frame = None
+        frames.append(frame)
+    if all(frame is None for frame in frames):
+        raise FrameUploadError(400, "Invalid image")
+    return frames
+
+
+async def run_login(frames: list[np.ndarray | None]) -> LoginDecision:
     svc = FaceRecognitionService.get_instance()
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, svc.identify_frame, frame)
-    return result
+    return await asyncio.get_running_loop().run_in_executor(None, svc.login, frames)
+
+
+def login_answer(decision: LoginDecision) -> dict:
+    """The face answer's keys: today's (identified, name, distance, face_count, error) plus reason and frames."""
+    return {
+        "identified": decision.identified,
+        "name": decision.label,
+        "distance": decision.distance,
+        "face_count": decision.face_count,
+        "error": None if FaceRecognitionService._available else "Model not loaded",
+        "reason": decision.reason,
+        "frames": decision.frames,
+    }
+
+
+def log_login(u_id: int | None, reason: str) -> None:
+    """The route's one line per login: the account id (or -), never the name."""
+    logger.info("face login: account=%s reason=%s", u_id if u_id is not None else "-", reason)
+
+
+@router.post("/identify")
+async def identify_face(files: List[UploadFile] = File(...)):
+    """Up to FACE_LOGIN_FRAMES photos, return the face login decision as JSON.
+    Public endpoint — no auth required, used during login flow."""
+    try:
+        frames = await read_login_frames(files)
+    except FrameUploadError as exc:
+        return JSONResponse({"identified": False, "error": exc.error}, status_code=exc.status)
+    return login_answer(await run_login(frames))
 
 
 @router.post("/login")
-async def face_login(file: UploadFile = File(...)):
-    """Identify face and return a signed session token for API access."""
-    image_bytes = await file.read()
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return JSONResponse({"identified": False, "error": "Invalid image"}, status_code=400)
+async def face_login(files: List[UploadFile] = File(...)):
+    """Decide the face login from up to FACE_LOGIN_FRAMES photos; when identified, return a signed session
+    token for API access."""
+    try:
+        frames = await read_login_frames(files)
+    except FrameUploadError as exc:
+        return JSONResponse({"identified": False, "error": exc.error}, status_code=exc.status)
+    decision = await run_login(frames)
+    result = login_answer(decision)
 
-    svc = FaceRecognitionService.get_instance()
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, svc.identify_frame, frame)
-
-    if not result.get("identified"):
+    if not decision.identified:
+        log_login(None, decision.reason)
         return result
 
-    face_label = result.get("name", "").lower()
+    face_label = decision.label.lower()
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -73,8 +124,11 @@ async def face_login(file: UploadFile = File(...)):
         )
 
     if not row:
-        return JSONResponse({"identified": False, "error": "User not found in database"}, status_code=404)
+        log_login(None, decision.reason)
+        return JSONResponse({"identified": False, "error": "User not found in database",
+                             "reason": decision.reason, "frames": decision.frames}, status_code=404)
 
+    log_login(row["u_id"], decision.reason)
     token = _face_signer.dumps({"u_id": row["u_id"], "name": row["name"]})
     return {**result, "token": token, "u_id": row["u_id"]}
 
@@ -193,7 +247,7 @@ async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
         for i, img in enumerate(images):
             # Find the face this photo stores and which other label the gallery (as it is before these
             # photos are saved) would take it for, by login's own matching (match_enrollment_face). It holds
-            # the service lock like identify_frame/identify_faces, and reuses the detection the crop below
+            # the service lock like identify_faces, and reuses the detection the crop below
             # needs anyway.
             found = await loop.run_in_executor(None, svc.match_enrollment_face, img, label)
             if found["error"]:

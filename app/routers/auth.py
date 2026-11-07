@@ -1,6 +1,3 @@
-import asyncio
-import cv2
-import numpy as np
 from typing import List
 from fastapi import APIRouter, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -8,15 +5,18 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from app.config import SECRET_KEY
 from app.database import get_pool
-from app.routers.api_face import save_enrollment
-from app.services.face_recognition_service import FaceRecognitionService
+from app.routers.api_face import (FrameUploadError, log_login, login_answer, read_login_frames, run_login,
+                                  save_enrollment)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 _signer = URLSafeTimedSerializer(SECRET_KEY)
+# /auth/face-frame hands this to the page when a face is identified; /auth/confirm-login takes only it.
+_ticket_signer = URLSafeTimedSerializer(SECRET_KEY, salt="face-login-ticket")
 
 SESSION_COOKIE = "medai_session"
 SESSION_MAX_AGE = 60 * 60 * 8  # 8 hours
+TICKET_MAX_AGE = 60  # seconds
 
 
 def _sign(data: dict) -> str:
@@ -52,23 +52,30 @@ async def register_page(request: Request):
 # ── API ───────────────────────────────────────────────────────────────────────
 
 @router.post("/face-frame")
-async def face_frame(request: Request):
-    """Accept raw JPEG bytes, return face recognition result."""
-    body = await request.body()
-    nparr = np.frombuffer(body, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return JSONResponse({"identified": False, "error": "Invalid image"}, status_code=400)
-
-    svc = FaceRecognitionService.get_instance()
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, svc.identify_frame, frame)
+async def face_frame(files: List[UploadFile] = File(...)):
+    """Up to FACE_LOGIN_FRAMES photos, return the face login decision; when identified, also a login_ticket
+    (valid TICKET_MAX_AGE seconds) for /auth/confirm-login."""
+    try:
+        frames = await read_login_frames(files)
+    except FrameUploadError as exc:
+        return JSONResponse({"identified": False, "error": exc.error}, status_code=exc.status)
+    decision = await run_login(frames)
+    result = login_answer(decision)
+    if decision.identified:
+        result["login_ticket"] = _ticket_signer.dumps(decision.label)
     return JSONResponse(result)
 
 
 @router.post("/confirm-login")
-async def confirm_login(response: Response, name: str = Form(...)):
-    """Look up user by face_label, create session cookie."""
+async def confirm_login(response: Response, ticket: str = Form("")):
+    """Turn a login_ticket from /auth/face-frame into a session cookie. A missing, bad or expired ticket is 400."""
+    try:
+        name = _ticket_signer.loads(ticket, max_age=TICKET_MAX_AGE) if ticket else None
+    except BadSignature:
+        name = None
+    if not isinstance(name, str) or not name:
+        return JSONResponse({"error": "invalid_ticket"}, status_code=400)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -76,8 +83,10 @@ async def confirm_login(response: Response, name: str = Form(...)):
         )
     if not row:
         # Face recognised but no DB record — send straight to register with face_label pre-filled
+        log_login(None, "match")
         return RedirectResponse(f"/auth/register?face_label={name}&hint=1", status_code=303)
 
+    log_login(row["u_id"], "match")
     token = _sign({"u_id": row["u_id"], "name": row["name"]})
     try:
         async with pool.acquire() as conn:

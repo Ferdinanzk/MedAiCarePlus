@@ -104,6 +104,15 @@ def test_model_unavailable_gives_no_face_and_error(svc, monkeypatch):
     assert not decision.identified and decision.reason == "no_face"
 
 
+
+def test_a_frame_that_is_not_an_image_is_no_face(svc):
+    assert svc.judge_frame(None).code == "no_face"
+    decision = svc.login([FRAME, FRAME, None, FRAME, FRAME])
+    assert decision.identified and decision.frames == 5
+    decision = svc.login([FRAME, FRAME, None, None, None])
+    assert not decision.identified and decision.reason == "no_face"
+
+
 # --- match_box itself, with fake face_id / lm_det / gallery (no models) ---
 
 class FakeResult:

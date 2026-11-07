@@ -92,3 +92,10 @@ def test_reason_ties():
 def test_distance_is_the_smallest_match():
     d = dec([m(0.2), m(0.05), m(0.15), v("unknown")])
     assert d.distance == 0.05
+
+
+def test_face_count_is_the_most_faces_in_one_frame():
+    two = FrameVerdict("two_faces", face_count=2)
+    assert dec([m(), m(), two, v("no_face")]).face_count == 2
+    assert dec([m(), m(), m()]).face_count == 1
+    assert dec([]).face_count == 0

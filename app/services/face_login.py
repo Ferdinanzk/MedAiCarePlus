@@ -36,6 +36,7 @@ class LoginDecision:
     distance: float | None
     reason: str
     frames: int
+    face_count: int = 0   # the most faces seen in any one frame
 
 
 # Order used to break ties between non-match codes (first wins).
@@ -58,9 +59,10 @@ def main_face(boxes: list[FaceBox], frame_w: int, frame_h: int, *, min_area_rati
 def decide(verdicts: list[FrameVerdict], *, min_matches: int, liveness_mode: str,
            liveness_threshold: float) -> LoginDecision:
     frames = len(verdicts)
+    face_count = max((v.face_count for v in verdicts), default=0)
 
     def fail(reason: str) -> LoginDecision:
-        return LoginDecision(False, None, None, reason, frames)
+        return LoginDecision(False, None, None, reason, frames, face_count)
 
     if any(v.code == "two_faces" for v in verdicts):
         return fail("two_faces")
@@ -78,7 +80,7 @@ def decide(verdicts: list[FrameVerdict], *, min_matches: int, liveness_mode: str
     if len(matches) >= min_matches:
         return LoginDecision(True, matches[0].label,
                              min(v.distance for v in matches if v.distance is not None),
-                             "match", frames)
+                             "match", frames, face_count)
 
     counts = Counter(v.code for v in verdicts if v.code != "match")
     if not counts:

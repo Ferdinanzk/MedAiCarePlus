@@ -556,7 +556,7 @@ def test_same_answer_as_logins_postprocess(monkeypatch, intel_matching):
         service = _service(monkeypatch, [_Roi(0, 0, 50, 60)], face_id)
 
         found = service.match_enrollment_face(FRAME, "pearl")
-        results, _ = face_id.postprocess()   # what identify_frame (login) computes
+        results, _ = face_id.postprocess()   # FaceIdentifier's own matching rule
         login = face_id.get_identity_label(results[0].id)
 
         assert found["label"] == (None if login == face_id.UNKNOWN_ID_LABEL else login)
