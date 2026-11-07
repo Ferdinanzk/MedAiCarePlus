@@ -26,6 +26,7 @@ sys.modules.setdefault("asyncpg", _asyncpg_stub)
 
 from app import config
 from app.routers import api_face, auth
+from app.services import face_recognition_service as frs
 from app.services.face_recognition_service import FaceRecognitionService
 
 USERS = {
@@ -96,10 +97,13 @@ class _FakeFaces:
         self.reloads += 1
 
 
-def _found(label=None, box=(10, 20, 40, 50), distance=None, error=None):
+def _found(label=None, box=(10, 20, 40, 50), distance=None, error=None, reason=None):
     if label is not None and distance is None:
         distance = 0.12
-    return {"box": list(box) if box else None, "label": label, "distance": distance, "error": error}
+    if reason is None:
+        reason = "ok" if box else "no_face"
+    return {"box": list(box) if box else None, "label": label, "distance": distance, "error": error,
+            "reason": reason}
 
 
 def _photo(seed=0):
@@ -234,6 +238,8 @@ def test_unknown_face_is_enrolled_as_the_detected_crop(gallery, monkeypatch):
 @pytest.mark.parametrize("answer, status, error", [
     (_found(box=None), 400, "No face detected in photo 1"),
     (_found(box=None, error="inference failed"), 503, "Face detection failed for photo 1"),
+    (_found(box=None, reason="two_faces"), 400, "Two faces in photo 1"),
+    (_found(box=None, reason="come_closer"), 400, "Face too small in photo 1"),
 ])
 def test_photo_without_a_usable_face_saves_nothing(gallery, monkeypatch, answer, status, error):
     service = _FakeFaces([_found(), answer, _found()])
@@ -331,9 +337,14 @@ def test_legacy_route_stores_a_new_face_as_crops_and_reloads(gallery, monkeypatc
 # --- FaceRecognitionService.match_enrollment_face, with fake models -----------------------------------
 
 class _Roi:
-    def __init__(self, x, y, w, h):
+    def __init__(self, x, y, w, h, confidence=0.9):
         self.position = np.array([x, y], dtype=float)
         self.size = np.array([w, h], dtype=float)
+        self.confidence = confidence
+
+    @classmethod
+    def from_output(cls, output):
+        return cls(output[3], output[4], output[5], output[6], output[2])
 
 
 class _Detector:
@@ -423,6 +434,7 @@ def _service(monkeypatch, rois, face_id):
     monkeypatch.setattr(FaceRecognitionService, "_available", True)
     service = object.__new__(FaceRecognitionService)
     service.lock = threading.RLock()
+    monkeypatch.setattr(frs, "FaceDetector", type("FD", (), {"Result": _Roi.from_output}))
     service.face_det = _Detector(service, rois)
     service.lm_det = _Landmarks()
     service.face_id = face_id
@@ -439,8 +451,11 @@ def test_matches_only_the_face_enrollment_stores_under_the_service_lock(monkeypa
 
     found = service.match_enrollment_face(FRAME, "pearl")
 
-    assert found == {"box": [100, 50, 200, 240], "label": "ab", "distance": pytest.approx(0.05), "error": None}
-    assert service.lm_det.calls == [[first]] and face_id.started == [[first]]
+    assert found == {"box": [100, 50, 200, 240], "label": "ab", "distance": pytest.approx(0.05), "error": None,
+                     "reason": "ok"}
+    assert len(service.lm_det.calls) == 1 and len(service.lm_det.calls[0]) == 1
+    (roi,) = service.lm_det.calls[0]
+    assert list(roi.position) == pytest.approx([100.7, 50.2]) and face_id.started == [[roi]]
     assert service.face_det.lock_held == [True]
 
 
@@ -448,32 +463,34 @@ def test_own_photos_are_left_out_even_when_closest(monkeypatch):
     """The 3 Oct gallery: the face is closest to "ab", yet within the threshold of "a" too."""
     identities = [("a", _vector(0.05)), ("ab", _vector(0.0))]
 
-    as_ab = _service(monkeypatch, [_Roi(0, 0, 50, 60)], _Identifier(identities, _vector(0.0)))
+    as_ab = _service(monkeypatch, [_Roi(0, 0, 200, 200)], _Identifier(identities, _vector(0.0)))
     found = as_ab.match_enrollment_face(FRAME, "AB")   # the caller's label, compared without case
     assert found["label"] == "a" and found["distance"] == pytest.approx(0.05)
 
-    as_a = _service(monkeypatch, [_Roi(0, 0, 50, 60)], _Identifier(identities, _vector(0.0)))
+    as_a = _service(monkeypatch, [_Roi(0, 0, 200, 200)], _Identifier(identities, _vector(0.0)))
     found = as_a.match_enrollment_face(FRAME, "a")
     assert found["label"] == "ab" and found["distance"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_unknown_face_own_label_only_and_empty_gallery_match_nobody(monkeypatch):
-    unknown = _service(monkeypatch, [_Roi(1, 2, 30, 40)], _Identifier([("a", _vector(0.0))], _vector(0.42)))
+    unknown = _service(monkeypatch, [_Roi(1, 2, 200, 200)], _Identifier([("a", _vector(0.0))], _vector(0.42)))
     found = unknown.match_enrollment_face(FRAME, "pearl")
-    assert found == {"box": [1, 2, 30, 40], "label": None, "distance": pytest.approx(0.42), "error": None}
+    assert found == {"box": [1, 2, 200, 200], "label": None, "distance": pytest.approx(0.42), "error": None,
+                     "reason": "ok"}
 
     for identities in ([("pearl", _vector(0.0))], []):
         face_id = _Identifier(identities, _vector(0.0))
-        service = _service(monkeypatch, [_Roi(1, 2, 30, 40)], face_id)
-        assert service.match_enrollment_face(FRAME, "pearl") == {"box": [1, 2, 30, 40], "label": None,
-                                                                 "distance": None, "error": None}
+        service = _service(monkeypatch, [_Roi(1, 2, 200, 200)], face_id)
+        assert service.match_enrollment_face(FRAME, "pearl") == {"box": [1, 2, 200, 200], "label": None,
+                                                                 "distance": None, "error": None,
+                                                                 "reason": "ok"}
         assert face_id.started == []   # nobody else to compare with: no descriptor needed
 
 
 def test_no_face_model_failure_and_missing_descriptor(monkeypatch):
     service = _service(monkeypatch, [], _Identifier([("a", _vector(0.0))], _vector(0.1)))
     assert service.match_enrollment_face(FRAME, "pearl") == {"box": None, "label": None, "distance": None,
-                                                             "error": None}
+                                                             "error": None, "reason": "no_face"}
 
     def broken(inputs):
         raise RuntimeError("inference failed")
@@ -481,7 +498,7 @@ def test_no_face_model_failure_and_missing_descriptor(monkeypatch):
     assert service.match_enrollment_face(FRAME, "pearl")["error"] == "inference failed"
 
     # A face that could not be checked is never passed as unknown.
-    no_descriptor = _service(monkeypatch, [_Roi(1, 2, 30, 40)], _Identifier([("a", _vector(0.0))], None))
+    no_descriptor = _service(monkeypatch, [_Roi(1, 2, 200, 200)], _Identifier([("a", _vector(0.0))], None))
     found = no_descriptor.match_enrollment_face(FRAME, "pearl")
     assert found["error"] and found["box"] is None and found["label"] is None
 
@@ -527,7 +544,7 @@ def _real_face_id(intel_matching, identities, descriptor):
 def test_threshold_is_logins(monkeypatch, intel_matching, offset, label):
     distance = 0.10 if offset is None else config.FACE_MATCH_THRESHOLD + offset
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.0)])], _vector(distance))
-    service = _service(monkeypatch, [_Roi(0, 0, 50, 60)], face_id)
+    service = _service(monkeypatch, [_Roi(0, 0, 200, 200)], face_id)
 
     found = service.match_enrollment_face(FRAME, "pearl")
 
@@ -537,7 +554,7 @@ def test_threshold_is_logins(monkeypatch, intel_matching, offset, label):
 
 def test_min_dist_picks_the_closest_label(monkeypatch, intel_matching):
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.2)]), ("ab", [_vector(0.05)])], _vector(0.0))
-    service = _service(monkeypatch, [_Roi(0, 0, 50, 60)], face_id)
+    service = _service(monkeypatch, [_Roi(0, 0, 200, 200)], face_id)
 
     assert service.match_enrollment_face(FRAME, "pearl")["label"] == "ab"
 
@@ -553,7 +570,7 @@ def test_same_answer_as_logins_postprocess(monkeypatch, intel_matching):
                                  for _ in range(int(rng.integers(1, 3)))]) for k in range(int(rng.integers(1, 4)))]
         descriptor = base + rng.normal(size=256) * rng.uniform(0.3, 3.0)
         face_id = _real_face_id(intel_matching, identities, descriptor)
-        service = _service(monkeypatch, [_Roi(0, 0, 50, 60)], face_id)
+        service = _service(monkeypatch, [_Roi(0, 0, 200, 200)], face_id)
 
         found = service.match_enrollment_face(FRAME, "pearl")
         results, _ = face_id.postprocess()   # FaceIdentifier's own matching rule
@@ -568,7 +585,7 @@ def test_same_answer_as_logins_postprocess(monkeypatch, intel_matching):
 def test_endpoint_refuses_the_incident_with_real_matching(gallery, monkeypatch, intel_matching):
     """A's photos are in the gallery; the same face enrolling for a new account is refused."""
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.0)])], _vector(0.05))
-    service = _service(monkeypatch, [_Roi(10, 20, 40, 50)], face_id)
+    service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
     service.reload_gallery = lambda: None
     _use(monkeypatch, service)
 
@@ -586,10 +603,60 @@ def test_endpoint_refuses_a_duplicate_the_caller_is_closer_to(gallery, monkeypat
     photos are closer: login takes the face for either, and the duplicate would stay. Neither account can
     enroll it until the duplicate is cleaned up by hand (as was done on 3 Oct)."""
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.05)]), ("ab", [_vector(0.0)])], _vector(0.0))
-    service = _service(monkeypatch, [_Roi(10, 20, 40, 50)], face_id)
+    service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
     service.reload_gallery = lambda: None
     _use(monkeypatch, service)
 
     assert _result(_enroll(u_id=34)) == (409, ALREADY_REGISTERED)
     assert _result(_enroll(u_id=1)) == (409, ALREADY_REGISTERED)
     assert _files(gallery.folder) == {} and gallery.conn.enrolled == []
+
+
+# --- The main-face rule on registration photos ---------------------------------------------------------
+
+def test_two_similar_size_faces_are_refused_and_nothing_is_stored(monkeypatch):
+    face_id = _Identifier([("a", _vector(0.0))], _vector(0.0))
+    service = _service(monkeypatch, [_Roi(0, 0, 200, 200), _Roi(300, 0, 180, 180)], face_id)
+
+    found = service.match_enrollment_face(FRAME, "pearl")
+
+    assert found == {"box": None, "label": None, "distance": None, "error": None, "reason": "two_faces"}
+    assert face_id.started == []
+
+
+def test_the_big_face_is_stored_when_a_small_one_is_also_there(monkeypatch):
+    face_id = _Identifier([("a", _vector(0.2))], _vector(0.0))
+    # The small face comes first and is the more confident one: rois[0] is not the face stored.
+    small, big = _Roi(500, 10, 80, 80, confidence=0.99), _Roi(100, 50, 250, 250, confidence=0.7)
+    service = _service(monkeypatch, [small, big], face_id)
+
+    found = service.match_enrollment_face(FRAME, "pearl")
+
+    assert found["reason"] == "ok" and found["box"] == [100, 50, 250, 250]
+    (roi,) = service.lm_det.calls[0]
+    assert list(roi.position) == [100, 50] and list(roi.size) == [250, 250]
+
+
+def test_a_too_small_face_is_refused(monkeypatch):
+    face_id = _Identifier([("a", _vector(0.0))], _vector(0.0))
+    service = _service(monkeypatch, [_Roi(10, 10, 50, 60)], face_id)
+
+    found = service.match_enrollment_face(FRAME, "pearl")
+
+    assert found["reason"] == "come_closer" and found["box"] is None and found["error"] is None
+    assert face_id.started == []
+
+
+def test_only_the_main_face_is_matched_against_other_labels(monkeypatch):
+    """The small second face would match "a"; the big one is new, so the photo passes."""
+    class _PerRoi(_Identifier):
+        def start_async(self, frame, rois, landmarks):
+            super().start_async(frame, rois, landmarks)
+            self.descriptor = _vector(0.0) if rois[0].size[0] < 100 else _vector(0.45)
+
+    face_id = _PerRoi([("a", _vector(0.0))], _vector(0.45))
+    service = _service(monkeypatch, [_Roi(500, 10, 80, 80), _Roi(100, 50, 250, 250)], face_id)
+
+    found = service.match_enrollment_face(FRAME, "pearl")
+
+    assert found["label"] is None and found["reason"] == "ok"

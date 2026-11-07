@@ -207,6 +207,14 @@ async def enroll_face(
     return {"saved": [str(path) for path in saved], "face_label": label}
 
 
+# One refusal sentence per reason the main-face rule gives (as face login's): the photo must hold one clear face.
+_PHOTO_REFUSALS = {
+    "no_face": "No face detected in photo {i}",
+    "two_faces": "Two faces in photo {i}",
+    "come_closer": "Face too small in photo {i}",
+}
+
+
 async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
                           new_label_only: bool = False) -> "list[Path] | JSONResponse":
     """Check 3 enrollment photos and store their face crops as <label>-<i>.jpg, then reload the gallery.
@@ -255,9 +263,9 @@ async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
                     {"error": f"Face detection failed for photo {i}"},
                     status_code=503,
                 )
-            if found["box"] is None:
+            if found["reason"] != "ok" or found["box"] is None:
                 return JSONResponse(
-                    {"error": f"No face detected in photo {i}"},
+                    {"error": _PHOTO_REFUSALS.get(found["reason"], "No face detected in photo {i}").format(i=i)},
                     status_code=400,
                 )
             if found["label"]:
