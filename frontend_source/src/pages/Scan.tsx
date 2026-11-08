@@ -92,6 +92,8 @@ export default function Scan() {
   const [lineDrafts, setLineDrafts] = useState<LineDraftRow[]>([]);
   const [lineOpenId, setLineOpenId] = useState<string | null>(null);
   const [lineError, setLineError] = useState('');
+  // Set by Open on a LINE row: the cards render below the camera box, out of sight on a phone, so they are scrolled to.
+  const scrollToCardsRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -102,6 +104,13 @@ export default function Scan() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!scrollToCardsRef.current || !parsed) return;
+    scrollToCardsRef.current = false;
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    document.getElementById('scan-cards')?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+  }, [parsed]);
 
   const startCamera = async (mode: 'environment' | 'user' = facingMode) => {
     if (stream) {
@@ -204,6 +213,7 @@ export default function Scan() {
       setCapturedImage(null);
       setParseError('');
       setAddError('');
+      scrollToCardsRef.current = true;
       setParsed(scan);
       setLineOpenId(id);
       setDrafts(medicinesOf(scan).map((med) => draftFrom(med, scan, today)));
@@ -789,7 +799,7 @@ export default function Scan() {
 
       {/* Every medicine found, each an editable card */}
       {parsed && !parsing && (
-        <div className="space-y-4">
+        <div id="scan-cards" className="space-y-4 scroll-mt-20">
           <div className="flex items-start gap-3">
             <Pill className="w-5 h-5 text-[#0057B8] mt-0.5 shrink-0" />
             <div>

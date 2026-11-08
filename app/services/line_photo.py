@@ -34,6 +34,7 @@ PRIORITY = 1
 MAX_BYTES = 10 * 1024 * 1024
 PER_HOUR = 10
 LOADING_SECONDS = 60
+STALE_MINUTES = 3        # a read still `reading` this long after its photo came was cut off (a restart, a shutdown)
 SAVE_ACTION = "line_photo_save"
 _SIG_HEX = 16
 _MAX_DATA = 300          # LINE's limit on postback data
@@ -49,6 +50,8 @@ BUSY_TEXT = "讀取服務現在忙碌中，請過幾分鐘再傳一次。/ The r
 FOOTER_TEXT = "要修改的話，請打開 App 的掃描頁。/ To change them, open the Scan page in the app."
 NOTHING_TEXT = "沒有可以直接儲存的藥，請打開 App 的掃描頁檢查。/ Nothing can be saved directly. Please check on the Scan page in the app."
 SAVED_TEXT = "已儲存 {n} 種藥。/ Saved {n} medicines."
+SAVED_ONE_TEXT = "已儲存 1 種藥。/ Saved 1 medicine."
+SAVED_NONE_TEXT = "沒有新的藥需要儲存。/ Nothing new to save."
 ALREADY_TEXT = "已經儲存過了。/ Already saved."
 EXPIRED_TEXT = "這份清單已過期，請重新傳送照片。/ This list has expired. Please send the photo again."
 SAVE_FAILED_TEXT = "儲存失敗，請在 App 的掃描頁再試一次。/ Couldn't save. Please try again on the Scan page in the app."
@@ -169,7 +172,8 @@ async def _answer(conn, u_id: int, sender: str, messages: list[dict], dedupe_key
 
 
 async def _fail(draft_id: str, u_id: int, sender: str, reply_token: str | None, received_at: datetime,
-                outcome: str, error_code: str, text: str, status: str = "failed") -> str:
+                outcome: str, error_code: str, text: str, status: str = "failed", quiet: bool = False) -> str:
+    """Mark the draft and answer `text`. `quiet`: the caller logs the photo's one line itself."""
     async with get_pool().acquire() as conn:
         async with conn.transaction():
             await conn.execute("UPDATE line_photo_draft SET status = $2, error_code = $3 WHERE draft_id = $1",
@@ -177,7 +181,7 @@ async def _fail(draft_id: str, u_id: int, sender: str, reply_token: str | None, 
             await _answer(conn, u_id, sender, [_text(text)], f"line_photo:{draft_id}:{outcome}",
                           reply_token, received_at)
     outbox.wake()
-    return _logged(outcome)
+    return outcome if quiet else _logged(outcome)
 
 
 # ── receiving ──
@@ -200,7 +204,10 @@ async def receive(event: dict, received_at: datetime) -> str:
             "SELECT 1 FROM family_contacts WHERE line_id = $1 AND relationship IS DISTINCT FROM 'user' LIMIT 1",
             sender) is not None
     if len(patients) != 1:
-        outcome, text = ("family", FAMILY_TEXT) if family else ("not_linked", NOT_LINKED_TEXT)
+        if family:
+            outcome, text = "family", FAMILY_TEXT
+        else:   # two active accounts on one LINE id get the unlinked answer, but their own outcome in the log
+            outcome, text = ("shared_line_id" if patients else "not_linked"), NOT_LINKED_TEXT
         await asyncio.to_thread(line_svc.reply_text, reply_token, sender, text)
         return _logged(outcome)
     u_id = patients[0]["u_id"]
@@ -240,9 +247,15 @@ async def process(draft_id: str, u_id: int, sender: str, message_id: str, reply_
     """Download, read and answer one photo (a background task). Returns the outcome it logged."""
     try:
         return await _process(draft_id, u_id, sender, message_id, reply_token, received_at)
-    except Exception as exc:   # a database failure: logged by type only, never the details
-        log.warning("[LINE] photo: error (%s)", type(exc).__name__)
+    except Exception as exc:   # a database failure or an unexpected OCR value: logged by type only, never the details
+        error = type(exc).__name__
+    try:   # the patient still gets an answer; once only, a second failure is only logged
+        await _fail(draft_id, u_id, sender, reply_token, received_at, "error", "error", BUSY_TEXT, quiet=True)
+    except Exception as again:
+        log.warning("[LINE] photo: error (%s), not answered (%s)", error, type(again).__name__)
         return "error"
+    log.warning("[LINE] photo: error (%s)", error)
+    return "error"
 
 
 async def _process(draft_id: str, u_id: int, sender: str, message_id: str, reply_token: str | None,
@@ -283,6 +296,29 @@ async def _process(draft_id: str, u_id: int, sender: str, message_id: str, reply
     return _logged("read")
 
 
+async def sweep_stale(conn) -> int:
+    """At start-up: drafts still `reading` STALE_MINUTES after their photo came were cut off (a restart or a shutdown
+    mid-read; nothing will finish them). Marks them failed (`interrupted`) and answers the busy text by push to the
+    owner's current LINE id (none when it is unlinked since). Returns how many were marked."""
+    async with conn.transaction():
+        rows = await conn.fetch(
+            "UPDATE line_photo_draft SET status = 'failed', error_code = 'interrupted' "
+            "WHERE status = 'reading' AND created_at < NOW() - make_interval(mins => $1) "
+            'RETURNING draft_id, u_id, (SELECT line_id FROM "user" u WHERE u.u_id = line_photo_draft.u_id) AS line_id',
+            STALE_MINUTES)
+        answered = 0
+        for row in rows:
+            if row["line_id"] is None:
+                continue
+            await _answer(conn, row["u_id"], row["line_id"], [_text(BUSY_TEXT)],
+                          f"line_photo:{row['draft_id']}:interrupted", None, None)
+            answered += 1
+    if answered:
+        outbox.wake()
+    log.info("[LINE] photo: %d interrupted reads marked failed", len(rows))
+    return len(rows)
+
+
 async def _active_names(conn, u_id: int) -> list[str]:
     """The names the Scan page compares against for duplicates: every medicine not archived."""
     return [row["med_name"] for row in await conn.fetch(
@@ -318,7 +354,8 @@ async def _save_drafts(conn, u_id: int, result: dict) -> str:
             continue
         await insert_medication(conn, u_id, payload)
         saved += 1
-    return "\n".join([SAVED_TEXT.format(n=saved), *skipped])
+    head = SAVED_NONE_TEXT if saved == 0 else SAVED_ONE_TEXT if saved == 1 else SAVED_TEXT.format(n=saved)
+    return "\n".join([head, *skipped])
 
 
 async def handle_save(conn, data: str, sender: str, reply_token: str | None, received_at: datetime) -> str | None:

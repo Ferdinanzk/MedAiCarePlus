@@ -381,7 +381,25 @@ def test_save_all_uses_the_taipei_date(env, monkeypatch):
     _press(env.db, draft_id)
     assert [args[1] for args in env.db.inserts] == ["ENDS6"]
     [row] = env.db.outbox
-    assert _texts(row) == ["已儲存 1 種藥。/ Saved 1 medicines.\nENDS4（請在 App 檢查 / check in the app）"]
+    assert _texts(row) == ["已儲存 1 種藥。/ Saved 1 medicine.\nENDS4（請在 App 檢查 / check in the app）"]
+
+
+def test_save_all_zero_and_one_wording(env):
+    # Nothing new: everything on the list was saved meanwhile (on the Scan page, say). The draft is still done.
+    env.db.meds.append({"u_id": 7, "med_name": "PANADOL", "is_active": True})
+    nothing = _draft(env.db, _result(_med("PANADOL"), _med("LOWSTOCK", stock=0)))
+    assert _press(env.db, nothing, at=datetime.datetime(2026, 10, 4, 3, 0, tzinfo=UTC)) == "saved"
+    assert env.db.inserts == [] and env.db.drafts[nothing]["status"] == "saved"
+
+    one = _draft(env.db, _result(_med("GOOD")))
+    assert _press(env.db, one, at=datetime.datetime(2026, 10, 4, 3, 1, tzinfo=UTC)) == "saved"
+    assert [args[1] for args in env.db.inserts] == ["GOOD"]
+
+    assert [_texts(row) for row in env.db.outbox] == [
+        ["沒有新的藥需要儲存。/ Nothing new to save.\n"
+         "PANADOL（已在清單中 / already saved）\n"
+         "LOWSTOCK（請在 App 檢查 / check in the app）"],
+        ["已儲存 1 種藥。/ Saved 1 medicine."]]
 
 
 def test_a_failed_insert_rolls_back_and_says_so(env, caplog):

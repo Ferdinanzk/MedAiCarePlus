@@ -28,7 +28,7 @@ from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.services import ai_settings, ai_store, line_pause, reminders
+from app.services import ai_settings, ai_store, line_pause, line_photo, reminders
 from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
@@ -61,6 +61,10 @@ async def lifespan(app: FastAPI):
         await ai_store.fill_openrouter_keys_from_env(config.OPENROUTER_API_KEY)   # every start: keyless ones only
         ai_settings.set_current(await ai_store.load(conn))
         await line_pause.load(conn)
+        try:   # LINE photo reads a restart or a shutdown cut off: marked failed and answered (never stops the start)
+            await line_photo.sweep_stale(conn)
+        except Exception as error:
+            log.warning("[LINE] photo: the start-up sweep failed (%s)", type(error).__name__)
         unusable = []
         for job in ai_settings.JOBS:   # before check_ai_settings, which can stop a prod start
             if not ai_settings.job_usable(ai_settings.current(), job):

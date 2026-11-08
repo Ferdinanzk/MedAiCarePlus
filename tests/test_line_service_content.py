@@ -119,6 +119,33 @@ def test_get_content_without_a_token_is_failed(monkeypatch):
     assert service.get_content(MESSAGE_ID, 10) == ("failed", None)
 
 
+def test_content_failure_logs_status_only(monkeypatch, caplog):
+    service = _service(monkeypatch)
+
+    def timeout(*a, **k):
+        raise line_service.requests.Timeout(f"{CHAT_ID} {MESSAGE_ID} TOKEN123")
+
+    with caplog.at_level(logging.DEBUG):
+        monkeypatch.setattr(line_service.requests, "get", lambda *a, **k: _Resp(404))
+        monkeypatch.setattr(line_service.requests, "post", lambda *a, **k: _Resp(500))
+        assert service.get_content(MESSAGE_ID, 10) == ("failed", None)
+        assert service.start_loading(CHAT_ID) is False
+        monkeypatch.setattr(line_service.requests, "get", timeout)
+        monkeypatch.setattr(line_service.requests, "post", timeout)
+        assert service.get_content(MESSAGE_ID, 10) == ("failed", None)
+        assert service.start_loading(CHAT_ID) is False
+        monkeypatch.setattr(line_service.requests, "get", lambda *a, **k: _Resp(200, [b"ok"]))
+        monkeypatch.setattr(line_service.requests, "post", lambda *a, **k: _Resp(200))
+        assert service.get_content(MESSAGE_ID, 10) == ("ok", b"ok")      # a success logs nothing
+        assert service.start_loading(CHAT_ID) is True
+    assert [r.getMessage() for r in caplog.records] == [
+        "[LINE] content download failed: 404",
+        "[LINE] loading animation failed: 500",
+        "[LINE] content download failed: Timeout",
+        "[LINE] loading animation failed: Timeout",
+    ]
+
+
 def test_content_calls_log_no_ids(monkeypatch, caplog):
     service = _service(monkeypatch)
 

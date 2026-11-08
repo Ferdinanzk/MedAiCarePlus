@@ -1,3 +1,4 @@
+import logging
 import time
 
 import requests
@@ -17,6 +18,8 @@ LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{message_id}/content
 LOADING_TIMEOUT_SECONDS = 10
 CONTENT_TIMEOUT_SECONDS = 30
 CONTENT_CHUNK_BYTES = 65536
+
+log = logging.getLogger(__name__)
 
 
 def verification_success_text(patient_name: str) -> str:
@@ -99,7 +102,8 @@ class LineService:
     def start_loading(self, chat_id: str, seconds: int = 60) -> bool:
         """Show LINE's loading animation in a one-to-one chat (5 to 60 seconds, multiples of 5).
 
-        True when LINE accepted it. Never raises, and never logs the chat id or the token.
+        True when LINE accepted it. Never raises. A failure logs only LINE's HTTP status or the exception's class
+        name, never the chat id or the token.
         """
         if not LineService._available or not chat_id:
             return False
@@ -110,15 +114,20 @@ class LineService:
         try:
             resp = requests.post(LINE_LOADING_URL, json={"chatId": chat_id, "loadingSeconds": seconds},
                                  headers=headers, timeout=LOADING_TIMEOUT_SECONDS)
-        except Exception:
+        except Exception as exc:
+            log.warning("[LINE] loading animation failed: %s", type(exc).__name__)
             return False
-        return 200 <= resp.status_code < 300
+        if not 200 <= resp.status_code < 300:
+            log.warning("[LINE] loading animation failed: %s", resp.status_code)
+            return False
+        return True
 
     def get_content(self, message_id: str, max_bytes: int) -> "tuple[str, bytes | None]":
         """Download a message's content (a photo) as ("ok", bytes), ("too_large", None) or ("failed", None).
 
         Reads the stream only until max_bytes + 1, so an oversized file is never held whole.
-        Never raises, and never logs the message id or the token.
+        Never raises. A failure logs only LINE's HTTP status or the exception's class name, never the URL, the
+        message id or the token.
         """
         if not LineService._available or not message_id:
             return "failed", None
@@ -128,6 +137,7 @@ class LineService:
             resp = requests.get(LINE_CONTENT_URL.format(message_id=message_id), headers=headers,
                                 stream=True, timeout=CONTENT_TIMEOUT_SECONDS)
             if resp.status_code != 200:
+                log.warning("[LINE] content download failed: %s", resp.status_code)
                 return "failed", None
             data = bytearray()
             for chunk in resp.iter_content(chunk_size=CONTENT_CHUNK_BYTES):
@@ -135,7 +145,8 @@ class LineService:
                 if len(data) > max_bytes:
                     return "too_large", None
             return "ok", bytes(data)
-        except Exception:
+        except Exception as exc:
+            log.warning("[LINE] content download failed: %s", type(exc).__name__)
             return "failed", None
         finally:
             if resp is not None:

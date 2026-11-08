@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import copy
 import datetime
 import hashlib
 import hmac
@@ -46,6 +47,18 @@ class FakeDB:
         self.transactions = 0
 
     async def fetch(self, query, *args):
+        if "UPDATE line_photo_draft" in query:   # the start-up sweep of reads a restart cut off
+            assert "status = 'reading'" in query and "created_at < NOW() - make_interval(mins => $1)" in query
+            assert "SET status = 'failed', error_code = 'interrupted'" in query and "RETURNING" in query
+            assert self.transactions, "the sweep runs in a transaction"
+            since = datetime.datetime.now(UTC) - datetime.timedelta(minutes=args[0])
+            rows = []
+            for draft in self.drafts.values():
+                if draft["status"] == "reading" and draft["created_at"] < since:
+                    draft.update(status="failed", error_code="interrupted")
+                    line_id = next(u["line_id"] for u in self.users if u["u_id"] == draft["u_id"])
+                    rows.append({"draft_id": uuid.UUID(draft["draft_id"]), "u_id": draft["u_id"], "line_id": line_id})
+            return rows
         if 'FROM "user"' in query:
             assert "line_id = $1" in query and "user_active = TRUE" in query
             return [{"u_id": u["u_id"]} for u in self.users if u["line_id"] == args[0] and u["user_active"]]
@@ -93,11 +106,14 @@ class FakeDB:
     def transaction(self):
         db = self
 
-        class Transaction:
+        class Transaction:   # rolled back on an exception, as PostgreSQL does
             async def __aenter__(self):
                 db.transactions += 1
+                self.saved = copy.deepcopy((db.drafts, db.outbox))
 
-            async def __aexit__(self, *exc):
+            async def __aexit__(self, exc_type, *exc):
+                if exc_type is not None:
+                    db.drafts, db.outbox = self.saved
                 return False
 
         return Transaction()
@@ -250,11 +266,16 @@ def test_unlinked_sender_is_told_to_link(env):
     assert env.db.drafts == {} and env.db.outbox == [] and env.spawned == []
 
 
-def test_two_patients_on_one_line_id_count_as_unlinked(env):
+def test_shared_line_id_outcome(env, caplog):
+    # Two active accounts on one LINE id: the same answer as an unlinked sender, but its own outcome in the log.
+    caplog.set_level(logging.INFO)
     env.db.users.append({"u_id": 8, "line_id": PATIENT, "user_active": True})
-    assert _receive(_image()) == "not_linked"
+    assert _receive(_image()) == "shared_line_id"
     assert [c[3] for c in env.calls] == [line_photo.NOT_LINKED_TEXT]
     assert env.db.drafts == {} and env.spawned == []
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[LINE] photo")]
+    assert lines == ["[LINE] photo: shared_line_id"]
+    assert PATIENT not in caplog.text
 
 
 def test_an_inactive_second_account_does_not_hide_the_patient(env):
@@ -374,6 +395,35 @@ def test_reader_errors_and_timeout_are_busy(env, monkeypatch, error, code):
     _failed_with(env, "busy", code, line_photo.BUSY_TEXT)
 
 
+def test_unexpected_error_still_answers_busy(env, monkeypatch, caplog):
+    # Anything that goes wrong after the download (an unexpected OCR value here) still answers the patient.
+    caplog.set_level(logging.DEBUG)
+
+    def broken(*args):
+        raise ValueError("SECRETMEDNAME")
+
+    monkeypatch.setattr(line_photo, "list_messages", broken)
+    assert _read(env) == "error"
+    _failed_with(env, "error", "error", line_photo.BUSY_TEXT)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[LINE] photo")]
+    assert lines == ["[LINE] photo: error (ValueError)"]
+    assert "SECRETMEDNAME" not in caplog.text and PATIENT not in caplog.text and TOKEN not in caplog.text
+
+
+def test_a_second_failure_while_answering_is_only_logged(env, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def no_outbox(*args, **kwargs):
+        raise ConnectionError(f"{PATIENT} {TOKEN}")
+
+    monkeypatch.setattr(line_photo, "_answer", no_outbox)
+    assert _read(env) == "error"
+    assert env.db.outbox == [] and env.wakes == []
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[LINE] photo")]
+    assert lines == ["[LINE] photo: error (ConnectionError), not answered (ConnectionError)"]
+    assert PATIENT not in caplog.text and TOKEN not in caplog.text
+
+
 def test_good_read_stores_the_result_and_answers_with_the_list_and_button(env):
     result = _result(_med("PANADOL"), _med("IBU", amount_each_intake="N/A", units_per_dose=2.0, as_needed=True,
                                            days=None, times_per_day=None, max_per_day=4,
@@ -457,6 +507,54 @@ def test_custom_times_and_bedtime_are_listed():
                times_per_day=6, days=None)
     (text, _) = line_photo.list_messages(_result(med), TODAY.isoformat(), [], str(uuid.uuid4()))
     assert text["text"].split("\n")[1] == "1. Q4H：1錠，一天 6 次（早上、中午、晚上、睡前、16:00、06:00）"
+
+
+# ── reads a restart or a shutdown cut off ────────────────────────────────────
+
+def _stored(env, status, minutes_old, u_id=7):
+    draft_id = str(uuid.uuid4())
+    env.db.drafts[draft_id] = {"draft_id": draft_id, "u_id": u_id, "line_message_id": f"m-{draft_id[:8]}",
+                               "status": status, "result": None, "error_code": None,
+                               "created_at": datetime.datetime.now(UTC) - datetime.timedelta(minutes=minutes_old)}
+    return draft_id
+
+
+def test_sweep_marks_stale_reading_drafts_and_answers(env, caplog):
+    caplog.set_level(logging.DEBUG)
+    env.db.users.append({"u_id": 9, "line_id": None, "user_active": True})   # unlinked since: nobody to answer
+    stale = _stored(env, "reading", 4)
+    unlinked = _stored(env, "reading", 60, u_id=9)
+    assert asyncio.run(line_photo.sweep_stale(env.db)) == 2
+
+    for draft_id in (stale, unlinked):
+        assert (env.db.drafts[draft_id]["status"], env.db.drafts[draft_id]["error_code"]) == ("failed", "interrupted")
+    (row,) = env.db.outbox
+    assert row["dedupe_key"] == f"line_photo:{stale}:interrupted"
+    assert (row["kind"], row["priority"], row["u_id"], row["recipient_line_id"], row["recipient_contact_id"]) == \
+        ("line_photo", 1, 7, PATIENT, None)
+    assert _texts(row) == [line_photo.BUSY_TEXT]
+    assert "reply_token" not in row["payload"]          # long past the reply window: it goes by push
+    assert env.wakes == [1]
+
+    # Run again (a second restart): nothing more is marked or sent.
+    assert asyncio.run(line_photo.sweep_stale(env.db)) == 0
+    assert len(env.db.outbox) == 1
+
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[LINE] photo")]
+    assert lines == ["[LINE] photo: 2 interrupted reads marked failed",
+                     "[LINE] photo: 0 interrupted reads marked failed"]
+    for secret in (PATIENT, stale, unlinked):
+        assert secret not in caplog.text
+
+
+def test_sweep_ignores_recent_and_finished_drafts(env):
+    recent = _stored(env, "reading", 1)
+    finished = {status: _stored(env, status, 60) for status in ("pending", "saved", "failed", "refused")}
+    assert asyncio.run(line_photo.sweep_stale(env.db)) == 0
+    assert env.db.drafts[recent]["status"] == "reading"
+    assert {status: env.db.drafts[d]["status"] for status, d in finished.items()} == \
+        {status: status for status in finished}
+    assert env.db.outbox == [] and env.wakes == []
 
 
 # ── the Save all postback data ───────────────────────────────────────────────

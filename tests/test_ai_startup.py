@@ -76,6 +76,12 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
     monkeypatch.setattr(ai_store, "fill_openrouter_keys_from_env", fill)
     monkeypatch.setattr(ai_store, "load", load)
     monkeypatch.setattr(main.line_pause, "load", nothing)
+
+    async def sweep(conn):   # the LINE photo reads a restart cut off: a failure there never stops the start
+        calls.append("sweep")
+        raise RuntimeError("sweepSECRET")
+
+    monkeypatch.setattr(main.line_photo, "sweep_stale", sweep)
     for service in ("FaceRecognitionService", "EmotionService", "OCRService", "LineService",
                     "IntakeDetectionService", "LandmarkService"):
         monkeypatch.setattr(main, service, types.SimpleNamespace(get_instance=lambda: None))
@@ -92,7 +98,8 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
 
     with caplog.at_level("WARNING"):
         asyncio.run(start_and_stop())
-    assert calls == ["seed", ("fill", ENV_KEY), "load", "check"]
+    assert calls == ["seed", ("fill", ENV_KEY), "load", "sweep", "check"]
+    assert "[LINE] photo: the start-up sweep failed (RuntimeError)" in caplog.text and "sweepSECRET" not in caplog.text
     unusable = [record.getMessage() for record in caplog.records
                 if record.levelname == "WARNING" and "no usable model" in record.getMessage()]
     assert len(unusable) == 2 and "AI job safety" in unusable[0] and "AI job after_chat" in unusable[1]

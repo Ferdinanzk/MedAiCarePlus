@@ -262,6 +262,7 @@ const lineDraft = () => ({ id: '11111111-1111-4111-8111-111111111111', created_a
 const FROM_LINE = `來自 LINE：3 種藥，${clock(LINE_AT)}`;
 
 test('a LINE list shows and opens into cards', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });   // a phone: the cards come below the camera box
   await seedSession(page);
   await mockApi(page, receiptScan(isoDaysAgo(0)), [], [lineDraft()]);
   await page.goto('/scan');
@@ -271,6 +272,54 @@ test('a LINE list shows and opens into cards', async ({ page }) => {
   await expect(page.getByText('找到 3 種藥物')).toBeVisible();
   await expect(page.getByLabel('藥物名稱')).toHaveCount(3);
   await expect(page.getByAltText('處方照片')).toHaveCount(0);   // the photo is never kept: no preview
+  // Opening scrolls the cards up to just below the sticky phone header, so the press visibly did something.
+  const belowHeader = async () => {
+    const header = await page.locator('header').first().boundingBox();
+    const heading = await page.getByText('找到 3 種藥物').boundingBox();
+    return heading!.y - (header!.y + header!.height);
+  };
+  await expect.poll(belowHeader).toBeLessThan(100);
+  expect(await belowHeader()).toBeGreaterThanOrEqual(0);
+  await expect(page.getByText('找到 3 種藥物')).toBeInViewport();
+  await expect(page.locator('#scan-card-0')).toBeInViewport();
+  if (process.env.SCAN_SCREENSHOTS) {
+    await page.screenshot({ path: `${process.env.SCAN_SCREENSHOTS}/scan-line-open-phone.png` });
+  }
+});
+
+for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+  test(`opening a LINE list scrolls ${reducedMotion === 'reduce' ? 'at once with reduced motion' : 'smoothly'}`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion });
+    await page.addInitScript(() => {
+      const scrolls: unknown[] = [];
+      (window as unknown as { scrolls: unknown[] }).scrolls = scrolls;
+      const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = function (options?: boolean | ScrollIntoViewOptions) {
+        scrolls.push({ id: this.id, options });
+        return original.call(this, options);
+      };
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await seedSession(page);
+    await mockApi(page, receiptScan(isoDaysAgo(0)), [], [lineDraft()]);
+    await page.goto('/scan');
+    await page.getByRole('button', { name: '開啟', exact: true }).click();
+    await expect(page.getByLabel('藥物名稱')).toHaveCount(3);
+    await expect.poll(() => page.evaluate(() => (window as unknown as { scrolls: unknown[] }).scrolls)).toEqual([
+      { id: 'scan-cards', options: { behavior: reducedMotion === 'reduce' ? 'auto' : 'smooth', block: 'start' } },
+    ]);
+  });
+}
+
+test('in English a LINE row with one medicine says "1 medicine"', async ({ page }) => {
+  await seedSession(page);
+  const one = { ...lineDraft(), result: { ...receiptScan(isoDaysAgo(0)), medications: [medicine({})] } };
+  await mockApi(page, receiptScan(isoDaysAgo(0)), [], [one]);
+  await page.goto('/scan');
+  await expect(page.getByText(`來自 LINE：1 種藥，${clock(LINE_AT)}`)).toBeVisible();   // Chinese: unchanged
+  // The app starts in Traditional Chinese (i18n.ts sets lng), so switch to English.
+  await page.getByRole('button', { name: '中文' }).first().click();
+  await expect(page.getByText(`From LINE: 1 medicine, ${clock(LINE_AT)}`)).toBeVisible();
 });
 
 test('saving every card marks the LINE list saved', async ({ page }) => {
