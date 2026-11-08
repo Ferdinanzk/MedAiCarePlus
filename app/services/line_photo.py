@@ -3,10 +3,11 @@
 A patient sends a photo of a medicine bag in a one-to-one chat. `receive` (called inline by the webhook) checks who
 sent it, the patient's consent and the hourly limit, and writes one `line_photo_draft` row per photo; `process` (a
 background task) downloads the photo, reads it with the OCR and answers with the list and a Save all button. Nothing
-is saved here: Save all (Task 4) or the Scan page saves.
+is saved until the patient presses Save all (`handle_save`, Task 4: what the Scan page would save, once, in one
+transaction) or saves on the Scan page.
 
 The photo is never stored or logged. Logs never hold LINE user ids, reply tokens, message ids, OCR text or medicine
-names: one line per photo, `[LINE] photo: <outcome>`."""
+names: one line per photo, `[LINE] photo: <outcome>`, and one per Save all, `[LINE] photo save: <outcome>`."""
 
 import asyncio
 import hashlib
@@ -14,11 +15,14 @@ import hmac
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl
+
+from pydantic import ValidationError
 
 from app.config import OCR_GEMINI_IMAGE_BUDGET, OLLAMA_TIMEOUT, SECRET_KEY
 from app.database import get_pool
+from app.routers.api_medications import MedicationPayload, insert_medication
 from app.services import consent_service, memory, outbox, scan_rules
 from app.services.line_service import LineService
 from app.services.ocr_service import OCRService, OCRServiceError
@@ -44,6 +48,12 @@ UNREADABLE_TEXT = "我看不清楚這張照片，請在光線好的地方再拍�
 BUSY_TEXT = "讀取服務現在忙碌中，請過幾分鐘再傳一次。/ The reader is busy right now. Please send the photo again in a few minutes."
 FOOTER_TEXT = "要修改的話，請打開 App 的掃描頁。/ To change them, open the Scan page in the app."
 NOTHING_TEXT = "沒有可以直接儲存的藥，請打開 App 的掃描頁檢查。/ Nothing can be saved directly. Please check on the Scan page in the app."
+SAVED_TEXT = "已儲存 {n} 種藥。/ Saved {n} medicines."
+ALREADY_TEXT = "已經儲存過了。/ Already saved."
+EXPIRED_TEXT = "這份清單已過期，請重新傳送照片。/ This list has expired. Please send the photo again."
+SAVE_FAILED_TEXT = "儲存失敗，請在 App 的掃描頁再試一次。/ Couldn't save. Please try again on the Scan page in the app."
+SKIPPED_DUPLICATE = "{name}（已在清單中 / already saved）"
+SKIPPED_CHECK = "{name}（請在 App 檢查 / check in the app）"
 SAVE_LABEL = "全部儲存 Save all"
 BUTTON_TEXT = "按「全部儲存」就會加入您的藥物清單。"
 
@@ -266,9 +276,94 @@ async def _process(draft_id: str, u_id: int, sender: str, message_id: str, reply
             await conn.execute(
                 "UPDATE line_photo_draft SET status = 'pending', result = $2::jsonb WHERE draft_id = $1",
                 draft_id, json.dumps(result, ensure_ascii=False))
-            names = [row["med_name"] for row in await conn.fetch(
-                "SELECT med_name FROM medication WHERE u_id = $1 AND is_active IS NOT FALSE", u_id)]
+            names = await _active_names(conn, u_id)
             messages = list_messages(result, memory.local_today().isoformat(), names, draft_id)
             await _answer(conn, u_id, sender, messages, f"line_photo:{draft_id}:read", reply_token, received_at)
     outbox.wake()
     return _logged("read")
+
+
+async def _active_names(conn, u_id: int) -> list[str]:
+    """The names the Scan page compares against for duplicates: every medicine not archived."""
+    return [row["med_name"] for row in await conn.fetch(
+        "SELECT med_name FROM medication WHERE u_id = $1 AND is_active IS NOT FALSE", u_id)]
+
+
+# ── Save all ──
+
+def _save_logged(outcome: str) -> str:
+    log.info("[LINE] photo save: %s", outcome)
+    return outcome
+
+
+async def _save_drafts(conn, u_id: int, result: dict) -> str:
+    """Insert every medicine the Scan page would save as it stands; the answer names the ones left out."""
+    today = memory.local_today().isoformat()
+    drafts = scan_rules.mark_duplicates(
+        [scan_rules.draft_from(med, result, today) for med in scan_rules.medicines_of(result)],
+        await _active_names(conn, u_id))
+    saved, skipped = 0, []
+    for draft in drafts:
+        name = draft["name"].strip()
+        if draft.get("duplicate"):
+            skipped.append(SKIPPED_DUPLICATE.format(name=name))
+            continue
+        if not draft["include"] or scan_rules.draft_problem(draft, today) is not None:
+            skipped.append(SKIPPED_CHECK.format(name=name))
+            continue
+        try:
+            payload = MedicationPayload(**scan_rules.medication_payload(draft, result))
+        except ValidationError:
+            skipped.append(SKIPPED_CHECK.format(name=name))
+            continue
+        await insert_medication(conn, u_id, payload)
+        saved += 1
+    return "\n".join([SAVED_TEXT.format(n=saved), *skipped])
+
+
+async def handle_save(conn, data: str, sender: str, reply_token: str | None, received_at: datetime) -> str | None:
+    """Save all, pressed under the list. None when `data` is not a Save all postback (the caller passes it on to
+    dose_confirmation); else the outcome it logged. Everything happens in one transaction under the draft's row lock,
+    so a second press, at once or later, saves nothing more."""
+    draft_id = verify_save(data)
+    if draft_id is None:
+        return None
+    dedupe_key = f"line_photo:{draft_id}:save:{received_at.isoformat()}"
+    owner = None
+    try:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                'SELECT d.*, u.line_id, u.user_active FROM line_photo_draft d JOIN "user" u USING (u_id) '
+                "WHERE d.draft_id = $1 FOR UPDATE OF d", draft_id)
+            if row is None or row["line_id"] != sender or not row["user_active"]:
+                outcome, text = "refused", EXPIRED_TEXT
+            else:
+                owner = row["u_id"]
+                if row["status"] == "saved":
+                    outcome, text = "already", ALREADY_TEXT
+                elif row["status"] != "pending" or row["expires_at"] <= datetime.now(timezone.utc):
+                    outcome, text = "expired", EXPIRED_TEXT
+                elif not consent_service.is_current(await consent_service.fetch_state(conn, owner), "core"):
+                    outcome, text = "consent", CONSENT_TEXT
+                else:
+                    result = row["result"]
+                    text = await _save_drafts(conn, owner, json.loads(result) if isinstance(result, str) else result)
+                    await conn.execute(
+                        "UPDATE line_photo_draft SET status = 'saved', saved_at = NOW() WHERE draft_id = $1",
+                        draft_id)
+                    outcome = "saved"
+                await _answer(conn, owner, sender, [_text(text)], dedupe_key, reply_token, received_at)
+    except Exception as exc:   # rolled back: nothing of this press is stored. Logged by type only.
+        log.warning("[LINE] photo save: failed (%s)", type(exc).__name__)
+        if owner is None:
+            await asyncio.to_thread(LineService.get_instance().reply_text, reply_token, sender, SAVE_FAILED_TEXT)
+        else:
+            async with conn.transaction():
+                await _answer(conn, owner, sender, [_text(SAVE_FAILED_TEXT)], dedupe_key, reply_token, received_at)
+            outbox.wake()
+        return "failed"
+    if owner is None:
+        await asyncio.to_thread(LineService.get_instance().reply_text, reply_token, sender, text)
+    else:
+        outbox.wake()
+    return _save_logged(outcome)

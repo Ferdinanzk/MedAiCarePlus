@@ -101,17 +101,18 @@ async def line_webhook(request: Request):
     for event in events:
         log.info("[LINE] webhook event: %s", event.get("type"))   # the type only: never an ID or a text
         if event.get("type") == "postback":
-            # Caregiver confirmation buttons. Invalid or unauthorised postbacks
+            # A patient's Save all under a medicine photo's list (services/line_photo.py), else caregiver
+            # confirmation buttons. Invalid or unauthorised postbacks
             # change nothing and get no reply (the reason is logged); replies go through the outbox.
             try:
+                data = (event.get("postback") or {}).get("data", "")
+                sender = (event.get("source") or {}).get("userId", "")
+                token = _usable_reply_token(event)
+                result = None
                 async with pool.acquire() as conn:
-                    result = await dose_confirmation.handle_postback(
-                        conn,
-                        (event.get("postback") or {}).get("data", ""),
-                        (event.get("source") or {}).get("userId", ""),
-                        _usable_reply_token(event),
-                        received_at=received_at,
-                    )
+                    if await line_photo.handle_save(conn, data, sender, token, received_at) is None:
+                        result = await dose_confirmation.handle_postback(
+                            conn, data, sender, token, received_at=received_at)
                 if result is not None:
                     log.info("[LINE] postback applied: %s", result.get("status"))
             except Exception as exc:

@@ -437,6 +437,49 @@ async def list_medications(user: dict = Depends(get_consented_user)):
     return result
 
 
+async def insert_medication(conn, u_id: int, payload: MedicationPayload) -> dict:
+    """Store one medicine and its dose rows: POST /api/medications and LINE's Save all (services/line_photo.py).
+    The caller owns the connection and any transaction."""
+    remaining = payload.pills_remaining if payload.pills_remaining is not None else Decimal(payload.total_pills)
+    dose_form = payload.dose_form or "solid_oral"
+    units_per_dose = payload.units_per_dose if payload.units_per_dose is not None else Decimal("1")
+    med_id = await conn.fetchval(
+        """
+        INSERT INTO medication
+            (u_id, med_name, dosage, pill_prescribed, pills_remaining,
+             instructions, warning, pill_description, use_before,
+             is_active, schedule_time, prescription_meta, dose_form, units_per_dose,
+             min_interval_minutes, max_daily_doses)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        RETURNING med_id
+        """,
+        u_id,
+        payload.name.strip(),
+        payload.dosage,
+        payload.total_pills,
+        remaining,
+        payload.instructions,
+        payload.warning,
+        payload.pill_description,
+        payload.use_before,
+        payload.is_active,
+        json.dumps(payload.schedule_time) if payload.schedule_time else None,
+        json.dumps(payload.prescription_meta) if payload.prescription_meta else None,
+        dose_form,
+        units_per_dose,
+        payload.min_interval_minutes,
+        payload.max_daily_doses,
+    )
+    # Auto-generate intake schedule rows
+    if payload.is_active:
+        await _generate_intake_schedule(
+            conn, med_id, u_id, payload.schedule_time, payload.use_before
+        )
+    return {"id": med_id, "name": payload.name.strip(), "dose_form": dose_form,
+            "units_per_dose": _number(units_per_dose), "min_interval_minutes": payload.min_interval_minutes,
+            "max_daily_doses": payload.max_daily_doses}
+
+
 @router.post("")
 async def create_medication(
     payload: MedicationPayload,
@@ -448,49 +491,12 @@ async def create_medication(
             {"detail": "Local user not found. Please link your account first."},
             status_code=404,
         )
-    remaining = payload.pills_remaining if payload.pills_remaining is not None else Decimal(payload.total_pills)
-    dose_form = payload.dose_form or "solid_oral"
-    units_per_dose = payload.units_per_dose if payload.units_per_dose is not None else Decimal("1")
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
-            med_id = await conn.fetchval(
-                """
-                INSERT INTO medication
-                    (u_id, med_name, dosage, pill_prescribed, pills_remaining,
-                     instructions, warning, pill_description, use_before,
-                     is_active, schedule_time, prescription_meta, dose_form, units_per_dose,
-                     min_interval_minutes, max_daily_doses)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-                RETURNING med_id
-                """,
-                u_id,
-                payload.name.strip(),
-                payload.dosage,
-                payload.total_pills,
-                remaining,
-                payload.instructions,
-                payload.warning,
-                payload.pill_description,
-                payload.use_before,
-                payload.is_active,
-                json.dumps(payload.schedule_time) if payload.schedule_time else None,
-                json.dumps(payload.prescription_meta) if payload.prescription_meta else None,
-                dose_form,
-                units_per_dose,
-                payload.min_interval_minutes,
-                payload.max_daily_doses,
-            )
-            # Auto-generate intake schedule rows
-            if payload.is_active:
-                await _generate_intake_schedule(
-                    conn, med_id, u_id, payload.schedule_time, payload.use_before
-                )
+            return await insert_medication(conn, u_id, payload)
         except Exception as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
-    return {"id": med_id, "name": payload.name.strip(), "dose_form": dose_form,
-            "units_per_dose": _number(units_per_dose), "min_interval_minutes": payload.min_interval_minutes,
-            "max_daily_doses": payload.max_daily_doses}
 
 
 @router.patch("/{med_id}")
