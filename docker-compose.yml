@@ -69,9 +69,14 @@ services:
   # Cloudflare quick tunnel: free, no account, but a new https://*.trycloudflare.com address on every
   # start. scripts/line-tunnel.ps1 reads it and updates the LINE webhook setting.
   line-tunnel:
-    image: cloudflare/cloudflared:2024.12.2
+    image: cloudflare/cloudflared:2026.10.7
     profiles: ["line"]
-    command: ["tunnel", "--no-autoupdate", "--url", "http://line-webhook-proxy:8080"]
+    # Named Cloudflare tunnel (8 Nov 2026): a fixed address on our own domain, so a restart no longer changes it.
+    # Its route (Cloudflare dashboard) sends the hostname in PUBLIC_BASE_URL to http://line-webhook-proxy:8080.
+    # The token stays in .env (CLOUDFLARE_TUNNEL_TOKEN); empty means cloudflared stops with an error.
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
       - line-webhook-proxy
     restart: unless-stopped

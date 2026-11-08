@@ -1,9 +1,11 @@
 <#
 Start the LINE webhook tunnel and point the LINE channel's webhook at it.
 
-The Cloudflare quick tunnel gets a new address every time it starts (laptop restart, Docker restart), so run
-this script again whenever LINE verification or caregiver buttons stop working. Only POST
-/api/notify/webhook/line is reachable through the tunnel (scripts/line-webhook/nginx.conf).
+Since 8 Nov 2026 the tunnel is a named Cloudflare tunnel (CLOUDFLARE_TUNNEL_TOKEN in .env) with a fixed address,
+PUBLIC_BASE_URL in .env: a restart no longer changes it, so this script is needed once, or when that address
+changes. With PUBLIC_BASE_URL empty it falls back to reading a quick tunnel's trycloudflare address from the log.
+Only POST /api/notify/webhook/line and the dose-video links are reachable through the tunnel
+(scripts/line-webhook/nginx.conf).
 
     & "C:\medcareai\MedAiCarePlus\scripts\line-tunnel.ps1"
 #>
@@ -80,17 +82,30 @@ with urllib.request.urlopen(req, timeout=20) as resp:
 print("LINE now sends to:", current.get("endpoint"), "| active:", current.get("active"))
 sys.exit(0 if body.get("success") and current.get("endpoint") == endpoint else 1)
 '@
-    # A tunnel that is up but dead (LINE's test fails) gets one fresh start: a new container, a new address.
+    # The named tunnel's fixed address (PUBLIC_BASE_URL in .env), or '' for a quick tunnel.
+    $fixedUrl = ''
+    $envLine = Select-String -LiteralPath (Join-Path $repoRoot '.env') -Pattern '^PUBLIC_BASE_URL=(https://\S+)' |
+        Select-Object -First 1
+    if ($envLine) { $fixedUrl = $envLine.Matches[0].Groups[1].Value.TrimEnd('/') }
+    # A tunnel that is up but dead (LINE's test fails) gets one fresh start: a new container (a quick tunnel: a new
+    # address; the named tunnel: a fresh connection to Cloudflare).
     for ($round = 1; $round -le 2; $round++) {
         $started = Get-TunnelStartedAt
         if (-not $started) { throw 'The line-tunnel container is not there (docker compose --profile line ps)' }
-        $url = Wait-TunnelUrl $started
-        if (-not $url) { throw 'The tunnel did not report an address within 90 s (docker compose --profile line logs line-tunnel)' }
+        if ($fixedUrl) {
+            $url = $fixedUrl
+        } else {
+            $url = Wait-TunnelUrl $started
+            if (-not $url) { throw 'The tunnel did not report an address within 90 s (docker compose --profile line logs line-tunnel)' }
+        }
         Write-Host "Tunnel: $url"
         $python | docker compose exec -T -e "WEBHOOK_URL=$url" -w /app app python -
         if ($LASTEXITCODE -eq 0) {
             New-Item -ItemType Directory -Force -Path (Split-Path $stampFile -Parent) | Out-Null
-            Set-Content -LiteralPath $stampFile -Value @("started_at=$started", "address=$url") -Encoding ASCII
+            # fixed=1: medcare-boot.ps1 -Reconcile then ignores tunnel restarts (the address does not change).
+            $stamp = @("started_at=$started", "address=$url")
+            if ($fixedUrl) { $stamp += 'fixed=1' }
+            Set-Content -LiteralPath $stampFile -Value $stamp -Encoding ASCII
             Write-Host 'LINE webhook is set and reachable.'
             return
         }

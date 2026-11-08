@@ -199,7 +199,12 @@ function Get-TunnelDrift([string]$Facts, [string[]]$StampLines) {
     $parts = "$Facts".Trim() -split '\|'
     if ($parts.Count -lt 2 -or -not $parts[1]) { return 'the tunnel container is not there' }
     if ($parts[0] -ne 'running') { return "the tunnel container is $($parts[0])" }
-    $stamped = @($StampLines | Where-Object { $_ -like 'started_at=*' } | ForEach-Object { $_.Substring(11).Trim() }) | Select-Object -First 1
+    if ($StampLines -contains 'fixed=1') {
+        # The named tunnel (since 8 Nov 2026): its address is fixed, so a restart leaves the webhook valid.
+        if (-not @($StampLines | Where-Object { $_ -like 'address=*' })) { return 'no address in logs\line-tunnel.stamp' }
+        return ''
+    }
+    $stamped =@($StampLines | Where-Object { $_ -like 'started_at=*' } | ForEach-Object { $_.Substring(11).Trim() }) | Select-Object -First 1
     if (-not $stamped) { return 'no stamp from line-tunnel.ps1 (logs\line-tunnel.stamp): the webhook was not registered for this tunnel start' }
     if ($stamped -ne $parts[1]) { return "the tunnel restarted at $($parts[1]) (the webhook was registered for its start at $stamped)" }
     return ''
