@@ -88,8 +88,9 @@ async def lifespan(app: FastAPI):
     try:
         unconverted = await face_vectors.photos_without_vectors()
         if unconverted:
-            log.warning("[FaceRecognition] %d face photo(s) in the photo folder have no face vectors, so face login "
-                        "does not know them: run the conversion", unconverted)
+            log.warning("[FaceRecognition] %d face photo(s) in the photo folder have no face vectors (not converted "
+                        "yet, or skipped by the conversion), so face login, the robot and the intake monitor do not "
+                        "recognise them", unconverted)
     except Exception as error:
         log.warning("[FaceRecognition] the photo folder check failed (%s)", type(error).__name__)
     EmotionService.get_instance()

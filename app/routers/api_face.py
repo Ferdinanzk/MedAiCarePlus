@@ -291,8 +291,14 @@ async def save_enrollment(photos: List[UploadFile], label: str, u_id: int, *,
                     )
                     for vector in vectors
                 ]
-        # Still under _enroll_lock: the next registration's check must already see these vectors.
-        await face_vectors.reload(pool)
+        # Still under _enroll_lock: the next registration's check must already see these vectors. The rows are
+        # committed, so a failed reload does not fail the registration: the next one's reload before its check
+        # reads them (and face login knows the face from then on).
+        try:
+            await face_vectors.reload(pool)
+        except Exception as exc:
+            logger.warning("Face enrollment for %s stored its vectors, but the gallery reload after the commit "
+                           "failed (%s)", caller, type(exc).__name__)
 
     return vector_ids
 
@@ -302,8 +308,8 @@ async def _known_face_refusal(other_label: str, distance: float, photo: int, cal
 
     3 Oct 2026: one face enrolled under two accounts, and Reachy could no longer verify the patient. When
     other_label belongs to an active account (face login's own lookup), the person should sign in to it.
-    When none does (photos left by the legacy route, or a deactivated account's), face login answers 404 for
-    this face, so that advice would not work: the stale photos have to be removed first."""
+    When none does (the gallery holds only active accounts' vectors, so in practice an account deactivated after
+    the gallery was loaded), face login answers 404 for this face, so that advice would not work."""
     pool = get_pool()
     async with pool.acquire() as conn:
         owner = await conn.fetchrow(

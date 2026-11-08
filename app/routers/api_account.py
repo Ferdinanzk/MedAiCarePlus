@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.database import get_pool
 from app.dependencies import get_current_user, _face_signer
 from app.routers.api_auth import _verify_password
+from app.routers import api_face
 from app.services import deletion_ledger, face_vectors
 
 router = APIRouter(prefix="/api/account", tags=["account"])
@@ -132,8 +133,10 @@ async def delete_account(payload: DeletePayload, request: Request,
     except Exception:
         logger.exception("Account %s deleted; gallery refresh failed", u_id)
     # A registration reload that read its rows before this deletion committed could have put the identity back.
+    # Under the registration lock, so such a reload has finished before this one reads the rows.
     try:
-        await face_vectors.reload()
+        async with api_face._enroll_lock:
+            await face_vectors.reload()
     except Exception as exc:
         logger.warning("Account %s deleted; face gallery reload failed (%s)", u_id, type(exc).__name__)
     return {"deleted": True}

@@ -235,8 +235,7 @@ def test_service_starts_empty_and_lifespan_loads_rows(face_vectors, monkeypatch,
     service = FaceRecognitionService()
     assert FaceRecognitionService._available is True
     assert isinstance(service.face_id.faces_database, NoFolder) and len(service.face_id.faces_database) == 0
-    service.reload_gallery()   # a logged no-op until registration writes rows (Task 2)
-    assert len(service.face_id.faces_database) == 0
+    assert not hasattr(FaceRecognitionService, "reload_gallery")   # removed: the rows are the gallery
 
     # The lifespan loads the rows after FaceRecognitionService.get_instance(), then warns about unconverted photos.
     from app import main
@@ -268,6 +267,11 @@ def test_service_starts_empty_and_lifespan_loads_rows(face_vectors, monkeypatch,
     assert calls == ["face", "reload", "folder"]
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING" and "conversion" in r.getMessage()]
     assert len(warnings) == 1 and "3 face photo" in warnings[0]
+    # Not converted yet, or skipped by the conversion (never "run the conversion" for ever), and the robot and the
+    # intake monitor's face check use the same gallery.
+    assert "not converted yet, or skipped by the conversion" in warnings[0]
+    assert "run the conversion" not in warnings[0]
+    assert "robot" in warnings[0] and "intake monitor" in warnings[0]
     assert any("2 label" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
 
 

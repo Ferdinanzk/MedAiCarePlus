@@ -84,7 +84,8 @@ async def reload(pool=None) -> int:
 
 
 async def photos_without_vectors(pool=None, folder=None) -> int:
-    """How many photos in the face photo folder have a label with no vector rows (the conversion has not run).
+    """How many photos in the face photo folder have a label with no vector rows (not converted yet, or skipped by
+    the conversion).
     Labels are read from the file names as FacesDatabase reads them; temporary dot files are not photos."""
     folder = Path(folder or config.FACE_GALLERY_DIR)
     if not folder.is_dir():

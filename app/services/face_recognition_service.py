@@ -95,12 +95,6 @@ class FaceRecognitionService:
         self.face_id.set_faces_database(gallery)
 
     @synchronized
-    def reload_gallery(self):
-        """Does nothing now: the gallery comes from the face_vector rows (face_vectors.reload), not the photo folder.
-        Kept until registration and deletion call face_vectors.reload themselves."""
-        log.info("[FaceRecognition] reload_gallery: the photo folder is no longer read; nothing reloaded")
-
-    @synchronized
     def get_face_direction(self, frame_bgr: np.ndarray) -> dict:
         """
         Detect face and determine head orientation (front/left/right) from landmarks.

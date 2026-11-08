@@ -209,6 +209,26 @@ def test_deletion_reloads_the_gallery_from_the_database_after_commit(setup_accou
     assert calls == ["refresh"]  # after the commit and after the in-memory drop
 
 
+def test_deletion_reload_holds_the_enrollment_lock(setup_account, monkeypatch):
+    """Minor 1 of the final review: a registration reload that read rows before the deletion committed must finish
+    before the deletion's reload starts, so the deleted label cannot come back after it."""
+    import asyncio as _asyncio
+    from app.routers import api_face
+    from app.services import face_vectors
+    lock = _asyncio.Lock()
+    monkeypatch.setattr(api_face, "_enroll_lock", lock)
+    held = []
+
+    async def reload(pool=None):
+        held.append(lock.locked())
+        return 0
+
+    monkeypatch.setattr(face_vectors, "reload", reload)
+    assert asyncio.run(api_account.delete_account(
+        api_account.DeletePayload(), _request(api_auth._sign({"u_id": 7})), {"u_id": 7})) == {"deleted": True}
+    assert held == [True] and not lock.locked()
+
+
 def test_deletion_survives_a_failing_reload_and_logs_only_the_type(setup_account, monkeypatch, caplog):
     from app.services import face_vectors
     conn, gallery = setup_account

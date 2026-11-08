@@ -1,14 +1,17 @@
 """Convert the old face photos into face_vector rows, once (face vectors, 8 Nov 2026).
 
-Run it once, with the user's OK, after the image with face vectors is built and before face login is tested:
+Run it once, with the user's OK, right after the image with face vectors is built and before face login is tested:
     docker compose -p medcareai2 run --rm --no-deps app python -m app.ops.convert_face_gallery
-then restart the app, which loads the rows. The vectors are computed exactly as the old gallery computed them
-(FacesDatabase on the folder: the whole stored crop as the face, no detector), so existing users match as before.
+then restart the app, which loads the rows. Until then face login, the robot and the intake monitor do not recognise
+the unconverted accounts, so the rebuild, this run and the restart go back to back, outside dose times. The vectors
+are computed exactly as the old gallery computed them (FacesDatabase on the folder: the whole stored crop as the
+face, no detector), so existing users match as before.
 The photo folder is only read, never changed. Only counts are printed; labels and vectors never.
 """
 
 import argparse
 import asyncio
+import copy
 import os
 import re
 from datetime import datetime, timezone
@@ -53,6 +56,22 @@ def _photo_times(gallery_dir: Path) -> dict[str, list[datetime]]:
     return times
 
 
+def _matches_another(identity, gallery) -> bool:
+    """Whether any of identity's vectors is a face login would take for another label of gallery: login's rule
+    (FacesDatabase.match_faces with MIN_DIST: each label's closest vector, then the closest label) and its threshold
+    (a distance above FACE_MATCH_THRESHOLD is no match; anything else, NaN included, is one)."""
+    others = [other for other in gallery.database if other.label != identity.label]
+    if not others:
+        return False
+    view = copy.copy(gallery)
+    view.database = others
+    for desc in identity.descriptors:
+        _, distance = view.match_faces([desc], "MIN_DIST")[0]
+        if not config.FACE_MATCH_THRESHOLD < float(distance):
+            return True
+    return False
+
+
 def _differs(folder_vectors, stored) -> bool:
     from scipy.spatial.distance import cosine
     if stored is None or len(stored.descriptors) != len(folder_vectors):
@@ -72,6 +91,11 @@ async def convert(conn, service, gallery_dir: Path) -> dict:
       newer account may reuse the label. A deletion older than all the photos does not skip;
     - any of its photos is older than the account (or the account has no created_at): the photos predate it;
     - its account has registered again (its own vectors stay, never mixed with old photos).
+    A label that passes those rules is still skipped, and counted apart as matched_other, when any of its photos is
+    a face login would take for another label (_matches_another) of the gallery: the stored rows as the transaction
+    reads them, plus every label this run converted before it. Otherwise one face would be under two accounts (the
+    3 Oct 2026 incident): someone may have registered an unconverted account's face between the rebuild and the
+    conversion. Of two folder labels with the same face, the first converted (the folder's reading order) is kept.
     The rows are read back in the same transaction and compared with the folder's vectors; any difference rolls
     everything back and raises ConversionMismatch.
     """
@@ -79,11 +103,12 @@ async def convert(conn, service, gallery_dir: Path) -> dict:
     folder = frs.FacesDatabase(str(gallery_dir), service.face_id, service.lm_det)   # today's gallery computation
     photo_times = _photo_times(gallery_dir)
     converted = []
-    skipped = 0
+    skipped = matched_other = 0
     async with conn.transaction():
         await conn.execute(LOCK_SQL)
         if await conn.fetchval(ALREADY_SQL):
-            return {"converted": 0, "labels": 0, "skipped_labels": 0, "already": True}
+            return {"converted": 0, "labels": 0, "skipped_labels": 0, "matched_other": 0, "already": True}
+        gallery = face_vectors.build_gallery(await face_vectors.fetch_rows(conn))   # the accounts' vectors now
         for identity in folder.database:
             owner = await conn.fetchrow(OWNER_SQL, identity.label)
             times = photo_times.get(identity.label)
@@ -94,16 +119,20 @@ async def convert(conn, service, gallery_dir: Path) -> dict:
             if (deleted_at is not None and deleted_at > min(times)) or any(t < owner["created_at"] for t in times):
                 skipped += 1
                 continue
+            if _matches_another(identity, gallery):
+                matched_other += 1
+                continue
             for desc in identity.descriptors:
                 await conn.execute(INSERT_SQL, owner["u_id"], identity.label, face_vectors.to_bytes(desc))
             converted.append(identity)
+            gallery.database.append(frs.FacesDatabase.Identity(identity.label, list(identity.descriptors)))
         stored = {i.label: i for i in face_vectors.build_gallery(await face_vectors.fetch_rows(conn)).database}
         wrong = sum(_differs(i.descriptors, stored.get(i.label)) for i in converted)
         if wrong:
             raise ConversionMismatch(f"the stored vectors differ from the photos for {wrong} label(s): "
                                      "nothing was written")
     return {"converted": sum(len(i.descriptors) for i in converted), "labels": len(converted),
-            "skipped_labels": skipped, "already": False}
+            "skipped_labels": skipped, "matched_other": matched_other, "already": False}
 
 
 async def run(gallery_dir: Path) -> dict:
@@ -135,6 +164,8 @@ def main() -> None:
     else:
         print(f"Converted {result['converted']} photo vector(s) for {result['labels']} account(s); "
               f"{result['skipped_labels']} photo label(s) skipped; the photo folder was not changed.")
+        if result["matched_other"]:
+            print(f"{result['matched_other']} label(s) skipped: the face matches another account.")
 
 
 if __name__ == "__main__":

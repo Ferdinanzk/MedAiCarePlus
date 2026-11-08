@@ -160,7 +160,7 @@ def test_conversion_writes_one_row_per_photo(convert_module, tmp_path):
 
     result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
 
-    assert result == {"converted": 3, "labels": 2, "skipped_labels": 0, "already": False}
+    assert result == {"converted": 3, "labels": 2, "skipped_labels": 0, "matched_other": 0, "already": False}
     rows = _rows(conn)
     assert sorted((u_id, label, source) for u_id, label, _, source in rows) == [
         (1, "pearl", "photo"), (1, "pearl", "photo"), (2, "jane", "photo")]
@@ -183,13 +183,13 @@ def test_conversion_is_once_and_skips_unknown_labels(convert_module, tmp_path):
     conn = _Conn({1: ("pearl", True), 2: ("old", False), 4: ("kim", True)}, vectors=[kim])
 
     first = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
-    assert first == {"converted": 1, "labels": 1, "skipped_labels": 4, "already": False}
+    assert first == {"converted": 1, "labels": 1, "skipped_labels": 4, "matched_other": 0, "already": False}
     assert [(u_id, label, source) for u_id, label, _, source in _rows(conn)] == [
         (4, "kim", "enroll"), (1, "pearl", "photo")]
 
     before = list(conn.vectors)
     second = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
-    assert second == {"converted": 0, "labels": 0, "skipped_labels": 0, "already": True}
+    assert second == {"converted": 0, "labels": 0, "skipped_labels": 0, "matched_other": 0, "already": True}
     assert conn.vectors == before
 
 
@@ -236,7 +236,7 @@ def test_photos_taken_before_a_deletion_of_the_label_are_skipped(convert_module,
 
     result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
 
-    assert result == {"converted": 1, "labels": 1, "skipped_labels": 1, "already": False}
+    assert result == {"converted": 1, "labels": 1, "skipped_labels": 1, "matched_other": 0, "already": False}
     assert [(u_id, label) for u_id, label, _, _ in _rows(conn)] == [(2, "jane")]
 
 
@@ -252,7 +252,7 @@ def test_a_deletion_before_the_photos_does_not_skip_the_new_owner(convert_module
 
     result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
 
-    assert result == {"converted": 2, "labels": 1, "skipped_labels": 0, "already": False}
+    assert result == {"converted": 2, "labels": 1, "skipped_labels": 0, "matched_other": 0, "already": False}
     assert [(u_id, label) for u_id, label, _, _ in _rows(conn)] == [(5, "pearl"), (5, "pearl")]
 
 
@@ -269,9 +269,58 @@ def test_photos_older_than_the_account_are_skipped(convert_module, tmp_path):
 
     result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
 
-    assert result == {"converted": 1, "labels": 1, "skipped_labels": 2, "already": False}
+    assert result == {"converted": 1, "labels": 1, "skipped_labels": 2, "matched_other": 0, "already": False}
     assert [(u_id, label) for u_id, label, _, _ in _rows(conn)] == [(2, "jane")]
     assert {path.name: path.stat().st_mtime_ns for path in tmp_path.iterdir()} == before   # only read
+
+
+def test_a_face_already_registered_to_another_account_is_skipped(convert_module, tmp_path):
+    # Between the rebuild and the conversion the gallery holds only 'enroll' rows, so jane could register pearl's
+    # face. Converting pearl's photos would then put one face under two labels (the 3 Oct incident). Any one of a
+    # label's photos within login's threshold of another account's vectors skips the whole label.
+    _photo(tmp_path, "pearl-0.png", 11)   # the face jane registered
+    _photo(tmp_path, "pearl-1.png", 12)   # far from every stored vector
+    _photo(tmp_path, "kim-0.png", 14)
+    jane = (1, 2, "jane", _vec(11).astype("<f4").tobytes(), "enroll")
+    gone = (2, 3, "gone", _vec(14).astype("<f4").tobytes(), "enroll")   # an inactive account: not in the gallery
+    conn = _Conn({1: ("pearl", True), 2: ("jane", True), 3: ("gone", False), 4: ("kim", True)},
+                 vectors=[jane, gone])
+
+    result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
+
+    assert result == {"converted": 1, "labels": 1, "skipped_labels": 0, "matched_other": 1, "already": False}
+    assert [(u_id, label, source) for u_id, label, _, source in _rows(conn)] == [
+        (2, "jane", "enroll"), (3, "gone", "enroll"), (4, "kim", "photo")]
+    assert conn.commits == 1 and conn.rollbacks == 0
+
+
+def test_two_folder_labels_with_the_same_face_are_both_checked(convert_module, tmp_path):
+    # Two folder labels with the same face: the first one converted (in the folder's reading order, os.listdir,
+    # as FacesDatabase reads it) is kept, and the second is checked against it and skipped.
+    _photo(tmp_path, "anna-0.png", 11)
+    _photo(tmp_path, "bob-0.png", 11)
+    _photo(tmp_path, "kim-0.png", 14)
+    first = next(name.split("-")[0] for name in os.listdir(tmp_path) if name.split("-")[0] in ("anna", "bob"))
+    conn = _Conn({1: ("anna", True), 2: ("bob", True), 3: ("kim", True)})
+
+    result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
+
+    assert result == {"converted": 2, "labels": 2, "skipped_labels": 0, "matched_other": 1, "already": False}
+    assert sorted(label for _, label, _, _ in _rows(conn)) == sorted([first, "kim"])
+
+
+def test_the_face_check_uses_logins_threshold(convert_module, tmp_path, monkeypatch):
+    # distance <= FACE_MATCH_THRESHOLD is a match, as login's FaceIdentifier.postprocess: a vector exactly at the
+    # threshold skips the label, one just above it does not.
+    from app import config
+    _photo(tmp_path, "pearl-0.png", 11)
+    rival = (1, 2, "jane", _vec(99).astype("<f4").tobytes(), "enroll")
+    distance = frs.FacesDatabase.Identity.cosine_dist(_vec(11), _vec(99))
+    for threshold, skipped in ((distance, 1), (distance - 1e-6, 0)):
+        monkeypatch.setattr(config, "FACE_MATCH_THRESHOLD", threshold)
+        conn = _Conn({1: ("pearl", True), 2: ("jane", True)}, vectors=[rival])
+        result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
+        assert result["matched_other"] == skipped and result["labels"] == 1 - skipped
 
 
 def _snapshot(folder):
@@ -319,6 +368,19 @@ def test_cli_prints_counts_only(convert_module, monkeypatch, tmp_path, capsys):
     assert out.strip().splitlines() == [
         "Converted 2 photo vector(s) for 1 account(s); 1 photo label(s) skipped; the photo folder was not changed."]
     assert "pearl" not in out and "ghost" not in out
+
+    # A label whose face is already another account's: one more count-only line, never the labels.
+    capsys.readouterr()
+    jane = (1, 2, "jane", _vec(11).astype("<f4").tobytes(), "enroll")
+    matched = _Conn({1: ("pearl", True), 2: ("jane", True)}, vectors=[jane])
+    _cli(convert_module, monkeypatch, matched)
+    convert_module.main()
+    out = capsys.readouterr().out
+    assert out.strip().splitlines() == [
+        "Converted 0 photo vector(s) for 0 account(s); 1 photo label(s) skipped; the photo folder was not changed.",
+        "1 label(s) skipped: the face matches another account."]
+    assert "pearl" not in out and "jane" not in out
+    _cli(convert_module, monkeypatch, conn)
 
     capsys.readouterr()
     convert_module.main()   # the second run writes nothing

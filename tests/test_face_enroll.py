@@ -459,6 +459,33 @@ def test_a_failed_refresh_refuses_and_stores_nothing(gallery, monkeypatch, caplo
     assert "RuntimeError" in logged                               # the exception's type only
 
 
+def test_a_failed_reload_after_the_commit_still_answers_success(gallery, monkeypatch, caplog):
+    """The vectors are stored; a reload that fails after the commit only logs its type. The registration answers
+    its normal success and the account is marked enrolled (the next registration's pre-check reload refreshes the
+    gallery)."""
+    service = _FakeFaces([_found(descriptor=_desc(11 + i)) for i in range(3)])
+    _use(monkeypatch, service)
+    real_reload = face_vectors.reload
+    calls = []
+
+    async def second_fails(pool=None):
+        calls.append(pool)
+        if len(calls) == 2:
+            raise RuntimeError("db-host-secret-9")
+        return await real_reload(pool)
+    monkeypatch.setattr(face_vectors, "reload", second_fails)
+
+    with caplog.at_level(logging.DEBUG):
+        status, body = _result(_enroll())
+
+    assert status == 200 and len(body["saved"]) == 3
+    assert len(calls) == 2
+    assert len(gallery.conn.rows_of(7)) == 3 and gallery.conn.enrolled == [7]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("RuntimeError" in message for message in warnings)
+    assert "db-host-secret-9" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
 def test_two_accounts_enrolling_one_face_at_once_cannot_both_pass(gallery, monkeypatch):
     # A slow load: were the lock released before the winner's load ends, the other registration's check could run
     # against a gallery without the winner's vectors and pass too.
