@@ -65,8 +65,12 @@ async function seedSession(page: Page) {
   });
 }
 
-async function mockApi(page: Page, scan: Record<string, unknown>, existing: Record<string, unknown>[] = []) {
-  const state = { medicationPosts: [] as Record<string, unknown>[] };
+type LineDraft = { id: string; created_at: string; result: Record<string, unknown> };
+
+async function mockApi(
+  page: Page, scan: Record<string, unknown>, existing: Record<string, unknown>[] = [], lineDrafts: LineDraft[] = [],
+) {
+  const state = { medicationPosts: [] as Record<string, unknown>[], lineSaved: [] as string[] };
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -75,6 +79,21 @@ async function mockApi(page: Page, scan: Record<string, unknown>, existing: Reco
     }
     if (path === '/api/reachy/status') return route.fulfill({ json: { paired: false } });
     if (path === '/api/ocr/parse') return route.fulfill({ json: scan });
+    if (path === '/api/line-drafts') {
+      const live = lineDrafts.filter((d) => !state.lineSaved.includes(d.id));
+      return route.fulfill({ json: live.map((d) => ({
+        id: d.id, created_at: d.created_at, count: (d.result.medications as unknown[]).length })) });
+    }
+    const lineMatch = path.match(/^\/api\/line-drafts\/([^/]+)(\/saved)?$/);
+    if (lineMatch) {
+      const draft = lineDrafts.find((d) => d.id === lineMatch[1]);
+      if (!draft) return route.fulfill({ status: 404, json: { detail: 'not_found' } });
+      if (lineMatch[2] && request.method() === 'POST') {
+        state.lineSaved.push(draft.id);
+        return route.fulfill({ json: { saved: true } });
+      }
+      return route.fulfill({ json: draft });
+    }
     if (path === '/api/medications' && request.method() === 'POST') {
       state.medicationPosts.push(request.postDataJSON());
       return route.fulfill({ json: { id: 90 + state.medicationPosts.length } });
@@ -231,4 +250,59 @@ test('a medicine already in the list starts unticked with a note', async ({ page
   await page.getByRole('button', { name: '加入 2 種藥物' }).click();
   await expect(page.getByText('已將 2 種藥物加入我的藥物。')).toBeVisible();
   expect(state.medicationPosts.map((post) => post.name)).toEqual(['VITACOBAL CAPSULES 0', 'OTOMYX OTIC DROPS.']);
+});
+
+function clock(iso: string) {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+const LINE_AT = new Date(Date.now() - 3600_000).toISOString();
+const lineDraft = () => ({ id: '11111111-1111-4111-8111-111111111111', created_at: LINE_AT, result: receiptScan(isoDaysAgo(0)) });
+const FROM_LINE = `來自 LINE：3 種藥，${clock(LINE_AT)}`;
+
+test('a LINE list shows and opens into cards', async ({ page }) => {
+  await seedSession(page);
+  await mockApi(page, receiptScan(isoDaysAgo(0)), [], [lineDraft()]);
+  await page.goto('/scan');
+  await expect(page.getByText(FROM_LINE)).toBeVisible();
+  await expect(page.getByLabel('藥物名稱')).toHaveCount(0);
+  await page.getByRole('button', { name: '開啟', exact: true }).click();
+  await expect(page.getByText('找到 3 種藥物')).toBeVisible();
+  await expect(page.getByLabel('藥物名稱')).toHaveCount(3);
+  await expect(page.getByAltText('處方照片')).toHaveCount(0);   // the photo is never kept: no preview
+});
+
+test('saving every card marks the LINE list saved', async ({ page }) => {
+  await seedSession(page);
+  const state = await mockApi(page, receiptScan(isoDaysAgo(0)), [], [lineDraft()]);
+  await page.goto('/scan');
+  await page.getByRole('button', { name: '開啟', exact: true }).click();
+  await page.getByRole('button', { name: '加入 3 種藥物' }).click();
+  await expect(page.getByText('已將 3 種藥物加入我的藥物。')).toBeVisible();
+  await expect.poll(() => state.lineSaved).toEqual([lineDraft().id]);
+  await expect(page.getByText(FROM_LINE)).toHaveCount(0);
+  expect(state.medicationPosts).toHaveLength(3);
+});
+
+test('a failed card keeps the LINE list', async ({ page }) => {
+  await seedSession(page);
+  const state = await mockApi(page, receiptScan(isoDaysAgo(0)), [], [lineDraft()]);
+  let failOnce = true;
+  await page.route('**/api/medications', async (route) => {
+    if (route.request().method() === 'POST' && failOnce) {
+      failOnce = false;
+      return route.fulfill({ status: 400, json: { detail: 'database unavailable' } });
+    }
+    return route.fallback();
+  });
+  await page.goto('/scan');
+  await page.getByRole('button', { name: '開啟', exact: true }).click();
+  await page.getByRole('button', { name: '加入 3 種藥物' }).click();
+  await expect(page.getByText('這個藥物無法儲存，請檢查內容後再試一次。')).toBeVisible();
+  expect(state.lineSaved).toEqual([]);
+  await expect(page.getByText(FROM_LINE)).toBeVisible();
+  // Retrying the failed card finishes the list.
+  await page.getByRole('button', { name: '加入 1 種藥物' }).click();
+  await expect.poll(() => state.lineSaved).toEqual([lineDraft().id]);
 });

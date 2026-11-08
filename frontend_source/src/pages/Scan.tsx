@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { getFaceToken } from '../lib/face-auth';
@@ -51,6 +51,30 @@ async function activeMedicineNames(headers: Record<string, string>): Promise<str
   }
 }
 
+interface LineDraftRow {
+  id: string;
+  created_at: string;
+  count: number;
+}
+
+/** Medicine photos the patient sent on LINE that are read and waiting; [] when none or the list can't be read. */
+async function lineDraftRows(headers: Record<string, string>): Promise<LineDraftRow[]> {
+  if (!headers.Authorization) return [];
+  try {
+    const res = await fetch('/api/line-drafts', { headers });
+    if (!res.ok) return [];
+    const list: unknown = await res.json();
+    return Array.isArray(list) ? (list as LineDraftRow[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function clockTime(iso: string): string {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 export default function Scan() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -65,6 +89,19 @@ export default function Scan() {
   const [addError, setAddError] = useState('');
   const [saving, setSaving] = useState(false);
   const [flashOn, setFlashOn] = useState(false);
+  const [lineDrafts, setLineDrafts] = useState<LineDraftRow[]>([]);
+  const [lineOpenId, setLineOpenId] = useState<string | null>(null);
+  const [lineError, setLineError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    lineDraftRows(getAuthHeaders()).then((rows) => {
+      if (!cancelled) setLineDrafts(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const startCamera = async (mode: 'environment' | 'user' = facingMode) => {
     if (stream) {
@@ -107,6 +144,7 @@ export default function Scan() {
     setParsed(null);
     setDrafts([]);
     setParseError('');
+    setLineOpenId(null);
     startCamera();
   };
 
@@ -126,6 +164,7 @@ export default function Scan() {
     setParseError('');
     setParsed(null);
     setDrafts([]);
+    setLineOpenId(null);
 
     try {
       const file = dataUrlToFile(capturedImage, 'prescription.jpg');
@@ -148,6 +187,33 @@ export default function Scan() {
       setParseError(t(timedOut ? 'scan.timeout' : 'scan.connectionFailed'));
     } finally {
       setParsing(false);
+    }
+  };
+
+  /** Open a photo read from LINE: the same cards a fresh scan gives (no photo is shown; the server keeps none). */
+  const openLineDraft = async (id: string) => {
+    setLineError('');
+    try {
+      const res = await fetch(`/api/line-drafts/${id}`, { headers: getAuthHeaders() });
+      if (!res.ok) throw new Error(String(res.status));
+      const body = await res.json();
+      const scan = body.result as ScanResult;
+      const today = isoDate(new Date());
+      stream?.getTracks().forEach((t) => t.stop());
+      setStream(null);
+      setCapturedImage(null);
+      setParseError('');
+      setAddError('');
+      setParsed(scan);
+      setLineOpenId(id);
+      setDrafts(medicinesOf(scan).map((med) => draftFrom(med, scan, today)));
+      const existing = await activeMedicineNames(getAuthHeaders());
+      if (existing.length > 0) setDrafts((current) => markDuplicates(current, existing));
+    } catch (error) {
+      console.warn('Opening a LINE photo failed', error);
+      setLineError(t('scan.lineOpenFailed'));
+      // It may have expired or been saved on another screen.
+      setLineDrafts(await lineDraftRows(getAuthHeaders()));
     }
   };
 
@@ -194,6 +260,7 @@ export default function Scan() {
       current = checked;
       setDrafts(checked);
     }
+    let everyTickedSaved = true;
     for (let index = 0; index < current.length; index++) {
       const draft = current[index];
       if (!draft.include || draft.status === 'saved') continue;
@@ -220,6 +287,21 @@ export default function Scan() {
         errorKey = saveErrorKey(null, undefined);
       }
       updateDraft(index, (d) => ({ ...d, status, errorKey }));
+      if (status !== 'saved') everyTickedSaved = false;
+    }
+    // A LINE list is marked saved only when every ticked card saved; a failed card keeps it for another try.
+    if (lineOpenId && everyTickedSaved) {
+      try {
+        const res = await fetch(`/api/line-drafts/${lineOpenId}/saved`, { method: 'POST', headers });
+        if (res.ok) {
+          setLineDrafts((rows) => rows.filter((row) => row.id !== lineOpenId));
+          setLineOpenId(null);
+        } else {
+          console.warn('Marking the LINE list saved failed', res.status);
+        }
+      } catch (error) {
+        console.warn('Marking the LINE list saved failed', error);
+      }
     }
     // New medicines change which doses the server refuses.
     forgetRefusals();
@@ -557,6 +639,26 @@ export default function Scan() {
           <X className="w-5 h-5" />
         </button>
       </div>
+
+      {/* Medicine photos sent on LINE, read and waiting */}
+      {lineDrafts.length > 0 && (
+        <div className="space-y-2">
+          {lineDrafts.map((row) => (
+            <div key={row.id} className="flex items-center justify-between gap-3 p-3 bg-green-50 border border-green-200 rounded-xl">
+              <span className="text-base text-gray-900">
+                {t('scan.fromLine', { count: row.count, time: clockTime(row.created_at) })}
+              </span>
+              <button
+                onClick={() => openLineDraft(row.id)}
+                className="px-4 py-2 bg-[#0057B8] text-white text-base rounded-xl font-medium hover:bg-[#003D82] active:scale-95 transition-all touch-target-large"
+              >
+                {t('scan.openLine')}
+              </button>
+            </div>
+          ))}
+          {lineError && <p className="text-sm text-red-600">{lineError}</p>}
+        </div>
+      )}
 
       {/* Camera / Preview */}
       <div className="relative aspect-[4/3] bg-gray-900 rounded-2xl overflow-hidden shadow-sm hover:shadow-md transition-all duration-300">

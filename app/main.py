@@ -23,7 +23,7 @@ from app.services.liveness_service import LivenessService
 from app.routers import auth, emotion, ocr, medicines, notifications, display
 from app.routers import api_face, api_ocr as api_ocr_router, api_emotion as api_emotion_router, api_notify, api_auth, api_family, api_medications, api_history, api_intake, api_monitor
 from app.routers import api_legal, api_consent, api_account, api_reachy, api_device, api_conversations, api_memory
-from app.routers import api_ai, api_dose_video, api_line_admin
+from app.routers import api_ai, api_dose_video, api_line_admin, api_line_drafts
 from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
@@ -230,6 +230,7 @@ app.include_router(api_dose_video.router,    tags=["dose-video"])
 app.include_router(api_dose_video.media_router, tags=["dose-video"])
 app.include_router(api_ai.router,            tags=["ai-connections"])
 app.include_router(api_line_admin.router,    tags=["line-admin"])
+app.include_router(api_line_drafts.router,   tags=["line-drafts"])
 
 
 # ── Health check (must be before catch-all) ──────────────────────────────────
