@@ -24,8 +24,10 @@ from app.services import face_vectors
 # itself and with the ROW EXCLUSIVE lock a registration's INSERT takes).
 LOCK_SQL = "LOCK TABLE face_vector IN SHARE ROW EXCLUSIVE MODE"
 ALREADY_SQL = "SELECT EXISTS (SELECT 1 FROM face_vector WHERE source = 'photo')"
-DELETED_SQL = ("SELECT EXISTS (SELECT 1 FROM deletion_ledger WHERE kind = 'account' "
-               "AND lower(object_id) = $1)")
+# The latest deletion of an account with that label. face_label is unique, so an account that reuses a label was
+# always created after the earlier owner's deletion.
+DELETED_SQL = ("SELECT max(deleted_at) FROM deletion_ledger WHERE kind = 'account' "
+               "AND lower(object_id) = $1")
 OWNER_SQL = ('SELECT u.u_id, u.created_at, (SELECT count(*) FROM face_vector f WHERE f.u_id = u.u_id) AS vectors '
              'FROM "user" u WHERE u.face_label = $1 AND u.user_active = TRUE')
 INSERT_SQL = "INSERT INTO face_vector (u_id, face_label, vector, source) VALUES ($1, $2, $3, 'photo')"
@@ -65,8 +67,9 @@ async def convert(conn, service, gallery_dir: Path) -> dict:
     Nothing is written when any 'photo' row exists (already converted), checked under a table lock in the
     transaction, so two runs at once never both write. A label is skipped and counted when:
     - no active account has it (an old backup can bring back a deleted user's photos);
-    - an account with that label was deleted (deletion_ledger kind 'account'): the photos may be the deleted
-      person's, left by a failed file delete or brought back by a restore, and a newer account may reuse the label;
+    - an account with that label was deleted (deletion_ledger kind 'account') after the label's oldest photo was
+      taken: those photos belonged to the deleted account (a failed file delete, or a restored old backup), and a
+      newer account may reuse the label. A deletion older than all the photos does not skip;
     - any of its photos is older than the account (or the account has no created_at): the photos predate it;
     - its account has registered again (its own vectors stay, never mixed with old photos).
     The rows are read back in the same transaction and compared with the folder's vectors; any difference rolls
@@ -84,9 +87,11 @@ async def convert(conn, service, gallery_dir: Path) -> dict:
         for identity in folder.database:
             owner = await conn.fetchrow(OWNER_SQL, identity.label)
             times = photo_times.get(identity.label)
-            if (owner is None or owner["vectors"] or await conn.fetchval(DELETED_SQL, identity.label)
-                    or owner["created_at"] is None or not times
-                    or any(t < owner["created_at"] for t in times)):
+            if owner is None or owner["vectors"] or owner["created_at"] is None or not times:
+                skipped += 1
+                continue
+            deleted_at = await conn.fetchval(DELETED_SQL, identity.label)
+            if (deleted_at is not None and deleted_at > min(times)) or any(t < owner["created_at"] for t in times):
                 skipped += 1
                 continue
             for desc in identity.descriptors:

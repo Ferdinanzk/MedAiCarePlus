@@ -93,7 +93,8 @@ class _Transaction:
 
 class _Conn:
     """"user" rows {u_id: (face_label, active)}, face_vector rows (vector_id, u_id, face_label, vector, source),
-    the 'account' deletion_ledger object ids and each account's created_at (OLD_ACCOUNT when not given)."""
+    the 'account' deletion_ledger rows (object_id, deleted_at) and each account's created_at (OLD_ACCOUNT when not
+    given)."""
 
     def __init__(self, users, vectors=(), tamper=False, deleted=(), created=None):
         self.users = users
@@ -112,8 +113,9 @@ class _Conn:
 
     async def fetchval(self, sql, *args):
         if "deletion_ledger" in sql:
-            assert "kind = 'account'" in sql and "lower(object_id) = $1" in sql
-            return any(object_id.lower() == args[0] for object_id in self.deleted)
+            assert "max(deleted_at)" in sql and "kind = 'account'" in sql and "lower(object_id) = $1" in sql
+            times = [deleted_at for object_id, deleted_at in self.deleted if object_id.lower() == args[0]]
+            return max(times) if times else None
         assert "source = 'photo'" in sql
         self.already_checks.append((self.in_transaction, self.locked))
         return any(row[4] == "photo" for row in self.vectors)
@@ -214,18 +216,44 @@ def test_the_already_check_runs_under_the_lock(convert_module, tmp_path):
     assert len(conn.vectors) == 1 and conn.commits == 2
 
 
-def test_a_label_with_a_deleted_account_in_the_ledger_is_skipped(convert_module, tmp_path):
+def _date(folder, name, *when):
+    stamp = datetime(*when, tzinfo=timezone.utc).timestamp()
+    os.utime(folder / name, (stamp, stamp))
+
+
+def test_photos_taken_before_a_deletion_of_the_label_are_skipped(convert_module, tmp_path):
     # A deleted account's photos left behind (a failed file delete, or an old backup restored) must never become
-    # the face of a newer account that reuses the label.
+    # the face of a newer account that reuses the label. Only the ledger rule fires here: the account's created_at
+    # (2020) is older than every photo, so the account's own time rule would let them through.
     _photo(tmp_path, "pearl-0.png", 11)
     _photo(tmp_path, "pearl-1.png", 12)
     _photo(tmp_path, "jane-0.png", 13)
-    conn = _Conn({5: ("pearl", True), 2: ("jane", True)}, deleted=["Pearl"])
+    _date(tmp_path, "pearl-0.png", 2024, 3, 1)   # the label's oldest photo predates the latest deletion
+    deleted = [("Pearl", datetime(2023, 1, 1, tzinfo=timezone.utc)),   # an older deletion of the same label
+               ("Pearl", datetime(2024, 6, 1, tzinfo=timezone.utc)),
+               ("janet", datetime(2030, 1, 1, tzinfo=timezone.utc))]   # another label: no effect on jane
+    conn = _Conn({5: ("pearl", True), 2: ("jane", True)}, deleted=deleted)
 
     result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
 
     assert result == {"converted": 1, "labels": 1, "skipped_labels": 1, "already": False}
     assert [(u_id, label) for u_id, label, _, _ in _rows(conn)] == [(2, "jane")]
+
+
+def test_a_deletion_before_the_photos_does_not_skip_the_new_owner(convert_module, tmp_path):
+    # As on the live folder: an earlier account with the same label was deleted 18 days before the current one was
+    # created, and the current account's photos were taken 44 s after it was created. They are its own.
+    _photo(tmp_path, "pearl-0.png", 11)
+    _photo(tmp_path, "pearl-1.png", 12)
+    for name in ("pearl-0.png", "pearl-1.png"):
+        _date(tmp_path, name, 2025, 2, 1)
+    conn = _Conn({5: ("pearl", True)}, created={5: datetime(2025, 1, 31, 23, 59, 16, tzinfo=timezone.utc)},
+                 deleted=[("Pearl", datetime(2025, 1, 13, tzinfo=timezone.utc))])
+
+    result = asyncio.run(convert_module.convert(conn, _service(), tmp_path))
+
+    assert result == {"converted": 2, "labels": 1, "skipped_labels": 0, "already": False}
+    assert [(u_id, label) for u_id, label, _, _ in _rows(conn)] == [(5, "pearl"), (5, "pearl")]
 
 
 def test_photos_older_than_the_account_are_skipped(convert_module, tmp_path):
