@@ -9,6 +9,9 @@ The photo folder is only read, never changed. Only counts are printed; labels an
 
 import argparse
 import asyncio
+import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
@@ -17,8 +20,13 @@ from app import config
 from app.services import face_recognition_service as frs
 from app.services import face_vectors
 
+# Two runs at once: the second waits for the first's commit, then finds its rows (SHARE ROW EXCLUSIVE conflicts with
+# itself and with the ROW EXCLUSIVE lock a registration's INSERT takes).
+LOCK_SQL = "LOCK TABLE face_vector IN SHARE ROW EXCLUSIVE MODE"
 ALREADY_SQL = "SELECT EXISTS (SELECT 1 FROM face_vector WHERE source = 'photo')"
-OWNER_SQL = ('SELECT u.u_id, (SELECT count(*) FROM face_vector f WHERE f.u_id = u.u_id) AS vectors '
+DELETED_SQL = ("SELECT EXISTS (SELECT 1 FROM deletion_ledger WHERE kind = 'account' "
+               "AND lower(object_id) = $1)")
+OWNER_SQL = ('SELECT u.u_id, u.created_at, (SELECT count(*) FROM face_vector f WHERE f.u_id = u.u_id) AS vectors '
              'FROM "user" u WHERE u.face_label = $1 AND u.user_active = TRUE')
 INSERT_SQL = "INSERT INTO face_vector (u_id, face_label, vector, source) VALUES ($1, $2, $3, 'photo')"
 TOLERANCE = 1e-6   # cosine distance between a photo's vector and the one read back
@@ -26,6 +34,21 @@ TOLERANCE = 1e-6   # cosine distance between a photo's vector and the one read b
 
 class ConversionMismatch(RuntimeError):
     """The rows read back differ from the photos' vectors; the transaction was rolled back."""
+
+
+def _photo_times(gallery_dir: Path) -> dict[str, list[datetime]]:
+    """Each folder label's photo modification times (UTC), with the files and labels FacesDatabase reads: every
+    name ending in jpg or png, label = the name without its extension and -<digits>, lower case. Only stat()."""
+    times: dict[str, list[datetime]] = {}
+    if not os.path.isdir(gallery_dir):
+        return times
+    for name in os.listdir(gallery_dir):
+        if name.split(".")[-1] not in frs.FacesDatabase.IMAGE_EXTENSIONS:
+            continue
+        label = re.split(r"-\d+$", os.path.splitext(name)[0])[0].lower()
+        mtime = os.stat(os.path.join(gallery_dir, name)).st_mtime
+        times.setdefault(label, []).append(datetime.fromtimestamp(mtime, timezone.utc))
+    return times
 
 
 def _differs(folder_vectors, stored) -> bool:
@@ -39,21 +62,31 @@ def _differs(folder_vectors, stored) -> bool:
 async def convert(conn, service, gallery_dir: Path) -> dict:
     """Write one 'photo' row per photo of every folder label that belongs to an active account.
 
-    Nothing is written when any 'photo' row exists (already converted). A label with no active account (an old
-    backup can bring back a deleted user's photos), or whose account has registered again (its own vectors stay,
-    never mixed with old photos), is skipped and counted. The rows are read back in the same transaction and
-    compared with the folder's vectors; any difference rolls everything back and raises ConversionMismatch.
+    Nothing is written when any 'photo' row exists (already converted), checked under a table lock in the
+    transaction, so two runs at once never both write. A label is skipped and counted when:
+    - no active account has it (an old backup can bring back a deleted user's photos);
+    - an account with that label was deleted (deletion_ledger kind 'account'): the photos may be the deleted
+      person's, left by a failed file delete or brought back by a restore, and a newer account may reuse the label;
+    - any of its photos is older than the account (or the account has no created_at): the photos predate it;
+    - its account has registered again (its own vectors stay, never mixed with old photos).
+    The rows are read back in the same transaction and compared with the folder's vectors; any difference rolls
+    everything back and raises ConversionMismatch.
     """
-    if await conn.fetchval(ALREADY_SQL):
-        return {"converted": 0, "labels": 0, "skipped_labels": 0, "already": True}
     frs._load_imports()
     folder = frs.FacesDatabase(str(gallery_dir), service.face_id, service.lm_det)   # today's gallery computation
+    photo_times = _photo_times(gallery_dir)
     converted = []
     skipped = 0
     async with conn.transaction():
+        await conn.execute(LOCK_SQL)
+        if await conn.fetchval(ALREADY_SQL):
+            return {"converted": 0, "labels": 0, "skipped_labels": 0, "already": True}
         for identity in folder.database:
             owner = await conn.fetchrow(OWNER_SQL, identity.label)
-            if owner is None or owner["vectors"]:
+            times = photo_times.get(identity.label)
+            if (owner is None or owner["vectors"] or await conn.fetchval(DELETED_SQL, identity.label)
+                    or owner["created_at"] is None or not times
+                    or any(t < owner["created_at"] for t in times)):
                 skipped += 1
                 continue
             for desc in identity.descriptors:
@@ -88,6 +121,9 @@ def main() -> None:
         result = asyncio.run(run(args.folder))
     except ConversionMismatch as error:
         print(f"Conversion failed, {error}; the photo folder was not changed.")
+        raise SystemExit(1)
+    except Exception as error:   # asyncpg.PostgresError and anything else: its text may hold labels, so never print it
+        print(f"Conversion failed ({type(error).__name__}); the photo folder was not changed.")
         raise SystemExit(1)
     if result["already"]:
         print("Already converted: nothing written; the photo folder was not changed.")
