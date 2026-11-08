@@ -890,6 +890,32 @@ semgrep was **not run** (not installed on this PC); the webhook and token code w
 - A confirm pressed after 60 s on the older page gives a raw JSON 400 (`invalid_ticket`).
 - Two INFO lines per login (the route's carries the account id, the service's the frame counts and liveness scores).
 
+## 16. Medicine photos over LINE (8 November 2026)
+
+**What changed** (branch `version-4-competition`, commits `0e2a14e` to `cbd95e7` and the clean-up commit after them; nothing pushed, nothing rebuilt yet). The same facts, with file and line, are in `CLAUDE.md` under "LINE medicine photo (Nov 2026)".
+
+- A patient sends a photo of a prescription or medicine bag to the LINE bot in a one-to-one chat. The sender must be the one active patient whose `"user".line_id` matches (`line_photo.py:185`). Family get a refusal, an unlinked sender gets a "link LINE first" text, and without current `core` consent the patient gets an "accept the terms" text.
+- The bot records one row in `line_photo_draft` (one per LINE message id), downloads the photo (at most 10 MB), shows LINE's loading animation, reads it with the OCR service (Gemini, within `OCR_GEMINI_IMAGE_BUDGET`, 45 s) and answers through the outbox with kind `line_photo`. At most 10 photos an hour per patient. The photo is not kept.
+- The answer lists the medicines and has a button 「全部儲存 Save all」 (signed postback). Save all (`handle_save`, `line_photo.py:324`) runs in one transaction under a row lock, checks consent again, and saves what the Scan page would save (`services/scan_rules.py`, held equal to `frontend_source/src/lib/scan.ts` by `tests/scan_parity.json`). Duplicates and medicines with problems are skipped and named in the answer. Pressing twice saves once.
+- The Scan page lists the patient's waiting drafts as "From LINE" rows (`/api/line-drafts`, consent-gated); opening one gives the usual cards. Drafts expire after 24 hours; the nightly clean-up and the restore replay delete them. They are part of the account export.
+- **Golden file rule:** change `scan.ts` and `scan_rules.py` together and regenerate `tests/scan_parity.json` with `cd frontend_source && node --experimental-strip-types tests/scan_parity.gen.ts`.
+
+**Release gate (the user's decision):** before real patients send medicine photos over LINE, a new notice version must name medicine photos and the OCR service, Google Gemini. The user writes the text. Until then the feature is for testing and the competition.
+
+**How to test with a real LINE account:**
+
+1. Rebuild the app: `.\scripts\rebuild-app.ps1` (only while no dose session runs). Until then the running container has none of this.
+2. The patient's own LINE must be linked to the account (the `line_id` on the patient, not a family contact). The patient must have accepted the current notice.
+3. The LINE webhook must be reachable through the tunnel (`scripts\line-tunnel.ps1`; the address changes at each start, so set the webhook URL in the LINE console again if it changed). Ask before moving a webhook to another channel.
+4. Send a photo of a medicine bag to the bot. Expect the loading animation, then a list within about a minute. Press 「全部儲存 Save all」 and check the Medications page. Send the same photo from a family member's LINE: expect the refusal text.
+5. On the Scan page a photo not yet saved appears under "From LINE".
+
+**Not done:**
+
+- No test with a real LINE account yet; everything was checked with fakes and the test suite.
+- semgrep has not been run (it is not installed on this PC).
+- The notice has not been changed (the release gate above).
+
 ---
 
 # History: handoff of 2 October 2026

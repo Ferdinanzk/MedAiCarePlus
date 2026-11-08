@@ -39,7 +39,7 @@ class _Connection:
             self.users.discard(args[0])
         elif "DELETE FROM ops_state" in query:
             self.marked = False
-        elif query.startswith(("DELETE FROM conversation_turn", "DELETE FROM patient_memory")):
+        elif query.startswith(("DELETE FROM conversation_turn", "DELETE FROM patient_memory", "DELETE FROM line_photo_draft")):
             assert self.marked   # retention purges run before the restore marker is cleared
         else:
             raise AssertionError(query)

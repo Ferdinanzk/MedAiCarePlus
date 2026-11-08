@@ -27,6 +27,8 @@ async def run_retention(conn) -> None:
         config.MEDCARE_TIMEZONE, EVENT_KEEP_DAYS)
     await conn.execute(
         "DELETE FROM patient_memory_deleted WHERE deleted_at < NOW() - make_interval(days => $1)", TOMBSTONE_DAYS)
+    # LINE medicine photo drafts (24 h); a draft stuck at 'reading' after a restart carries expires_at too.
+    await conn.execute("DELETE FROM line_photo_draft WHERE expires_at < NOW()")
 
 
 async def purge_old_transcripts():

@@ -23,7 +23,7 @@ EXPORT_TABLES = (
     "notification_settings", "notification", "login_log", "monitor_event", "consent",
     "conversation", "conversation_turn", "patient_memory", "patient_memory_deleted",
     "dose_confirmation", "monitor_extra_event", "reachy_device", "reachy_task", "notification_outbox",
-    "dose_video", "dose_video_link", "dose_emotion",
+    "dose_video", "dose_video_link", "dose_emotion", "line_photo_draft",
 )
 # Tables without a u_id column, read through the row that owns them.
 EXPORT_QUERIES = {
