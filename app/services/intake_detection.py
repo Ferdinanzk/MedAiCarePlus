@@ -1624,7 +1624,7 @@ class IntakeDetectionService:
             hand_objects=payload.get("hand_objects"),
         )
 
-        result = pipeline.process(timestamp, True, observations)
+        result = pipeline.process(timestamp, True, observations, mouth_open=bool(mouth_geom["mouth_open"]))
         if result.get("candidate_id") is not None:
             key = self._key(state.user_id, state.session_id)
             token_source = f"{key}:{result['candidate_id']}".encode("utf-8")

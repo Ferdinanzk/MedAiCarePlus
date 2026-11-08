@@ -398,12 +398,22 @@ Transitions are at `intake_temporal.py:217-318`.
 
 | Outcome | Condition | Confidence |
 |---|---|---|
-| `none` (`closed_mouth_sequence_rejected`) | No open mouth before, at or after contact | 0.0 |
+| `none` (`closed_mouth_sequence_rejected`) | No open mouth before, at or after contact, and the mouth was never fully covered (peak mouth occlusion under `covered_mouth_occlusion`, 0.95; 8 Nov 2026: a mouth the hand hides completely reads as shut, so such an event goes on and can only prompt) | 0.0 |
+| `none` (`mouth_open_before_approach_rejected`, 8 Nov 2026) | No holding grip seen, and the mouth was open in `pre_approach_open_max` (0.35) or more of the face readings in the `pre_approach_seconds` (1.5 s) before the approach started (at least `pre_approach_min_samples`, 8): a cough, a yawn or talk, not a dose | 0.0 |
 | `confirmed` (`coherent_delivery_sequence`) | Mouth evidence, a holding grip seen, outward motion seen, no contradiction, flat-palm share < 0.75, not forced middle | **0.82** (`HIGH_EVIDENCE_CONFIDENCE`, line 129) |
 | `uncertain` with tongue support | As above but incoherent, and 2 of 3 aligned tongue frames from contact − 0.4 s to last contact + 0.6 s | 0.56 (unreachable live, see below) |
 | `uncertain` | Everything else | **0.48** (`MIDDLE_EVIDENCE_CONFIDENCE`, line 130) |
 
 Detector session store (in memory): 600 frames, 5 min active TTL, 15 min completed TTL, capacity 32 (`intake_detection.py:1224-1227`).
+
+**The mouth rules** (8 Nov 2026, branch `intake-mouth-timing`). `TemporalIntakePipeline.process` takes the face's
+mouth reading of each frame (`mouth_open`, passed by `IntakeDetectionService._process_ordered_frame`) and keeps the
+last 3 s of them; the open fraction before an approach is stored on the event (`pre_approach_open_ratio`,
+`pre_approach_samples` in the result). Both rejections re-arm the detector at once, like the closed-mouth one.
+Measured with `C:\pilldetector` on 99 clips (the 33 originals and dark and bright copies of each): accuracy with any
+alert counted as "took" went from 52.5 % to 71.7 % (false alerts 24 to 11, intakes alerted 37 to 43 of 60, no false
+auto-log), and 70.7 % when the two thresholds are chosen without each held-out gesture
+(`C:\pilldetector\CONFUSION_AND_LIGHTING.md`). The thresholds were read off these clips; new footage may score lower.
 
 **Hand depth evidence** (3 Nov 2026, robot frames with the depth model, section 4.1): `_accumulate` counts the observations in the contact zone (after the first contact, distance ≤ `exit_distance`) that carry a `front`, and how many of them are at or above `depth_front_threshold` (0.8). With at least `depth_min_samples` (2) readings of which `depth_front_ratio` (0.6) or more are in front, the result says `depth_no_contact` (also `depth_samples` and `depth_front_median`). The band and confidence above are unchanged; the policy caps such an event at `uncertain`.
 

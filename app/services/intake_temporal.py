@@ -7,6 +7,7 @@ observations and request timing never count as positive evidence.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from math import hypot
@@ -55,6 +56,23 @@ class TemporalConfig:
     # object_min_samples checked observations, the label seen in object_ratio or more of them is `object_in_hand`.
     object_min_samples: int = 2
     object_ratio: float = 0.5
+    # The mouth before the approach (8 Nov 2026). A pill-taker's mouth stays closed until the hand arrives; a cough,
+    # a yawn, a wipe or talking with a hand near the face has it open already. Over the pre_approach_seconds before
+    # an approach starts, with at least pre_approach_min_samples face readings, an open fraction at or above
+    # pre_approach_open_max on an event that never showed a holding grip is no event at all
+    # (mouth_open_before_approach_rejected). On the C:\pilldetector clips (M_ownership traces) the real intakes read
+    # 0.00-0.14 (one, 1_a2, 0.32) and 7 of the 9 false prompts 0.38-0.94; a grip keeps the event whatever the mouth
+    # did, so a patient who opens wide before a pinched pill still prompts.
+    pre_approach_seconds: float = 1.5
+    pre_approach_open_max: float = 0.35
+    pre_approach_min_samples: int = 8
+    # A mouth the hand covers completely is no evidence of a closed mouth (8 Nov 2026): the face model cannot see the
+    # lips and reads them as shut. With a peak mouth occlusion at or above covered_mouth_occlusion, a gesture whose
+    # mouth was never seen open is not rejected as closed_mouth_sequence_rejected; it can only prompt (coherent
+    # delivery still needs the mouth seen open). On the clips every real intake rejected as closed-mouth (t_a1, t_g1,
+    # in all three lightings) had occlusion 1.0, the not-taken ones 0.30-0.55 but one, which the mouth-before rule
+    # rejects.
+    covered_mouth_occlusion: float = 0.95
 
 
 @dataclass
@@ -127,6 +145,8 @@ class TemporalEvent:
     depth_fronts: List[float] = field(default_factory=list)
     object_samples: int = 0         # contact-zone observations the object detector checked
     object_counts: Dict[str, int] = field(default_factory=dict)
+    pre_approach_open_ratio: Optional[float] = None   # the mouth's open fraction before the approach (None: too few)
+    pre_approach_samples: int = 0
 
 
 class TemporalIntakePipeline:
@@ -164,6 +184,7 @@ class TemporalIntakePipeline:
         self.reacquired = False
         self.completion_reason: Optional[str] = None
         self.reset_reason: Optional[str] = None
+        self.mouth_history: deque = deque()   # (timestamp, mouth open) of the recent frames with a face
 
     def _stage(self, stage: Stage, now: float, reason: str) -> None:
         self.event.stage = stage
@@ -218,9 +239,29 @@ class TemporalIntakePipeline:
                     del self.tracks[track_id]
         return matched
 
+    def _note_mouth(self, now: float, mouth_open: Optional[bool]) -> None:
+        """Keep the mouth readings of the last 2 * pre_approach_seconds (the window before an approach)."""
+        if mouth_open is not None:
+            self.mouth_history.append((now, bool(mouth_open)))
+        horizon = now - 2 * self.config.pre_approach_seconds
+        while self.mouth_history and self.mouth_history[0][0] < horizon:
+            self.mouth_history.popleft()
+
+    def _mouth_before(self, start: float) -> tuple[Optional[float], int]:
+        """The open fraction of the mouth readings in the pre_approach_seconds before `start` (this frame left out),
+        and how many there were; None when there were fewer than pre_approach_min_samples."""
+        window = [opened for at, opened in self.mouth_history
+                  if start - self.config.pre_approach_seconds <= at < start]
+        if len(window) < self.config.pre_approach_min_samples:
+            return None, len(window)
+        return sum(window) / len(window), len(window)
+
     def process(
-        self, now: float, face_reliable: bool, observations: List[Observation]
+        self, now: float, face_reliable: bool, observations: List[Observation],
+        mouth_open: Optional[bool] = None,
     ) -> dict:
+        """One frame. `mouth_open`: the face's mouth reading on this frame (None without one), kept for the
+        mouth-before-the-approach rule; the observations' own mouth flags are unchanged."""
         self.reacquired = False
         self.hand_lost = False
         self.completion_reason = None
@@ -231,6 +272,8 @@ class TemporalIntakePipeline:
         if self.last_timestamp is not None and now <= self.last_timestamp:
             return self.result("stale_timestamp", accepted=False)
         self.last_timestamp = now
+        before = self._mouth_before(now)   # read before this frame's reading joins the history
+        self._note_mouth(now, mouth_open if face_reliable else None)
 
         matched = self._match(observations, now)
         event = self.event
@@ -286,6 +329,7 @@ class TemporalIntakePipeline:
                     event.active_track = track_id
                     event.started_at = now
                     event.pre_contact_mouth_open = obs.mouth_open
+                    event.pre_approach_open_ratio, event.pre_approach_samples = before
                     self._stage(Stage.APPROACHING, now, "inward_velocity_toward_mouth")
                     break
 
@@ -428,7 +472,8 @@ class TemporalIntakePipeline:
             or event.contact_mouth_open
             or event.post_contact_mouth_open
         )
-        if not mouth_evidence:
+        mouth_hidden = event.max_occlusion >= self.config.covered_mouth_occlusion
+        if not mouth_evidence and not mouth_hidden:
             result = self.result(
                 decision="none",
                 confidence=0.0,
@@ -442,6 +487,21 @@ class TemporalIntakePipeline:
             # The result was built before the reset: carry its reason on this one
             # frame, so the monitor logs it.
             result["reset_reason"] = "closed_mouth_sequence_rejected"
+            return result
+
+        if (not event.delivery_seen and event.pre_approach_open_ratio is not None
+                and event.pre_approach_open_ratio >= self.config.pre_approach_open_max):
+            # The mouth was already open before the hand came, and no holding grip was seen: a cough, a yawn or
+            # talk, not a dose. Like a closed-mouth gesture it re-arms at once and never prompts.
+            result = self.result(
+                decision="none",
+                confidence=0.0,
+                candidate_id=None,
+                decision_reason="mouth_open_before_approach_rejected",
+            )
+            self._reset(now, stage=Stage.READY, reason="mouth_open_before_approach_rejected")
+            self.tracks.clear()
+            result["reset_reason"] = "mouth_open_before_approach_rejected"
             return result
 
         event.candidate_id += 1
@@ -596,4 +656,7 @@ class TemporalIntakePipeline:
             "depth_no_contact": self._depth_no_contact(event),
             "object_samples": event.object_samples,
             "object_in_hand": self._object_in_hand(event),
+            "pre_approach_open_ratio": (None if event.pre_approach_open_ratio is None
+                                        else round(event.pre_approach_open_ratio, 3)),
+            "pre_approach_samples": event.pre_approach_samples,
         }
