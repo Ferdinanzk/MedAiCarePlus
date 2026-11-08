@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from app.database import get_pool
 from app.dependencies import get_current_user, _face_signer
 from app.routers.api_auth import _verify_password
-from app.services import deletion_ledger
+from app.services import deletion_ledger, face_vectors
 
 router = APIRouter(prefix="/api/account", tags=["account"])
 logger = logging.getLogger(__name__)
@@ -70,6 +70,14 @@ async def export_account(user: dict = Depends(get_current_user)):
                 query = EXPORT_QUERIES.get(table, f'SELECT * FROM "{table}" WHERE u_id=$1')
                 rows = await conn.fetch(query, user["u_id"])
                 account[table] = [dict(row) for row in rows]
+            # Face vectors are biometric numbers: the export says only how many there are and when they were made.
+            summary = await conn.fetchrow(
+                "SELECT count(*) AS count, min(created_at) AS first, max(created_at) AS last "
+                "FROM face_vector WHERE u_id=$1", user["u_id"])
+    account["face_vectors"] = {
+        "count": summary["count"],
+        "first": summary["first"].isoformat() if summary["first"] else None,
+        "last": summary["last"].isoformat() if summary["last"] else None}
     if not account["user"]:
         raise HTTPException(404, "account_not_found")
     face_label = account["user"][0].get("face_label")
@@ -123,4 +131,9 @@ async def delete_account(payload: DeletePayload, request: Request,
         deletion_ledger.refresh_gallery(face_label)
     except Exception:
         logger.exception("Account %s deleted; gallery refresh failed", u_id)
+    # A registration reload that read its rows before this deletion committed could have put the identity back.
+    try:
+        await face_vectors.reload()
+    except Exception as exc:
+        logger.warning("Account %s deleted; face gallery reload failed (%s)", u_id, type(exc).__name__)
     return {"deleted": True}

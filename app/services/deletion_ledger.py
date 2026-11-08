@@ -60,8 +60,8 @@ def refresh_gallery(face_label: str | None) -> None:
 
     service = FaceRecognitionService.get_instance()
     with service.lock:
-        service.reload_gallery()
-        # A failed unlink or reload must not leave a deleted identity in memory.
+        # The gallery comes from the face_vector rows, so there is no folder to reload here. The cascade deleted the
+        # rows; this drops the identity from memory at once (the route then reloads from the database as well).
         if FaceRecognitionService._available and face_label:
             database = service.face_id.faces_database
             database.database[:] = [identity for identity in database.database

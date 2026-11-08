@@ -2,6 +2,8 @@ import asyncio
 import datetime
 import io
 import json
+import logging
+import pathlib
 import sys
 import threading
 import types
@@ -51,12 +53,18 @@ class _Connection:
         self.ledger = []
         self.events = []
         self.queries = []
+        self.queries_vector = []
+        self.vector_summary = {"count": 3, "first": datetime.datetime(2026, 11, 8, 9, 0, tzinfo=datetime.timezone.utc),
+                               "last": datetime.datetime(2026, 11, 8, 9, 5, tzinfo=datetime.timezone.utc)}
 
     def transaction(self, **kwargs):
         return _Transaction(self)
 
     async def fetchrow(self, query, *args):
         assert args == (7,)
+        if "FROM face_vector" in query:
+            self.queries_vector.append(query)
+            return self.vector_summary
         return None if self.deleted else self.row
 
     async def fetch(self, query, *args):
@@ -128,11 +136,93 @@ def test_export_contains_owned_rows_and_photos_without_password(setup_account):
     with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
         assert set(archive.namelist()) == {"account.json", "face/pearl-0.jpg"}
         account = json.loads(archive.read("account.json"))
-        assert set(account) == set(api_account.EXPORT_TABLES)
+        assert set(account) == set(api_account.EXPORT_TABLES) | {"face_vectors"}
         assert "password_hash" not in account["user"][0]
         assert account["monitor_event"][0]["event_id"] == str(uuid.UUID(int=1))
         assert archive.read("face/pearl-0.jpg") == b"face"
     assert len(conn.queries) == len(api_account.EXPORT_TABLES)
+
+
+def test_export_summarises_vectors_without_numbers(setup_account):
+    conn, gallery = setup_account
+    response = asyncio.run(api_account.export_account({"u_id": 7}))
+    assert "face_vector" not in api_account.EXPORT_TABLES
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        text = archive.read("account.json").decode("utf-8")
+        account = json.loads(text)
+    assert account["face_vectors"] == {"count": 3, "first": "2026-11-08T09:00:00+00:00",
+                                       "last": "2026-11-08T09:05:00+00:00"}
+    assert "vector" not in text.replace("face_vectors", "")
+    assert len(conn.queries_vector) == 1
+    assert "count(*)" in conn.queries_vector[0] and "vector," not in conn.queries_vector[0]
+
+
+def test_export_vector_summary_for_an_account_without_vectors(setup_account):
+    conn, gallery = setup_account
+    conn.vector_summary = {"count": 0, "first": None, "last": None}
+    response = asyncio.run(api_account.export_account({"u_id": 7}))
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        assert json.loads(archive.read("account.json"))["face_vectors"] == {"count": 0, "first": None, "last": None}
+
+
+def test_export_still_includes_remaining_photo_files(setup_account):
+    conn, gallery = setup_account
+    response = asyncio.run(api_account.export_account({"u_id": 7}))
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        assert "face/pearl-0.jpg" in archive.namelist()
+        assert "face/pearl-jane-0.jpg" not in archive.namelist()
+        assert archive.read("face/pearl-0.jpg") == b"face"
+
+
+def test_account_delete_cascades_vectors(setup_account):
+    """No extra SQL: the one DELETE FROM "user" carries the face_vector rows (ON DELETE CASCADE)."""
+    conn, gallery = setup_account
+    executed = []
+    original = conn.execute
+
+    async def spy(query, *args):
+        executed.append(query)
+        return await original(query, *args)
+
+    conn.execute = spy
+    asyncio.run(api_account.delete_account(api_account.DeletePayload(), _request(api_auth._sign({"u_id": 7})), {"u_id": 7}))
+    assert [q for q in executed if "face_vector" in q] == []
+    assert sum('DELETE FROM "user"' in q for q in executed) == 1
+    init_sql = (pathlib.Path(__file__).resolve().parents[1] / "sql" / "init.sql").read_text(encoding="utf-8")
+    block = init_sql.split("CREATE TABLE IF NOT EXISTS face_vector", 1)[1].split(");", 1)[0]
+    assert "ON DELETE CASCADE" in block
+
+
+def test_deletion_reloads_the_gallery_from_the_database_after_commit(setup_account, monkeypatch):
+    """Ruling R3: a registration reload that read rows before the deletion committed must not bring the identity back."""
+    from app.services import face_vectors
+    conn, gallery = setup_account
+    calls = []
+
+    async def reload(pool=None):
+        calls.append(conn.events[-1])
+        return 0
+
+    monkeypatch.setattr(face_vectors, "reload", reload)
+    assert asyncio.run(api_account.delete_account(
+        api_account.DeletePayload(), _request(api_auth._sign({"u_id": 7})), {"u_id": 7})) == {"deleted": True}
+    assert calls == ["refresh"]  # after the commit and after the in-memory drop
+
+
+def test_deletion_survives_a_failing_reload_and_logs_only_the_type(setup_account, monkeypatch, caplog):
+    from app.services import face_vectors
+    conn, gallery = setup_account
+
+    async def reload(pool=None):
+        raise RuntimeError("secret-vector-bytes")
+
+    monkeypatch.setattr(face_vectors, "reload", reload)
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(api_account.delete_account(
+            api_account.DeletePayload(), _request(api_auth._sign({"u_id": 7})), {"u_id": 7})) == {"deleted": True}
+    assert "RuntimeError" in caplog.text
+    assert "secret-vector-bytes" not in caplog.text
+    assert conn.deleted
 
 
 def test_account_routes_use_identity_without_consent():
@@ -227,17 +317,14 @@ def test_host_ledger_failure_never_fails_delete(setup_account, monkeypatch, capl
     assert "Could not append host deletion ledger" in caplog.text
 
 
-def test_refresh_removes_identity_even_when_files_remain(monkeypatch):
+def test_refresh_drops_the_identity_without_reading_the_folder(monkeypatch):
     identities = [types.SimpleNamespace(label="pearl"), types.SimpleNamespace(label="other")]
     database = types.SimpleNamespace(database=identities)
-    calls = []
     service = types.SimpleNamespace(
-        lock=threading.RLock(), face_id=types.SimpleNamespace(faces_database=database),
-        reload_gallery=lambda: calls.append("reload"))
+        lock=threading.RLock(), face_id=types.SimpleNamespace(faces_database=database))
     monkeypatch.setattr(FaceRecognitionService, "get_instance", classmethod(lambda cls: service))
     monkeypatch.setattr(FaceRecognitionService, "_available", True)
     deletion_ledger.refresh_gallery("pearl")
-    assert calls == ["reload"]
     assert [identity.label for identity in database.database] == ["other"]
 
 
