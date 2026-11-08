@@ -2,6 +2,7 @@
 //   node --experimental-strip-types --test tests/scan.unit.ts
 // The scan is shaped like the server's answer for a three-row pharmacy receipt (made-up names and numbers).
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
   autoRecordable, courseStart, doseLimits, draftFrom, draftProblem, lastDayFor, markDuplicates, medicationPayload,
@@ -9,6 +10,8 @@ import {
   withoutCustomTime,
 } from '../src/lib/scan.ts';
 import type { ScanResult, ScannedMedicine } from '../src/lib/scan.ts';
+import { GOLDEN_FILE, expectedOf } from './scan_parity.gen.ts';
+import type { ParityCase } from './scan_parity.gen.ts';
 
 const SIX = (on: string[]) => Object.fromEntries(
   ['morning', 'noon', 'night', 'bedtime', 'before_meals', 'after_meals'].map((slot) => [slot, on.includes(slot)]));
@@ -229,4 +232,12 @@ test('an unscheduled medicine saves without a schedule; an as-needed one keeps i
   assert.equal(body.schedule_time, null);
   assert.equal(body.max_daily_doses, 3);
   assert.equal(body.min_interval_minutes, 360);
+});
+
+test('the golden file matches scan.ts', () => {
+  // tests/scan_parity.json holds app/services/scan_rules.py equal to scan.ts. If this fails after a change to
+  // scan.ts, run `node --experimental-strip-types tests/scan_parity.gen.ts` and port the change to scan_rules.py.
+  const { cases } = JSON.parse(readFileSync(GOLDEN_FILE, 'utf-8')) as { cases: (ParityCase & { expected: unknown })[] };
+  assert.ok(cases.length > 0);
+  for (const c of cases) assert.deepEqual(expectedOf(c), c.expected, c.name);
 });
