@@ -28,7 +28,7 @@ from app.routers.api_notify import line_router
 from app.jobs.scheduler import start_scheduler, stop_scheduler
 from app.database import get_pool
 from app.services.legal_service import register_documents
-from app.services import ai_settings, ai_store, line_pause, line_photo, reminders
+from app.services import ai_settings, ai_store, face_vectors, line_pause, line_photo, reminders
 from app.startup_checks import run_startup_checks, check_ai_settings, check_restore_state
 from app.config import DEVICE_PORT
 from app.services.outbox_dispatcher import start_dispatcher, stop_dispatcher
@@ -79,6 +79,19 @@ async def lifespan(app: FastAPI):
         check_ai_settings(ai_settings.current())
         await register_documents(conn)   # after the AI settings: the notices name the services in use
     FaceRecognitionService.get_instance()
+    try:   # face login's gallery: the face_vector rows (the photo folder is no longer read); counts only, no labels
+        labels = await face_vectors.reload()
+        log.info("[FaceRecognition] gallery loaded from the face vectors: %d label(s)", labels)
+    except Exception as error:
+        log.warning("[FaceRecognition] the face vectors were not loaded (%s): the gallery is empty",
+                    type(error).__name__)
+    try:
+        unconverted = await face_vectors.photos_without_vectors()
+        if unconverted:
+            log.warning("[FaceRecognition] %d face photo(s) in the photo folder have no face vectors, so face login "
+                        "does not know them: run the conversion", unconverted)
+    except Exception as error:
+        log.warning("[FaceRecognition] the photo folder check failed (%s)", type(error).__name__)
     EmotionService.get_instance()
     OCRService.get_instance()
     LineService.get_instance()

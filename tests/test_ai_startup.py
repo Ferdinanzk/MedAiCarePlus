@@ -85,6 +85,8 @@ def test_the_start_fills_keys_after_the_first_start_copy_and_warns_per_unusable_
     for service in ("FaceRecognitionService", "EmotionService", "OCRService", "LineService",
                     "IntakeDetectionService", "LandmarkService"):
         monkeypatch.setattr(main, service, types.SimpleNamespace(get_instance=lambda: None))
+    monkeypatch.setattr(main.face_vectors, "reload", nothing)                       # no database here
+    monkeypatch.setattr(main.face_vectors, "photos_without_vectors", nothing)
     for name in ("start_scheduler", "stop_scheduler"):
         monkeypatch.setattr(main, name, lambda: None)
     for name in ("start_dispatcher", "stop_dispatcher"):

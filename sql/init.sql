@@ -627,3 +627,14 @@ CREATE TABLE IF NOT EXISTS line_photo_draft (
 );
 CREATE INDEX IF NOT EXISTS idx_line_photo_draft_user ON line_photo_draft(u_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_line_id ON "user"(line_id);
+
+-- Face vectors (8 Nov 2026): face login keeps the 256 numbers of each registration photo, never the photo.
+CREATE TABLE IF NOT EXISTS face_vector (
+    vector_id BIGSERIAL PRIMARY KEY,
+    u_id INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    face_label VARCHAR(100) NOT NULL,
+    vector BYTEA NOT NULL CHECK (octet_length(vector) = 1024),
+    source VARCHAR(10) NOT NULL CHECK (source IN ('enroll', 'photo')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_face_vector_user ON face_vector(u_id, created_at DESC);

@@ -6,7 +6,7 @@ from functools import wraps
 import numpy as np
 from app.config import (
     FACE_REC_BASE, FACE_DET_MODEL, FACE_REID_MODEL,
-    LANDMARKS_MODEL, FACE_GALLERY_DIR,
+    LANDMARKS_MODEL,
     FACE_DET_CONFIDENCE, FACE_MATCH_THRESHOLD, DEVICE,
     FACE_MIN_AREA_RATIO, FACE_SECOND_FACE_RATIO, FACE_LOGIN_MIN_MATCHES,
     FACE_LIVENESS_MODE, FACE_LIVENESS_THRESHOLD,
@@ -70,10 +70,13 @@ class FaceRecognitionService:
             )
             self.face_id.deploy(DEVICE, max_requests=10)
 
-            faces_db = FacesDatabase(str(FACE_GALLERY_DIR), self.face_id, self.lm_det)
+            # The gallery starts empty; the lifespan loads it from the face_vector table (face_vectors.reload).
+            from app.services import face_vectors
+            faces_db = face_vectors.build_gallery([])
             self.face_id.set_faces_database(faces_db)
             FaceRecognitionService._available = True
-            print(f"[FaceRecognition] Loaded — {len(faces_db)} identity(ies) in gallery.")
+            log.info("[FaceRecognition] Loaded: %d identity(ies) in the gallery until the face vectors load",
+                     len(faces_db))
         except Exception as exc:
             FaceRecognitionService._available = False
             print(f"[FaceRecognition] Not available: {exc}")
@@ -85,16 +88,17 @@ class FaceRecognitionService:
         return cls._instance
 
     @synchronized
-    def reload_gallery(self):
-        """Reload faces database from disk after new enrollments."""
+    def load_gallery(self, gallery) -> None:
+        """Give face login the gallery built from the face_vector rows (face_vectors.reload)."""
         if not FaceRecognitionService._available:
             return
-        try:
-            faces_db = FacesDatabase(str(FACE_GALLERY_DIR), self.face_id, self.lm_det)
-            self.face_id.set_faces_database(faces_db)
-            print(f"[FaceRecognition] Gallery reloaded — {len(faces_db)} identity(ies).")
-        except Exception as exc:
-            print(f"[FaceRecognition] Gallery reload failed: {exc}")
+        self.face_id.set_faces_database(gallery)
+
+    @synchronized
+    def reload_gallery(self):
+        """Does nothing now: the gallery comes from the face_vector rows (face_vectors.reload), not the photo folder.
+        Kept until registration and deletion call face_vectors.reload themselves."""
+        log.info("[FaceRecognition] reload_gallery: the photo folder is no longer read; nothing reloaded")
 
     @synchronized
     def get_face_direction(self, frame_bgr: np.ndarray) -> dict:
