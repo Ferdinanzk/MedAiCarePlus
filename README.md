@@ -59,7 +59,7 @@ The server, not the robot, decides what is recorded.
 | Face, hand, and pose landmarks (robot frames) | The same MediaPipe models converted to ONNX, in `models/landmarks/` (six files, pinned by SHA-256 in `app/services/landmark_service.py`) |
 | Robot voice and listening | On the robot: ElevenLabs Flash v2.5 for Mandarin prompts and live replies (API key saved in the robot settings); Whisper Base (faster-whisper, CPU int8) + Silero VAD for speech recognition. Whisper weights are fetched from Hugging Face on deploy. |
 
-The expression model predicts Angry, Disgust, Fear, Happy, Sad, Surprise, and Neutral. The face gallery is bind-mounted from `models/face_recognition/face_gallery`, so enrollments survive container rebuilds. PostgreSQL data is in the `medcareai2_pgdata` volume.
+The expression model predicts Angry, Disgust, Fear, Happy, Sad, Surprise, and Neutral. Face login's registered faces are face vectors in the database (table `face_vector`), not photos. The old face photos stay in `models/face_recognition/face_gallery` (bind-mounted) until the user decides they may go; `python -m app.ops.convert_face_gallery`, run once, turns them into vectors (see `HANDOFF.md` section 17). PostgreSQL data is in the `medcareai2_pgdata` volume.
 
 `/health` reports each model service. `ocr` is `true` once your own `GEMINI_API_KEY` is in `.env` (never commit it); prescription scanning then works for every account ([docs/OCR.md](docs/OCR.md)). `line` is `false` until LINE is configured. Everything else should be `true`.
 

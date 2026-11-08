@@ -916,6 +916,42 @@ semgrep was **not run** (not installed on this PC); the webhook and token code w
 - semgrep has not been run (it is not installed on this PC).
 - The notice has not been changed (the release gate above).
 
+## 17. Face vectors instead of face photos (8-9 November 2026)
+
+**What changed** (branch `version-4-competition`, commits `2e74d47` to the conversion commit, on top of `cf8cf0b`; nothing pushed, nothing rebuilt yet). The same facts, with file and line, are in `CLAUDE.md` under "Face vectors (Nov 2026)".
+
+- Face registration stores the 256 numbers of each of the 3 photos' main face in the table `face_vector` (`source` `enroll`) and keeps no photo. Re-registering replaces the account's vectors. Deleting the account deletes them (the table's cascade).
+- Face login matches against those rows: the app loads them at start and after every registration. Matching itself is unchanged (threshold 0.3).
+- The older registration page's photo route (`POST /auth/register-photos`) is retired and answers 410 "Please register in the app.". Face registration happens in the app's onboarding.
+- The account export lists how many face vectors there are and when they were made, never the numbers. It still adds the old photo files while they exist.
+- The refusal `face_registered_without_account` still speaks of old face photos to remove; with the gallery built from active accounts only, it now practically fires only for an account that is no longer active. Its text was not changed.
+- Accounts registered before this have only photos in `models/face_recognition/face_gallery`. **Until the conversion runs, they cannot log in by face**; at every start the log says how many folder photos have no vectors (`[FaceRecognition] N face photo(s) in the photo folder have no face vectors`).
+
+**Deploy order** (each step only after the one before worked):
+
+1. Rebuild the app: `.\scripts\rebuild-app.ps1` (only while no dose session runs). The new table is created at start.
+2. Run the conversion once, with the user's OK:
+   `docker compose -p medcareai2 run --rm --no-deps app python -m app.ops.convert_face_gallery`
+   It reads the photo folder (never changes it), writes one `photo` row per photo of each active account, checks the rows against the photos and rolls everything back on any difference (exit 1). It prints counts only, for example `Converted 6 photo vector(s) for 2 account(s); 1 photo label(s) skipped; ...`. A skipped label is a photo name with no active account (an old backup can bring back a deleted user's photos) or an account that already registered again. Running it again writes nothing (`Already converted`).
+3. Restart the app (`docker compose -p medcareai2 restart app`), so it loads the new rows. The start log should no longer count photos without vectors, except skipped labels.
+4. Test face login with each existing account, and one new registration.
+5. Only then the user decides whether the photo folder may be deleted, and whether `gallery.tar` is dropped from the backup (`scripts/backup/backup.sh:18,28`) and from the restore (`scripts/restore.ps1:3`, a required parameter). No code deletes or empties the folder.
+
+**Measurement still to do (ruling 3 of the plan):** converted vectors come from the stored face crops, new registrations from the main face box on the full frame. In a throwaway container with the real models and a throwaway database, register one real face both ways and log in with a third frame; record both distances here. If the new way gives the larger distance, switch new registrations to the crop computation.
+
+| Registered as | Login distance |
+| --- | --- |
+| Converted crop | to measure |
+| Login path (new registration) | to measure |
+
+**Open (the user's decisions):**
+
+- Release gate: the core notice still says "face enrollment photos"; the next notice version must say face vectors instead.
+- A future change of the face recognition model means everyone registers again: without the photos, old vectors cannot be computed again.
+- When the photo folder and `gallery.tar` may go (step 5).
+
+**Not done:** the conversion has not been run on the real database; semgrep was not run (not installed on this PC).
+
 ---
 
 # History: handoff of 2 October 2026
