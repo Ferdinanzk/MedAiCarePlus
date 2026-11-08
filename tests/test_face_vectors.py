@@ -150,10 +150,41 @@ def test_reload_fetches_active_rows_and_loads_them(face_vectors, monkeypatch):
     service = types.SimpleNamespace(load_gallery=loaded.append)
     monkeypatch.setattr(FaceRecognitionService, "get_instance", classmethod(lambda cls: service))
     assert asyncio.run(face_vectors.reload(_Pool(conn))) == 2
-    assert conn.sql == ['SELECT f.face_label, f.vector FROM face_vector f JOIN "user" u USING (u_id) '
+    assert conn.sql == ['SELECT u.face_label, f.vector FROM face_vector f JOIN "user" u USING (u_id) '
                         'WHERE u.user_active = TRUE ORDER BY vector_id']
     (gallery,) = loaded
     assert [i.label for i in gallery.database] == ["pearl", "jane"]
+
+
+class _JoinConn:
+    """face_vector rows (u_id, stored face_label, vector) joined to "user" rows {u_id: (face_label, active)} the way
+    the query's SELECT list says: u.face_label gives the owner's label, f.face_label the row's own."""
+
+    def __init__(self, vectors, users):
+        self.vectors = vectors
+        self.users = users
+
+    async def fetch(self, sql, *args):
+        owner = "u.face_label" in sql.split("FROM")[0]
+        return [{"face_label": self.users[u_id][0] if owner else stored, "vector": vector}
+                for u_id, stored, vector in self.vectors if self.users[u_id][1]]
+
+
+def test_gallery_label_comes_from_the_owning_account(face_vectors, monkeypatch):
+    # A row whose stored face_label differs from its owner's (a rename, a bad writer, a hand edit) must never match
+    # as the account that owns the stored label: face login maps a label to "user".face_label.
+    victim, owner = _vec(1), _vec(2)
+    conn = _JoinConn([(1, "victim", face_vectors.to_bytes(owner)), (2, "victim", face_vectors.to_bytes(victim))],
+                     {1: ("Mallory", True), 2: ("victim", True)})
+    loaded = []
+    monkeypatch.setattr(FaceRecognitionService, "get_instance",
+                        classmethod(lambda cls: types.SimpleNamespace(load_gallery=loaded.append)))
+    assert asyncio.run(face_vectors.reload(_Pool(conn))) == 2
+    (gallery,) = loaded
+    assert [i.label for i in gallery.database] == ["mallory", "victim"]
+    assert np.array_equal(gallery[0].descriptors[0], owner) and len(gallery[1].descriptors) == 1
+    (index, distance), = gallery.match_faces([owner], "MIN_DIST")
+    assert gallery[index].label == "mallory" and distance == pytest.approx(0.0, abs=1e-6)
 
 
 def test_photos_without_vectors_counts_only_unconverted_labels(face_vectors, tmp_path):

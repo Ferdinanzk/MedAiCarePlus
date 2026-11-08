@@ -22,7 +22,9 @@ log = logging.getLogger(__name__)
 
 VECTOR_BYTES = 1024   # 256 float32 values
 
-ROWS_SQL = ('SELECT f.face_label, f.vector FROM face_vector f JOIN "user" u USING (u_id) '
+# The label is the owning account's, never the row's own face_label: face login maps a matched label to the account
+# with that "user".face_label, so a row whose stored label differed would otherwise log in as another account.
+ROWS_SQL = ('SELECT u.face_label, f.vector FROM face_vector f JOIN "user" u USING (u_id) '
             'WHERE u.user_active = TRUE ORDER BY vector_id')
 LABELS_SQL = "SELECT DISTINCT lower(face_label) AS label FROM face_vector"
 PHOTO_EXTENSIONS = ("jpg", "png")   # FacesDatabase.IMAGE_EXTENSIONS
@@ -67,7 +69,7 @@ def build_gallery(rows: list[tuple[str, bytes]]):
 
 
 async def fetch_rows(conn) -> list[tuple[str, bytes]]:
-    """The vectors of active accounts, oldest first."""
+    """The vectors of active accounts, oldest first, each with its owning account's face_label."""
     return [(row["face_label"], row["vector"]) for row in await conn.fetch(ROWS_SQL)]
 
 
