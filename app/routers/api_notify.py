@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from app.config import LINE_CHANNEL_SECRET
 from app.dependencies import get_consented_user
 from app.services.line_service import LineService, verification_success_text
-from app.services import dose_confirmation, dose_safety, dose_video, line_pause, outbox
+from app.services import dose_confirmation, dose_safety, dose_video, line_pause, line_photo, outbox
 from app.database import get_pool
 from pydantic import BaseModel
 from typing import Optional
@@ -131,6 +131,13 @@ async def line_webhook(request: Request):
             continue
 
         msg = event["message"]
+        if msg.get("type") == "image":
+            # A medicine photo (services/line_photo.py): checked here, read in the background.
+            try:
+                await line_photo.receive(event, received_at)
+            except Exception as exc:
+                log.warning("[LINE] photo handling failed: %s", type(exc).__name__)
+            continue
         if msg.get("type") != "text":
             continue
 
