@@ -875,10 +875,14 @@ semgrep was **not run** (not installed on this PC); the webhook and token code w
 
 | Case | Liveness scores (5 frames) | Result |
 | --- | --- | --- |
-| Normal light | to measure | |
-| Dim light | to measure | |
-| Phone photo | to measure | |
-| Printout | to measure | |
+| Normal light | 1.0 ×5, twice (two people, 8 Nov) | `match` |
+| Dim light | not measured yet | |
+| Phone photo | 0.0 ×5 in four logins; 0.94, 0.93, 0.95, 0.86, 0.95 once, phone held close (8 Nov, `block`) | the close one passed |
+| Printout | not measured yet | |
+
+8 Nov finding (workflow investigation; evidence in the session scratchpad): our crop matches the Silent-Face source; the
+model itself accepts a bright phone screen held close (upstream issue #15 reports the same). `block` mode is on in `.env`
+but does not stop that case. A head-turn or blink check would; both are held by the user.
 
 **Switching to `block`** (the user's call, after the table is filled in): set `FACE_LIVENESS_MODE=block` (and `FACE_LIVENESS_THRESHOLD` if the measurement says so) in `.env`, then recreate the container (`docker compose up -d app`; an environment change needs a recreate). In `block`, a frame coded `match` or `unknown` with a score below the threshold, or no score, makes the login `not_live`; `come_closer` and `no_face` frames are not judged for liveness (`face_login.py:83-87`). Any value other than `block` means `log`, so check the `[STARTUP]` liveness line (`mode block (a low score refuses the frame)`). To go back, set `log`.
 
@@ -937,12 +941,14 @@ semgrep was **not run** (not installed on this PC); the webhook and token code w
 4. Test face login with each existing account, and one new registration.
 5. Only then the user decides whether the photo folder may be deleted, and whether `gallery.tar` is dropped from the backup (`scripts/backup/backup.sh:18,28`) and from the restore (`scripts/restore.ps1:3`, a required parameter). No code deletes or empties the folder.
 
-**Measurement still to do (ruling 3 of the plan):** converted vectors come from the stored face crops, new registrations from the main face box on the full frame. In a throwaway container with the real models and a throwaway database, register one real face both ways and log in with a third frame; record both distances here. If the new way gives the larger distance, switch new registrations to the crop computation.
+**Measurement (ruling 3 of the plan), 9 Nov:** converted vectors come from the stored face crops, new registrations from the main face box on the full frame. Measured in a throwaway container with the real models on the 8 Nov test photo's main face: the two vectors of the same face are 0.0016 apart; seven login frames (the same frame, shifted 20 px, scaled 0.85, darker 0.6, brighter 1.3, JPEG quality 40, blurred) give these mean distances (threshold 0.3, smaller is closer). The new way is not worse, so new registrations keep the login path.
 
-| Registered as | Login distance |
+| Registered as | Mean login distance (7 frames) |
 | --- | --- |
-| Converted crop | to measure |
-| Login path (new registration) | to measure |
+| Converted crop | 0.0030 |
+| Login path (new registration) | 0.0027 |
+
+The frames are variants of one photo, not separate sessions, so this checks the two computations against each other, not real-world accuracy.
 
 **Open (the user's decisions):**
 
