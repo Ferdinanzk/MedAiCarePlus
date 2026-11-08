@@ -207,6 +207,8 @@ def _enroll(u_id=7):
 ALREADY_REGISTERED = {"error": "face_already_registered", "detail": api_face.FACE_ALREADY_REGISTERED}
 WITHOUT_ACCOUNT = {"error": "face_registered_without_account", "detail": api_face.FACE_WITHOUT_ACCOUNT}
 RETIRED = {"error": "use_app_registration", "detail": "Please register in the app."}
+GALLERY_UNREADABLE = {"error": "Face check unavailable. Please try again later."}
+REAL_BUILD_GALLERY = face_vectors.build_gallery
 
 
 @pytest.fixture
@@ -252,7 +254,7 @@ def test_face_of_another_account_is_refused_without_naming_it(gallery, monkeypat
     assert service.own_labels == ["pearl"]
     assert gallery.conn.label_lookups == [("a", True)]
     assert _snapshot(gallery.conn) == before and _files(gallery.folder) == {}
-    assert service.reloads == 0 and gallery.conn.enrolled == []
+    assert service.reloads == 1 and gallery.conn.enrolled == []      # only the refresh before the checks
 
 
 @pytest.mark.parametrize("label", ["ghost", "gone"])   # no account at all / a deactivated account
@@ -269,7 +271,7 @@ def test_face_in_the_gallery_without_an_active_account_says_so(gallery, monkeypa
     # The operator needs the label to find the stale photos; it names no account.
     assert any(label in record.getMessage() for record in caplog.records)
     assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
-    assert service.reloads == 0 and gallery.conn.enrolled == []
+    assert service.reloads == 1 and gallery.conn.enrolled == []      # only the refresh before the checks
 
 
 def test_any_one_of_the_three_photos_refuses_all(gallery, monkeypatch):
@@ -281,7 +283,7 @@ def test_any_one_of_the_three_photos_refuses_all(gallery, monkeypatch):
     assert (status, body) == (409, ALREADY_REGISTERED)
     assert service.checked == 3
     assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
-    assert service.reloads == 0 and gallery.conn.enrolled == []
+    assert service.reloads == 1 and gallery.conn.enrolled == []      # only the refresh before the checks
 
 
 def test_enrolling_stores_three_vectors_and_no_files(gallery, monkeypatch):
@@ -303,7 +305,7 @@ def test_enrolling_stores_three_vectors_and_no_files(gallery, monkeypatch):
     assert [np.array_equal(face_vectors.from_bytes(row["vector"]), d) for row, d in zip(rows, descriptors)] \
         == [True] * 3
     # Login sees the new face at once, and the account is marked enrolled.
-    assert service.reloads == 1 and service.loaded == ["pearl"]
+    assert service.reloads == 2 and service.loaded == ["pearl"]      # before the checks, and after the rows
     assert gallery.conn.enrolled == [7]
 
 
@@ -341,7 +343,7 @@ def test_reenrolling_replaces_your_vectors(gallery, monkeypatch):
     assert [row["vector"] for row in rows] == [face_vectors.to_bytes(_desc(20 + i)) for i in range(3)]
     assert not old_ids & {row["vector_id"] for row in rows}
     assert gallery.conn.rows_of(1) == [someone_else]            # another account's vector is untouched
-    assert service.reloads == 1 and sorted(service.loaded) == ["a", "pearl"]
+    assert service.reloads == 2 and sorted(service.loaded) == ["a", "pearl"]
     assert gallery.conn.enrolled == [7]
 
 
@@ -383,7 +385,7 @@ def test_any_refused_photo_stores_nothing(gallery, monkeypatch, answer, status):
     assert service.checked == 3
     assert _snapshot(gallery.conn) == before            # your old vectors stay, nothing new is written
     assert _files(gallery.folder) == {}
-    assert service.reloads == 0 and gallery.conn.enrolled == []
+    assert service.reloads == 1 and gallery.conn.enrolled == []      # only the refresh before the checks
 
 
 @pytest.mark.parametrize("answer, status, error", [
@@ -400,28 +402,67 @@ def test_photo_without_a_usable_face_saves_nothing(gallery, monkeypatch, answer,
 
     assert (got_status, body) == (status, {"error": error})
     assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
-    assert service.reloads == 0 and gallery.conn.enrolled == []
+    assert service.reloads == 1 and gallery.conn.enrolled == []      # only the refresh before the checks
+
+
+class _OneFace(_FakeFaces):
+    """Every photo is the same person: matched to any other label the loaded gallery holds."""
+
+    def __init__(self, load_seconds=0.0):
+        super().__init__([])
+        self.load_seconds = load_seconds
+
+    def match_enrollment_face(self, frame, own_label=None):
+        self.checked += 1
+        others = [label for label in self.loaded if label != own_label.lower()]
+        return _found(others[0] if others else None)
+
+    def load_gallery(self, gallery):
+        time.sleep(self.load_seconds)
+        super().load_gallery(gallery)
+
+
+def test_registration_refreshes_the_gallery_before_checking(gallery, monkeypatch):
+    """jane's vectors are in the database but not in this process's gallery (another process stored them, or a
+    reload after their commit failed). The same face registering for pearl is still refused."""
+    gallery.conn.add_vectors(8, [face_vectors.to_bytes(_desc(i)) for i in range(3)])
+    before = _snapshot(gallery.conn)
+    service = _OneFace()
+    assert service.loaded == []          # the in-memory gallery does not know jane
+    _use(monkeypatch, service)
+
+    assert _result(_enroll(u_id=7)) == (409, ALREADY_REGISTERED)
+    assert service.loaded == ["jane"] and service.reloads == 1
+    assert _snapshot(gallery.conn) == before and gallery.conn.enrolled == []
+
+
+def test_a_failed_refresh_refuses_and_stores_nothing(gallery, monkeypatch, caplog):
+    """Without the stored vectors the duplicate check cannot be trusted: fail closed, before any photo is checked."""
+    gallery.conn.add_vectors(7, [face_vectors.to_bytes(_desc(90 + i)) for i in range(3)])
+    before = (_snapshot(gallery.conn), gallery.conn.next_id)
+    service = _FakeFaces([_found()] * 3)
+    _use(monkeypatch, service)
+
+    async def broken(pool=None):
+        raise RuntimeError("connection refused by db-host-secret-7")
+    monkeypatch.setattr(face_vectors, "reload", broken)
+
+    with caplog.at_level(logging.DEBUG):
+        status, body = _result(_enroll())
+
+    assert (status, body) == (503, GALLERY_UNREADABLE)
+    assert service.checked == 0                                   # no photo was checked
+    assert (_snapshot(gallery.conn), gallery.conn.next_id) == before   # no DELETE, no INSERT
+    assert gallery.conn.enrolled == []
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "db-host-secret-7" not in logged and "db-host-secret-7" not in json.dumps(body)
+    assert "RuntimeError" in logged                               # the exception's type only
 
 
 def test_two_accounts_enrolling_one_face_at_once_cannot_both_pass(gallery, monkeypatch):
-    class _OneFace(_FakeFaces):
-        """Every photo is the same person: matched to any other label the loaded gallery holds."""
-
-        def __init__(self):
-            super().__init__([])
-
-        def match_enrollment_face(self, frame, own_label=None):
-            self.checked += 1
-            others = [label for label in self.loaded if label != own_label.lower()]
-            return _found(others[0] if others else None)
-
-        def load_gallery(self, gallery):
-            # A slow load: were the lock released before it ends, the other registration's check would run
-            # against the gallery without the winner's vectors and pass too.
-            time.sleep(0.3)
-            super().load_gallery(gallery)
-
-    service = _OneFace()
+    # A slow load: were the lock released before the winner's load ends, the other registration's check could run
+    # against a gallery without the winner's vectors and pass too.
+    service = _OneFace(load_seconds=0.3)
     _use(monkeypatch, service)
 
     async def both():
@@ -769,14 +810,24 @@ def test_same_answer_as_logins_postprocess(monkeypatch, intel_matching):
     assert outcomes == {True, False}   # both matches and unknown faces were exercised
 
 
+def _real_gallery_from_rows(monkeypatch):
+    """The real face_vectors.build_gallery (a FacesDatabase) instead of the fixture's stand-in."""
+    pytest.importorskip("openvino")
+    frs._load_imports()
+    monkeypatch.setattr(face_vectors, "build_gallery", REAL_BUILD_GALLERY)
+
+
 def test_endpoint_refuses_the_incident_with_real_matching(gallery, monkeypatch, intel_matching):
-    """A's photos are in the gallery; the same face enrolling for a new account is refused."""
-    face_id = _real_face_id(intel_matching, [("a", [_vector(0.0)])], _vector(0.05))
+    """A's vectors are stored; the same face enrolling for a new account is refused."""
+    _real_gallery_from_rows(monkeypatch)
+    gallery.conn.add_vectors(1, [face_vectors.to_bytes(_vector(0.0))])
+    face_id = _real_face_id(intel_matching, [], _vector(0.05))
     service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
     _use(monkeypatch, service)
 
     assert _result(_enroll(u_id=8)) == (409, ALREADY_REGISTERED)
-    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
+    assert gallery.conn.rows_of(8) == [] and len(gallery.conn.vectors) == 1 and _files(gallery.folder) == {}
+    assert isinstance(face_id.faces_database, frs.FacesDatabase)   # matched against the gallery built from rows
 
     # The owner re-enrolling their own label is still allowed.
     status, body = _result(_enroll(u_id=1))
@@ -789,13 +840,18 @@ def test_endpoint_refuses_a_duplicate_the_caller_is_closer_to(gallery, monkeypat
     """The 3 Oct gallery held the face as "a" and "ab". "ab" re-enrolling must not pass because its own old
     photos are closer: login takes the face for either, and the duplicate would stay. Neither account can
     enroll it until the duplicate is cleaned up by hand (as was done on 3 Oct)."""
-    face_id = _real_face_id(intel_matching, [("a", [_vector(0.05)]), ("ab", [_vector(0.0)])], _vector(0.0))
+    _real_gallery_from_rows(monkeypatch)
+    gallery.conn.add_vectors(1, [face_vectors.to_bytes(_vector(0.05))])
+    gallery.conn.add_vectors(34, [face_vectors.to_bytes(_vector(0.0))])
+    before = _snapshot(gallery.conn)
+    face_id = _real_face_id(intel_matching, [], _vector(0.0))
     service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
     _use(monkeypatch, service)
 
     assert _result(_enroll(u_id=34)) == (409, ALREADY_REGISTERED)
     assert _result(_enroll(u_id=1)) == (409, ALREADY_REGISTERED)
-    assert gallery.conn.vectors == [] and _files(gallery.folder) == {} and gallery.conn.enrolled == []
+    assert isinstance(face_id.faces_database, frs.FacesDatabase)   # matched against the gallery built from rows
+    assert _snapshot(gallery.conn) == before and _files(gallery.folder) == {} and gallery.conn.enrolled == []
 
 
 # --- The main-face rule on registration photos ---------------------------------------------------------

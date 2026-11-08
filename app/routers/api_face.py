@@ -24,6 +24,8 @@ FACE_ALREADY_REGISTERED = ("This face is already registered to another account. 
 FACE_WITHOUT_ACCOUNT = ("This face is already in the face gallery, but no account uses those photos, so face "
                         "login cannot sign it in. Ask your caregiver or whoever runs this app to remove the "
                         "old face photos, then enroll again.")
+# The stored face vectors could not be read before the duplicate check: nothing is stored.
+FACE_CHECK_UNAVAILABLE = "Face check unavailable. Please try again later."
 
 
 MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -238,9 +240,19 @@ async def save_enrollment(photos: List[UploadFile], label: str, u_id: int, *,
         images.append(img)
 
     loop = asyncio.get_running_loop()
+    pool = get_pool()
     # One enrollment at a time, from the first check until the gallery holds the new vectors, so two
     # accounts enrolling the same face at once cannot both pass the check below.
     async with _enroll_lock:
+        # Check against the vectors as stored, not only this process's gallery: rows another process stored, or
+        # rows whose reload after their commit failed, must refuse the same face too. Without them the check
+        # cannot be trusted, so a failed read stores nothing (fail closed).
+        try:
+            await face_vectors.reload(pool)
+        except Exception as exc:
+            logger.error("Face enrollment refused for %s: the stored face vectors could not be read (%s)",
+                         caller, type(exc).__name__)
+            return JSONResponse({"error": FACE_CHECK_UNAVAILABLE}, status_code=503)
         vectors = []
         for i, img in enumerate(images):
             # Find the face this photo stores, its descriptor, and which other label the gallery (as it is
@@ -268,7 +280,6 @@ async def save_enrollment(photos: List[UploadFile], label: str, u_id: int, *,
                     status_code=503,
                 )
 
-        pool = get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM face_vector WHERE u_id = $1", u_id)

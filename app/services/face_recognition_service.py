@@ -206,7 +206,9 @@ class FaceRecognitionService:
 
     def _descriptor(self, frame_bgr: np.ndarray, box: FaceBox) -> np.ndarray | None:
         """The 256-number descriptor of the face in box, computed on the full frame (landmarks, then the
-        identifier), or None when none was computed. Callers hold the service lock."""
+        identifier), or None when none was computed. It does not take the service lock itself; its two callers
+        run under it: _match_identities (from match_box, @synchronized, face login) and match_enrollment_face
+        (@synchronized, registration)."""
         roi = FaceDetector.Result([0, 0, box.confidence, box.x, box.y, box.w, box.h])
         landmarks = self.lm_det.infer((frame_bgr, [roi]))
         self.face_id.clear()
