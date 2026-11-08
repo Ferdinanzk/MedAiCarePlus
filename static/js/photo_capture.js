@@ -278,10 +278,11 @@ function showReview() {
 }
 
 // ── Upload (called by form submit) ─────────────────────────────────────────────
+// Returns { ok, message }: message is set when the server says this page can no longer register (410).
 export async function uploadPhotos(faceLabel) {
   if (capturedBlobs.length !== 3) {
     alert("Please complete all 3 shots first.");
-    return false;
+    return { ok: false };
   }
   const fd = new FormData();
   fd.append("face_label", faceLabel);
@@ -290,7 +291,13 @@ export async function uploadPhotos(faceLabel) {
   );
   const resp = await fetch("/auth/register-photos", { method: "POST", body: fd });
   const data = await resp.json();
+  // 8 Nov 2026: the route is retired (use_app_registration); show its sentence and stop before /auth/register.
+  if (resp.status === 410) {
+    const message = data.detail || "Please register in the app.";
+    alert(message);
+    return { ok: false, message };
+  }
   // A refused face (409) carries a sentence in `detail`, e.g. face_already_registered: use face login instead.
-  if (data.error) { alert("Photo save error: " + (data.detail || data.error)); return false; }
-  return true;
+  if (data.error) { alert("Photo save error: " + (data.detail || data.error)); return { ok: false }; }
+  return { ok: true };
 }

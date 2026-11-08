@@ -1,9 +1,11 @@
-"""Face enrollment refuses a face the gallery already knows under another label.
+"""Face enrollment stores three face vectors in the database, and refuses a face the gallery already knows under
+another label.
 
 3 Oct 2026: one person enrolled under two accounts ("a" and "ab"). The gallery then held the face twice, and
 the monitor's identity check for the robot's patient matched it to the other account, so Reachy never
-verified the patient. Both enrollment routes (POST /api/face/enroll and the legacy /auth/register-photos)
-go through api_face.save_enrollment. No models are needed here: the face service is a fake, or the real
+verified the patient. POST /api/face/enroll goes through api_face.save_enrollment. 8 Nov 2026: registration
+keeps the 256 numbers of each photo's main face (face_vector rows), never the photo; the legacy
+/auth/register-photos is retired (410). No models are needed here: the face service is a fake, or the real
 Intel matching code (FaceIdentifier.postprocess + FacesDatabase.match_faces) with fake detectors.
 """
 import asyncio
@@ -12,13 +14,15 @@ import json
 import logging
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
-from fastapi import UploadFile
+from fastapi import FastAPI, UploadFile
+from fastapi.testclient import TestClient
 
 _asyncpg_stub = types.ModuleType("asyncpg")
 _asyncpg_stub.Pool = object
@@ -27,10 +31,11 @@ sys.modules.setdefault("asyncpg", _asyncpg_stub)
 from app import config
 from app.routers import api_face, auth
 from app.services import face_recognition_service as frs
+from app.services import face_vectors
 from app.services.face_recognition_service import FaceRecognitionService
 
 USERS = {
-    1: {"u_id": 1, "face_label": "a"},
+    1: {"u_id": 1, "face_label": "a", "face_enrolled": True},
     7: {"u_id": 7, "face_label": "pearl"},
     8: {"u_id": 8, "face_label": "jane"},
     9: {"u_id": 9, "face_label": "gone", "active": False},
@@ -49,10 +54,45 @@ class _Acquire:
         return False
 
 
+class _Transaction:
+    """All or nothing, as asyncpg's: the face_vector rows go back to how they were when the block raises."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        self.saved = ([dict(row) for row in self.conn.vectors], self.conn.next_id)
+        self.conn.in_transaction = True
+
+    async def __aexit__(self, kind, *args):
+        self.conn.in_transaction = False
+        if kind is not None:
+            self.conn.vectors, self.conn.next_id = self.saved
+        return False
+
+
 class _Connection:
+    """The "user" rows above and a face_vector table in memory."""
+
     def __init__(self):
         self.enrolled = []
         self.label_lookups = []
+        self.vectors = []        # face_vector rows: vector_id, u_id, face_label, vector, source
+        self.next_id = 1
+        self.in_transaction = False
+
+    def transaction(self):
+        return _Transaction(self)
+
+    def add_vectors(self, u_id, vectors, label=None):
+        for vector in vectors:
+            self.vectors.append({"vector_id": self.next_id, "u_id": u_id,
+                                 "face_label": label or USERS[u_id]["face_label"], "vector": vector,
+                                 "source": "enroll"})
+            self.next_id += 1
+
+    def rows_of(self, u_id):
+        return [row for row in self.vectors if row["u_id"] == u_id]
 
     async def fetchrow(self, query, *args):
         assert 'FROM "user"' in query
@@ -63,11 +103,34 @@ class _Connection:
                          if user["face_label"] == args[0] and (user.get("active", True) or not active_only)), None)
         assert "u_id=$1 AND user_active=TRUE" in query
         user = USERS.get(args[0])
-        return user if user and user.get("active", True) else None
+        return {**user, "face_enrolled": user.get("face_enrolled", False)} if user and user.get("active", True) \
+            else None
+
+    async def fetchval(self, query, *args):
+        if query.startswith("INSERT INTO face_vector"):
+            assert self.in_transaction
+            assert "(u_id, face_label, vector, source) VALUES ($1, $2, $3, 'enroll') RETURNING vector_id" in query
+            u_id, label, vector = args
+            assert isinstance(vector, bytes)
+            self.add_vectors(u_id, [vector], label)
+            return self.next_id - 1
+        assert query == "SELECT count(*) FROM face_vector WHERE u_id = $1"
+        return len(self.rows_of(args[0]))
+
+    async def fetch(self, query, *args):
+        # face_vectors.fetch_rows: each row under its owning active account's label, oldest first.
+        assert query == face_vectors.ROWS_SQL
+        return [{"face_label": USERS[row["u_id"]]["face_label"], "vector": row["vector"]}
+                for row in sorted(self.vectors, key=lambda row: row["vector_id"])
+                if USERS[row["u_id"]].get("active", True)]
 
     async def execute(self, query, *args):
-        assert "face_enrolled = TRUE" in query
-        self.enrolled.append(args[0])
+        if "face_enrolled = TRUE" in query:
+            self.enrolled.append(args[0])
+            return
+        assert query == "DELETE FROM face_vector WHERE u_id = $1"
+        assert self.in_transaction
+        self.vectors = [row for row in self.vectors if row["u_id"] != args[0]]
 
 
 class _Pool:
@@ -78,8 +141,14 @@ class _Pool:
         return _Acquire(self.conn)
 
 
+def _desc(seed):
+    """A 256-number descriptor, as face-reidentification-retail-0095 gives (float32)."""
+    return np.random.default_rng(seed).standard_normal(256).astype(np.float32)
+
+
 class _FakeFaces:
-    """Answers match_enrollment_face from a script, one answer per photo."""
+    """Answers match_enrollment_face from a script, one answer per photo. load_gallery is what
+    face_vectors.reload gives the service; there is no reload_gallery, so registration must not call it."""
 
     def __init__(self, answers):
         self.lock = threading.RLock()
@@ -87,23 +156,31 @@ class _FakeFaces:
         self.checked = 0
         self.own_labels = []
         self.reloads = 0
+        self.loaded = []
 
     def match_enrollment_face(self, frame, own_label=None):
         self.checked += 1
         self.own_labels.append(own_label)
         return self.answers.pop(0)
 
-    def reload_gallery(self):
+    def load_gallery(self, gallery):
         self.reloads += 1
+        self.loaded = [identity.label for identity in gallery.database]
 
 
-def _found(label=None, box=(10, 20, 40, 50), distance=None, error=None, reason=None):
+_UNSET = object()
+
+
+def _found(label=None, box=(10, 20, 40, 50), distance=None, error=None, reason=None, descriptor=_UNSET):
     if label is not None and distance is None:
         distance = 0.12
     if reason is None:
         reason = "ok" if box else "no_face"
+    if descriptor is _UNSET:
+        # match_enrollment_face gives the descriptor only for a photo it accepts.
+        descriptor = _desc(0) if reason == "ok" and box and label is None and error is None else None
     return {"box": list(box) if box else None, "label": label, "distance": distance, "error": error,
-            "reason": reason}
+            "reason": reason, "descriptor": descriptor}
 
 
 def _photo(seed=0):
@@ -127,13 +204,9 @@ def _enroll(u_id=7):
     return asyncio.run(api_face.enroll_face(photos=_uploads(), user={"u_id": u_id}))
 
 
-def _legacy(face_label):
-    return asyncio.run(auth.register_photos(face_label=face_label, photos=_uploads()))
-
-
 ALREADY_REGISTERED = {"error": "face_already_registered", "detail": api_face.FACE_ALREADY_REGISTERED}
 WITHOUT_ACCOUNT = {"error": "face_registered_without_account", "detail": api_face.FACE_WITHOUT_ACCOUNT}
-LABEL_TAKEN = {"error": "face_label_taken", "detail": api_face.FACE_LABEL_TAKEN}
+RETIRED = {"error": "use_app_registration", "detail": "Please register in the app."}
 
 
 @pytest.fixture
@@ -145,6 +218,9 @@ def gallery(monkeypatch, tmp_path):
     monkeypatch.setattr(api_face, "_enroll_lock", asyncio.Lock())
     conn = _Connection()
     monkeypatch.setattr(api_face, "get_pool", lambda: _Pool(conn))
+    # face_vectors.reload runs as it is (rows read, then the service's load_gallery); only the FacesDatabase it
+    # builds is a stand-in, so these tests need no OpenVINO.
+    monkeypatch.setattr(face_vectors, "build_gallery", _Gallery.from_rows)
     return types.SimpleNamespace(folder=folder, conn=conn)
 
 
@@ -156,9 +232,13 @@ def _files(folder):
     return {path.name: path.read_bytes() for path in folder.iterdir()}
 
 
+def _snapshot(conn):
+    return [dict(row) for row in conn.vectors]
+
+
 def test_face_of_another_account_is_refused_without_naming_it(gallery, monkeypatch):
-    (gallery.folder / "a-0.jpg").write_bytes(b"the other account")
-    before = _files(gallery.folder)
+    gallery.conn.add_vectors(1, [face_vectors.to_bytes(_desc(1))])
+    before = _snapshot(gallery.conn)
     service = _FakeFaces([_found("a")])
     _use(monkeypatch, service)
 
@@ -171,7 +251,7 @@ def test_face_of_another_account_is_refused_without_naming_it(gallery, monkeypat
     # The caller's own label is left out of the match, and "a" was looked up as face login does.
     assert service.own_labels == ["pearl"]
     assert gallery.conn.label_lookups == [("a", True)]
-    assert _files(gallery.folder) == before          # nothing written, not even a temp file
+    assert _snapshot(gallery.conn) == before and _files(gallery.folder) == {}
     assert service.reloads == 0 and gallery.conn.enrolled == []
 
 
@@ -188,7 +268,7 @@ def test_face_in_the_gallery_without_an_active_account_says_so(gallery, monkeypa
     assert label not in json.dumps(body)
     # The operator needs the label to find the stale photos; it names no account.
     assert any(label in record.getMessage() for record in caplog.records)
-    assert _files(gallery.folder) == {}
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
     assert service.reloads == 0 and gallery.conn.enrolled == []
 
 
@@ -200,39 +280,110 @@ def test_any_one_of_the_three_photos_refuses_all(gallery, monkeypatch):
 
     assert (status, body) == (409, ALREADY_REGISTERED)
     assert service.checked == 3
-    assert _files(gallery.folder) == {}
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
     assert service.reloads == 0 and gallery.conn.enrolled == []
 
 
-def test_reenrolling_your_own_face_replaces_your_photos(gallery, monkeypatch):
-    for i in range(3):
-        (gallery.folder / f"pearl-{i}.jpg").write_bytes(b"old photo")
-    (gallery.folder / "a-0.jpg").write_bytes(b"someone else")
-    # The service leaves pearl's own photos out of the match, so it finds no other label.
-    service = _FakeFaces([_found(), _found(), _found()])
+def test_enrolling_stores_three_vectors_and_no_files(gallery, monkeypatch):
+    descriptors = [_desc(11), _desc(12), _desc(13)]
+    service = _FakeFaces([_found(descriptor=d) for d in descriptors])
+    _use(monkeypatch, service)
+
+    status, body = _result(_enroll())
+
+    assert status == 200
+    assert _files(gallery.folder) == {}          # registration no longer writes to the photo folder
+    rows = gallery.conn.rows_of(7)
+    assert len(rows) == 3 and gallery.conn.vectors == rows
+    assert [len(row["vector"]) for row in rows] == [1024] * 3
+    assert [row["source"] for row in rows] == ["enroll"] * 3
+    assert [row["face_label"] for row in rows] == ["pearl"] * 3
+    # Each row is that photo's descriptor, in photo order, as 256 little-endian float32 numbers.
+    assert [row["vector"] for row in rows] == [face_vectors.to_bytes(d) for d in descriptors]
+    assert [np.array_equal(face_vectors.from_bytes(row["vector"]), d) for row, d in zip(rows, descriptors)] \
+        == [True] * 3
+    # Login sees the new face at once, and the account is marked enrolled.
+    assert service.reloads == 1 and service.loaded == ["pearl"]
+    assert gallery.conn.enrolled == [7]
+
+
+def test_the_answer_carries_no_paths_or_numbers(gallery, monkeypatch):
+    service = _FakeFaces([_found(descriptor=_desc(i)) for i in range(3)])
+    _use(monkeypatch, service)
+
+    status, body = _result(_enroll())
+
+    assert status == 200
+    # Three entries (Onboarding needs saved.length === 3): the new rows' ids as text, nothing else.
+    assert body == {"saved": [str(row["vector_id"]) for row in gallery.conn.rows_of(7)], "face_label": "pearl"}
+    assert all(isinstance(entry, str) and entry.isdigit() for entry in body["saved"])
+    text = json.dumps(body)
+    assert "/" not in text and "\\" not in text and "face_gallery" not in text and ".jpg" not in text
+    assert "descriptor" not in text and "vector" not in text
+
+
+def test_reenrolling_replaces_your_vectors(gallery, monkeypatch):
+    old = [face_vectors.to_bytes(_desc(90 + i)) for i in range(3)]
+    gallery.conn.add_vectors(7, old)
+    gallery.conn.add_vectors(1, [face_vectors.to_bytes(_desc(1))])
+    someone_else = _snapshot(gallery.conn)[3]
+    old_ids = {row["vector_id"] for row in gallery.conn.rows_of(7)}
+    # The service leaves pearl's own vectors out of the match, so it finds no other label.
+    service = _FakeFaces([_found(descriptor=_desc(20 + i)) for i in range(3)])
     _use(monkeypatch, service)
 
     status, body = _result(_enroll())
 
     assert status == 200 and body["face_label"] == "pearl" and len(body["saved"]) == 3
     assert service.own_labels == ["pearl"] * 3
-    files = _files(gallery.folder)
-    assert sorted(files) == ["a-0.jpg", "pearl-0.jpg", "pearl-1.jpg", "pearl-2.jpg"]
-    assert all(files[f"pearl-{i}.jpg"] != b"old photo" for i in range(3))
-    assert files["a-0.jpg"] == b"someone else"
-    assert service.reloads == 1 and gallery.conn.enrolled == [7]
+    rows = gallery.conn.rows_of(7)
+    assert len(rows) == 3                                       # replaced, never added to
+    assert [row["vector"] for row in rows] == [face_vectors.to_bytes(_desc(20 + i)) for i in range(3)]
+    assert not old_ids & {row["vector_id"] for row in rows}
+    assert gallery.conn.rows_of(1) == [someone_else]            # another account's vector is untouched
+    assert service.reloads == 1 and sorted(service.loaded) == ["a", "pearl"]
+    assert gallery.conn.enrolled == [7]
 
 
-def test_unknown_face_is_enrolled_as_the_detected_crop(gallery, monkeypatch):
-    service = _FakeFaces([_found(box=(10, 20, 40, 50)), _found(box=(0, 0, 30, 60)), _found(box=(90, 100, 40, 50))])
+def test_first_ever_registration(gallery, monkeypatch):
+    """An empty gallery: nobody to compare with, yet each photo's descriptor is computed and stored."""
+    descriptor = _vector(0.3).astype(np.float32)
+    face_id = _Identifier([], descriptor)
+    service = _service(monkeypatch, [_Roi(10, 20, 60, 70)], face_id)
     _use(monkeypatch, service)
 
     status, body = _result(_enroll())
 
-    assert status == 200
-    shapes = [cv2.imread(str(gallery.folder / f"pearl-{i}.jpg")).shape[:2] for i in range(3)]
-    assert shapes == [(50, 40), (60, 30), (20, 10)]  # the last box runs off the 100x120 photo
-    assert service.reloads == 1 and gallery.conn.enrolled == [7]
+    assert status == 200 and len(body["saved"]) == 3
+    assert len(face_id.started) == 3                    # one descriptor per photo, on the main face's box
+    rows = gallery.conn.rows_of(7)
+    assert [row["vector"] for row in rows] == [face_vectors.to_bytes(descriptor)] * 3
+    # The service now holds the gallery built from the rows.
+    assert [identity.label for identity in face_id.faces_database.database] == ["pearl"]
+    assert gallery.conn.enrolled == [7]
+
+
+@pytest.mark.parametrize("answer, status", [
+    (_found("a"), 409),
+    (_found(box=None), 400),
+    (_found(box=None, reason="two_faces"), 400),
+    (_found(box=None, reason="come_closer"), 400),
+    (_found(box=None, error="inference failed"), 503),
+    (_found(descriptor=None), 503),                 # a face that could not be checked is never stored
+])
+def test_any_refused_photo_stores_nothing(gallery, monkeypatch, answer, status):
+    gallery.conn.add_vectors(7, [face_vectors.to_bytes(_desc(90 + i)) for i in range(3)])
+    before = _snapshot(gallery.conn)
+    service = _FakeFaces([_found(), _found(), answer])
+    _use(monkeypatch, service)
+
+    got_status, _ = _result(_enroll())
+
+    assert got_status == status
+    assert service.checked == 3
+    assert _snapshot(gallery.conn) == before            # your old vectors stay, nothing new is written
+    assert _files(gallery.folder) == {}
+    assert service.reloads == 0 and gallery.conn.enrolled == []
 
 
 @pytest.mark.parametrize("answer, status, error", [
@@ -248,7 +399,7 @@ def test_photo_without_a_usable_face_saves_nothing(gallery, monkeypatch, answer,
     got_status, body = _result(_enroll())
 
     assert (got_status, body) == (status, {"error": error})
-    assert _files(gallery.folder) == {}
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
     assert service.reloads == 0 and gallery.conn.enrolled == []
 
 
@@ -258,16 +409,17 @@ def test_two_accounts_enrolling_one_face_at_once_cannot_both_pass(gallery, monke
 
         def __init__(self):
             super().__init__([])
-            self.loaded = []
 
         def match_enrollment_face(self, frame, own_label=None):
             self.checked += 1
             others = [label for label in self.loaded if label != own_label.lower()]
             return _found(others[0] if others else None)
 
-        def reload_gallery(self):
-            self.reloads += 1
-            self.loaded = sorted({path.name.rsplit("-", 1)[0] for path in gallery.folder.glob("*.jpg")})
+        def load_gallery(self, gallery):
+            # A slow load: were the lock released before it ends, the other registration's check would run
+            # against the gallery without the winner's vectors and pass too.
+            time.sleep(0.3)
+            super().load_gallery(gallery)
 
     service = _OneFace()
     _use(monkeypatch, service)
@@ -278,61 +430,67 @@ def test_two_accounts_enrolling_one_face_at_once_cannot_both_pass(gallery, monke
 
     results = dict(zip((7, 8), (_result(response) for response in asyncio.run(both()))))
 
-    # Either may win (the uploads are read in threads); exactly one does.
+    # Either may win (the uploads are read in threads); exactly one does. The winner's rows reach the gallery
+    # before the lock is released, so the second registration sees them.
     winners = [u_id for u_id, (status, _) in results.items() if status == 200]
     assert len(winners) == 1
     loser = 15 - winners[0]
     assert results[loser] == (409, ALREADY_REGISTERED)
-    label = USERS[winners[0]]["face_label"]
-    assert sorted(_files(gallery.folder)) == [f"{label}-{i}.jpg" for i in range(3)]
+    assert {row["u_id"] for row in gallery.conn.vectors} == {winners[0]}
+    assert len(gallery.conn.vectors) == 3
+    assert service.loaded == [USERS[winners[0]]["face_label"]]
     assert gallery.conn.enrolled == winners
+    assert _files(gallery.folder) == {}
 
 
-# --- The legacy route POST /auth/register-photos (no login, client-chosen label) -----------------------
+def test_enrollment_status_counts_rows(gallery):
+    gallery.conn.add_vectors(7, [face_vectors.to_bytes(_desc(i)) for i in range(3)])
+    (gallery.folder / "jane-0.jpg").write_bytes(b"an old photo")   # the folder no longer counts
 
-def test_legacy_route_refuses_a_face_of_another_account(gallery, monkeypatch):
-    service = _FakeFaces([_found(), _found("a")])
-    _use(monkeypatch, service)
+    def status(u_id):
+        return asyncio.run(api_face.enrollment_status(user={"u_id": u_id}))
 
-    status, body = _result(_legacy(" Newbie "))
-
-    assert (status, body) == (409, ALREADY_REGISTERED)
-    assert service.own_labels == ["newbie", "newbie"]
-    assert _files(gallery.folder) == {} and service.reloads == 0
+    assert status(7) == {"enrolled": True, "count": 3}
+    assert status(8) == {"enrolled": False, "count": 0}
+    assert status(1) == {"enrolled": True, "count": 0}     # face_enrolled still counts
+    assert status(9) == {"enrolled": False, "count": 0}    # no active account
 
 
-@pytest.mark.parametrize("existing_file, label", [
-    ("pearl-0.jpg", "pearl"),   # someone's gallery photos
-    ("kim.png", "kim"),         # FacesDatabase also reads .png and names without -<n>
-    (None, "jane"),             # an account whose face is not enrolled yet
-    (None, "gone"),             # a deactivated account: face_label is still UNIQUE
-])
-def test_legacy_route_never_writes_under_a_label_in_use(gallery, monkeypatch, existing_file, label):
-    if existing_file:
-        (gallery.folder / existing_file).write_bytes(b"someone's photo")
-    before = _files(gallery.folder)
+def test_legacy_register_photos_is_retired(gallery, monkeypatch):
     service = _FakeFaces([_found()] * 3)
     _use(monkeypatch, service)
+    app = FastAPI()
+    app.include_router(auth.router, prefix="/auth")
+    files = [("photos", (f"newbie-{i}.jpg", _photo(i), "image/jpeg")) for i in range(3)]
 
-    status, body = _result(_legacy(label.upper()))
+    with TestClient(app) as client:
+        answer = client.post("/auth/register-photos", data={"face_label": "newbie"}, files=files)
+        empty = client.post("/auth/register-photos")
 
-    assert (status, body) == (409, LABEL_TAKEN)
-    assert _files(gallery.folder) == before
+    assert (answer.status_code, answer.json()) == (410, RETIRED)
+    assert (empty.status_code, empty.json()) == (410, RETIRED)
     assert service.checked == 0 and service.reloads == 0
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
+    # The older page shows the answer's sentence instead of going on to /auth/register.
+    script = (Path(__file__).resolve().parents[1] / "static" / "js" / "photo_capture.js").read_text(encoding="utf-8")
+    assert "resp.status === 410" in script and "data.detail" in script
 
 
-def test_legacy_route_stores_a_new_face_as_crops_and_reloads(gallery, monkeypatch):
-    service = _FakeFaces([_found(), _found(), _found()])
+def test_descriptor_never_logged(gallery, monkeypatch, caplog):
+    marker = np.full(256, 0.987654321, np.float32)
+    service = _FakeFaces([_found(descriptor=marker)] * 3 + [_found(descriptor=marker), _found("ghost")])
     _use(monkeypatch, service)
 
-    status, body = _result(_legacy("newbie"))
+    with caplog.at_level(logging.DEBUG):
+        assert _result(_enroll())[0] == 200
+        assert _result(_enroll(u_id=8))[0] == 409
 
-    assert status == 200 and body["face_label"] == "newbie" and len(body["saved"]) == 3
-    shapes = [cv2.imread(str(gallery.folder / f"newbie-{i}.jpg")).shape[:2] for i in range(3)]
-    assert shapes == [(50, 40)] * 3
-    # Login sees the face at once; face_enrolled is not touched (/auth/register creates the account after).
-    assert service.reloads == 1 and gallery.conn.enrolled == []
-
+    raw = face_vectors.to_bytes(marker)
+    for record in caplog.records:
+        text = record.getMessage()
+        assert "0.98765" not in text and "9876" not in text
+        assert raw.hex()[:16] not in text and repr(raw[:8]) not in text
+        assert not any(isinstance(arg, (bytes, np.ndarray)) for arg in (record.args or ()))
 
 # --- FaceRecognitionService.match_enrollment_face, with fake models -----------------------------------
 
@@ -401,6 +559,19 @@ class _Gallery:
     def __getitem__(self, index):
         return self.database[index]
 
+    @classmethod
+    def from_rows(cls, rows):
+        """face_vectors.build_gallery's grouping (one identity per lower-case label, row order) without OpenVINO."""
+        gallery = cls([])
+        by_label = {}
+        for label, raw in rows:
+            label = label.lower()
+            if label not in by_label:
+                by_label[label] = types.SimpleNamespace(label=label, descriptors=[])
+                gallery.database.append(by_label[label])
+            by_label[label].descriptors.append(face_vectors.from_bytes(raw))
+        return gallery
+
     def match_faces(self, descriptors, match_algo):
         assert match_algo == "MIN_DIST"
         matches = []
@@ -423,11 +594,19 @@ class _Identifier:
     def clear(self):
         pass
 
+    def set_faces_database(self, database):
+        self.faces_database = database
+
     def start_async(self, frame, rois, landmarks):
         self.started.append(rois)
 
     def get_descriptors(self):
         return [] if self.descriptor is None else [self.descriptor]
+
+
+def _without_descriptor(found):
+    """The answer's other keys (a numpy array cannot be compared inside a dict)."""
+    return {key: value for key, value in found.items() if key != "descriptor"}
 
 
 def _service(monkeypatch, rois, face_id):
@@ -452,7 +631,7 @@ def test_matches_only_the_face_enrollment_stores_under_the_service_lock(monkeypa
     found = service.match_enrollment_face(FRAME, "pearl")
 
     assert found == {"box": [100, 50, 200, 240], "label": "ab", "distance": pytest.approx(0.05), "error": None,
-                     "reason": "ok"}
+                     "reason": "ok", "descriptor": None}   # refused: no descriptor to store
     assert len(service.lm_det.calls) == 1 and len(service.lm_det.calls[0]) == 1
     (roi,) = service.lm_det.calls[0]
     assert list(roi.position) == pytest.approx([100.7, 50.2]) and face_id.started == [[roi]]
@@ -475,32 +654,40 @@ def test_own_photos_are_left_out_even_when_closest(monkeypatch):
 def test_unknown_face_own_label_only_and_empty_gallery_match_nobody(monkeypatch):
     unknown = _service(monkeypatch, [_Roi(1, 2, 200, 200)], _Identifier([("a", _vector(0.0))], _vector(0.42)))
     found = unknown.match_enrollment_face(FRAME, "pearl")
-    assert found == {"box": [1, 2, 200, 200], "label": None, "distance": pytest.approx(0.42), "error": None,
-                     "reason": "ok"}
+    assert _without_descriptor(found) == {"box": [1, 2, 200, 200], "label": None, "distance": pytest.approx(0.42),
+                                          "error": None, "reason": "ok"}
+    assert np.array_equal(found["descriptor"], _vector(0.42))
 
     for identities in ([("pearl", _vector(0.0))], []):
-        face_id = _Identifier(identities, _vector(0.0))
+        descriptor = _vector(0.1)
+        face_id = _Identifier(identities, descriptor)
         service = _service(monkeypatch, [_Roi(1, 2, 200, 200)], face_id)
-        assert service.match_enrollment_face(FRAME, "pearl") == {"box": [1, 2, 200, 200], "label": None,
-                                                                 "distance": None, "error": None,
-                                                                 "reason": "ok"}
-        assert face_id.started == []   # nobody else to compare with: no descriptor needed
+        found = service.match_enrollment_face(FRAME, "pearl")
+        assert _without_descriptor(found) == {"box": [1, 2, 200, 200], "label": None, "distance": None,
+                                              "error": None, "reason": "ok"}
+        # Nobody else to compare with, yet the descriptor is computed on the main face's box, to be stored.
+        assert np.array_equal(found["descriptor"], descriptor)
+        (roi,) = service.lm_det.calls[0]
+        assert face_id.started == [[roi]] and list(roi.position) == [1, 2] and list(roi.size) == [200, 200]
 
 
 def test_no_face_model_failure_and_missing_descriptor(monkeypatch):
     service = _service(monkeypatch, [], _Identifier([("a", _vector(0.0))], _vector(0.1)))
     assert service.match_enrollment_face(FRAME, "pearl") == {"box": None, "label": None, "distance": None,
-                                                             "error": None, "reason": "no_face"}
+                                                             "error": None, "reason": "no_face",
+                                                             "descriptor": None}
 
     def broken(inputs):
         raise RuntimeError("inference failed")
     service.face_det.infer = broken
-    assert service.match_enrollment_face(FRAME, "pearl")["error"] == "inference failed"
+    found = service.match_enrollment_face(FRAME, "pearl")
+    assert found["error"] == "inference failed" and found["descriptor"] is None
 
-    # A face that could not be checked is never passed as unknown.
-    no_descriptor = _service(monkeypatch, [_Roi(1, 2, 200, 200)], _Identifier([("a", _vector(0.0))], None))
-    found = no_descriptor.match_enrollment_face(FRAME, "pearl")
-    assert found["error"] and found["box"] is None and found["label"] is None
+    # A face that could not be checked is never passed as unknown, whether or not the gallery has other labels.
+    for identities in ([("a", _vector(0.0))], []):
+        no_descriptor = _service(monkeypatch, [_Roi(1, 2, 200, 200)], _Identifier(identities, None))
+        found = no_descriptor.match_enrollment_face(FRAME, "pearl")
+        assert found["error"] and found["box"] is None and found["label"] is None and found["descriptor"] is None
 
 
 # --- The real matching code: MIN_DIST and FACE_MATCH_THRESHOLD as login uses them --------------------
@@ -586,15 +773,15 @@ def test_endpoint_refuses_the_incident_with_real_matching(gallery, monkeypatch, 
     """A's photos are in the gallery; the same face enrolling for a new account is refused."""
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.0)])], _vector(0.05))
     service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
-    service.reload_gallery = lambda: None
     _use(monkeypatch, service)
 
     assert _result(_enroll(u_id=8)) == (409, ALREADY_REGISTERED)
-    assert _files(gallery.folder) == {}
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {}
 
     # The owner re-enrolling their own label is still allowed.
     status, body = _result(_enroll(u_id=1))
     assert status == 200 and body["face_label"] == "a"
+    assert [row["vector"] for row in gallery.conn.rows_of(1)] == [face_vectors.to_bytes(_vector(0.05))] * 3
     assert gallery.conn.enrolled == [1]
 
 
@@ -604,12 +791,11 @@ def test_endpoint_refuses_a_duplicate_the_caller_is_closer_to(gallery, monkeypat
     enroll it until the duplicate is cleaned up by hand (as was done on 3 Oct)."""
     face_id = _real_face_id(intel_matching, [("a", [_vector(0.05)]), ("ab", [_vector(0.0)])], _vector(0.0))
     service = _service(monkeypatch, [_Roi(10, 20, 200, 200)], face_id)
-    service.reload_gallery = lambda: None
     _use(monkeypatch, service)
 
     assert _result(_enroll(u_id=34)) == (409, ALREADY_REGISTERED)
     assert _result(_enroll(u_id=1)) == (409, ALREADY_REGISTERED)
-    assert _files(gallery.folder) == {} and gallery.conn.enrolled == []
+    assert gallery.conn.vectors == [] and _files(gallery.folder) == {} and gallery.conn.enrolled == []
 
 
 # --- The main-face rule on registration photos ---------------------------------------------------------
@@ -620,7 +806,8 @@ def test_two_similar_size_faces_are_refused_and_nothing_is_stored(monkeypatch):
 
     found = service.match_enrollment_face(FRAME, "pearl")
 
-    assert found == {"box": None, "label": None, "distance": None, "error": None, "reason": "two_faces"}
+    assert found == {"box": None, "label": None, "distance": None, "error": None, "reason": "two_faces",
+                     "descriptor": None}
     assert face_id.started == []
 
 
@@ -635,6 +822,7 @@ def test_the_big_face_is_stored_when_a_small_one_is_also_there(monkeypatch):
     assert found["reason"] == "ok" and found["box"] == [100, 50, 250, 250]
     (roi,) = service.lm_det.calls[0]
     assert list(roi.position) == [100, 50] and list(roi.size) == [250, 250]
+    assert face_id.started == [[roi]]   # the descriptor is computed for the big face only
 
 
 def test_a_too_small_face_is_refused(monkeypatch):
@@ -644,7 +832,7 @@ def test_a_too_small_face_is_refused(monkeypatch):
     found = service.match_enrollment_face(FRAME, "pearl")
 
     assert found["reason"] == "come_closer" and found["box"] is None and found["error"] is None
-    assert face_id.started == []
+    assert found["descriptor"] is None and face_id.started == []
 
 
 def test_only_the_main_face_is_matched_against_other_labels(monkeypatch):
@@ -660,3 +848,4 @@ def test_only_the_main_face_is_matched_against_other_labels(monkeypatch):
     found = service.match_enrollment_face(FRAME, "pearl")
 
     assert found["label"] is None and found["reason"] == "ok"
+    assert np.array_equal(found["descriptor"], _vector(0.45))   # the stored vector is the main face's

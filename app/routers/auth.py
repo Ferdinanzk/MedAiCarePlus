@@ -5,8 +5,7 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from app.config import SECRET_KEY
 from app.database import get_pool
-from app.routers.api_face import (FrameUploadError, log_login, login_answer, read_login_frames, run_login,
-                                  save_enrollment)
+from app.routers.api_face import FrameUploadError, log_login, login_answer, read_login_frames, run_login
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -137,26 +136,9 @@ async def logout(response: Response):
 
 
 @router.post("/register-photos")
-async def register_photos(
-    face_label: str = Form(...),
-    photos: List[UploadFile] = File(...),
-):
-    """
-    Save 3 enrollment photos into face_gallery as:
-      {face_label}-0.jpg, {face_label}-1.jpg, {face_label}-2.jpg
-    The legacy register page (static/js/photo_capture.js) posts them before /auth/register creates the
-    account. They go through the same checks as POST /api/face/enroll (api_face.save_enrollment): a face
-    login already takes for another account is refused with 409, nothing saved. This route has no login,
-    so it only takes a label with no gallery photos and no account yet (409 face_label_taken): it can never
-    replace anyone's photos.
-    """
-    label = face_label.strip().lower()
-    if not label or "/" in label or "\\" in label:
-        return JSONResponse({"error": "Invalid face_label"}, status_code=400)
-    if len(photos) != 3:
-        return JSONResponse({"error": "Exactly 3 photos required"}, status_code=400)
-
-    saved = await save_enrollment(photos, label, caller="legacy /auth/register-photos", new_label_only=True)
-    if isinstance(saved, JSONResponse):
-        return saved
-    return {"saved": [str(path) for path in saved], "face_label": label}
+async def register_photos():
+    """Retired (8 Nov 2026): faces are stored as face vectors of an account, and this route ran before the
+    account existed. Registration is in the app (POST /api/face/enroll after sign-up). Always 410; nothing is
+    read or stored."""
+    return JSONResponse({"error": "use_app_registration", "detail": "Please register in the app."},
+                        status_code=410)

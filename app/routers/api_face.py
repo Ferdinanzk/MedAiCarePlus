@@ -1,10 +1,7 @@
 import asyncio
 import logging
-import re
 import cv2
 import numpy as np
-import uuid
-from pathlib import Path
 from typing import List
 from fastapi import APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
@@ -12,6 +9,7 @@ from itsdangerous import URLSafeTimedSerializer
 from app.dependencies import get_consented_user
 from app.config import SECRET_KEY, FACE_LOGIN_FRAMES
 from app.database import get_pool
+from app.services import face_vectors
 from app.services.face_login import LoginDecision
 from app.services.face_recognition_service import FaceRecognitionService
 
@@ -26,9 +24,6 @@ FACE_ALREADY_REGISTERED = ("This face is already registered to another account. 
 FACE_WITHOUT_ACCOUNT = ("This face is already in the face gallery, but no account uses those photos, so face "
                         "login cannot sign it in. Ask your caregiver or whoever runs this app to remove the "
                         "old face photos, then enroll again.")
-# Legacy /auth/register-photos only: it has no login, so it may not write under a label someone has.
-FACE_LABEL_TAKEN = ("This face ID is already in use. Choose another name, or sign in to that account and "
-                    "enroll the face there.")
 
 
 MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -163,11 +158,12 @@ async def enroll_face(
     photos: List[UploadFile] = File(...),
     user: dict = Depends(get_consented_user),
 ):
-    """Save 3 enrollment photos to face gallery.
+    """Store the face vectors of 3 enrollment photos (face_vector rows; the photos are not kept).
     face_label is derived from the authenticated user's DB row — never from the request.
     409 (nothing saved) when any photo's face is one login would take for another gallery label:
     face_already_registered when an active account has that label, face_registered_without_account when
-    none does. Replacing your own photos is allowed (save_enrollment)."""
+    none does. Replacing your own vectors is allowed (save_enrollment). The answer's saved holds the 3 new
+    rows' ids as text: never a path or a vector."""
     if len(photos) != 3:
         return JSONResponse({"error": "Exactly 3 photos required"}, status_code=400)
 
@@ -192,7 +188,7 @@ async def enroll_face(
         )
 
     label = row["face_label"]
-    saved = await save_enrollment(photos, label, caller=f"u_id {row['u_id']}")
+    saved = await save_enrollment(photos, label, row["u_id"], caller=f"u_id {row['u_id']}")
     if isinstance(saved, JSONResponse):
         return saved
 
@@ -204,7 +200,7 @@ async def enroll_face(
             row["u_id"],
         )
 
-    return {"saved": [str(path) for path in saved], "face_label": label}
+    return {"saved": [str(vector_id) for vector_id in saved], "face_label": label}
 
 
 # One refusal sentence per reason the main-face rule gives (as face login's): the photo must hold one clear face.
@@ -215,18 +211,16 @@ _PHOTO_REFUSALS = {
 }
 
 
-async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
-                          new_label_only: bool = False) -> "list[Path] | JSONResponse":
-    """Check 3 enrollment photos and store their face crops as <label>-<i>.jpg, then reload the gallery.
+async def save_enrollment(photos: List[UploadFile], label: str, u_id: int, *,
+                          caller: str) -> "list[int] | JSONResponse":
+    """Check 3 enrollment photos and store each one's face vector as a face_vector row of u_id, replacing
+    u_id's earlier rows, then reload face login's gallery from the rows.
 
-    Shared by POST /api/face/enroll and the legacy POST /auth/register-photos. Returns the saved paths, or
-    a JSONResponse saying why nothing was saved. Every photo is checked against the gallery as it is before
-    any of them is saved, leaving out label's own photos (these replace them); a face login would take for
-    another gallery label is refused (_known_face_refusal). new_label_only is for the legacy route, which has
-    no login: it also refuses a label that already has gallery photos or an account (409 face_label_taken),
-    so that route can never replace anyone's photos. caller is for the log only."""
-    from app.config import FACE_GALLERY_DIR
-
+    Returns the 3 new vector_ids, or a JSONResponse saying why nothing was stored. Every photo is checked
+    against the gallery as it is before anything is stored, leaving out label's own vectors (these replace
+    them); a face login would take for another gallery label is refused (_known_face_refusal). The vector is
+    the main face's descriptor computed on the full photo, as face login computes it (match_enrollment_face).
+    No photo is written anywhere. Vectors are never logged. caller is for the log only."""
     svc = FaceRecognitionService.get_instance()
     if not FaceRecognitionService._available:
         return JSONResponse(
@@ -244,19 +238,14 @@ async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
         images.append(img)
 
     loop = asyncio.get_running_loop()
-    # One enrollment at a time, from the first check until the gallery holds the new photos, so two
+    # One enrollment at a time, from the first check until the gallery holds the new vectors, so two
     # accounts enrolling the same face at once cannot both pass the check below.
     async with _enroll_lock:
-        if new_label_only and await _label_in_use(label, FACE_GALLERY_DIR):
-            logger.warning("Face enrollment refused for %s: its face label already has gallery photos "
-                           "or an account", caller)
-            return JSONResponse({"error": "face_label_taken", "detail": FACE_LABEL_TAKEN}, status_code=409)
-        face_imgs = []
+        vectors = []
         for i, img in enumerate(images):
-            # Find the face this photo stores and which other label the gallery (as it is before these
-            # photos are saved) would take it for, by login's own matching (match_enrollment_face). It holds
-            # the service lock like identify_faces, and reuses the detection the crop below
-            # needs anyway.
+            # Find the face this photo stores, its descriptor, and which other label the gallery (as it is
+            # before these vectors are stored) would take it for, by login's own matching
+            # (match_enrollment_face, under the service lock like identify_faces).
             found = await loop.run_in_executor(None, svc.match_enrollment_face, img, label)
             if found["error"]:
                 return JSONResponse(
@@ -270,34 +259,31 @@ async def save_enrollment(photos: List[UploadFile], label: str, *, caller: str,
                 )
             if found["label"]:
                 return await _known_face_refusal(found["label"], found["distance"], i, caller)
-            # Crop to the detected face before storing. The gallery descriptor is
-            # computed over the whole stored image, while login detects + crops the
-            # face first — so we must store a tight face crop here for the two
-            # descriptors to live in the same space and actually match.
-            x, y, w, h = found["box"]
-            crop = img[max(0, y):y + h, max(0, x):x + w]
-            face_imgs.append(crop if crop.size else img)
+            try:
+                vectors.append(face_vectors.to_bytes(found["descriptor"]))
+            except (TypeError, ValueError):
+                # Fail closed: a face without a usable descriptor is never stored.
+                return JSONResponse(
+                    {"error": f"Face detection failed for photo {i}"},
+                    status_code=503,
+                )
 
-        FACE_GALLERY_DIR.mkdir(parents=True, exist_ok=True)
-        staged: list[tuple[Path, Path]] = []
-        final_paths = []
-        for i, face_img in enumerate(face_imgs):
-            temp_path = FACE_GALLERY_DIR / f".{label}-{uuid.uuid4().hex}-{i}.jpg"
-            if not cv2.imwrite(str(temp_path), face_img):
-                for old_temp, _ in staged:
-                    old_temp.unlink(missing_ok=True)
-                temp_path.unlink(missing_ok=True)
-                return JSONResponse({"error": f"Cannot save photo {i}"}, status_code=500)
-            final_path = FACE_GALLERY_DIR / f"{label}-{i}.jpg"
-            staged.append((temp_path, final_path))
-            final_paths.append(final_path)
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM face_vector WHERE u_id = $1", u_id)
+                vector_ids = [
+                    await conn.fetchval(
+                        "INSERT INTO face_vector (u_id, face_label, vector, source) "
+                        "VALUES ($1, $2, $3, 'enroll') RETURNING vector_id",
+                        u_id, label.lower(), vector,
+                    )
+                    for vector in vectors
+                ]
+        # Still under _enroll_lock: the next registration's check must already see these vectors.
+        await face_vectors.reload(pool)
 
-        for temp_path, final_path in staged:
-            temp_path.replace(final_path)
-
-        await loop.run_in_executor(None, svc.reload_gallery)
-
-    return final_paths
+    return vector_ids
 
 
 async def _known_face_refusal(other_label: str, distance: float, photo: int, caller: str) -> JSONResponse:
@@ -331,50 +317,27 @@ async def _known_face_refusal(other_label: str, distance: float, photo: int, cal
     )
 
 
-def _gallery_labels(gallery_dir: Path) -> set[str]:
-    """The labels FacesDatabase reads from this folder: each .jpg/.png file's name without its extension
-    and a trailing -<number>, in lower case."""
-    if not gallery_dir.exists():
-        return set()
-    return {re.split(r"-\d+$", path.stem)[0].lower() for path in gallery_dir.iterdir()
-            if path.name.split(".")[-1] in ("jpg", "png")}
-
-
-async def _label_in_use(label: str, gallery_dir: Path) -> bool:
-    """Whether label already has gallery photos or an account (active or not: face_label is UNIQUE)."""
-    if label.lower() in _gallery_labels(gallery_dir):
-        return True
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow('SELECT 1 FROM "user" WHERE face_label = $1', label) is not None
-
-
 @router.get("/enrollment-status")
 async def enrollment_status(user: dict = Depends(get_consented_user)):
     """Report whether the authenticated user already has an enrolled face.
 
-    Used by the onboarding wizard to skip the 3-pose capture when the gallery
-    already holds this user's photos. Checks the DB flag first, then falls back
-    to the gallery files on disk (the recognizer's actual source of truth)."""
-    from app.config import FACE_GALLERY_DIR
-
+    Used by the onboarding wizard to skip the 3-pose capture when the account already has its face vectors.
+    count is the account's face_vector rows (face login's source of truth); face_enrolled also counts."""
     pool = get_pool()
     async with pool.acquire() as conn:
         if "u_id" in user:
             row = await conn.fetchrow(
-                'SELECT face_label, face_enrolled FROM "user" WHERE u_id=$1 AND user_active=TRUE',
+                'SELECT u_id, face_label, face_enrolled FROM "user" WHERE u_id=$1 AND user_active=TRUE',
                 user["u_id"],
             )
         else:
             row = await conn.fetchrow(
-                'SELECT face_label, face_enrolled FROM "user" WHERE supabase_id=$1 AND user_active=TRUE',
+                'SELECT u_id, face_label, face_enrolled FROM "user" WHERE supabase_id=$1 AND user_active=TRUE',
                 user.get("sub"),
             )
+        if not row or not row["face_label"]:
+            return {"enrolled": False, "count": 0}
+        count = await conn.fetchval("SELECT count(*) FROM face_vector WHERE u_id = $1", row["u_id"])
 
-    if not row or not row["face_label"]:
-        return {"enrolled": False, "count": 0}
-
-    label = row["face_label"]
-    count = len(list(FACE_GALLERY_DIR.glob(f"{label}-*.jpg"))) if FACE_GALLERY_DIR.exists() else 0
     enrolled = bool(row["face_enrolled"]) or count > 0
     return {"enrolled": enrolled, "count": count}

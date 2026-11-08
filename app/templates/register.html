@@ -241,10 +241,11 @@
     btn.disabled = true;
     statusEl.textContent = "Uploading photos…";
     statusEl.className = "small mb-2 text-muted";
-    const ok = await window._uploadPhotos(faceLabel);
-    if (!ok) {
+    const upload = await window._uploadPhotos(faceLabel);
+    if (!upload.ok) {
       btn.disabled = false;
-      statusEl.textContent = "Photo upload failed — please retake.";
+      // A retired route (410) says where to register instead; "retake" would not help.
+      statusEl.textContent = upload.message || "Photo upload failed — please retake.";
       statusEl.className = "small mb-2 text-danger";
       return;
     }

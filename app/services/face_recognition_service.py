@@ -199,14 +199,25 @@ class FaceRecognitionService:
 
         Returns (label within FACE_MATCH_THRESHOLD or None, distance), or None when no descriptor was computed.
         """
+        descriptor = self._descriptor(frame_bgr, box)
+        if descriptor is None:
+            return None
+        return self._match_descriptor(descriptor, identities)
+
+    def _descriptor(self, frame_bgr: np.ndarray, box: FaceBox) -> np.ndarray | None:
+        """The 256-number descriptor of the face in box, computed on the full frame (landmarks, then the
+        identifier), or None when none was computed. Callers hold the service lock."""
         roi = FaceDetector.Result([0, 0, box.confidence, box.x, box.y, box.w, box.h])
         landmarks = self.lm_det.infer((frame_bgr, [roi]))
         self.face_id.clear()
         self.face_id.start_async(frame_bgr, [roi], landmarks)
         descriptors = self.face_id.get_descriptors()
-        if not descriptors:
-            return None
-        index, distance = identities.match_faces(descriptors[:1], self.face_id.match_algo)[0]
+        return descriptors[0] if descriptors else None
+
+    def _match_descriptor(self, descriptor: np.ndarray, identities) -> tuple[str | None, float]:
+        """Login's rule: each label's closest descriptor, then the closest label (MIN_DIST); a distance above
+        FACE_MATCH_THRESHOLD is no label."""
+        index, distance = identities.match_faces([descriptor], self.face_id.match_algo)[0]
         distance = float(distance)
         if self.face_id.match_threshold < distance:
             return None, distance
@@ -246,54 +257,60 @@ class FaceRecognitionService:
 
     @synchronized
     def match_enrollment_face(self, frame_bgr: np.ndarray, own_label: str | None = None) -> dict:
-        """Find the face an enrollment photo will store, and which other gallery label login would take it for.
+        """Find the face an enrollment photo will store, its descriptor, and which other gallery label login
+        would take it for.
 
-        It runs on the full photo, as face login (detect) and the monitor (identify_faces) do: the same
-        detector, landmarks and descriptor, and login's own choice of face (main_face: the biggest face,
-        refused when a second one is nearly as big or the biggest is too small). The gallery stores that
-        face's crop as a whole image, so its descriptor is the one login computes for this face. The match
-        is login's rule: FacesDatabase.match_faces (each label's closest photo, then the closest label,
-        MIN_DIST) and FaceIdentifier.postprocess's threshold (a distance above FACE_MATCH_THRESHOLD is Unknown).
+        It runs on the full photo, as face login (detect, match_box) does: the same detector, landmarks and
+        descriptor, and login's own choice of face (main_face: the biggest face, refused when a second one is
+        nearly as big or the biggest is too small). The descriptor is computed for that face's box on the full
+        photo (_descriptor, login's path), always, also when the gallery has no other label: it is what
+        registration stores (a face_vector row). The match is login's rule: FacesDatabase.match_faces (each
+        label's closest vector, then the closest label, MIN_DIST) and FaceIdentifier.postprocess's threshold
+        (a distance above FACE_MATCH_THRESHOLD is Unknown).
 
-        own_label's photos are left out: the enrollment replaces them. A face within the threshold of
+        own_label's vectors are left out: the enrollment replaces them. A face within the threshold of
         another label is confused with it by login whichever of the two is closer on a given frame
         (3 Oct 2026: one face in the gallery as both "a" and "ab" was matched to either), so being closer
-        to your own old photos must not let it through.
+        to your own old vectors must not let it through.
 
         Returns {"box": [x, y, w, h] | None, "label": str | None, "distance": float | None,
-        "error": str | None, "reason": "ok" | "no_face" | "two_faces" | "come_closer"}.
+        "error": str | None, "reason": "ok" | "no_face" | "two_faces" | "come_closer",
+        "descriptor": np.ndarray | None}.
         box is set only when reason is "ok". label is the closest other label within the threshold, else
-        None; distance is to the closest other label (None when the gallery has no other label).
+        None; distance is to the closest other label (None when the gallery has no other label). descriptor is
+        set only for a photo that may be stored (reason "ok", no other label, no error); it is never logged
+        and never sent in an HTTP answer.
         """
+        refused = {"box": None, "label": None, "distance": None, "descriptor": None}
         if not self._available:
-            return {"box": None, "label": None, "distance": None, "reason": "no_face",
-                    "error": "Face recognition model unavailable"}
+            return {**refused, "reason": "no_face", "error": "Face recognition model unavailable"}
         try:
             boxes = self.detect(frame_bgr)
             frame_h, frame_w = frame_bgr.shape[:2]
             reason, main = main_face(boxes, frame_w, frame_h, min_area_ratio=FACE_MIN_AREA_RATIO,
                                      second_ratio=FACE_SECOND_FACE_RATIO)
             if reason != "ok" or main is None:
-                return {"box": None, "label": None, "distance": None, "error": None, "reason": reason}
+                return {**refused, "error": None, "reason": reason}
             box = [int(main.x), int(main.y), int(main.w), int(main.h)]
+            descriptor = self._descriptor(frame_bgr, main)
+            if descriptor is None:
+                # Fail closed: a face that could not be checked must not be enrolled.
+                return {**refused, "reason": "ok", "error": "No face descriptor computed"}
             gallery = self.face_id.faces_database
             own = (own_label or "").lower()
             others = [gallery[i] for i in range(len(gallery))] if gallery else []
             others = [identity for identity in others if identity.label.lower() != own]
             # No other label: nobody to confuse it with (and match_faces cannot take an argmin over nothing).
             if not others:
-                return {"box": box, "label": None, "distance": None, "error": None, "reason": "ok"}
+                return {"box": box, "label": None, "distance": None, "error": None, "reason": "ok",
+                        "descriptor": descriptor}
             view = copy.copy(gallery)
             view.database = others
-            matched = self._match_identities(frame_bgr, main, view)
-            if matched is None:
-                # Fail closed: an unchecked face must not be enrolled.
-                return {"box": None, "label": None, "distance": None, "reason": "ok",
-                        "error": "No face descriptor computed"}
-            label, distance = matched
-            return {"box": box, "label": label, "distance": distance, "error": None, "reason": "ok"}
+            label, distance = self._match_descriptor(descriptor, view)
+            return {"box": box, "label": label, "distance": distance, "error": None, "reason": "ok",
+                    "descriptor": None if label else descriptor}
         except Exception as exc:
-            return {"box": None, "label": None, "distance": None, "error": str(exc), "reason": "no_face"}
+            return {**refused, "error": str(exc), "reason": "no_face"}
 
     @synchronized
     def identify_faces(self, frame_bgr: np.ndarray) -> dict:
