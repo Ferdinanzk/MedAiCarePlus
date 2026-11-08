@@ -611,3 +611,19 @@ CREATE TABLE IF NOT EXISTS ai_live (
     last_error     TEXT,                     -- the last Check's error code; NULL after a pass
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+-- LINE medicine photo (8 Nov 2026): one row per photo a patient sends; the photo itself is never kept.
+CREATE TABLE IF NOT EXISTS line_photo_draft (
+    draft_id UUID PRIMARY KEY,
+    u_id INTEGER NOT NULL REFERENCES "user"(u_id) ON DELETE CASCADE,
+    line_message_id VARCHAR(64) NOT NULL UNIQUE,
+    status VARCHAR(10) NOT NULL DEFAULT 'reading'
+        CHECK (status IN ('reading', 'pending', 'saved', 'failed', 'refused')),
+    result JSONB,
+    error_code VARCHAR(40),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
+    saved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_line_photo_draft_user ON line_photo_draft(u_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_line_id ON "user"(line_id);

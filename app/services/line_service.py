@@ -12,6 +12,11 @@ QUOTA_URL = "https://api.line.me/v2/bot/message/quota"
 QUOTA_CONSUMPTION_URL = "https://api.line.me/v2/bot/message/quota/consumption"
 QUOTA_TIMEOUT_SECONDS = 10
 QUOTA_CACHE_SECONDS = 300
+LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
+LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{message_id}/content"
+LOADING_TIMEOUT_SECONDS = 10
+CONTENT_TIMEOUT_SECONDS = 30
+CONTENT_CHUNK_BYTES = 65536
 
 
 def verification_success_text(patient_name: str) -> str:
@@ -90,6 +95,54 @@ class LineService:
         status = "invalid_token" if resp.status_code == 400 else "failed"
         return {"status": status, "http_status": resp.status_code, "request_id": request_id,
                 "error": f"LINE reply {resp.status_code}"}
+
+    def start_loading(self, chat_id: str, seconds: int = 60) -> bool:
+        """Show LINE's loading animation in a one-to-one chat (5 to 60 seconds, multiples of 5).
+
+        True when LINE accepted it. Never raises, and never logs the chat id or the token.
+        """
+        if not LineService._available or not chat_id:
+            return False
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        }
+        try:
+            resp = requests.post(LINE_LOADING_URL, json={"chatId": chat_id, "loadingSeconds": seconds},
+                                 headers=headers, timeout=LOADING_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+        return 200 <= resp.status_code < 300
+
+    def get_content(self, message_id: str, max_bytes: int) -> "tuple[str, bytes | None]":
+        """Download a message's content (a photo) as ("ok", bytes), ("too_large", None) or ("failed", None).
+
+        Reads the stream only until max_bytes + 1, so an oversized file is never held whole.
+        Never raises, and never logs the message id or the token.
+        """
+        if not LineService._available or not message_id:
+            return "failed", None
+        headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        resp = None
+        try:
+            resp = requests.get(LINE_CONTENT_URL.format(message_id=message_id), headers=headers,
+                                stream=True, timeout=CONTENT_TIMEOUT_SECONDS)
+            if resp.status_code != 200:
+                return "failed", None
+            data = bytearray()
+            for chunk in resp.iter_content(chunk_size=CONTENT_CHUNK_BYTES):
+                data += chunk
+                if len(data) > max_bytes:
+                    return "too_large", None
+            return "ok", bytes(data)
+        except Exception:
+            return "failed", None
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
     _quota_cache: "tuple[float, dict] | None" = None
 
